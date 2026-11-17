@@ -506,7 +506,7 @@ impl Runner {
         if let Some(job) = self.job.take() {
             let _ = job.release();
         }
-        self.executor.restore_group();
+        let _ = self.executor.restore_group();
         self.run_in_caller_group("fail_open")
     }
 
@@ -554,14 +554,16 @@ impl Runner {
         }
     }
 
-    /// Step 9: release, record, and exit as the stage did.
+    /// Step 9: release, record, and exit as the stage did. The reservation is released only
+    /// when no member of the stage's group is left; otherwise it stays for the recovery pass,
+    /// which releases it once the group is empty (section 4.5).
     fn finish(mut self, outcome: &ExecOutcome, spawned: Instant, path: &'static str) -> ExitCode {
         let wall_ms = u64::try_from(spawned.elapsed().as_millis()).unwrap_or(u64::MAX);
         if let Some(job) = self.job.take() {
-            if group_outlived_parent(&self.watch, &job) {
-                job.abandon();
-            } else {
+            if self.group_is_empty(&job) {
                 let _ = job.release();
+            } else {
+                job.abandon();
             }
         }
         let (exit, signal) = match outcome {
@@ -619,6 +621,30 @@ impl Runner {
         }
     }
 
+    /// Whether the job's group has no member left besides the runner. The runner first moves
+    /// back into the caller's group, so that `kill(-pgid, 0)` sees only the stage's processes;
+    /// no other process can create a group with this ID while the runner is alive. When it
+    /// cannot move, it reads the process table instead. A group that cannot be read counts as
+    /// not empty.
+    #[cfg(unix)]
+    fn group_is_empty(&self, job: &Job) -> bool {
+        let GroupIdentity::Pgid { pgid, .. } = job.reservation().group;
+        if self.executor.restore_group() {
+            !os::unix::group_exists(pgid)
+        } else {
+            os::unix::other_group_members(pgid).is_ok_and(|members| members.is_empty())
+        }
+    }
+
+    #[cfg(not(unix))]
+    #[allow(
+        clippy::unused_self,
+        reason = "the same signature as on Unix; no job is admitted on this platform"
+    )]
+    fn group_is_empty(&self, _job: &Job) -> bool {
+        true
+    }
+
     fn waited_ms(&self) -> Option<u64> {
         self.waited
             .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
@@ -635,19 +661,6 @@ impl Runner {
         }
         let _ = ctx.recorder.append(&record);
     }
-}
-
-/// Whether the runner's parent exited and the job's group still has members besides the
-/// runner: the supervisor gave up waiting, and the reservation stays for recovery.
-#[cfg(unix)]
-fn group_outlived_parent(watch: &Watch, job: &Job) -> bool {
-    let GroupIdentity::Pgid { pgid, .. } = job.reservation().group;
-    watch.parent_exited() && os::unix::other_group_members(pgid).map_or(true, |m| !m.is_empty())
-}
-
-#[cfg(not(unix))]
-fn group_outlived_parent(_watch: &Watch, _job: &Job) -> bool {
-    false
 }
 
 fn cwd_string() -> String {

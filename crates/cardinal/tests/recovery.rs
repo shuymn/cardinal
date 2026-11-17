@@ -136,7 +136,7 @@ fn previous_boot_is_stale_even_with_a_live_group() {
 #[cfg(unix)]
 mod real {
     use std::os::unix::process::CommandExt as _;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use cardinal::admission::{in_use, list_reservations, recovery_pass};
     use cardinal::config::HostConfig;
@@ -298,6 +298,53 @@ mod real {
         wait_gone(descendant, descendant_start);
         let report = recovery_pass(&env.state(), &host()).unwrap();
         assert_eq!(report.released.len(), 1, "released once the group is empty");
+        assert_eq!(env.reservations(), []);
+    }
+
+    /// A stage whose direct child exits while a descendant stays in its group: the runner
+    /// returns the child's status at once, and keeps the reservation, and so the budget and the
+    /// worktree, until the descendant has ended. Nothing signals the descendant.
+    #[test]
+    fn descendant_keeps_the_reservation_after_the_child_exits() {
+        let env = Env::with_budget(1);
+        let pids = env.file("pids");
+        let script = format!(
+            "sleep 30 </dev/null >/dev/null 2>&1 & echo $! > '{}'",
+            pids.display()
+        );
+        let start = Instant::now();
+        let out = output(&mut env.run(None, &["sh", "-c", &script]));
+        assert_eq!(out.status.code(), Some(0));
+        assert!(start.elapsed() < Duration::from_secs(5), "returned at once");
+        let pgid: u32 = env.records_of(RecordKind::JobStarted)[0].data["pgid"]
+            .as_u64()
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let group = GroupGuard(pgid);
+        let descendant: u32 = std::fs::read_to_string(&pids)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let descendant_start = cardinal::os::start_time_s(descendant).unwrap();
+        let job = env.records_of(RecordKind::JobFinished)[0]
+            .job_id
+            .clone()
+            .unwrap();
+
+        let report = recovery_pass(&env.state(), &host()).unwrap();
+        assert_eq!(report.released, Vec::<String>::new());
+        assert_eq!(report.reservations.len(), 1);
+        assert_eq!(report.reservations[0].reservation.job_id, job);
+        assert_eq!(report.reservations[0].derived, DerivedState::RecoveryNeeded);
+        assert!(in_use(&env.state(), &env.worktree_key()).unwrap().value);
+        assert!(cardinal::os::is_alive(descendant, descendant_start));
+
+        drop(group);
+        wait_gone(descendant, descendant_start);
+        let report = recovery_pass(&env.state(), &host()).unwrap();
+        assert_eq!(report.released, [job]);
         assert_eq!(env.reservations(), []);
     }
 

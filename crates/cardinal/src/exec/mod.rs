@@ -244,14 +244,19 @@ impl LocalExecutor {
 
     /// Moves the runner back into the group it was in before [`Executor::prepare`], so a stage
     /// started afterwards shares the caller's group. When that group no longer exists, the
-    /// runner stays in its own group and the stage starts there.
-    pub fn restore_group(&self) {
+    /// runner stays in its own group and the stage starts there. Returns whether the runner
+    /// left a group it led: false when it led none, already led its group before `prepare`,
+    /// or could not move.
+    #[must_use]
+    pub fn restore_group(&self) -> bool {
         #[cfg(unix)]
-        if let Some(setup) = self.group.take()
-            && os::unix::rejoin_group(setup).is_err()
-        {
+        if let Some(setup) = self.group.take() {
+            if setup.original != setup.pgid && os::unix::rejoin_group(setup).is_ok() {
+                return true;
+            }
             self.group.set(Some(setup));
         }
+        false
     }
 
     /// Starts `inv`. The error is the spawn's own: the OS guarantees that no child ran.

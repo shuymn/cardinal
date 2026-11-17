@@ -438,8 +438,8 @@ impl Job {
     }
 
     /// Keeps the reservation and the live lock file in place and drops the live lock: the
-    /// reservation is then evaluated like that of a runner that died. Used when the stage's
-    /// group did not empty before the runner gave up waiting.
+    /// reservation is then evaluated like that of a runner that died. Used when members of the
+    /// stage's group are left once the stage has ended.
     pub fn abandon(mut self) {
         self.done = true;
         drop(self.live.take());
