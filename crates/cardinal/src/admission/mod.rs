@@ -5,8 +5,9 @@
 //! `recovery_needed` reservation plus the new job's, compared per resource with the budgets
 //! of `host.toml`, inside the admission lock. A job gets all of its resources or none.
 //!
-//! Admission never starts a process and never touches the network; it signals only process
-//! groups that a recovery pass verified (section 4.5).
+//! Admission never starts a process, never touches the network, and never signals: a
+//! recovery-needed reservation counts until its group is empty or the boot changed, because
+//! nothing pins a dead runner's process group ID between a check and a signal (section 4.5).
 
 mod budget;
 mod liveness;
@@ -26,17 +27,11 @@ use crate::contract::{
 use crate::record::Recorder;
 use crate::state::{self, Durability, FileLock, LockError, LockMode, Probe, StateDir, now_ms};
 
-/// How long after the recovery pass's SIGTERM a later pass sends SIGKILL to a group that is
-/// still alive.
-pub const KILL_AFTER_MS: u64 = 2000;
-
 /// What one recovery pass did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RecoveryReport {
     /// Jobs whose stale reservations were deleted.
     pub released: Vec<String>,
-    /// Jobs whose verified groups were sent SIGTERM or SIGKILL.
-    pub signalled: Vec<String>,
     /// The reservations left after the pass, with their derived state.
     pub reservations: Vec<ReservationView>,
 }
@@ -179,12 +174,11 @@ pub fn in_use(state: &StateDir, worktree_key: &str) -> Result<InUse, Error> {
     })
 }
 
-/// What a recovery pass did to one reservation, appended as a `job_recovered` record once the
+/// A reservation a recovery pass released, appended as a `job_recovered` record once the
 /// admission lock is released.
 #[derive(Clone, Debug)]
 struct Recovered {
     job_id: String,
-    action: &'static str,
     pgid: u32,
 }
 
@@ -192,68 +186,37 @@ struct Recovered {
 struct Recovery {
     /// Every reservation that is still there, with its derived state.
     kept: Vec<(Reservation, Derived)>,
-    actions: Vec<Recovered>,
+    released: Vec<Recovered>,
 }
 
 /// The recovery pass of section 4.4, run while holding the admission lock: deletes `stale`
-/// reservations and their live lock files, deletes free live lock files without a
-/// reservation, sends SIGTERM to each verified `recovery_needed` group, and SIGKILL to one
-/// still alive at least [`KILL_AFTER_MS`] after that SIGTERM.
+/// reservations and their live lock files, and deletes free live lock files without a
+/// reservation. It keeps `live` and `recovery_needed` reservations as they are and signals
+/// nothing.
 fn recover(
     _lock: &AdmissionLock,
     state: &StateDir,
     facts: &dyn ProcessFacts,
-    signals: &dyn StopGroup,
 ) -> Result<Recovery, AdmissionError> {
     let reservations = read_reservations(state)?;
     let mut kept = Vec::new();
-    let mut actions = Vec::new();
-    for mut reservation in reservations {
+    let mut released = Vec::new();
+    for reservation in reservations {
         let derived = derive(&reservation, probe_live(state, &reservation.job_id), facts);
-        let GroupIdentity::Pgid { pgid, .. } = reservation.group;
-        match derived.state {
-            DerivedState::Live => kept.push((reservation, derived)),
-            DerivedState::Stale => {
-                remove_if_exists(&state.reservation(&reservation.job_id)).map_err(state_error)?;
-                let _ = remove_if_exists(&state.live_lock(&reservation.job_id));
-                actions.push(Recovered {
-                    job_id: reservation.job_id,
-                    action: "released",
-                    pgid,
-                });
-            }
-            DerivedState::RecoveryNeeded => {
-                if derived.verified {
-                    let now = now_ms();
-                    match reservation.stop_signal_ms {
-                        None => {
-                            signals.stop(pgid, Stop::Term);
-                            reservation.stop_signal_ms = Some(now);
-                            reservation.updated_ms = now;
-                            write_reservation(state, &reservation)?;
-                            actions.push(Recovered {
-                                job_id: reservation.job_id.clone(),
-                                action: "sigterm",
-                                pgid,
-                            });
-                        }
-                        Some(sent) if now.saturating_sub(sent) >= KILL_AFTER_MS => {
-                            signals.stop(pgid, Stop::Kill);
-                            actions.push(Recovered {
-                                job_id: reservation.job_id.clone(),
-                                action: "sigkill",
-                                pgid,
-                            });
-                        }
-                        Some(_) => {}
-                    }
-                }
-                kept.push((reservation, derived));
-            }
+        if derived.state == DerivedState::Stale {
+            let GroupIdentity::Pgid { pgid, .. } = reservation.group;
+            remove_if_exists(&state.reservation(&reservation.job_id)).map_err(state_error)?;
+            let _ = remove_if_exists(&state.live_lock(&reservation.job_id));
+            released.push(Recovered {
+                job_id: reservation.job_id,
+                pgid,
+            });
+        } else {
+            kept.push((reservation, derived));
         }
     }
     collect_free_live_locks(state, &kept);
-    Ok(Recovery { kept, actions })
+    Ok(Recovery { kept, released })
 }
 
 /// Deletes live lock files that nobody holds and no reservation names: left by runners that
@@ -281,41 +244,13 @@ fn collect_free_live_locks(state: &StateDir, kept: &[(Reservation, Derived)]) {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Stop {
-    Term,
-    Kill,
-}
-
-/// Sends the recovery pass's stop signals; tests record them instead.
-trait StopGroup {
-    fn stop(&self, pgid: u32, stop: Stop);
-}
-
-/// Signals real process groups.
-struct HostSignals;
-
-impl StopGroup for HostSignals {
-    #[cfg(unix)]
-    fn stop(&self, pgid: u32, stop: Stop) {
-        let sig = match stop {
-            Stop::Term => crate::os::unix::SIGTERM,
-            Stop::Kill => crate::os::unix::SIGKILL,
-        };
-        let _ = crate::os::unix::signal_group(pgid, sig);
-    }
-
-    #[cfg(not(unix))]
-    fn stop(&self, _pgid: u32, _stop: Stop) {}
-}
-
-fn append_recovered(recorder: Option<&Recorder>, actions: &[Recovered]) {
+fn append_recovered(recorder: Option<&Recorder>, released: &[Recovered]) {
     let Some(recorder) = recorder else { return };
-    for action in actions {
+    for job in released {
         let mut record = recorder.record(RecordKind::JobRecovered);
-        record.job_id = Some(action.job_id.clone());
-        record.data.insert("action".into(), action.action.into());
-        record.data.insert("pgid".into(), action.pgid.into());
+        record.job_id = Some(job.job_id.clone());
+        record.data.insert("action".into(), "released".into());
+        record.data.insert("pgid".into(), job.pgid.into());
         let _ = recorder.append(&record);
     }
 }
@@ -326,24 +261,17 @@ pub fn recovery_pass(state: &StateDir, host: &HostConfig) -> Result<RecoveryRepo
     let facts = HostFacts::new();
     let recorder = Recorder::new(state, host.records.max_bytes, host.records.keep);
     let guard = lock(state, Duration::from_millis(host.admission.lock_timeout_ms))?;
-    let recovery = recover(&guard, state, &facts, &HostSignals)?;
+    let recovery = recover(&guard, state, &facts)?;
     drop(guard);
-    append_recovered(Some(&recorder), &recovery.actions);
-    let mut report = RecoveryReport::default();
-    for action in &recovery.actions {
-        let list = if action.action == "released" {
-            &mut report.released
-        } else {
-            &mut report.signalled
-        };
-        list.push(action.job_id.clone());
-    }
-    report.reservations = recovery
-        .kept
-        .into_iter()
-        .map(|(reservation, derived)| view(reservation, derived, &facts))
-        .collect();
-    Ok(report)
+    append_recovered(Some(&recorder), &recovery.released);
+    Ok(RecoveryReport {
+        released: recovery.released.into_iter().map(|r| r.job_id).collect(),
+        reservations: recovery
+            .kept
+            .into_iter()
+            .map(|(reservation, derived)| view(reservation, derived, &facts))
+            .collect(),
+    })
 }
 
 /// The result of one admission pass.
@@ -402,7 +330,7 @@ impl Admitter {
         if self.live.is_none() {
             self.live = Some(self.claim_job_id()?);
         }
-        let recovery = recover(&guard, &self.state, &facts, &HostSignals)?;
+        let recovery = recover(&guard, &self.state, &facts)?;
         let reserved = sum(recovery.kept.iter().map(|(r, _)| &r.resources));
         let within = fits(&self.budget, &reserved, &draft.resources);
         let admitted = if within || overflow {
@@ -425,7 +353,7 @@ impl Admitter {
             None
         };
         drop(guard);
-        append_recovered(self.recorder.as_ref(), &recovery.actions);
+        append_recovered(self.recorder.as_ref(), &recovery.released);
         Ok(match admitted {
             Some(reservation) => Pass::Admitted(Box::new(Job {
                 state: self.state.clone(),

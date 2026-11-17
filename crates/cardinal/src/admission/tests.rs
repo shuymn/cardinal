@@ -1,13 +1,9 @@
-//! The recovery pass and admission passes against a fake process table, so no real process
-//! group is ever signalled.
+//! The recovery pass and admission passes against a fake process table.
 
-use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use super::{
-    Admitter, Pass, ProcessFacts, Stop, StopGroup, lock, recover, resources, write_reservation,
-};
+use super::{Admitter, Pass, ProcessFacts, lock, recover, resources, write_reservation};
 use crate::config::HostConfig;
 use crate::contract::{
     AdmissionResult, DerivedState, GroupIdentity, GroupMember, Priority, ProcessIdentity,
@@ -46,15 +42,6 @@ impl ProcessFacts for Fake {
                 name: format!("p{pid}"),
             })
             .collect()
-    }
-}
-
-#[derive(Default)]
-struct Recorded(RefCell<Vec<(u32, Stop)>>);
-
-impl StopGroup for Recorded {
-    fn stop(&self, pgid: u32, stop: Stop) {
-        self.0.borrow_mut().push((pgid, stop));
     }
 }
 
@@ -117,11 +104,10 @@ fn stale_reservations_and_orphaned_live_locks_are_removed() {
         .unwrap()
         .unwrap();
 
-    let signals = Recorded::default();
     let guard = lock(&state, Duration::from_secs(1)).unwrap();
-    let recovery = recover(&guard, &state, &Fake::default(), &signals).unwrap();
+    let recovery = recover(&guard, &state, &Fake::default()).unwrap();
     assert_eq!(recovery.kept.len(), 0);
-    assert_eq!(recovery.actions.len(), 1);
+    assert_eq!(recovery.released.len(), 1);
     assert!(read(&state, "aaaa000000000001").is_none());
     assert!(!state.live_lock("aaaa000000000001").exists());
     assert!(!state.live_lock("aaaa000000000002").exists());
@@ -129,43 +115,36 @@ fn stale_reservations_and_orphaned_live_locks_are_removed() {
         state.live_lock("aaaa000000000003").exists(),
         "a held live lock is never collected"
     );
-    assert!(
-        signals.0.borrow().is_empty(),
-        "empty groups are never signalled"
-    );
     drop(waiting);
 }
 
+/// A verified group is kept as it is: the pass writes nothing into its reservation and
+/// releases it only once the group is empty.
 #[test]
-fn verified_groups_get_sigterm_then_sigkill_after_two_seconds() {
+fn verified_groups_are_kept_untouched_until_empty() {
     let (_dir, state) = state();
     let job = "bbbb000000000001";
     write_reservation(&state, &reservation(job, 200, Some((201, 21)), 1)).unwrap();
+    let written = std::fs::read(state.reservation(job)).unwrap();
     let facts = Fake {
         processes: [(201, (21, 200)), (202, (22, 200))].into_iter().collect(),
     };
-    let signals = Recorded::default();
     let guard = lock(&state, Duration::from_secs(1)).unwrap();
 
-    let first = recover(&guard, &state, &facts, &signals).unwrap();
-    assert_eq!(first.kept.len(), 1);
-    assert_eq!(first.kept[0].1.state, DerivedState::RecoveryNeeded);
-    assert!(first.kept[0].1.verified);
-    assert_eq!(*signals.0.borrow(), [(200, Stop::Term)]);
-    let sent = read(&state, job)
-        .unwrap()
-        .stop_signal_ms
-        .expect("SIGTERM recorded");
-
-    recover(&guard, &state, &facts, &signals).unwrap();
-    assert_eq!(signals.0.borrow().len(), 1, "no SIGKILL within 2 s");
-
-    let mut old = read(&state, job).unwrap();
-    old.stop_signal_ms = Some(sent - 2_000);
-    write_reservation(&state, &old).unwrap();
-    recover(&guard, &state, &facts, &signals).unwrap();
-    assert_eq!(signals.0.borrow()[1], (200, Stop::Kill));
-    assert!(read(&state, job).is_some(), "kept until the group is empty");
+    for _ in 0..2 {
+        let recovery = recover(&guard, &state, &facts).unwrap();
+        assert_eq!(recovery.kept.len(), 1);
+        assert_eq!(recovery.kept[0].1.state, DerivedState::RecoveryNeeded);
+        assert!(recovery.kept[0].1.verified);
+        assert!(recovery.released.is_empty());
+        assert_eq!(std::fs::read(state.reservation(job)).unwrap(), written);
+    }
+    let recovery = recover(&guard, &state, &Fake::default()).unwrap();
+    assert_eq!(recovery.released.len(), 1);
+    assert!(
+        read(&state, job).is_none(),
+        "released once the group is empty"
+    );
 }
 
 #[test]
@@ -182,9 +161,8 @@ fn unverified_groups_are_kept_and_never_signalled() {
     let facts = Fake {
         processes: [(302, (32, 300)), (401, (41, 400))].into_iter().collect(),
     };
-    let signals = Recorded::default();
     let guard = lock(&state, Duration::from_secs(1)).unwrap();
-    let recovery = recover(&guard, &state, &facts, &signals).unwrap();
+    let recovery = recover(&guard, &state, &facts).unwrap();
     assert_eq!(recovery.kept.len(), 2);
     assert!(
         recovery
@@ -192,7 +170,7 @@ fn unverified_groups_are_kept_and_never_signalled() {
             .iter()
             .all(|(_, d)| d.state == DerivedState::RecoveryNeeded && !d.verified)
     );
-    assert!(signals.0.borrow().is_empty());
+    assert!(recovery.released.is_empty());
 }
 
 #[test]
@@ -204,7 +182,7 @@ fn recovery_needed_reservations_count_against_the_budget() {
     let need = resources([("cpu", 1)]);
     let reserved_with = |facts: &Fake| {
         let guard = lock(&state, Duration::from_secs(1)).unwrap();
-        let recovery = recover(&guard, &state, facts, &Recorded::default()).unwrap();
+        let recovery = recover(&guard, &state, facts).unwrap();
         super::sum(recovery.kept.iter().map(|(r, _)| &r.resources))
     };
     let alive = Fake {

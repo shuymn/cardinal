@@ -1,6 +1,6 @@
 //! Recovery after a runner crash (C8, A4, `docs/architecture.md` sections 4.5 and 13.2): a
 //! dead runner's reservation and in-use state count until its process group is empty or the
-//! boot changed, and only a verified group is ever signalled.
+//! boot changed, and recovery never signals a group, verified or not.
 //!
 //! Real process groups cover what a system produces on demand; a fake process table covers a
 //! reused PGID and a child that left its descendants behind.
@@ -151,10 +151,11 @@ mod real {
     }
 
     /// Section 13.2: a runner killed while its stage runs leaves a verified recovery-needed
-    /// reservation that keeps its worktree in use and its budget taken; the next admission
-    /// stops the group, then admits the next job.
+    /// reservation that keeps its worktree in use and its budget taken. Recovery passes leave
+    /// the group running; once the group is empty, the next admission releases the
+    /// reservation and admits the next job.
     #[test]
-    fn crashed_runner_group_is_stopped_then_released() {
+    fn crashed_runner_group_is_kept_until_empty() {
         let env = Env::with_budget(1);
         let mut runner = ChildGuard::new(
             env.run_at(
@@ -168,7 +169,7 @@ mod real {
         );
         env.points.wait_reached(RUN_AFTER_SPAWN, runner.id(), WAIT);
         let pgid = runner.id();
-        let _group = GroupGuard(pgid);
+        let group = GroupGuard(pgid);
         let job = env.reservations()[0].job_id.clone();
         wait_for("both sleeps in the group", WAIT, || {
             let members = list_reservations(&env.state()).ok()?[0].members.len();
@@ -189,13 +190,29 @@ mod real {
             "the OS dropped the dead runner's shared lock; the reservation keeps it in use"
         );
 
+        let members: Vec<(u32, u64)> = views[0]
+            .members
+            .iter()
+            .map(|m| (m.pid, m.start_s))
+            .collect();
+        for _ in 0..2 {
+            let report = recovery_pass(&env.state(), &host()).unwrap();
+            assert_eq!(report.released, Vec::<String>::new());
+            assert_eq!(report.reservations[0].derived, DerivedState::RecoveryNeeded);
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        for &(pid, start_s) in &members {
+            assert!(
+                cardinal::os::is_alive(pid, start_s),
+                "{pid} was not signalled"
+            );
+        }
+        assert_eq!(env.records_of(RecordKind::JobRecovered), []);
+
+        drop(group);
         let out = output(&mut env.run(None, &["sh", "-c", "echo next"]));
         assert_eq!(out.status.code(), Some(0));
         assert_eq!(out.stdout, b"next\n");
-        assert!(
-            !cardinal::os::unix::group_exists(pgid),
-            "kill(-pgid, 0) gives ESRCH"
-        );
         let recovered: Vec<(String, String)> = env
             .records_of(RecordKind::JobRecovered)
             .iter()
@@ -206,16 +223,9 @@ mod real {
                 )
             })
             .collect();
-        assert_eq!(
-            recovered,
-            [(job.clone(), "sigterm".into()), (job, "released".into())]
-        );
+        assert_eq!(recovered, [(job, "released".into())]);
         let next = env.records_of(RecordKind::JobFinished);
         assert_eq!(next[0].data["admission"], "within_budget");
-        assert!(
-            next[0].data["waited_ms"].as_u64().unwrap() > 0,
-            "the next job waited while recovery stopped the group"
-        );
         assert_eq!(env.reservations(), []);
         assert!(!in_use(&env.state(), &env.worktree_key()).unwrap().value);
     }
@@ -239,13 +249,12 @@ mod real {
         );
         let report = recovery_pass(&env.state(), &host()).unwrap();
         assert_eq!(report.released, [job]);
-        assert_eq!(report.signalled, Vec::<String>::new());
         assert_eq!(env.reservations(), []);
         assert_eq!(env.live_locks(), Vec::<String>::new());
     }
 
-    /// The child exited and left a descendant in the group: the group is not verified, so it
-    /// is never signalled, and the reservation counts until the group is empty.
+    /// The child exited and left a descendant in the group: the group is not verified, it is
+    /// never signalled, and the reservation counts until the group is empty.
     #[test]
     fn unverified_group_not_signalled() {
         let env = Env::with_budget(1);
@@ -270,7 +279,6 @@ mod real {
 
         for _ in 0..2 {
             let report = recovery_pass(&env.state(), &host()).unwrap();
-            assert_eq!(report.signalled, Vec::<String>::new());
             assert_eq!(report.released, Vec::<String>::new());
             assert_eq!(report.reservations.len(), 1);
             assert_eq!(report.reservations[0].derived, DerivedState::RecoveryNeeded);
@@ -327,7 +335,6 @@ mod real {
 
         let report = recovery_pass(&state, &host()).unwrap();
         assert_eq!(report.released, [reservation.job_id.clone()]);
-        assert_eq!(report.signalled, Vec::<String>::new());
         std::thread::sleep(Duration::from_millis(100));
         assert!(
             process.child().try_wait().unwrap().is_none(),

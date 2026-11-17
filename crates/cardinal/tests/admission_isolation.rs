@@ -164,8 +164,8 @@ fn no_network() {
     isolation.assert_untouched(&inbox_before);
 }
 
-/// A recovery-needed reservation that recovery may not stop (its group is unverified) is what
-/// the arbiter handles later; admission neither raises it to the inbox nor waits for anyone.
+/// A recovery-needed reservation, which recovery never stops, is what the arbiter handles
+/// later; admission neither raises it to the inbox nor waits for anyone.
 #[test]
 fn no_arbiter() {
     let isolation = Isolation::new();
