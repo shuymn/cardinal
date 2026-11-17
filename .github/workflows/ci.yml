@@ -143,8 +143,9 @@ jobs:
             target/
           key: ${{ steps.cache-key.outputs.key }}
 
-      # bubblewrap confines each test process. Ubuntu restricts unprivileged user
-      # namespaces through AppArmor, which bubblewrap needs; lift that on the runner.
+      # bubblewrap confines each test process, and the bind-mount tests create a user and
+      # mount namespace inside that confinement. Ubuntu restricts unprivileged user
+      # namespaces through AppArmor, which both need; lift that on the runner.
       - name: Install bubblewrap
         run: |
           sudo apt-get update -q
