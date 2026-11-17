@@ -3,8 +3,10 @@
 //!
 //! Every directory is opened relative to its parent with `O_DIRECTORY | O_NOFOLLOW`, starting
 //! from the worktree root, so a directory replaced by a symbolic link is never entered, and a
-//! directory replaced by another one is detected by its `(dev, ino)`. An entry is unlinked only
-//! when its metadata still equals the snapshot; a directory is removed only once empty.
+//! directory replaced by another one is detected by its `(dev, ino)`. A directory on another
+//! mount than the target (a bind mount on the same device included) is never entered, and a
+//! target that is a mount point is refused. An entry is unlinked only when its metadata still
+//! equals the snapshot; a directory is removed only once empty.
 
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
@@ -17,7 +19,7 @@ use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, Stat};
 use rustix::io::Errno;
 
 use crate::contract::RootId;
-use crate::plan::{Entry, EntryKind, Walk};
+use crate::plan::{Entry, EntryKind, Mount, Walk};
 
 const DIR_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::DIRECTORY)
@@ -58,6 +60,60 @@ fn open_dir_at(dir: impl AsFd, name: &OsStr) -> io::Result<OwnedFd> {
     Ok(rustix::fs::openat(dir, name, DIR_FLAGS, Mode::empty())?)
 }
 
+/// What identifies the mount an open directory is on: the mount ID (`statx`, Linux 5.8 and
+/// later) on Linux, the path the filesystem is mounted on (`statfs`) on macOS. An error means
+/// the mount cannot be told, and the callers fail closed.
+#[cfg(target_os = "linux")]
+fn mount_of(fd: impl AsFd) -> Result<Vec<u8>, String> {
+    statx_mount(fd, c"", AtFlags::EMPTY_PATH)
+}
+
+#[cfg(target_os = "linux")]
+fn statx_mount<P: rustix::path::Arg>(
+    dir: impl AsFd,
+    path: P,
+    flags: AtFlags,
+) -> Result<Vec<u8>, String> {
+    use rustix::fs::StatxFlags;
+    let st = rustix::fs::statx(dir, path, flags | AtFlags::NO_AUTOMOUNT, StatxFlags::MNT_ID)
+        .map_err(|err| format!("statx: {err}"))?;
+    if StatxFlags::from_bits_retain(st.stx_mask).contains(StatxFlags::MNT_ID) {
+        Ok(st.stx_mnt_id.to_ne_bytes().to_vec())
+    } else {
+        Err("statx reports no mount ID (Linux before 5.8)".to_owned())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn mount_of(fd: impl AsFd) -> Result<Vec<u8>, String> {
+    let st = rustix::fs::fstatfs(fd).map_err(|err| format!("fstatfs: {err}"))?;
+    Ok(st
+        .f_mntonname
+        .iter()
+        .map(|c| u8::from_ne_bytes(c.to_ne_bytes()))
+        .take_while(|&b| b != 0)
+        .collect())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn mount_of(_fd: impl AsFd) -> Result<Vec<u8>, String> {
+    Err("mount identity is not available on this platform".to_owned())
+}
+
+/// The mount of the entry `name` in `dir` that is not a directory. Only Linux mounts on
+/// files; elsewhere such an entry is on its directory's mount.
+fn file_mount_at(dir: &OwnedFd, name: &OsStr) -> Result<Vec<u8>, String> {
+    #[cfg(target_os = "linux")]
+    {
+        statx_mount(dir, name, AtFlags::SYMLINK_NOFOLLOW)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = name;
+        mount_of(dir)
+    }
+}
+
 /// Names in an open directory, sorted, without `.` and `..`.
 fn names(dir: impl AsFd) -> io::Result<Vec<OsString>> {
     let mut names = Vec::new();
@@ -77,6 +133,8 @@ pub struct Target {
     /// The directory that contains the target.
     parent: OwnedFd,
     parent_dev: u64,
+    /// The mount of `parent`.
+    parent_mount: Result<Vec<u8>, String>,
     /// The target's name in `parent`.
     name: OsString,
     /// The target's path relative to the worktree (empty for the worktree itself).
@@ -120,9 +178,11 @@ impl Target {
             .collect();
         let Some((last, dirs)) = names.split_last() else {
             let parent_dev = entry(PathBuf::new(), &rustix::fs::fstat(&top)?).dev;
+            let parent_mount = mount_of(&top);
             return Ok(Self {
                 parent: top,
                 parent_dev,
+                parent_mount,
                 name: wt_name.to_os_string(),
                 rel,
                 path: target.to_path_buf(),
@@ -154,9 +214,11 @@ impl Target {
             }
         }
         let parent_dev = entry(PathBuf::new(), &rustix::fs::fstat(&current)?).dev;
+        let parent_mount = mount_of(&current);
         Ok(Self {
             parent: current,
             parent_dev,
+            parent_mount,
             name: last.to_os_string(),
             rel,
             path: target.to_path_buf(),
@@ -175,7 +237,7 @@ impl Target {
     }
 
     /// Records every entry of the target: `(dev, ino, type, size, mtime)`, without following
-    /// symbolic links or entering another device.
+    /// symbolic links or entering another device or mount.
     pub fn snapshot(&self) -> io::Result<Walk> {
         if let Some(link) = &self.link_in_path {
             let mut root = self.root.clone();
@@ -183,27 +245,48 @@ impl Target {
             root.kind = EntryKind::Symlink;
             return Ok(Walk {
                 root,
-                parent_dev: self.parent_dev,
+                mount: Mount::Unknown("not reached: a symbolic link is on the way".to_owned()),
                 link_in_path: Some(link.clone()),
                 entries: Vec::new(),
             });
         }
         let root = entry(self.rel.clone(), &lstat_at(&self.parent, &self.name)?);
         let mut entries = Vec::new();
-        // A target on another device than its parent is refused: nothing below is recorded.
-        if root.kind == EntryKind::Dir && root.dev == self.parent_dev {
+        // A target that is not on its parent's mount is refused: nothing below is recorded.
+        let mount = if root.dev != self.parent_dev {
+            Mount::Boundary
+        } else if root.kind == EntryKind::Dir {
             let fd = open_dir_at(&self.parent, &self.name)?;
             if !root.same_identity(&entry(self.rel.clone(), &rustix::fs::fstat(&fd)?)) {
                 return Err(io::Error::other("the target changed while it was opened"));
             }
-            snapshot_dir(&fd, &self.rel, root.dev, &mut entries)?;
-        }
+            let (mount, own) = self.target_mount(root.dev, Some(&fd));
+            if let (Mount::Same, Ok(key)) = (&mount, &own) {
+                snapshot_dir(&fd, &self.rel, root.dev, key, &mut entries)?;
+            }
+            mount
+        } else {
+            self.target_mount(root.dev, None).0
+        };
         Ok(Walk {
             root,
-            parent_dev: self.parent_dev,
+            mount,
             link_in_path: None,
             entries,
         })
+    }
+
+    /// Whether the target, on device `dev`, is on its parent's mount, and its own mount:
+    /// read from `dir` when the target is that open directory, by name otherwise.
+    fn target_mount(&self, dev: u64, dir: Option<&OwnedFd>) -> (Mount, Result<Vec<u8>, String>) {
+        let own = match dir {
+            Some(fd) => mount_of(fd),
+            None => file_mount_at(&self.parent, &self.name),
+        };
+        (
+            Mount::between(self.parent_dev, dev, &self.parent_mount, &own),
+            own,
+        )
     }
 
     /// Deletes every entry of the target that still equals `walk`, bottom up. With
@@ -227,7 +310,9 @@ impl Target {
             }
         };
         if walk.root.kind != EntryKind::Dir {
-            if walk.root.unchanged(&current) {
+            if walk.root.unchanged(&current)
+                && self.target_mount(current.dev, None).0 == Mount::Same
+            {
                 match rustix::fs::unlinkat(&self.parent, &self.name, AtFlags::empty()) {
                     Ok(()) => {
                         deletion.freed += walk.root.allocated;
@@ -256,9 +341,15 @@ impl Target {
                 return deletion;
             }
         }
+        // Mounted on since the snapshot: not entered.
+        let (Mount::Same, Ok(mount)) = self.target_mount(current.dev, Some(&fd)) else {
+            deletion.skipped.push(self.path.clone());
+            return deletion;
+        };
         let context = Context {
             index: &index,
             dev: walk.root.dev,
+            mount: &mount,
             base: &self.path,
             root_rel: &self.rel,
             keep_git,
@@ -310,7 +401,15 @@ impl Target {
     }
 }
 
-fn snapshot_dir(fd: &OwnedFd, rel: &Path, dev: u64, out: &mut Vec<Entry>) -> io::Result<()> {
+/// Records the entries below `fd`. A directory on another device or mount than `dev` and
+/// `mount` is recorded but not entered; a mount that cannot be read fails the snapshot.
+fn snapshot_dir(
+    fd: &OwnedFd,
+    rel: &Path,
+    dev: u64,
+    mount: &[u8],
+    out: &mut Vec<Entry>,
+) -> io::Result<()> {
     for name in names(fd)? {
         let st = match lstat_at(fd, &name) {
             Ok(st) => st,
@@ -329,8 +428,10 @@ fn snapshot_dir(fd: &OwnedFd, rel: &Path, dev: u64, out: &mut Vec<Entry>) -> io:
                     let opened = entry(child_rel.clone(), &rustix::fs::fstat(&child_fd)?);
                     // Replaced between the stat and the open: the deletion sees the mismatch
                     // and keeps it, so nothing below needs recording.
-                    if snapshot.same_identity(&opened) {
-                        snapshot_dir(&child_fd, &child_rel, dev, out)?;
+                    if snapshot.same_identity(&opened)
+                        && mount_of(&child_fd).map_err(io::Error::other)? == mount
+                    {
+                        snapshot_dir(&child_fd, &child_rel, dev, mount, out)?;
                     }
                 }
                 Err(err)
@@ -360,8 +461,9 @@ pub struct Deletion {
 
 struct Context<'a> {
     index: &'a HashMap<&'a Path, &'a Entry>,
-    /// The device of the target; nothing on another device is entered.
+    /// The device and mount of the target; nothing on another one is entered.
     dev: u64,
+    mount: &'a [u8],
     /// The absolute target path.
     base: &'a Path,
     /// The target relative to the worktree.
@@ -419,6 +521,10 @@ impl Context<'_> {
                         out.skipped.push(path);
                         continue;
                     }
+                }
+                if mount_of(&child).as_deref() != Ok(self.mount) {
+                    out.skipped.push(path);
+                    continue;
                 }
                 self.delete_dir(&child, &child_rel, out);
                 drop(child);

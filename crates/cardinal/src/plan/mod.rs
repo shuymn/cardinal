@@ -15,7 +15,7 @@ use std::time::Duration;
 pub use checks::{
     DataLists, InUseFacts, Inspection, approval, evaluate, invariants_ok, processes_inside,
 };
-pub use walk::{Entry, EntryKind, Walk, root_identity, walk};
+pub use walk::{Entry, EntryKind, Mount, Walk, root_identity, walk};
 
 use crate::admission;
 use crate::config::Config;

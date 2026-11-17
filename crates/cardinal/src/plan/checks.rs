@@ -13,7 +13,7 @@ use crate::contract::{
 use crate::observe::WorktreeObservation;
 use crate::os::{Detail, ProcessTable};
 
-use super::walk::Walk;
+use super::walk::{Mount, Walk};
 
 /// What makes a worktree in use (`docs/architecture.md` section 4.6). `Err` holds why a fact
 /// could not be read.
@@ -390,16 +390,21 @@ fn plain_target(i: &Inspection<'_>) -> Check {
             format!("{} is a symbolic link", link.display()),
         );
     }
-    match walk.root.kind {
-        super::EntryKind::Symlink => {
+    match (walk.root.kind, &walk.mount) {
+        (super::EntryKind::Symlink, _) => {
             invariant("plain_target", CheckResult::Fail, "a symbolic link")
         }
-        _ if walk.root.dev != walk.parent_dev => invariant(
+        (_, Mount::Boundary) => invariant(
             "plain_target",
             CheckResult::Fail,
             "a mount point, or on another device than its parent",
         ),
-        _ => pass("plain_target"),
+        (_, Mount::Unknown(err)) => invariant(
+            "plain_target",
+            CheckResult::Unknown,
+            format!("the mount cannot be read: {err}"),
+        ),
+        (_, Mount::Same) => pass("plain_target"),
     }
 }
 

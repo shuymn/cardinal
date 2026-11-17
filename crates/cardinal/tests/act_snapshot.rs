@@ -21,6 +21,8 @@
 mod fakes;
 mod support;
 
+#[cfg(target_os = "linux")]
+use std::fmt::Write as _;
 use std::path::Path;
 use std::time::Duration;
 
@@ -193,6 +195,118 @@ fn replaced_directory_is_not_entered() {
     assert_eq!(result.status, ActStatus::Partial, "{result:#?}");
     assert!(skipped(&result, &wt.join("node_modules/pkg")));
     assert!(wt.join("node_modules/pkg/index.js").exists());
+}
+
+/// The flags that give `unshare` a private mount namespace where `mount --bind` works:
+/// `-m` as root, `-r -m` (a user namespace) otherwise; `None`, with the reason printed, where
+/// neither does. The probe's mount ends with its namespace.
+#[cfg(target_os = "linux")]
+fn mount_namespace(s: &Setup) -> Option<&'static [&'static str]> {
+    let probe = s.fx.path("probe");
+    std::fs::create_dir_all(&probe).unwrap();
+    for flags in [&["-m"][..], &["-r", "-m"]] {
+        let mut command = std::process::Command::new("unshare");
+        command
+            .args(flags)
+            .args(["mount", "--bind"])
+            .arg(&probe)
+            .arg(&probe);
+        let probed = fakes::confined(&s.fx, command, s.fx.root()).output();
+        if probed.is_ok_and(|o| o.status.success()) {
+            return Some(flags);
+        }
+    }
+    eprintln!(
+        "skipped: no private mount namespace for a bind mount (neither `unshare -m` as root \
+         nor `unshare -rm` works here)"
+    );
+    None
+}
+
+/// Runs `act` of `plan` in a helper inside a private mount namespace where each `(source,
+/// target)` of `binds` is bind-mounted first. The mounts are undone after the helper, and end
+/// with the namespace on every other path (a failed mount, a panic, a kill).
+#[cfg(target_os = "linux")]
+fn act_with_binds(s: &Setup, flags: &[&str], plan: &str, binds: &[(&Path, &Path)]) -> ActResult {
+    let quote = |path: &Path| format!("'{}'", path.display().to_string().replace('\'', "'\\''"));
+    let mut mounts = String::new();
+    let mut unmounts = String::new();
+    for (source, target) in binds {
+        let _ = writeln!(
+            mounts,
+            "mount --bind {} {} || exit 97",
+            quote(source),
+            quote(target)
+        );
+        unmounts.insert_str(0, &format!("umount {}\n", quote(target)));
+    }
+    let script = format!("{mounts}\"$@\"\nstatus=$?\n{unmounts}exit $status\n");
+    let out = s.fx.path(&format!("result-{plan}.json"));
+    let act = s.act_command(plan, &arbiter(), &out);
+    let mut command = std::process::Command::new("unshare");
+    command
+        .args(flags)
+        .args(["sh", "-c", &script, "sh"])
+        .arg(act.get_program())
+        .args(act.get_args());
+    for (key, value) in act.get_envs() {
+        if let Some(value) = value {
+            command.env(key, value);
+        }
+    }
+    let status = fakes::confined(&s.fx, command, s.fx.root())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "the act helper in the namespace: {status}"
+    );
+    fakes::read_result(&out)
+}
+
+/// A7 on Linux: a bind mount on the same filesystem is a mount point. `act` refuses a target
+/// that is one and does not enter one below its target, and the bound data survives both.
+#[cfg(target_os = "linux")]
+#[test]
+fn bind_mounts_are_not_entered() {
+    let s = Setup::new();
+    let Some(flags) = mount_namespace(&s) else {
+        return;
+    };
+    let owner = s.fx.path("owner");
+    write(&owner, "data/keep", "precious");
+    let wt = s.worktree(
+        "bound",
+        &[
+            ("target", IgnoredClass::Regenerable),
+            ("node_modules", IgnoredClass::Regenerable),
+        ],
+    );
+    write(&wt, "target/debug/app", "bin");
+    write(&wt, "node_modules/pkg/index.js", "x");
+    std::fs::create_dir_all(wt.join("node_modules/cache")).unwrap();
+    let data = owner.join("data");
+
+    let target = wt.join("target");
+    let plan = s.plan(PlanKind::ReclaimDir, &target);
+    let result = act_with_binds(&s, flags, &plan.id, &[(&data, &target)]);
+    assert_eq!(result.status, ActStatus::Rejected, "{result:#?}");
+    assert_eq!(result.reasons, ["plain_target"]);
+    assert!(data.join("keep").exists(), "the bound data survives");
+    assert!(wt.join("target/debug/app").exists(), "nothing touched");
+
+    let cache = wt.join("node_modules/cache");
+    let plan = s.plan(PlanKind::ReclaimDir, &wt.join("node_modules"));
+    let result = act_with_binds(&s, flags, &plan.id, &[(&data, &cache)]);
+    assert_eq!(result.status, ActStatus::Partial, "{result:#?}");
+    assert!(skipped(&result, &cache), "{result:#?}");
+    assert!(data.join("keep").exists(), "the bound data survives");
+    assert!(
+        !wt.join("node_modules/pkg").exists(),
+        "the rest is reclaimed"
+    );
 }
 
 /// HEAD and branch are read again right before deleting: switching the worktree to another
