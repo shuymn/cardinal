@@ -204,9 +204,12 @@ mod candidates {
         let _shared = cardinal::state::try_lock(&lock_path, cardinal::state::LockMode::Shared)
             .unwrap()
             .unwrap();
-        let mut sleeper =
-            fakes::spawn_helper(&s.fx, &support::helper::Mode::Sleep, &busy.join("src"));
-        support::helper::wait_for(
+        let mut sleeper = support::helper::spawn(
+            s.fx.scope(),
+            &support::helper::Mode::Sleep,
+            &busy.join("src"),
+        );
+        cardinal_test_support::process::wait_for(
             "the sleeper's cwd",
             std::time::Duration::from_secs(10),
             || cardinal::os::cwd(sleeper.id()).filter(|cwd| cwd.starts_with(&busy)),
@@ -234,9 +237,8 @@ mod identity {
         let plan = s.plan(PlanKind::ReclaimWorktree, &wt);
         // Hold the old root open so the new directory cannot reuse its inode.
         let _old_root = std::fs::File::open(&wt).unwrap();
-        let path = wt.display().to_string();
-        s.fx.git(&s.main, &["worktree", "remove", "--force", &path]);
-        s.fx.git(&s.main, &["worktree", "add", "-q", &path, "again"]);
+        s.fx.worktree_remove(&s.main, &wt);
+        s.fx.worktree_add_existing(&s.main, "again", "again");
         let result = s.act(&plan.id, &arbiter()).unwrap();
         assert_eq!(result.status, ActStatus::Expired);
         assert_eq!(result.reasons, ["identity_changed:root_id"]);
@@ -479,7 +481,7 @@ fn plain_target_checks(
 #[cfg(target_os = "macos")]
 #[test]
 fn mount_point_refused() {
-    struct Attached(std::process::Command);
+    struct Attached(cardinal_test_support::Command);
     impl Drop for Attached {
         fn drop(&mut self) {
             let _ = self.0.status();

@@ -11,7 +11,9 @@
 //! The mode and its paths travel only as command-line arguments that [`command`] builds,
 //! never as environment variables, so nothing a test run inherits can turn a test into a
 //! helper or point a helper elsewhere. Helpers start through the spawn API, so the scope that
-//! started one kills it.
+//! started one kills it. A test crate with a helper mode of its own starts it as
+//! [`Mode::Custom`] and runs it from its `helper` test, before [`run_if_requested`], when
+//! [`custom_request`] returns its argument.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -83,6 +85,9 @@ pub enum Mode {
     /// with `keep_output`; otherwise it holds no handle of them.
     #[cfg(windows)]
     Leave { dir: PathBuf, keep_output: bool },
+    /// A mode the test crate runs itself: its name, and one argument such as a JSON request
+    /// (see [`custom_request`]).
+    Custom { name: &'static str, arg: String },
 }
 
 /// Runs the helper mode named on the command line, then exits; returns at once in a normal
@@ -287,6 +292,20 @@ fn child_signal() -> &'static str {
     }
 }
 
+/// The argument of helper mode `name` when this process was started in it as
+/// [`Mode::Custom`]; `None` in a normal test run and in any other mode.
+pub fn custom_request(name: &str) -> Option<String> {
+    let mut request = std::env::args().filter_map(|arg| arg.strip_prefix(TAG).map(str::to_owned));
+    if request.next()? != name {
+        return None;
+    }
+    Some(
+        request
+            .next()
+            .expect("a custom helper mode takes one argument"),
+    )
+}
+
 /// The arguments that make this test binary run `mode`, after the program.
 pub fn args(mode: &Mode) -> Vec<String> {
     let (name, args): (&str, Vec<String>) = match mode {
@@ -351,6 +370,7 @@ pub fn args(mode: &Mode) -> Vec<String> {
                 if *keep_output { "keep-output" } else { "" }.to_owned(),
             ],
         ),
+        Mode::Custom { name, arg } => (name, vec![arg.clone()]),
     };
     ["helper", "--exact", "--nocapture", "--test-threads=1", "--"]
         .into_iter()

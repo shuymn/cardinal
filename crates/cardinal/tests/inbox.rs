@@ -4,7 +4,8 @@
 //!
 //! The recovery pass is a fake until the integration gate runs these against the real
 //! `admission` module; sessions and processes are real. A refresh that must pause runs in a
-//! helper process (this test binary re-run) with the same fake.
+//! helper process (this test binary re-run in the custom helper mode `refresh`) with the same
+//! fake.
 
 mod fakes;
 mod support;
@@ -21,6 +22,8 @@ use cardinal::contract::{
 };
 use cardinal::inbox::{self, NewItem, StatusFilter};
 use cardinal::state::StateDir;
+use cardinal_test_support::process::wait_for;
+use cardinal_test_support::{Child, Command};
 use support::cardinal::Dirs;
 use support::helper::{self, Mode};
 
@@ -30,7 +33,8 @@ fn helper() {
     helper::run_if_requested();
 }
 
-const REFRESH_ENV: &str = "CARDINAL_TEST_REFRESH";
+/// The custom helper mode that refreshes with a fake recovery pass.
+const REFRESH_MODE: &str = "refresh";
 
 /// What a helper process needs to refresh with a fake recovery pass that reports
 /// `recovery_needed` reservations of these jobs.
@@ -59,7 +63,7 @@ fn recovery_needed(
 
 /// Runs the refresh a helper process was started for, then exits; returns at once otherwise.
 fn run_refresh_if_requested() {
-    let Ok(request) = std::env::var(REFRESH_ENV) else {
+    let Some(request) = helper::custom_request(REFRESH_MODE) else {
         return;
     };
     let request: RefreshRequest = serde_json::from_str(&request).expect("a refresh request");
@@ -71,7 +75,6 @@ fn run_refresh_if_requested() {
 }
 
 struct Env {
-    fx: support::fixture::Fixture,
     dirs: Dirs,
     config: Config,
     state: StateDir,
@@ -82,7 +85,6 @@ fn env() -> Env {
     let config = Config::load(dirs.config()).unwrap();
     let state = StateDir::open(dirs.state()).unwrap();
     Env {
-        fx: support::fixture::Fixture::new(),
         dirs,
         config,
         state,
@@ -90,31 +92,30 @@ fn env() -> Env {
 }
 
 impl Env {
-    /// The `cardinal` binary on this state and config, confined to the fixture.
-    fn cardinal(&self) -> assert_cmd::Command {
-        fakes::cardinal(&self.fx, &self.dirs)
+    /// The `cardinal` binary on this state and config.
+    fn cardinal(&self) -> Command {
+        self.dirs.cmd()
     }
 
-    /// A helper process that refreshes with a recovery pass reporting `jobs`, confined to the
-    /// fixture.
-    fn refresh_command(&self, jobs: &[&str]) -> std::process::Command {
+    /// A helper process that refreshes with a recovery pass reporting `jobs`.
+    fn refresh_command(&self, jobs: &[&str]) -> Command {
         let request = RefreshRequest {
             config: self.dirs.config().to_path_buf(),
             state: self.state.root().to_path_buf(),
             recovery_needed: jobs.iter().map(|&job| job.to_owned()).collect(),
         };
-        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-        command
-            .args(["helper", "--exact", "--nocapture", "--test-threads=1"])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .env(REFRESH_ENV, serde_json::to_string(&request).unwrap());
-        fakes::confined(&self.fx, command, self.fx.root())
+        let mode = Mode::Custom {
+            name: REFRESH_MODE,
+            arg: serde_json::to_string(&request).unwrap(),
+        };
+        let scope = self.dirs.scope();
+        helper::command(scope, &mode, scope.root())
     }
 
-    /// A sleeping helper process, confined to the fixture.
-    fn sleeper(&self) -> helper::ChildGuard {
-        fakes::spawn_helper(&self.fx, &Mode::Sleep, self.fx.root())
+    /// A sleeping helper process.
+    fn sleeper(&self) -> Child {
+        let scope = self.dirs.scope();
+        helper::spawn(scope, &Mode::Sleep, scope.root())
     }
 }
 
@@ -259,7 +260,7 @@ fn resolving_needs_a_pending_item() {
 }
 
 fn alive_start(pid: u32) -> u64 {
-    helper::wait_for("the process start time", Duration::from_secs(10), || {
+    wait_for("the process start time", Duration::from_secs(10), || {
         cardinal::os::start_time_s(pid)
     })
 }
@@ -492,10 +493,10 @@ fn concurrent_refresh_keeps_newer_items() {
     let e = env();
     let (old, new) = ("aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb");
     refresh(&e, &recovery_needed(&[old.to_owned()]));
-    let points = support::testpoints::TestPoints::new();
+    let points = support::testpoints::TestPoints::new(e.dirs.scope());
     let mut command = e.refresh_command(&[]);
     points.apply(&mut command, &[cardinal::testpoint::INBOX_OBSERVED], None);
-    let mut first = helper::ChildGuard::new(command.spawn().unwrap());
+    let mut first = command.spawn().unwrap();
     points.wait_reached(
         cardinal::testpoint::INBOX_OBSERVED,
         first.id(),
@@ -503,7 +504,7 @@ fn concurrent_refresh_keeps_newer_items() {
     );
     refresh(&e, &recovery_needed(&[old.to_owned(), new.to_owned()]));
     points.release(cardinal::testpoint::INBOX_OBSERVED);
-    assert!(first.child().wait().unwrap().success());
+    assert!(first.wait().unwrap().success());
 
     let items = list(&e, Some(StatusFilter::All));
     let status = |job: &str| {

@@ -5,12 +5,11 @@
 //! The facts live in a JSON file that every call reads again, so a test can change them while
 //! an `act` is paused at a test point. HEAD and branch are read from the worktree's git files
 //! on disk (no git process), so a branch switch or a new commit made through the fixture is
-//! seen as it would be by git. `act` runs in a helper process (this test binary re-run) when a
-//! test needs pause points.
+//! seen as it would be by git. `act` runs in a helper process (this test binary re-run in the
+//! custom helper mode `act`) when a test needs pause points.
 //!
-//! Every child these helpers start (the `act` helper, the `cardinal` binary, the support
-//! helper modes) gets the fixture's constructed environment and a working directory inside
-//! the fixture, and every `act` first checks that its plan's target lies inside the fixture.
+//! Every child starts through the spawn API of `cardinal_test_support` in a scope of the setup,
+//! and every `act` first checks that its plan's target lies inside the fixture.
 
 #![allow(
     dead_code,
@@ -18,9 +17,7 @@
 )]
 
 use std::collections::BTreeMap;
-use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
 
 use cardinal::act::{self, ActOptions};
 use cardinal::config::Config;
@@ -31,11 +28,12 @@ use cardinal::contract::{
 use cardinal::observe::WorktreeObservation;
 use cardinal::plan::Sources;
 use cardinal::state::StateDir;
+use cardinal_test_support::Command;
+use cardinal_test_support::fixture::{BareRepo, Fixture};
 use serde::{Deserialize, Serialize};
 
 use crate::support::cardinal::Dirs;
-use crate::support::fixture::Fixture;
-use crate::support::helper::{ChildGuard, Mode};
+use crate::support::helper::Mode;
 
 /// One observed worktree with its repository.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -307,37 +305,6 @@ pub fn assert_plans_inside(root: &Path, state: &StateDir, prefix: &str) {
     }
 }
 
-/// `command` with the fixture's constructed environment, keeping the variables `command`
-/// sets itself, and `dir`, inside the fixture, as its working directory.
-pub fn confined(fx: &Fixture, mut command: Command, dir: &Path) -> Command {
-    assert_inside(fx.root(), dir, "working directory");
-    let own: Vec<(OsString, OsString)> = command
-        .get_envs()
-        .filter_map(|(k, v)| Some((k.to_owned(), v?.to_owned())))
-        .collect();
-    command
-        .env_clear()
-        .envs(fx.env())
-        .envs(own)
-        .current_dir(dir);
-    command
-}
-
-/// The `cardinal` binary with `dirs` as its state and config directories, confined to `fx`.
-pub fn cardinal(fx: &Fixture, dirs: &Dirs) -> assert_cmd::Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_cardinal"));
-    command
-        .env("CARDINAL_STATE_DIR", dirs.state())
-        .env("CARDINAL_CONFIG_DIR", dirs.config());
-    assert_cmd::Command::from_std(confined(fx, command, fx.root()))
-}
-
-/// Starts a support helper in `mode`, confined to `fx` and running in `cwd`.
-pub fn spawn_helper(fx: &Fixture, mode: &Mode, cwd: &Path) -> ChildGuard {
-    let mut command = confined(fx, crate::support::helper::command(mode), cwd);
-    ChildGuard::new(command.spawn().expect("start a helper process"))
-}
-
 /// What a helper process needs to run `act` against the fake.
 #[derive(Debug, Serialize, Deserialize)]
 struct ActRequest {
@@ -353,11 +320,12 @@ struct ActRequest {
     out: PathBuf,
 }
 
-const ACT_ENV: &str = "CARDINAL_TEST_ACT";
+/// The custom helper mode that runs `act` against the fake.
+const ACT_MODE: &str = "act";
 
 /// A command that runs `act` against the fake in a helper process (this test binary, whose
-/// `helper` test calls [`run_act_if_requested`]), confined to `fx`; the result is written to
-/// `out`. Panics if the plan targets anything outside the fixture.
+/// `helper` test calls [`run_act_if_requested`]) in the fixture root; the result is written
+/// to `out`. Panics if the plan targets anything outside the fixture.
 pub fn act_command(
     fx: &Fixture,
     config_dir: &Path,
@@ -379,18 +347,16 @@ pub fn act_command(
         caller: options.caller.to_string(),
         out: out.to_path_buf(),
     };
-    let mut command = Command::new(std::env::current_exe().expect("the test binary"));
-    command
-        .args(["helper", "--exact", "--nocapture", "--test-threads=1"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .env(ACT_ENV, serde_json::to_string(&request).unwrap());
-    confined(fx, command, fx.root())
+    let mode = Mode::Custom {
+        name: ACT_MODE,
+        arg: serde_json::to_string(&request).unwrap(),
+    };
+    crate::support::helper::command(fx.scope(), &mode, fx.root())
 }
 
 /// Runs the `act` a helper process was started for, then exits; returns at once otherwise.
 pub fn run_act_if_requested() {
-    let Ok(request) = std::env::var(ACT_ENV) else {
+    let Some(request) = crate::support::helper::custom_request(ACT_MODE) else {
         return;
     };
     let request: ActRequest = serde_json::from_str(&request).expect("parse the act request");
@@ -457,13 +423,13 @@ pub fn write(root: &Path, rel: &str, contents: &str) {
 
 /// A main repository with a bare `origin`, cardinal's config and state dirs, and the fake.
 pub struct Setup {
-    pub fx: crate::support::fixture::Fixture,
-    pub dirs: crate::support::cardinal::Dirs,
+    pub fx: Fixture,
+    pub dirs: Dirs,
     pub config: Config,
     pub state: StateDir,
     pub fake: FakeSources,
     pub main: PathBuf,
-    pub origin: crate::support::fixture::BareRepo,
+    pub origin: BareRepo,
 }
 
 /// What the main repository ignores, so worktrees stay clean around their ignored data.
@@ -476,13 +442,13 @@ impl Setup {
 
     /// A setup whose `host.toml` is `host_toml`.
     pub fn with_host(host_toml: Option<&str>) -> Self {
-        let fx = crate::support::fixture::Fixture::new();
+        let fx = Fixture::new();
         let main = fx.init("main");
         fx.commit_file(&main, ".gitignore", GITIGNORE, "ignore build output");
         fx.commit_file(&main, "src/main.rs", "fn main() {}\n", "start");
         let origin = fx.init_bare("origin.git");
         fx.push(&main, &origin, "main");
-        let dirs = crate::support::cardinal::Dirs::new();
+        let dirs = Dirs::new();
         let config = config(dirs.config(), host_toml);
         let state = StateDir::open(dirs.state()).expect("open the state dir");
         let fake = FakeSources::new(&fx.path("world.json"), &World::default());
@@ -527,6 +493,17 @@ impl Setup {
         act::execute_with(&self.config, &self.state, &self.fake, plan, options)
     }
 
+    /// The `cardinal` binary on this setup's state and config, in the fixture root.
+    pub fn cardinal(&self) -> Command {
+        let mut command = self
+            .fx
+            .command(env!("CARGO_BIN_EXE_cardinal"), self.fx.root());
+        command
+            .env("CARDINAL_STATE_DIR", self.dirs.state())
+            .env("CARDINAL_CONFIG_DIR", self.dirs.config());
+        command
+    }
+
     /// A helper process running `act` through the fake, writing its result to `out`.
     pub fn act_command(&self, plan: &str, options: &ActOptions, out: &Path) -> Command {
         act_command(
@@ -538,13 +515,6 @@ impl Setup {
             options,
             out,
         )
-    }
-}
-
-impl Setup {
-    /// The `cardinal` binary on this setup's state and config, confined to the fixture.
-    pub fn cardinal(&self) -> assert_cmd::Command {
-        cardinal(&self.fx, &self.dirs)
     }
 }
 

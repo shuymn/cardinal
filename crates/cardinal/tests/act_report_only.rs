@@ -45,7 +45,7 @@ impl Untouched {
         Self {
             worktree: fakes::listing(wt),
             main,
-            registered: s.fx.git(&s.main, &["worktree", "list", "--porcelain"]),
+            registered: s.fx.worktree_list(&s.main),
             plan: std::fs::read(s.state.plan_file(plan)).unwrap(),
             claimed: s.state.plan_claim(plan).exists(),
             result: s.state.plan_result(plan).exists(),

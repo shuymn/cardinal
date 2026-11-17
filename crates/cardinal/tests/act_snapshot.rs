@@ -3,7 +3,8 @@
 //! on Linux does not enter a bind mount below the target or accept a target that is one;
 //! `plan`'s walk lists only the directories it recorded. A race pauses `act` or the walk in a
 //! helper process at its test point, makes the change once the point is reached, and releases
-//! it.
+//! it. On Linux the bind mounts are made in a mount namespace of the helper's own
+//! (`Scope::mount_namespace` and `Scope::bind_mount`).
 //!
 //! Observation comes from the fake in `tests/fakes` until the integration gate; it reads
 //! HEAD and branch from the worktree's git files, as git would.
@@ -11,14 +12,13 @@
 mod fakes;
 mod support;
 
-#[cfg(target_os = "linux")]
-use std::fmt::Write as _;
 use std::path::Path;
 use std::time::Duration;
 
 use cardinal::contract::{ActResult, ActStatus, IgnoredClass, PlanKind};
+use cardinal_test_support::{Command, Scope};
 use fakes::{Setup, arbiter, write};
-use support::helper::ChildGuard;
+use support::helper::Mode;
 use support::testpoints::TestPoints;
 
 #[test]
@@ -27,12 +27,13 @@ fn helper() {
     walk_if_requested();
 }
 
-const WALK_ENV: &str = "CARDINAL_TEST_WALK";
+/// The custom helper mode that runs `plan::walk`.
+const WALK_MODE: &str = "walk";
 
 /// Runs the `plan::walk` a helper process was started for, writes the mount and the entries
 /// it found, and exits; returns at once otherwise.
 fn walk_if_requested() {
-    let Ok(request) = std::env::var(WALK_ENV) else {
+    let Some(request) = support::helper::custom_request(WALK_MODE) else {
         return;
     };
     let request: serde_json::Value = serde_json::from_str(&request).expect("a walk request");
@@ -54,15 +55,17 @@ const WAIT: Duration = Duration::from_secs(20);
 /// Runs `act` of `plan` in a helper paused at `point`, calls `change` once the helper has
 /// reached it, releases it, and returns its result.
 fn act_with_change_at(s: &Setup, plan: &str, point: &str, change: impl FnOnce()) -> ActResult {
-    let points = TestPoints::new();
+    // A test-point directory of its own, so no release file of an earlier race is left.
+    let scope = Scope::new();
+    let points = TestPoints::new(&scope);
     let out = points.dir().join("result.json");
     let mut command = s.act_command(plan, &arbiter(), &out);
     points.apply(&mut command, &[point], None);
-    let mut child = ChildGuard::new(command.spawn().unwrap());
+    let mut child = command.spawn().unwrap();
     points.wait_reached(point, child.id(), WAIT);
     change();
     points.release(point);
-    assert!(child.child().wait().unwrap().success());
+    assert!(child.wait().unwrap().success());
     fakes::read_result(&out)
 }
 
@@ -105,7 +108,9 @@ fn branch_switch_expires_the_plan() {
             PlanKind::ReclaimDir => wt.join("node_modules"),
         };
         let plan = s.plan(kind, &target);
-        s.fx.git(&wt, &["switch", "-q", "-c", &format!("other-{n}")]);
+        let other = format!("other-{n}");
+        s.fx.branch(&wt, &other);
+        s.fx.switch(&wt, &other);
         let result = s.act(&plan.id, &arbiter()).unwrap();
         assert_eq!(result.status, ActStatus::Expired, "{kind:?}: {result:#?}");
         assert_eq!(result.reasons, ["identity_changed:branch"], "{kind:?}");
@@ -121,117 +126,56 @@ fn report(line: &str) {
     let _ = writeln!(std::io::stderr(), "{line}");
 }
 
-/// The flags that give `unshare` a private mount namespace where `mount --bind` works:
-/// `-m` as root, `-r -m` (a user namespace) otherwise. Where neither does, `test` is skipped
-/// with the reason reported, and fails instead where `CI` is `true`, so a CI run never passes
-/// it without running it. The probe's mount ends with its namespace.
+/// Whether a child can bind-mount in a mount namespace of its own here. Where it cannot,
+/// `test` is skipped with the reason reported, and fails instead where `CI` is `true`, so a CI
+/// run never passes it without running it. The probe's mount ends with its namespace.
 #[cfg(target_os = "linux")]
-fn mount_namespace(s: &Setup, test: &str) -> Option<&'static [&'static str]> {
+fn mount_namespace(s: &Setup, test: &str) -> bool {
     let probe = s.fx.path("probe");
     std::fs::create_dir_all(&probe).unwrap();
-    let mut tried = String::new();
-    for flags in [&["-m"][..], &["-r", "-m"]] {
-        let mut command = std::process::Command::new("unshare");
-        command
-            .args(flags)
-            .args(["mount", "--bind"])
-            .arg(&probe)
-            .arg(&probe);
-        let flags_shown = flags.join(" ");
-        match fakes::confined(&s.fx, command, s.fx.root()).output() {
-            Ok(probed) if probed.status.success() => return Some(flags),
-            Ok(probed) => {
-                let _ = writeln!(
-                    tried,
-                    "`unshare {flags_shown} mount --bind`: {}: {}",
-                    probed.status,
-                    String::from_utf8_lossy(&probed.stderr).trim()
-                );
-            }
-            Err(err) => {
-                let _ = writeln!(tried, "`unshare {flags_shown}`: {err}");
-            }
-        }
-    }
-    let reason = format!("{test}: no private mount namespace for a bind mount\n{tried}");
+    let mut command = s.fx.command("true", s.fx.root());
+    s.fx.scope()
+        .mount_namespace(&mut command, &[(&probe, &probe)]);
+    let error = match command.status() {
+        Ok(status) if status.success() => return true,
+        Ok(status) => status.to_string(),
+        Err(err) => err.to_string(),
+    };
+    let reason = format!("{test}: no private mount namespace for a bind mount: {error}");
     assert!(
         std::env::var("CI").as_deref() != Ok("true"),
         "CI runs every bind-mount test: {reason}"
     );
     report(&format!("skipped {reason}"));
-    None
+    false
 }
 
-/// Reports that `test` ran its assertions in a namespace made with `flags`.
+/// Reports that `test` ran its assertions in a private mount namespace.
 #[cfg(target_os = "linux")]
-fn ran_in_namespace(test: &str, flags: &[&str]) {
-    report(&format!(
-        "{test}: ran in a private mount namespace (unshare {})",
-        flags.join(" ")
-    ));
+fn ran_in_namespace(test: &str) {
+    report(&format!("{test}: ran in a private mount namespace"));
 }
 
-/// `path` quoted for `sh`.
+/// Runs `inner` in a mount namespace of its own where each `(source, target)` of `binds` is
+/// bind-mounted first. The mounts end with the namespace.
 #[cfg(target_os = "linux")]
-fn quote(path: &Path) -> String {
-    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
-}
-
-/// Runs `script` with `sh` inside a private mount namespace, with `inner`'s program and
-/// arguments as its positional parameters and `inner`'s environment. Mounts made there end
-/// with the namespace on every path (a failed mount, a panic, a kill).
-#[cfg(target_os = "linux")]
-fn in_namespace(s: &Setup, flags: &[&str], script: &str, inner: &std::process::Command) {
-    let mut command = std::process::Command::new("unshare");
-    command
-        .args(flags)
-        .args(["sh", "-c", script, "sh"])
-        .arg(inner.get_program())
-        .args(inner.get_args());
-    for (key, value) in inner.get_envs() {
-        if let Some(value) = value {
-            command.env(key, value);
-        }
-    }
-    let status = fakes::confined(&s.fx, command, s.fx.root())
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .status()
-        .unwrap();
+fn with_binds(s: &Setup, binds: &[(&Path, &Path)], mut inner: Command) {
+    s.fx.scope().mount_namespace(&mut inner, binds);
+    let status = inner.status().unwrap();
     assert!(status.success(), "the helper in the namespace: {status}");
-}
-
-/// Runs `inner` inside a private mount namespace where each `(source, target)` of `binds` is
-/// bind-mounted first. The mounts are undone after `inner`, and end with the namespace on
-/// every other path.
-#[cfg(target_os = "linux")]
-fn with_binds(s: &Setup, flags: &[&str], binds: &[(&Path, &Path)], inner: &std::process::Command) {
-    let mut mounts = String::new();
-    let mut unmounts = String::new();
-    for (source, target) in binds {
-        let _ = writeln!(
-            mounts,
-            "mount --bind {} {} || exit 97",
-            quote(source),
-            quote(target)
-        );
-        unmounts.insert_str(0, &format!("umount {}\n", quote(target)));
-    }
-    let script = format!("{mounts}\"$@\"\nstatus=$?\n{unmounts}exit $status\n");
-    in_namespace(s, flags, &script, inner);
 }
 
 /// Runs `act` of `plan` in a helper under `binds` (see [`with_binds`]).
 #[cfg(target_os = "linux")]
-fn act_with_binds(s: &Setup, flags: &[&str], plan: &str, binds: &[(&Path, &Path)]) -> ActResult {
+fn act_with_binds(s: &Setup, plan: &str, binds: &[(&Path, &Path)]) -> ActResult {
     let out = s.fx.path(&format!("result-{plan}.json"));
-    with_binds(s, flags, binds, &s.act_command(plan, &arbiter(), &out));
+    with_binds(s, binds, s.act_command(plan, &arbiter(), &out));
     fakes::read_result(&out)
 }
 
 /// A helper process (this test binary, see [`walk_if_requested`]) that runs `plan::walk` of
 /// `target` and writes what it found to `out`, a fresh file.
-fn walk_command(s: &Setup, worktree: &Path, target: &Path, out: &Path) -> std::process::Command {
+fn walk_command(s: &Setup, worktree: &Path, target: &Path, out: &Path) -> Command {
     match std::fs::remove_file(out) {
         Err(err) if err.kind() != std::io::ErrorKind::NotFound => panic!("{err}"),
         _ => {}
@@ -239,10 +183,11 @@ fn walk_command(s: &Setup, worktree: &Path, target: &Path, out: &Path) -> std::p
     let request = serde_json::json!({
         "root": s.fx.root(), "worktree": worktree, "target": target, "out": out,
     });
-    let mut walk = std::process::Command::new(std::env::current_exe().unwrap());
-    walk.args(["helper", "--exact", "--nocapture", "--test-threads=1"])
-        .env(WALK_ENV, request.to_string());
-    walk
+    let mode = Mode::Custom {
+        name: WALK_MODE,
+        arg: request.to_string(),
+    };
+    support::helper::command(s.fx.scope(), &mode, s.fx.root())
 }
 
 /// The mount and the entries a walk helper wrote to `out`, with `/` between path components
@@ -263,13 +208,12 @@ fn read_walk(out: &Path) -> (String, Vec<String>) {
 #[cfg(target_os = "linux")]
 fn walk_with_binds(
     s: &Setup,
-    flags: &[&str],
     worktree: &Path,
     target: &Path,
     binds: &[(&Path, &Path)],
 ) -> (String, Vec<String>) {
     let out = s.fx.path("walk.json");
-    with_binds(s, flags, binds, &walk_command(s, worktree, target, &out));
+    with_binds(s, binds, walk_command(s, worktree, target, &out));
     read_walk(&out)
 }
 
@@ -282,65 +226,40 @@ fn walk_with_change_at(
     point: &str,
     change: impl FnOnce(),
 ) -> (String, Vec<String>) {
-    let points = TestPoints::new();
+    let scope = Scope::new();
+    let points = TestPoints::new(&scope);
     let out = s.fx.path("walk.json");
     let mut command = walk_command(s, worktree, target, &out);
     points.apply(&mut command, &[point], None);
-    let mut child = ChildGuard::new(
-        fakes::confined(&s.fx, command, s.fx.root())
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .spawn()
-            .unwrap(),
-    );
+    let mut child = command.spawn().unwrap();
     points.wait_reached(point, child.id(), WAIT);
     change();
     points.release(point);
-    assert!(child.child().wait().unwrap().success());
+    assert!(child.wait().unwrap().success());
     read_walk(&out)
 }
 
-/// Runs `plan::walk` of `target` in a helper inside a private mount namespace, paused at
+/// Runs `plan::walk` of `target` in a helper in a mount namespace of its own, paused at
 /// `point`; once the helper has reached it, bind-mounts `source` over `over` in that
 /// namespace and releases it. Returns the mount and the entries the walk found.
 #[cfg(target_os = "linux")]
 fn walk_with_bind_at(
     s: &Setup,
-    flags: &[&str],
     (worktree, target): (&Path, &Path),
     point: &str,
     (source, over): (&Path, &Path),
 ) -> (String, Vec<String>) {
-    use cardinal::testpoint::release_file;
-    let points = TestPoints::new();
+    let scope = Scope::new();
+    let points = TestPoints::new(&scope);
     let out = s.fx.path("walk.json");
     let mut walk = walk_command(s, worktree, target, &out);
     points.apply(&mut walk, &[point], None);
-    // The helper's reached file is `<dir>/<point>.<pid>.reached`. It is waited for 20 s at
-    // most; a paused helper aborts on its own after its pause limit.
-    let script = format!(
-        r#""$@" &
-pid=$!
-reached={dir}/'{point}'."$pid".reached
-n=0
-until [ -e "$reached" ]; do
-    n=$((n + 1))
-    if [ "$n" -gt 2000 ]; then kill "$pid"; exit 96; fi
-    sleep 0.01
-done
-mount --bind {source} {over} || {{ kill "$pid"; exit 97; }}
-: > {release}
-wait "$pid"
-status=$?
-umount {over}
-exit "$status"
-"#,
-        dir = quote(points.dir()),
-        source = quote(source),
-        over = quote(over),
-        release = quote(&release_file(points.dir(), point)),
-    );
-    in_namespace(s, flags, &script, &walk);
+    s.fx.scope().mount_namespace(&mut walk, &[]);
+    let mut child = walk.spawn().unwrap();
+    points.wait_reached(point, child.id(), WAIT);
+    s.fx.scope().bind_mount(&child, source, over).unwrap();
+    points.release(point);
+    assert!(child.wait().unwrap().success());
     read_walk(&out)
 }
 
@@ -352,9 +271,9 @@ exit "$status"
 #[test]
 fn bind_mounts_are_not_entered() {
     let s = Setup::new();
-    let Some(flags) = mount_namespace(&s, "bind_mounts_are_not_entered") else {
+    if !mount_namespace(&s, "bind_mounts_are_not_entered") {
         return;
-    };
+    }
     let owner = s.fx.path("owner");
     let big = "x".repeat(1 << 20);
     write(&owner, "data/keep", &big);
@@ -373,13 +292,13 @@ fn bind_mounts_are_not_entered() {
 
     let target = wt.join("target");
     let plan = s.plan(PlanKind::ReclaimDir, &target);
-    let result = act_with_binds(&s, flags, &plan.id, &[(&data, &target)]);
+    let result = act_with_binds(&s, &plan.id, &[(&data, &target)]);
     assert_eq!(result.status, ActStatus::Rejected, "{result:#?}");
     assert_eq!(result.reasons, ["plain_target"]);
 
     let cache = wt.join("node_modules/cache");
     let plan = s.plan(PlanKind::ReclaimDir, &wt.join("node_modules"));
-    let result = act_with_binds(&s, flags, &plan.id, &[(&data, &cache)]);
+    let result = act_with_binds(&s, &plan.id, &[(&data, &cache)]);
     assert_eq!(result.status, ActStatus::DryRun, "{result:#?}");
     assert!(
         result.freed_bytes.unwrap() < big.len() as u64,
@@ -389,11 +308,10 @@ fn bind_mounts_are_not_entered() {
     assert_eq!(std::fs::read_to_string(data.join("keep")).unwrap(), big);
     assert_eq!(fakes::listing(&wt), before, "nothing touched");
 
-    let (mount, entries) = walk_with_binds(&s, flags, &wt, &target, &[(&data, &target)]);
+    let (mount, entries) = walk_with_binds(&s, &wt, &target, &[(&data, &target)]);
     assert_eq!(mount, "Boundary");
     assert!(entries.is_empty(), "{entries:?}");
-    let (mount, entries) =
-        walk_with_binds(&s, flags, &wt, &wt.join("node_modules"), &[(&data, &cache)]);
+    let (mount, entries) = walk_with_binds(&s, &wt, &wt.join("node_modules"), &[(&data, &cache)]);
     assert_eq!(mount, "Same");
     assert!(
         entries.contains(&"node_modules/cache".to_owned())
@@ -401,7 +319,7 @@ fn bind_mounts_are_not_entered() {
             && !entries.iter().any(|e| e.starts_with("node_modules/cache/")),
         "the bind mount is listed, not entered: {entries:?}"
     );
-    ran_in_namespace("bind_mounts_are_not_entered", flags);
+    ran_in_namespace("bind_mounts_are_not_entered");
 }
 
 /// Whether a directory was opened and whether its entries were read since [`Watch::new`],
@@ -449,9 +367,9 @@ impl Watch {
 #[test]
 fn bind_mounts_are_not_listed() {
     let s = Setup::new();
-    let Some(flags) = mount_namespace(&s, "bind_mounts_are_not_listed") else {
+    if !mount_namespace(&s, "bind_mounts_are_not_listed") {
         return;
-    };
+    }
     let data = s.fx.path("owner/data");
     write(&data, "keep", "x");
     let wt = s.worktree("bound", &[("node_modules", IgnoredClass::Regenerable)]);
@@ -462,7 +380,7 @@ fn bind_mounts_are_not_listed() {
     let plan = s.plan(PlanKind::ReclaimDir, &target);
 
     let watch = Watch::new(&data);
-    let (mount, entries) = walk_with_binds(&s, flags, &wt, &target, &[(&data, &cache)]);
+    let (mount, entries) = walk_with_binds(&s, &wt, &target, &[(&data, &cache)]);
     assert_eq!(mount, "Same");
     assert!(
         entries.contains(&"node_modules/cache".to_owned()),
@@ -474,10 +392,10 @@ fn bind_mounts_are_not_listed() {
         "the walk neither opens nor lists the bind mount"
     );
 
-    let result = act_with_binds(&s, flags, &plan.id, &[(&data, &cache)]);
+    let result = act_with_binds(&s, &plan.id, &[(&data, &cache)]);
     assert_eq!(result.status, ActStatus::DryRun, "{result:#?}");
     assert!(!watch.seen().1, "the snapshot does not list the bind mount");
-    ran_in_namespace("bind_mounts_are_not_listed", flags);
+    ran_in_namespace("bind_mounts_are_not_listed");
 }
 
 /// A target, and a directory below it, set up for a walk race: `walk-<n>/node_modules` holds
@@ -624,19 +542,19 @@ fn walk_records_a_directory_removed_after_it_was_listed() {
 fn walk_does_not_list_a_mount_made_after_its_check() {
     let s = Setup::new();
     let test = "walk_does_not_list_a_mount_made_after_its_check";
-    let Some(flags) = mount_namespace(&s, test) else {
+    if !mount_namespace(&s, test) {
         return;
-    };
+    }
     let mut failed = Vec::new();
     for (n, point) in WALK_POINTS.into_iter().enumerate() {
         let (wt, target, outside) = walk_race(&s, n);
         let over = replaced_at(point, &target);
-        let found = walk_with_bind_at(&s, flags, (&wt, &target), point, (&outside, &over));
+        let found = walk_with_bind_at(&s, (&wt, &target), point, (&outside, &over));
         if let Err(err) = replacement_left_out(point, &found) {
             failed.push(format!("{point}: {err}"));
         }
         assert!(outside.join("secret").exists());
     }
     assert!(failed.is_empty(), "{failed:#?}");
-    ran_in_namespace(test, flags);
+    ran_in_namespace(test);
 }
