@@ -3,12 +3,14 @@
 //!
 //! [`find_stages`] splits a command into stages or refuses it; [`decide`] classifies each
 //! stage and applies the rules of section 7.2 that keep a stage unwrapped; [`rewrite`] wraps
-//! the stages that remain (section 6.4). Not understanding a command only ever leads to a
-//! missed rewrite, never a changed one.
+//! the stages that remain (section 6.4); [`trace`] reports, from the same outcomes, how each
+//! stage was classified. Not understanding a command only ever leads to a missed rewrite,
+//! never a changed one.
 
 mod normalize;
 mod rewrite;
 mod tokenize;
+mod trace;
 mod words;
 
 use std::collections::BTreeMap;
@@ -23,6 +25,7 @@ use crate::contract::{
 
 pub use rewrite::{CallIds, Rewritten, rewrite};
 pub use tokenize::Refusal;
+pub use trace::{RuleMatch, StageTrace, trace};
 
 use normalize::{Arg, base_name};
 
@@ -96,19 +99,17 @@ impl Classifier for BuiltIn<'_, '_> {
         if Instant::now() >= deadline {
             return pass("the classification deadline passed");
         }
-        for (_, rule) in self.selection.rules() {
-            if let Some(pattern) = rule_match(rule, &req.argv) {
-                return ClassifyResponse {
-                    schema: ClassifyResponseSchema,
-                    decision: ClassifyDecision::Wrap,
-                    class: Some(rule.class.clone()),
-                    rule: Some(rule.qualified_id.clone()),
-                    resources: rule.resources.clone(),
-                    reason: format!("rule {} matched `{}`", rule.qualified_id, pattern.text),
-                };
-            }
+        let Some((_, rule, pattern)) = first_match(self.selection, &req.argv) else {
+            return pass("no rule matched");
+        };
+        ClassifyResponse {
+            schema: ClassifyResponseSchema,
+            decision: ClassifyDecision::Wrap,
+            class: Some(rule.class.clone()),
+            rule: Some(rule.qualified_id.clone()),
+            resources: rule.resources.clone(),
+            reason: format!("rule {} matched `{}`", rule.qualified_id, pattern.text),
         }
-        pass("no rule matched")
     }
 }
 
@@ -121,6 +122,17 @@ fn pass(reason: &str) -> ClassifyResponse {
         resources: None,
         reason: reason.to_owned(),
     }
+}
+
+/// The first rule of `selection` in precedence order that matches `argv`, with its profile
+/// and the pattern that matched: what the built-in classifier wraps by.
+fn first_match<'a>(
+    selection: &Selection<'a>,
+    argv: &[String],
+) -> Option<(&'a Profile, &'a Rule, &'a Pattern)> {
+    selection
+        .rules()
+        .find_map(|(profile, rule)| rule_match(rule, argv).map(|pattern| (profile, rule, pattern)))
 }
 
 /// The pattern of `rule` that matches `argv`: a prefix of it, with `*` matching any one word,

@@ -5,11 +5,14 @@ use proptest::prelude::{Just, Strategy, prop, prop_assert, prop_assert_eq, prop_
 use proptest::test_runner::Config as ProptestConfig;
 
 use super::{
-    BuiltIn, Context, Refusal, Skip, Stage, StageOutcome, decide, normalize, rules_could_match,
-    tokenize,
+    BuiltIn, CallIds, Classifier, Context, Refusal, Rewritten, Skip, Stage, StageOutcome,
+    StageTrace, decide, normalize, rewrite, rules_could_match, tokenize, trace,
 };
 use crate::config::{Profile, Selection};
-use crate::contract::{ClassifyDecision, ClassifyTool, ToolName};
+use crate::contract::{
+    ClassifyDecision, ClassifyRequest, ClassifyResponse, ClassifyResponseSchema, ClassifyTool,
+    ToolName,
+};
 
 fn stages(command: &str) -> Vec<Stage> {
     tokenize(command).unwrap_or_else(|err| panic!("{command:?} refused: {err}"))
@@ -797,4 +800,175 @@ fn rewrite_wraps_the_decided_stages_with_their_specs() {
         ])
     );
     assert_eq!(rewrite_of(""), Rewritten::Unchanged(vec![]));
+}
+
+const APP_TEST: &str = "[match]\nremotes = [\"github.com/o/app\"]\n[[rule]]\nid = \"t\"\ncommands = [\"cargo build\", \"cargo * test\", \"cargo test\"]\nclass = \"app-test\"";
+
+const TRACED: &str = "cd x && npx cargo +nightly test --all | tail -3; make; CI=1 vitest; sleep 1";
+
+fn trace_tool() -> ClassifyTool {
+    ClassifyTool {
+        name: ToolName::Bash,
+        timeout_ms: 1000,
+        background: false,
+    }
+}
+
+/// The outcomes of `command` under the app and generic profiles, both selected, and their
+/// trace; `classifier` replaces the built-in one.
+fn traced(
+    command: &str,
+    classifier: Option<&dyn Classifier>,
+) -> (Vec<StageOutcome>, Vec<StageTrace>) {
+    let profiles = [profile("app", APP_TEST), profile("generic", GENERIC)];
+    let selection = Selection::new(&profiles, |_| true);
+    let tool = trace_tool();
+    let ctx = Context {
+        command,
+        cwd: "/w",
+        repo: None,
+        tool: &tool,
+    };
+    let built_in = BuiltIn {
+        selection: &selection,
+    };
+    let decided = decide(
+        stages(command),
+        &ctx,
+        &selection,
+        classifier.unwrap_or(&built_in),
+        Instant::now() + Duration::from_secs(10),
+    );
+    let found = trace(command, &decided, &selection);
+    (decided, found)
+}
+
+#[test]
+fn trace_reports_argv_rule_pattern_and_skip() {
+    let (_, found) = traced(TRACED, None);
+    let summary: Vec<_> = found
+        .iter()
+        .map(|t| {
+            (
+                t.index,
+                t.stage.as_str(),
+                t.argv.as_ref().map(|argv| argv.join(" ")),
+                t.matched
+                    .as_ref()
+                    .map(|m| (m.profile.as_str(), m.rule.as_str(), m.pattern.as_str())),
+                t.skip,
+            )
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        [
+            (0, "cd x", None, None, Some(Skip::ShellCommand)),
+            (
+                1,
+                "npx cargo +nightly test --all",
+                Some("cargo test --all".into()),
+                Some(("app", "app/t", "cargo test")),
+                None
+            ),
+            (
+                2,
+                "tail -3",
+                Some("tail -3".into()),
+                None,
+                Some(Skip::Unclassified)
+            ),
+            (
+                3,
+                "make",
+                Some("make".into()),
+                Some(("generic", "generic/build", "make")),
+                None
+            ),
+            (
+                4,
+                "CI=1 vitest",
+                Some("vitest".into()),
+                Some(("generic", "generic/test", "vitest")),
+                Some(Skip::Assignments)
+            ),
+            (5, "sleep 1", None, None, Some(Skip::Sleep)),
+        ]
+    );
+    assert!(
+        found[1]
+            .matched
+            .as_ref()
+            .unwrap()
+            .file
+            .ends_with("app.toml")
+    );
+    assert_eq!(
+        found[1].response.as_ref().unwrap().class.as_deref(),
+        Some("app-test")
+    );
+}
+
+/// The stages the trace leaves unskipped are the ones the rewrite wraps, by the same rule.
+#[test]
+fn trace_unskipped_stages_are_the_wrapped_ones() {
+    use crate::contract::{Resources, RunSpec};
+
+    let (decided, found) = traced(TRACED, None);
+    let tool = trace_tool();
+    let ctx = Context {
+        command: TRACED,
+        cwd: "/w",
+        repo: None,
+        tool: &tool,
+    };
+    let ids = CallIds {
+        session_id: None,
+        agent_id: None,
+        tool_use_id: None,
+    };
+    let Rewritten::Command(text) = rewrite(&ctx, &decided, "/r", &Resources::default(), &ids)
+    else {
+        panic!("nothing wrapped");
+    };
+    let wrapped: Vec<(u32, Option<String>)> = text
+        .split("--spec-b64 ")
+        .skip(1)
+        .map(|rest| RunSpec::decode_b64(rest.split(' ').next().unwrap()).unwrap())
+        .map(|spec| (spec.stage_index, spec.rule))
+        .collect();
+    let unskipped: Vec<(u32, Option<String>)> = found
+        .iter()
+        .filter(|t| t.skip.is_none())
+        .map(|t| (t.index, t.matched.as_ref().map(|m| m.rule.clone())))
+        .collect();
+    assert_eq!(wrapped, unskipped);
+}
+
+/// A classifier that wraps everything under a rule no profile holds.
+struct Unit;
+
+impl Classifier for Unit {
+    fn classify(&self, _: &ClassifyRequest, _: Instant) -> ClassifyResponse {
+        ClassifyResponse {
+            schema: ClassifyResponseSchema,
+            decision: ClassifyDecision::Wrap,
+            class: Some("unit".into()),
+            rule: Some("unit/x".into()),
+            resources: None,
+            reason: "unit".into(),
+        }
+    }
+}
+
+/// A rule named by another classifier has no profile pattern behind it.
+#[test]
+fn trace_of_another_classifier_has_no_profile_rule() {
+    let (_, found) = traced("make", Some(&Unit));
+    assert_eq!(found[0].matched, None);
+    assert_eq!(
+        found[0].response.as_ref().unwrap().rule.as_deref(),
+        Some("unit/x")
+    );
+    assert_eq!(found[0].skip, None);
 }
