@@ -86,7 +86,13 @@ pub fn create_with(
 ) -> Result<Plan, Error> {
     housekeeping(state);
     let target = canonical_target(kind, target)?;
-    let observation = sources.observe_worktree(&target)?;
+    // A target that is a symbolic link is planned as the link it is (its checks refuse it),
+    // so its worktree is the one of the directory the link is in, not of what it points to.
+    let inside = match std::fs::symlink_metadata(&target) {
+        Ok(meta) if meta.is_symlink() => target.parent().unwrap_or(&target),
+        _ => &target,
+    };
+    let observation = sources.observe_worktree(inside)?;
     let worktree = PathBuf::from(&observation.worktree.path);
     match kind {
         PlanKind::ReclaimWorktree if target != worktree => {
