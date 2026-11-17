@@ -1294,6 +1294,8 @@ fn lookup_changes_refuse_the_command() {
         "shopt -s checkhash",
         "set -r",
         "setopt restricted",
+        "set -k",
+        "set -o keyword",
         "hash -r",
         "rehash",
     ] {

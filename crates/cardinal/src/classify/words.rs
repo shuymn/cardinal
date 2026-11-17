@@ -211,7 +211,8 @@ const CALLER_ARRAYS: &[&str] = &[
 /// searching `PATH` afresh, does not follow: zsh's `PATH_DIRS` searches `PATH` for a command
 /// word with a slash (`tools/probe`), the hashing options (zsh's `HASH_CMDS`, `HASH_DIRS`,
 /// `HASH_EXECUTABLES_ONLY`, bash's `hashall` and `checkhash`) decide whether the shell runs
-/// a remembered path instead, and `restricted` refuses the runner's path.
+/// a remembered path instead, and `restricted` refuses the runner's path. bash's `keyword`
+/// moves a stage's `NAME=value` arguments into the runner's environment.
 const REFUSED_OPTIONS: &[&str] = &[
     "xtrace",
     "verbose",
@@ -224,11 +225,12 @@ const REFUSED_OPTIONS: &[&str] = &[
     "hashall",
     "checkhash",
     "restricted",
+    "keyword",
 ];
 
 /// The letters of [`REFUSED_OPTIONS`] for `set`: `x`, `v`, bash's `T` (`functrace`) and `h`
-/// (`hashall`), zsh's `Q` (`PATH_DIRS`), and `r` (restricted) in both.
-const REFUSED_SET_LETTERS: [char; 6] = ['x', 'v', 'T', 'h', 'Q', 'r'];
+/// (`hashall`) and `k` (`keyword`), zsh's `Q` (`PATH_DIRS`), and `r` (restricted) in both.
+const REFUSED_SET_LETTERS: [char; 7] = ['x', 'v', 'T', 'h', 'k', 'Q', 'r'];
 
 /// The letters of [`REFUSED_OPTIONS`] for zsh's `setopt` and `unsetopt`.
 const REFUSED_SETOPT_LETTERS: [char; 4] = ['x', 'v', 'Q', 'r'];
