@@ -67,9 +67,9 @@ pub fn execute_with(
 }
 
 /// What an evaluation decided.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 struct Outcome {
-    status: Option<ActStatus>,
+    status: ActStatus,
     reasons: Vec<String>,
     checks: Vec<Check>,
     provenance: Provenance,
@@ -77,10 +77,24 @@ struct Outcome {
     error: Option<String>,
 }
 
+impl Default for Outcome {
+    /// `rejected` until an evaluation decides otherwise.
+    fn default() -> Self {
+        Self {
+            status: ActStatus::Rejected,
+            reasons: Vec::new(),
+            checks: Vec::new(),
+            provenance: Provenance::default(),
+            freed_bytes: None,
+            error: None,
+        }
+    }
+}
+
 impl Outcome {
     fn refused(status: ActStatus, reasons: Vec<String>) -> Self {
         Self {
-            status: Some(status),
+            status,
             reasons,
             ..Self::default()
         }
@@ -119,7 +133,7 @@ impl Run<'_> {
         let snapshot = Snapshot::take(&worktree, &target);
         if let Err(err) = testpoint::hit(testpoint::ACT_SNAPSHOTTED) {
             return Outcome {
-                status: Some(ActStatus::Rejected),
+                status: ActStatus::Rejected,
                 error: Some(err.to_string()),
                 ..Outcome::default()
             };
@@ -161,14 +175,14 @@ impl Run<'_> {
             ..Outcome::default()
         };
         if !failed.is_empty() {
-            outcome.status = Some(ActStatus::Rejected);
+            outcome.status = ActStatus::Rejected;
             outcome.reasons = failed;
         } else if plan::approval(&outcome.checks) == Approval::Owner && !self.options.owner_approved
         {
-            outcome.status = Some(ActStatus::Rejected);
+            outcome.status = ActStatus::Rejected;
             outcome.reasons = vec!["owner_approval_required".into()];
         } else {
-            outcome.status = Some(ActStatus::DryRun);
+            outcome.status = ActStatus::DryRun;
             outcome.freed_bytes = snapshot.walk.as_ref().ok().map(Walk::allocated);
         }
         outcome
@@ -255,7 +269,7 @@ impl Run<'_> {
             schema: ActResultSchema,
             plan_id: self.plan.id.clone(),
             caller: self.options.caller.to_string(),
-            status: outcome.status.unwrap_or(ActStatus::Rejected),
+            status: outcome.status,
             reasons: outcome.reasons,
             checks: outcome.checks,
             freed_bytes: outcome.freed_bytes,
