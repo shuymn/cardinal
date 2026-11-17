@@ -10,7 +10,7 @@ mod support;
 use std::os::unix::process::ExitStatusExt as _;
 use std::process::Command;
 
-use cardinal::testpoint::RUN_BEFORE_STARTING;
+use cardinal::testpoint::{ADMISSION_WAITING, RUN_BEFORE_STARTING};
 use runner_support::{Env, WAIT, output};
 use support::helper::{ChildGuard, wait_for_file};
 
@@ -129,4 +129,30 @@ fn fail_open_ignores_sigint_and_forwards_sigterm() {
     );
     cardinal::os::unix::signal_process(runner.id(), cardinal::os::unix::SIGTERM).unwrap();
     assert_eq!(runner.child().wait().unwrap().code(), Some(6));
+}
+
+/// A signal before the spawn cancels the run: the stage never starts, the runner leaves
+/// nothing behind, and it dies by that signal.
+#[test]
+fn signal_before_the_spawn_cancels_the_run() {
+    let env = Env::with_budget(1);
+    let _full = env.hold_budget(1);
+    let script = format!("echo run >> '{}'", env.file("counter").display());
+    let mut runner = ChildGuard::new(
+        env.run_at(None, &["sh", "-c", &script], &[ADMISSION_WAITING], None)
+            .spawn()
+            .unwrap(),
+    );
+    env.points
+        .wait_reached(ADMISSION_WAITING, runner.id(), WAIT);
+    cardinal::os::unix::signal_process(runner.id(), cardinal::os::unix::SIGTERM).unwrap();
+    env.points.release(ADMISSION_WAITING);
+    let status = runner.child().wait().unwrap();
+    assert_eq!(status.signal(), Some(15), "{status:?}");
+    assert_eq!(env.lines("counter"), Vec::<String>::new());
+    assert_eq!(env.reservations().len(), 1, "only the held reservation");
+    assert_eq!(env.live_locks().len(), 1, "the runner's live lock is gone");
+    assert!(env.worktree_lock_free());
+    let finished = env.records_of(cardinal::contract::RecordKind::JobFinished);
+    assert_eq!(finished[0].data["cancelled"], "signal 15");
 }
