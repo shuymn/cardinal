@@ -37,8 +37,13 @@ use std::time::{Duration, Instant};
 #[cfg(unix)]
 use crate::os::unix;
 
-/// Variables git children copy from the caller's environment (section 8.1). `LC_*` is
-/// copied too.
+/// The test harness's run marker (section 13.4), passed to every git and gh child so the
+/// harness's sweep finds what such a child leaves running. Only the harness sets it, so
+/// outside tests it is unset and passing it changes nothing.
+const RUN_MARKER: &str = "CARDINAL_TEST_RUN";
+
+/// Variables git children copy from the caller's environment (section 8.1). `LC_*` and
+/// [`RUN_MARKER`] are copied too.
 const GIT_INHERITED: &[&str] = &[
     "PATH",
     "HOME",
@@ -55,11 +60,12 @@ const GIT_INHERITED: &[&str] = &[
     "GH_HOST",
     "GH_CONFIG_DIR",
     "SSH_AUTH_SOCK",
+    RUN_MARKER,
 ];
 
-/// Variables gh children copy: where gh keeps its configuration and the tokens it
-/// authenticates with. `GH_HOST` and `GH_REPO` are left out, because they would point gh at
-/// another host or repository than the `--repo HOST/OWNER/NAME` observation passes.
+/// Variables gh children copy: where gh keeps its configuration, the tokens it authenticates
+/// with, and [`RUN_MARKER`]. `GH_HOST` and `GH_REPO` are left out, because they would point
+/// gh at another host or repository than the `--repo HOST/OWNER/NAME` observation passes.
 const GH_INHERITED: &[&str] = &[
     "PATH",
     "HOME",
@@ -73,6 +79,7 @@ const GH_INHERITED: &[&str] = &[
     "GITHUB_TOKEN",
     "GH_ENTERPRISE_TOKEN",
     "GITHUB_ENTERPRISE_TOKEN",
+    RUN_MARKER,
 ];
 
 /// Variables Windows programs need, copied on Windows only.
@@ -563,6 +570,7 @@ mod tests {
             ("GIT_CONFIG_GLOBAL", "/h/.gitconfig"),
             ("GIT_OPTIONAL_LOCKS", "1"),
             ("GH_TOKEN", "t"),
+            ("CARDINAL_TEST_RUN", "run-1"),
             ("SECRET", "s"),
         ]));
         let names: Vec<_> = env.iter().map(|(k, _)| k.to_str().unwrap()).collect();
@@ -575,7 +583,14 @@ mod tests {
         ] {
             assert!(!names.contains(&absent), "{absent} passed: {names:?}");
         }
-        for present in ["PATH", "HOME", "LC_ALL", "GIT_CONFIG_GLOBAL", "GH_TOKEN"] {
+        for present in [
+            "PATH",
+            "HOME",
+            "LC_ALL",
+            "GIT_CONFIG_GLOBAL",
+            "GH_TOKEN",
+            "CARDINAL_TEST_RUN",
+        ] {
             assert!(names.contains(&present), "{present} missing: {names:?}");
         }
         assert_eq!(lookup(&env, "GIT_OPTIONAL_LOCKS").unwrap(), "0");
@@ -596,6 +611,7 @@ mod tests {
             ("GH_HOST", "evil.example.com"),
             ("GH_REPO", "evil/repo"),
             ("GIT_DIR", "/decoy/.git"),
+            ("CARDINAL_TEST_RUN", "run-1"),
         ]));
         let names: Vec<_> = env.iter().map(|(k, _)| k.to_str().unwrap()).collect();
         for absent in ["GH_HOST", "GH_REPO", "GIT_DIR"] {
@@ -606,6 +622,7 @@ mod tests {
             "GH_TOKEN",
             "GH_ENTERPRISE_TOKEN",
             "GH_PROMPT_DISABLED",
+            "CARDINAL_TEST_RUN",
         ] {
             assert!(names.contains(&present), "{present} missing: {names:?}");
         }
