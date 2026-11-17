@@ -1,6 +1,6 @@
 //! The Unix waits and signal handling [`super`] needs. `os::unix` (the runner work unit)
-//! carries the same `ignored`, `watch_signals`, and `die_by_signal`, and `wait_unreaped`
-//! covers `ended`; these fold into it once both are in one tree.
+//! carries the same `ignored`, `reset_child_signal`, `watch_signals`, and `die_by_signal`,
+//! and `wait_unreaped` covers `ended`; these fold into it once both are in one tree.
 
 use std::io::{self, Read as _};
 use std::sync::Arc;
@@ -45,6 +45,21 @@ fn disposition(sig: i32) -> io::Result<libc::sigaction> {
 /// Reads the disposition without changing it.
 fn ignored(sig: i32) -> bool {
     disposition(sig).is_ok_and(|action| action.sa_sigaction == libc::SIG_IGN)
+}
+
+/// Sets SIGCHLD to its default action, so that every child of this process stays unreaped
+/// until this process reaps it. A caller that ignores SIGCHLD passes that on across `exec`,
+/// and Linux then reaps the children itself (macOS does when this process sets it): no wait
+/// could keep a child's PID, and the process group it leads, from reuse. Call before the
+/// first child is started; children then start with the default too.
+pub(super) fn reset_child_signal() {
+    let mut action = std::mem::MaybeUninit::<libc::sigaction>::zeroed();
+    // SAFETY: `action` is a zeroed `sigaction` (`SIG_DFL`, no flags) whose mask `sigemptyset`
+    // initializes; `sigaction` reads it and writes nothing back with a null old action.
+    unsafe {
+        libc::sigemptyset(&raw mut (*action.as_mut_ptr()).sa_mask);
+        libc::sigaction(libc::SIGCHLD, action.as_ptr(), std::ptr::null_mut());
+    }
 }
 
 /// Calls `on_signal` on a background thread for every delivery of one of `signals`, which

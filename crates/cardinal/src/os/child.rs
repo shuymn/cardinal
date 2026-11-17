@@ -291,11 +291,13 @@ fn live() -> MutexGuard<'static, Vec<u32>> {
     LIVE.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Makes this process take its children along when it is terminated, once per process:
-/// SIGTERM, SIGINT, and SIGHUP (unless ignored) kill every live child's process group, then
-/// end the process by the same signal with its default action. A failure installs no handler
-/// and is returned by this and every later call: signal-hook keeps a slot for a signal it
-/// once took, so a second attempt would not install its handler again.
+/// Makes this process take its children along when it is terminated, once per process.
+/// SIGCHLD goes to its default action first, so every child stays unreaped, and the process
+/// group it leads pinned, until [`Reaper::finish`] reaps it, also when the caller ignored
+/// SIGCHLD. Then SIGTERM, SIGINT, and SIGHUP (unless ignored) kill every live child's process
+/// group and end the process by the same signal with its default action. A failure installs
+/// no handler and is returned by this and every later call: signal-hook keeps a slot for a
+/// signal it once took, so a second attempt would not install its handler again.
 #[cfg(unix)]
 fn guard_termination() -> std::io::Result<()> {
     use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
@@ -303,6 +305,7 @@ fn guard_termination() -> std::io::Result<()> {
     static GUARD: OnceLock<Result<(), String>> = OnceLock::new();
     GUARD
         .get_or_init(|| {
+            unix::reset_child_signal();
             unix::watch_signals(&[SIGTERM, SIGINT, SIGHUP], |sig| {
                 // Held until the process ends: no child starts or is reaped after this.
                 let live = live();
