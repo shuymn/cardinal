@@ -122,17 +122,17 @@ struct WatchInner {
     own: [std::sync::atomic::AtomicU32; 4],
 }
 
-/// Signals and parent exit, reported as [`Event`]s from the runner's start. Watching is best
-/// effort: when a handler cannot be installed, the signal keeps its default action.
+/// Signals and parent exit, reported as [`Event`]s from the runner's start.
 #[derive(Clone)]
 pub struct Watch {
     inner: Arc<WatchInner>,
 }
 
 impl Watch {
-    /// Starts watching signals and the parent process.
-    #[must_use]
-    pub fn start() -> Self {
+    /// Starts watching signals and the parent process. The result says whether the handled
+    /// signals are watched: when their handlers cannot be set up, none is installed, and each
+    /// signal keeps the disposition it had. The parent is watched either way.
+    pub fn start() -> (Self, std::io::Result<()>) {
         let (tx, rx) = mpsc::channel();
         let watch = Self {
             inner: Arc::new(WatchInner {
@@ -146,30 +146,37 @@ impl Watch {
                 own: Default::default(),
             }),
         };
+        #[cfg(not(unix))]
+        let signals = Ok(());
         #[cfg(unix)]
-        {
+        let signals = {
             let inner = Arc::clone(&watch.inner);
-            let _ = os::unix::watch_signals(&HANDLED, move |sig| {
-                if let Some(slot) = HANDLED.iter().position(|&s| s == sig)
-                    && take_one(&inner.own[slot])
-                {
-                    return;
-                }
-                let _ = inner.tx.send(Event::Signal(sig));
-            });
-            if watch.inner.parent.is_some() {
-                let poller = watch.clone();
-                let _ = std::thread::Builder::new()
-                    .name("cardinal-parent".into())
-                    .spawn(move || {
-                        while !poller.parent_exited() {
-                            std::thread::sleep(PARENT_POLL);
+            testpoint::hit(testpoint::RUN_WATCHING)
+                .map_err(std::io::Error::other)
+                .and_then(|()| {
+                    os::unix::watch_signals(&HANDLED, move |sig| {
+                        if let Some(slot) = HANDLED.iter().position(|&s| s == sig)
+                            && take_one(&inner.own[slot])
+                        {
+                            return;
                         }
-                        let _ = poller.inner.tx.send(Event::ParentExited);
-                    });
-            }
+                        let _ = inner.tx.send(Event::Signal(sig));
+                    })
+                })
+        };
+        #[cfg(unix)]
+        if watch.inner.parent.is_some() {
+            let poller = watch.clone();
+            let _ = std::thread::Builder::new()
+                .name("cardinal-parent".into())
+                .spawn(move || {
+                    while !poller.parent_exited() {
+                        std::thread::sleep(PARENT_POLL);
+                    }
+                    let _ = poller.inner.tx.send(Event::ParentExited);
+                });
         }
-        watch
+        (watch, signals)
     }
 
     /// The next event, waiting at most `timeout`.

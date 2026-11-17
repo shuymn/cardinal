@@ -2,10 +2,11 @@
 //! (`docs/architecture.md` section 5).
 //!
 //! **The stage has started once the spawn has returned a child.** Before that, every failure
-//! the runner can observe (a configuration or state error, a lock past its deadline, a failed
-//! spawn, a panic) ends in fail-open: the runner runs the stage itself, once. After it, the
-//! runner never runs the stage again; an error ends in waiting for the child and returning its
-//! status, or in exit 125 with one line on stderr when the status is unknown.
+//! the runner can observe (signal handlers that cannot be set up, a configuration or state
+//! error, a lock past its deadline, a failed spawn, a panic) ends in fail-open: the runner runs
+//! the stage itself, once. After it, the runner never runs the stage again; an error ends in
+//! waiting for the child and returning its status, or in exit 125 with one line on stderr when
+//! the status is unknown.
 //!
 //! The runner adds no output to a command: waits are recorded, never printed.
 
@@ -96,9 +97,10 @@ pub fn run(spec_b64: Option<&str>, command: &[OsString]) -> ExitCode {
     // Before the first child: the runner's children stay unreaped until it reaps them.
     #[cfg(unix)]
     os::unix::reset_child_signal();
-    let watch = Watch::start();
+    let (watch, signals) = Watch::start();
     let tty = std::io::stdin().is_terminal();
-    let mut runner = Runner::new(started, command, watch);
+    let unwatched = signals.err().map(|err| FailOpen::new("signal_setup", &err));
+    let mut runner = Runner::new(started, command, watch, unwatched);
     let mut result = catch_unwind(AssertUnwindSafe(|| runner.drive(spec_b64, tty)));
     // A panic in recovery re-enters it, and recovery goes on from what the runner holds: a
     // stage that has started is waited for, never run again. A runner that still cannot get
@@ -199,6 +201,8 @@ struct Runner {
     started: Instant,
     argv: Vec<OsString>,
     watch: Watch,
+    /// Why the signals are not watched (step 1), which makes the run fail open.
+    unwatched: Option<FailOpen>,
     executor: LocalExecutor,
     job_id: String,
     spec: Option<RunSpec>,
@@ -214,12 +218,18 @@ struct Runner {
 }
 
 impl Runner {
-    fn new(started: Instant, command: &[OsString], watch: Watch) -> Self {
+    fn new(
+        started: Instant,
+        command: &[OsString],
+        watch: Watch,
+        unwatched: Option<FailOpen>,
+    ) -> Self {
         Self {
             started,
             argv: command.to_vec(),
             executor: LocalExecutor::new(watch.clone()),
             watch,
+            unwatched,
             job_id: state::new_id(),
             spec: None,
             ctx: None,
@@ -297,6 +307,9 @@ impl Runner {
         if tty {
             self.record(RecordKind::TtyPassthrough, json!({ "cwd": cwd_string() }));
             return Next::Passthrough;
+        }
+        if let Some(fail) = self.unwatched.take() {
+            return Next::FailOpen(fail);
         }
         if let Err(fail) = loaded {
             return Next::FailOpen(fail);

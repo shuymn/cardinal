@@ -19,6 +19,9 @@ pub const ADMISSION_RESERVED: &str = "admission.reserved";
 pub const ADMISSION_WAITING: &str = "admission.waiting";
 /// Waiting for the worktree in-use lock.
 pub const INUSE_WAITING: &str = "inuse.waiting";
+/// The runner is about to set up its signal handlers (Unix); an injected failure stands for
+/// handlers that cannot be set up.
+pub const RUN_WATCHING: &str = "run.watching";
 /// Immediately before the `starting` record and the spawn.
 pub const RUN_BEFORE_STARTING: &str = "run.before_starting";
 /// The admitted path is about to spawn the stage, after its last cancellation check.
@@ -47,6 +50,7 @@ pub const POINTS: &[&str] = &[
     ADMISSION_RESERVED,
     ADMISSION_WAITING,
     INUSE_WAITING,
+    RUN_WATCHING,
     RUN_BEFORE_STARTING,
     RUN_SPAWNING,
     RUN_SPAWNED,

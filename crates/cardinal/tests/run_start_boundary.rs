@@ -59,6 +59,34 @@ fn injected_failure_before_starting_runs_the_stage_once() {
     assert_eq!(env.live_locks(), Vec::<String>::new());
 }
 
+/// Signal handlers that cannot be set up make the run fail open before admission: the stage
+/// runs once, in the caller's group, where it gets terminal signals itself.
+#[cfg(unix)]
+#[test]
+fn signal_setup_failure_runs_the_stage_once_in_the_callers_group() {
+    let env = Env::with_budget(4);
+    let stage = counting_stage(&env);
+    let out = output(&mut env.run_at(
+        None,
+        &args(&stage),
+        &[],
+        Some(cardinal::testpoint::RUN_WATCHING),
+    ));
+    assert_eq!(out.status.code(), Some(7));
+    assert_eq!(env.lines("counter"), ["run"]);
+    assert!(out.stdout.is_empty() && out.stderr.is_empty(), "{out:?}");
+    assert_eq!(fail_open_reasons(&env), ["signal_setup"]);
+    let started = env.records_of(cardinal::contract::RecordKind::JobStarted);
+    assert_eq!(started.len(), 1);
+    assert_eq!(started[0].data["path"], "fail_open");
+    assert_eq!(
+        env.records_of(cardinal::contract::RecordKind::JobAdmitted),
+        []
+    );
+    assert_eq!(env.reservations(), []);
+    assert!(env.worktree_lock_free());
+}
+
 #[cfg(unix)]
 #[test]
 fn runner_killed_before_starting_runs_the_stage_zero_times() {
