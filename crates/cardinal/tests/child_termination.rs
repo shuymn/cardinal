@@ -12,6 +12,8 @@ use std::process::{Child, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use observe_common::Scene;
+#[cfg(windows)]
+use support::helper::ChildGuard;
 
 /// Polls `check` every 20 ms until it returns `Some` or `limit` passes.
 fn poll<T>(limit: Duration, mut check: impl FnMut() -> Option<T>) -> Option<T> {
@@ -194,18 +196,6 @@ fn a_terminated_cardinal_kills_its_children() {
 #[cfg(windows)]
 const HELPER_PID_FILE: &str = "CARDINAL_TEST_HELPER_PID_FILE";
 
-/// Kills and reaps the helper if a failing test left it running.
-#[cfg(windows)]
-struct KillChild(Child);
-
-#[cfg(windows)]
-impl Drop for KillChild {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
 /// Kills the helper's `ping` by PID, if it still runs with its start time.
 #[cfg(windows)]
 struct KillProcess(u32, u64);
@@ -276,7 +266,7 @@ fn outside_os_child_helper() {
 fn a_process_started_outside_os_child_outlives_cardinal() {
     let dir = tempfile::tempdir().unwrap();
     let pid_file = dir.path().join("ping.pid");
-    let mut helper = KillChild(
+    let mut helper = ChildGuard::new(
         std::process::Command::new(std::env::current_exe().unwrap())
             .args(["outside_os_child_helper", "--exact", "--ignored"])
             .env(HELPER_PID_FILE, &pid_file)
@@ -293,8 +283,8 @@ fn a_process_started_outside_os_child_outlives_cardinal() {
     let start_s = cardinal::os::start_time_s(pid).expect("ping runs");
     let _ping = KillProcess(pid, start_s);
 
-    helper.0.kill().unwrap();
-    wait_or_kill(&mut helper.0);
+    helper.child().kill().unwrap();
+    wait_or_kill(helper.child());
     let survived = (0..50).all(|_| {
         std::thread::sleep(Duration::from_millis(20));
         cardinal::os::is_alive(pid, start_s)

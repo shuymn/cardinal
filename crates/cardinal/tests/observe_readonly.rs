@@ -156,33 +156,12 @@ fn split_index_is_left_unread() {
     scene.push(&wt, "feat");
     scene.merge_into_base(&head);
     scene.fx.git(&wt, &["update-index", "--split-index"]);
-    let shared: Vec<_> = listing(&scene.repo.join(".git"))
-        .keys()
-        .filter(|k| k.contains("sharedindex."))
-        .map(|k| scene.repo.join(".git").join(k))
-        .collect();
-    assert!(!shared.is_empty(), "git wrote a shared index");
-    for file in &shared {
-        age(file);
-    }
+    let shared = aged_shared_indexes(&scene.repo.join(".git"));
 
     let before = listing(&scene.repo);
-    let output = scene
-        .cardinal()
-        .args(["inventory", "--repo"])
-        .arg(&scene.repo)
-        .output()
-        .unwrap();
-    assert!(output.status.success(), "{output:?}");
-    let inv = scene.inventory();
+    let inv = observe_all(&scene);
     scene.observe(&wt).unwrap();
-    let after = listing(&scene.repo);
-    let changed: Vec<&String> = before
-        .keys()
-        .chain(after.keys())
-        .filter(|k| before.get(*k) != after.get(*k))
-        .collect();
-    assert!(changed.is_empty(), "observation changed {changed:?}");
+    assert_unchanged(&before, &listing(&scene.repo));
     assert_no_monitor(&scene, &scene.repo);
     assert_no_monitor(&scene, &wt);
 
