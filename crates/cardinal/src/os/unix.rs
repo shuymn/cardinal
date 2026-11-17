@@ -226,16 +226,23 @@ pub fn stop_self(sig: i32) {
     let _ = signal_hook::low_level::raise(sig);
 }
 
+/// The current disposition of `sig`, read without changing it.
+fn disposition(sig: i32) -> io::Result<libc::sigaction> {
+    let mut current = std::mem::MaybeUninit::<libc::sigaction>::zeroed();
+    // SAFETY: without a new action, `sigaction` only writes the current one into `current`,
+    // which is valid for writes.
+    if unsafe { libc::sigaction(sig, std::ptr::null(), current.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `current` is zero-initialized, a valid `sigaction`, and filled on success.
+    Ok(unsafe { current.assume_init() })
+}
+
 /// Whether this process ignores `sig` (`SIG_IGN`, inherited across `exec` from the caller).
 /// Reads the disposition without changing it.
 #[must_use]
 pub fn ignored(sig: i32) -> bool {
-    let mut current = std::mem::MaybeUninit::<libc::sigaction>::zeroed();
-    // SAFETY: without a new action, `sigaction` only writes the current one into `current`,
-    // which is valid for writes.
-    let read = unsafe { libc::sigaction(sig, std::ptr::null(), current.as_mut_ptr()) };
-    // SAFETY: `current` is zero-initialized, a valid `sigaction`, and filled on success.
-    read == 0 && unsafe { current.assume_init() }.sa_sigaction == libc::SIG_IGN
+    disposition(sig).is_ok_and(|action| action.sa_sigaction == libc::SIG_IGN)
 }
 
 /// Whether SIGCHLD was ignored when [`reset_child_signal`] reset it.
@@ -304,21 +311,40 @@ pub fn reap(raw_pid: u32) -> io::Result<ChildEnd> {
 /// children. A signal this process ignores is skipped: it stays ignored here and in the
 /// children, as it would for a stage started directly.
 ///
-/// Each signal's handler writes one byte to an OS pipe of its own, read by a thread that calls
-/// `on_signal`; a pipe, unlike the socket pair `signal-hook`'s iterator uses, keeps the runner
-/// free of sockets. Watching is best effort: signals registered before a failure stay watched.
+/// Each signal's handler writes one byte to an OS pipe of its own, read by a thread of its own
+/// that calls `on_signal`; a pipe, unlike the socket pair `signal-hook`'s iterator uses, keeps
+/// the runner free of sockets.
+///
+/// Every reader runs before the first handler is installed, so no handler writes to a pipe
+/// nobody reads, which would swallow its signal. On a failure no handler stays installed: each
+/// signal gets back the disposition it had, and the readers end.
 pub fn watch_signals(
     signals: &[i32],
     on_signal: impl Fn(i32) + Send + Sync + 'static,
 ) -> io::Result<()> {
+    watch_signals_with(signals, on_signal, |name, body| {
+        std::thread::Builder::new().name(name).spawn(body).map(drop)
+    })
+}
+
+/// A thread body for [`watch_signals_with`]'s `start`.
+type Body = Box<dyn FnOnce() + Send + 'static>;
+
+/// [`watch_signals`], with `start` starting each reader thread from a name and a body.
+fn watch_signals_with(
+    signals: &[i32],
+    on_signal: impl Fn(i32) + Send + Sync + 'static,
+    mut start: impl FnMut(String, Body) -> io::Result<()>,
+) -> io::Result<()> {
     let on_signal = Arc::new(on_signal);
+    // Dropping a writer before its handler holds it ends its reader at end of file.
+    let mut writers = Vec::new();
     for &sig in signals.iter().filter(|&&sig| !ignored(sig)) {
         let (mut reader, writer) = io::pipe()?;
-        signal_hook::low_level::pipe::register(sig, writer)?;
         let on_signal = Arc::clone(&on_signal);
-        std::thread::Builder::new()
-            .name(format!("cardinal-signal-{sig}"))
-            .spawn(move || {
+        start(
+            format!("cardinal-signal-{sig}"),
+            Box::new(move || {
                 let mut byte = [0u8; 1];
                 loop {
                     match reader.read(&mut byte) {
@@ -327,7 +353,31 @@ pub fn watch_signals(
                         _ => return,
                     }
                 }
-            })?;
+            }),
+        )?;
+        writers.push((sig, writer));
+    }
+    let mut installed = Vec::new();
+    for (sig, writer) in writers {
+        let registered = disposition(sig).and_then(|previous| {
+            let id = signal_hook::low_level::pipe::register(sig, writer)?;
+            Ok((sig, id, previous))
+        });
+        match registered {
+            Ok(entry) => installed.push(entry),
+            Err(err) => {
+                for (sig, id, previous) in installed.into_iter().rev() {
+                    // signal-hook keeps its handler installed when its last action goes, so
+                    // the previous disposition is put back first. Unregistering then closes
+                    // the writer, which ends the reader.
+                    // SAFETY: `previous` was read from `sigaction` for this signal; a null old
+                    // action makes `sigaction` write nothing.
+                    unsafe { libc::sigaction(sig, &raw const previous, std::ptr::null_mut()) };
+                    signal_hook::low_level::unregister(id);
+                }
+                return Err(err);
+            }
+        }
     }
     Ok(())
 }
@@ -344,7 +394,85 @@ pub fn die_by_signal(sig: i32) -> ! {
 
 #[cfg(test)]
 mod tests {
-    use super::{SIGKILL, group_exists, ignored, parent_pid, pgid_of};
+    use std::io;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use super::{
+        Body, SIGKILL, disposition, group_exists, ignored, parent_pid, pgid_of, watch_signals_with,
+    };
+
+    /// The handler of `sig` and the flags that change how it runs, which a failed watch must
+    /// leave as they were. The raw flags can differ after a restore: glibc on `x86_64` adds
+    /// `SA_RESTORER` to every action it installs.
+    fn handler(sig: i32) -> (libc::sighandler_t, libc::c_int) {
+        let behaviour = libc::SA_ONSTACK
+            | libc::SA_RESTART
+            | libc::SA_RESETHAND
+            | libc::SA_NODEFER
+            | libc::SA_SIGINFO
+            | libc::SA_NOCLDSTOP
+            | libc::SA_NOCLDWAIT;
+        let action = disposition(sig).unwrap();
+        (action.sa_sigaction, action.sa_flags & behaviour)
+    }
+
+    /// Starts each reader on a real thread that reports on `ended` when it returns; the
+    /// `fail_at`-th start (counting from 1) fails as thread creation does without resources.
+    fn start_reporting(
+        ended: &mpsc::Sender<()>,
+        fail_at: Option<usize>,
+    ) -> impl FnMut(String, Body) -> io::Result<()> {
+        let ended = ended.clone();
+        let mut calls = 0;
+        move |name, body| {
+            calls += 1;
+            if Some(calls) == fail_at {
+                return Err(io::Error::from_raw_os_error(libc::EAGAIN));
+            }
+            let ended = ended.clone();
+            std::thread::Builder::new()
+                .name(name)
+                .spawn(move || {
+                    body();
+                    let _ = ended.send(());
+                })
+                .map(drop)
+        }
+    }
+
+    /// A reader thread that cannot start fails the watch before any handler is installed: the
+    /// signals keep their dispositions, and the reader that did start ends.
+    #[test]
+    fn a_reader_that_cannot_start_leaves_no_handler() {
+        let signals = [libc::SIGUSR1, libc::SIGWINCH];
+        let before = signals.map(handler);
+        let (sender, ended) = mpsc::channel();
+        let err =
+            watch_signals_with(&signals, |_| {}, start_reporting(&sender, Some(2))).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EAGAIN), "{err}");
+        assert_eq!(signals.map(handler), before);
+        ended
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the started reader ended");
+    }
+
+    /// A handler that cannot be installed after another was takes that one back: its signal
+    /// gets its disposition back, and both readers end.
+    #[test]
+    fn a_handler_that_cannot_be_installed_leaves_no_handler() {
+        // Signal 0 starts a reader, but has no disposition to read or replace.
+        let signals = [libc::SIGUSR2, 0];
+        let before = handler(libc::SIGUSR2);
+        let (sender, ended) = mpsc::channel();
+        watch_signals_with(&signals, |_| {}, start_reporting(&sender, None)).unwrap_err();
+        assert_eq!(handler(libc::SIGUSR2), before);
+        for _ in signals {
+            ended
+                .recv_timeout(Duration::from_secs(10))
+                .expect("every reader ended");
+        }
+    }
 
     #[test]
     fn own_group_exists_and_is_reported() {
