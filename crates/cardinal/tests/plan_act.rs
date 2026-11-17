@@ -477,7 +477,8 @@ fn plain_target_checks(
 }
 
 /// A7 end to end: `act` refuses a regenerable directory that is a mount point (a disk image
-/// attached there), and what is on it stays.
+/// attached there), and what is on it stays. The image is written as a file and attached
+/// read-only: formatting a writable image writes to its device, which the test sandbox denies.
 #[cfg(target_os = "macos")]
 #[test]
 fn mount_point_refused() {
@@ -490,16 +491,17 @@ fn mount_point_refused() {
     let s = Setup::new();
     let wt = s.worktree("mounted", &[("node_modules", IgnoredClass::Regenerable)]);
     std::fs::create_dir(wt.join("node_modules")).unwrap();
+    let contents = s.fx.path("image");
+    write(&contents, "pkg/index.js", "on the image");
     let image = s.fx.path("disk.dmg");
     let created =
         s.fx.command("hdiutil", s.fx.root())
-            .args([
-                "create", "-quiet", "-size", "1m", "-fs", "HFS+", "-layout", "NONE",
-            ])
+            .args(["makehybrid", "-quiet", "-hfs", "-o"])
             .arg(&image)
+            .arg(&contents)
             .status()
             .unwrap();
-    assert!(created.success(), "hdiutil create");
+    assert!(created.success(), "hdiutil makehybrid");
     let attached =
         s.fx.command("hdiutil", s.fx.root())
             .args([
@@ -519,14 +521,16 @@ fn mount_point_refused() {
         .args(["detach", "-force", "-quiet"])
         .arg(wt.join("node_modules"));
     let _attached = Attached(detach);
-    write(&wt, "node_modules/pkg/index.js", "on the image");
 
     let plan = s.plan(PlanKind::ReclaimDir, &wt.join("node_modules"));
     assert_eq!(check(&plan.checks, "plain_target"), CheckResult::Fail);
     let result = s.act(&plan.id, &owner_approved()).unwrap();
     assert_eq!(result.status, ActStatus::Rejected);
     assert_eq!(result.reasons, ["plain_target"]);
-    assert!(wt.join("node_modules/pkg/index.js").exists());
+    assert_eq!(
+        std::fs::read_to_string(wt.join("node_modules/pkg/index.js")).unwrap(),
+        "on the image"
+    );
 }
 
 /// A8: both plan kinds are refused for a worktree managed by another app, whether
