@@ -1,0 +1,14 @@
+# Tests written to escape the harness, run only by `scripts/test --self-check`, which expects
+# each escape to fail or to be caught (docs/architecture.md section 13.4). Its own workspace,
+# so the normal suite never builds or runs it.
+[package]
+name = "cardinal-harness-canaries"
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[lib]
+doctest = false
+
+[workspace]

@@ -1,20 +1,410 @@
-#!/usr/bin/env bash
-# The completion check of every change: formatting, clippy, and the tests, with the
-# repository guard around the tests (docs/architecture.md section 13.4). Run it as
-# `mise exec -- scripts/test`.
-set -euo pipefail
+#!/bin/sh
+# The completion check of every change (docs/architecture.md section 13.4): formatting,
+# clippy, and the tests, run confined between a snapshot and a verify of the repository
+# guard. Run it as `mise exec -- scripts/test` (on Windows, `mise exec -- sh scripts/test`).
+#
+#   scripts/test                 the check
+#   scripts/test --self-check    show that each isolation mechanism holds: run the canaries
+#                                of crates/test-support/canaries and expect each escape to
+#                                fail or be caught
+#
+# Phase 1 (fmt, clippy, `cargo nextest archive`) builds without confinement. Phase 2 runs the
+# archived tests with cargo-nextest in a constructed environment under a per-run root R
+# (HOME, XDG dirs, temp dir, and git's global config inside R), each test process confined
+# so that it can write only inside R: sandbox-exec on macOS, bubblewrap on Linux where it
+# works; Windows gets the environment and the guard only. Every test process carries a
+# marker unique to the run (CARDINAL_TEST_RUN=<id>, found in /proc on Linux; an inherited
+# descriptor of $R/marker, found with lsof on macOS); afterwards any process still carrying
+# it is listed, killed, and fails the run.
 
-root=$(cd "$(dirname "$0")/.." && pwd)
+# POSIX prelude: start over in a constructed environment before bash reads any startup file.
+# A script run by `sh` reads no startup file, and `bash --noprofile --norc` with BASH_ENV and
+# ENV unset reads none either. What passes, and why:
+#   PATH                       the pinned toolchain that `mise exec` put first
+#   CARGO_HOME, RUSTUP_HOME    where that toolchain and the registry live (defaulting to the
+#   RUSTUP_TOOLCHAIN           locations under HOME), and which toolchain mise pinned
+#   CI                         selects the guard's whole-repository mode
+#   CARGO_TERM_COLOR           output only
+#   Windows: SYSTEMROOT, SYSTEMDRIVE, WINDIR, COMSPEC, PATHEXT, TEMP, TMP, USERPROFILE,
+#   APPDATA, LOCALAPPDATA, ProgramData, ProgramFiles, ProgramFiles(x86), ProgramW6432,
+#   NUMBER_OF_PROCESSORS, PROCESSOR_ARCHITECTURE, OS: what Windows programs and the MSVC
+#   linker lookup need to start at all.
+# Nothing else passes: not HOME, BASH_ENV, ENV, GIT_*, GH_*, CLAUDE_*, or CARDINAL_*.
+if [ "${1-}" != --clean-env ]; then
+  cargo_home=${CARGO_HOME:-${HOME:-}/.cargo}
+  rustup_home=${RUSTUP_HOME:-${HOME:-}/.rustup}
+  case $(uname -s) in
+    MINGW* | MSYS* | CYGWIN*)
+      exec env -i PATH="$PATH" CARGO_HOME="$cargo_home" RUSTUP_HOME="$rustup_home" \
+        RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN-}" CI="${CI-}" CARGO_TERM_COLOR="${CARGO_TERM_COLOR-}" \
+        SYSTEMROOT="${SYSTEMROOT-}" SYSTEMDRIVE="${SYSTEMDRIVE-}" WINDIR="${WINDIR-}" \
+        COMSPEC="${COMSPEC-}" PATHEXT="${PATHEXT-}" TEMP="${TEMP-}" TMP="${TMP-}" \
+        USERPROFILE="${USERPROFILE-}" APPDATA="${APPDATA-}" LOCALAPPDATA="${LOCALAPPDATA-}" \
+        ProgramData="$(printenv ProgramData)" ProgramFiles="$(printenv ProgramFiles)" \
+        "ProgramFiles(x86)=$(printenv 'ProgramFiles(x86)')" ProgramW6432="$(printenv ProgramW6432)" \
+        NUMBER_OF_PROCESSORS="${NUMBER_OF_PROCESSORS-}" \
+        PROCESSOR_ARCHITECTURE="${PROCESSOR_ARCHITECTURE-}" OS="${OS-}" \
+        bash --noprofile --norc "$0" --clean-env "$@"
+      ;;
+    *)
+      exec env -i PATH="$PATH" CARGO_HOME="$cargo_home" RUSTUP_HOME="$rustup_home" \
+        RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN-}" CI="${CI-}" CARGO_TERM_COLOR="${CARGO_TERM_COLOR-}" \
+        bash --noprofile --norc "$0" --clean-env "$@"
+      ;;
+  esac
+fi
+shift
+
+set -euo pipefail
+shopt -s inherit_errexit 2>/dev/null || true
+export LC_ALL=C
+[ -n "${RUSTUP_TOOLCHAIN-}" ] || unset RUSTUP_TOOLCHAIN
+[ -n "${CARGO_TERM_COLOR-}" ] || unset CARGO_TERM_COLOR
+
+root=$(cd "$(dirname "$0")/.." && pwd -P)
 cd "$root"
+os=$(uname -s)
+case $os in MINGW* | MSYS* | CYGWIN*) os=Windows ;; esac
+
+say() {
+  printf 'scripts/test: %s\n' "$*" >&2
+}
+
+# The per-run root, outside any repository: `mktemp -d` in the system temp dir (TMPDIR did
+# not pass). Removed on every exit, after the sweep.
+R=$(cd "$(mktemp -d)" && pwd -P)
+dir=$R
+while [ "$dir" != / ] && [ -n "$dir" ]; do
+  if [ -e "$dir/.git" ]; then
+    say "the per-run root $R is inside the repository $dir"
+    exit 1
+  fi
+  dir=$(dirname "$dir")
+done
+mkdir -p "$R/home/.config" "$R/home/.cache" "$R/home/.local/state" "$R/home/.local/share" \
+  "$R/tmp" "$R/archive"
+: >"$R/empty-gitconfig"
+: >"$R/marker"
+run_id=$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')
+marker="CARDINAL_TEST_RUN=$run_id"
+
+cleanup() {
+  local status=$?
+  if ! sweep; then
+    status=1
+  fi
+  rm -rf "$R"
+  exit "$status"
+}
+trap cleanup EXIT
+
+# Phase 1 runs with HOME inside R too, so nothing it starts reads the user's dotfiles.
+export HOME=$R/home XDG_CONFIG_HOME=$R/home/.config XDG_CACHE_HOME=$R/home/.cache \
+  XDG_STATE_HOME=$R/home/.local/state XDG_DATA_HOME=$R/home/.local/share \
+  GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=$R/empty-gitconfig GIT_TERMINAL_PROMPT=0
+
+# --- Supervisor: processes that carry this run's marker -------------------------------
+
+# Prints the PIDs of this user's processes that carry the marker; fails when the process
+# table cannot be read.
+marked_pids() {
+  case $os in
+    Darwin)
+      # macOS shows a process's environment only to the process itself, so the marker
+      # here is an open descriptor of $R/marker that every test process inherits.
+      local pids status=0
+      pids=$(lsof -t -- "$R/marker" 2>/dev/null) || status=$?
+      # lsof exits 1 both when nothing holds the file and on errors; the probe in
+      # check_sweep shows that it can see a holder.
+      [ "$status" -le 1 ] || return 1
+      [ -z "$pids" ] || printf '%s\n' "$pids"
+      ;;
+    Linux)
+      [ -r /proc/self/environ ] || return 1
+      local proc
+      for proc in /proc/[0-9]*; do
+        [ -O "$proc" ] || continue
+        # A process that exits meanwhile has no environment left to read.
+        if tr '\0' '\n' <"$proc/environ" 2>/dev/null | grep -qxF "$marker"; then
+          echo "${proc#/proc/}"
+        fi
+      done
+      ;;
+    *)
+      return 2
+      ;;
+  esac
+}
+
+# Kills and lists every process this run left behind; fails if there was one or if the
+# process table cannot be read. The marker is unique to this run, so each PID found is one
+# this run started.
+swept=0
+sweep() {
+  local pids status=0
+  pids=$(marked_pids) || status=$?
+  if [ "$status" -eq 2 ]; then
+    return 0
+  elif [ "$status" -ne 0 ]; then
+    say "cannot read the process table to find leftover test processes"
+    return 1
+  fi
+  [ -n "$pids" ] || return 0
+  for pid in $pids; do
+    say "leftover test process: $(ps -o pid= -o pgid= -o command= -p "$pid" 2>/dev/null || echo "$pid")"
+    kill -KILL "$pid" 2>/dev/null || true
+    swept=$((swept + 1))
+  done
+  sleep 0.2
+  if [ -n "$(marked_pids)" ]; then
+    say "leftover test processes survived SIGKILL: $(marked_pids | tr '\n' ' ')"
+  fi
+  return 1
+}
+
+# Starts a process with the marker and checks that the sweep sees it, so a sweep that finds
+# nothing means nothing was left.
+check_sweep() {
+  [ "$os" != Windows ] || {
+    say "Windows: no process sweep; leftovers are found only by nextest's leak check"
+    return 0
+  }
+  env -i "$marker" sleep 30 9<"$R/marker" &
+  local probe=$! pids tries=0
+  # The fork shows the marker only once env has run.
+  while :; do
+    pids=$(marked_pids) || {
+      kill "$probe"
+      say "cannot read the process table"
+      return 1
+    }
+    case " $(printf '%s ' $pids)" in *" $probe "*) break ;; esac
+    tries=$((tries + 1))
+    [ "$tries" -lt 50 ] || break
+    sleep 0.1
+  done
+  kill "$probe"
+  wait "$probe" 2>/dev/null || true
+  case " $(printf '%s ' $pids)" in
+    *" $probe "*) ;;
+    *)
+      say "the process sweep cannot see the marker of process $probe"
+      return 1
+      ;;
+  esac
+}
+
+# --- Confinement -------------------------------------------------------------------------
+
+# Sets `runner` to the command that confines one test process, or empty, and `confinement`
+# to a description.
+runner=
+confinement=
+setup_confinement() {
+  case $os in
+    Darwin)
+      cat >"$R/sandbox.sb" <<EOF
+(version 1)
+(allow default)
+(deny file-write*)
+(allow file-write*
+  (subpath "$R")
+  (literal "/dev/null")
+  (literal "/dev/tty")
+  (literal "/dev/ptmx")
+  (regex #"^/dev/fd/[0-9]+\$")
+  (regex #"^/dev/ttys[0-9]+\$"))
+(deny network*)
+(allow network* (local unix-socket (subpath "$R")))
+(allow network* (remote unix-socket (subpath "$R")))
+EOF
+      runner="sandbox-exec -f $R/sandbox.sb"
+      confinement="sandbox-exec: writes only under the per-run root, no network"
+      ;;
+    Linux)
+      local probe=(bwrap --ro-bind / / --bind "$R" "$R" --unshare-net --die-with-parent --)
+      local error
+      if error=$("${probe[@]}" true 2>&1); then
+        runner="bwrap --ro-bind / / --bind $R $R --unshare-net --die-with-parent --"
+        confinement="bubblewrap: writes only under the per-run root, no network"
+      else
+        confinement="UNCONFINED: bubblewrap does not work here (${error:-not installed}); writes outside the per-run root are found only by the repository guard"
+      fi
+      ;;
+    *)
+      confinement="UNCONFINED on $os: constructed environment and the repository guard only"
+      ;;
+  esac
+  case $R in *' '*)
+    runner=
+    confinement="UNCONFINED: the per-run root $R has a space, which a target runner cannot carry"
+    ;;
+  esac
+  say "$confinement"
+}
+
+# --- Phase 2 -----------------------------------------------------------------------------
+
+host=$(rustc -vV | sed -n 's/^host: //p')
+runner_var=CARGO_TARGET_$(printf '%s' "$host" | tr 'a-z-' 'A-Z_')_RUNNER
+
+# run_archive <archive> <workspace> [nextest args...]: the archived tests in the constructed
+# environment, each test process confined. Returns nextest's status.
+run_archive() {
+  local archive=$1 workspace=$2
+  shift 2
+  local extract
+  extract=$(mktemp -d "$R/archive/XXXXXX")
+  local env=(
+    PATH="$PATH"
+    HOME="$R/home"
+    XDG_CONFIG_HOME="$R/home/.config"
+    XDG_CACHE_HOME="$R/home/.cache"
+    XDG_STATE_HOME="$R/home/.local/state"
+    XDG_DATA_HOME="$R/home/.local/share"
+    GIT_CONFIG_NOSYSTEM=1
+    GIT_CONFIG_GLOBAL="$R/empty-gitconfig"
+    GIT_CEILING_DIRECTORIES="$(dirname "$R")"
+    GIT_TERMINAL_PROMPT=0
+    LC_ALL=C
+    PROPTEST_DISABLE_FAILURE_PERSISTENCE=1
+    "$marker"
+  )
+  if [ "$os" = Windows ]; then
+    env+=(TEMP="$R/tmp" TMP="$R/tmp" USERPROFILE="$R/home" APPDATA="$R/home/AppData/Roaming"
+      LOCALAPPDATA="$R/home/AppData/Local" SYSTEMROOT="$SYSTEMROOT" SYSTEMDRIVE="${SYSTEMDRIVE-}"
+      WINDIR="$WINDIR" COMSPEC="$COMSPEC" PATHEXT="$PATHEXT"
+      NUMBER_OF_PROCESSORS="${NUMBER_OF_PROCESSORS-}")
+  else
+    env+=(TMPDIR="$R/tmp")
+  fi
+  [ -z "${CARGO_TERM_COLOR-}" ] || env+=(CARGO_TERM_COLOR="$CARGO_TERM_COLOR")
+  [ -z "$runner" ] || env+=("$runner_var=$runner")
+  env -i "${env[@]}" cargo-nextest nextest run 9<"$R/marker" --archive-file "$archive" \
+    --workspace-remap "$workspace" --extract-to "$extract" \
+    --config-file "$root/.config/nextest.toml" "$@"
+}
+
+# --- Self-check ----------------------------------------------------------------------------
+
+canaries=$root/crates/test-support/canaries
+canary_target=$root/target/canaries
+
+self_check() {
+  local failed=0 out status
+  check() {
+    say "self-check: $1: $2"
+    [ "$2" != FAILED ] || failed=1
+  }
+  CARGO_TARGET_DIR=$canary_target cargo nextest archive --locked \
+    --manifest-path "$canaries/Cargo.toml" --archive-file "$R/canaries.tar.zst"
+
+  # A raw spawn fails the lint.
+  if out=$(CARGO_TARGET_DIR=$canary_target cargo clippy --locked \
+    --manifest-path "$canaries/Cargo.toml" --example raw_spawn -- -D warnings 2>&1); then
+    check "raw Command::new fails the lint" FAILED
+  elif printf '%s' "$out" | grep -q 'disallowed_methods\|disallowed method'; then
+    check "raw Command::new fails the lint" ok
+  else
+    printf '%s\n' "$out" >&2
+    check "raw Command::new fails the lint" FAILED
+  fi
+
+  # A write outside R fails, and nothing is written.
+  local escape=$root/target/canary-escape
+  rm -f "$escape"
+  status=0
+  run_archive "$R/canaries.tar.zst" "$canaries" -E 'test(=writes_outside_root)' || status=$?
+  if [ -n "$runner" ]; then
+    if [ "$status" -ne 0 ] && [ ! -e "$escape" ]; then
+      check "a write outside the per-run root fails" ok
+    else
+      check "a write outside the per-run root fails" FAILED
+    fi
+  else
+    check "a write outside the per-run root fails" "not prevented on $os ($confinement)"
+  fi
+  rm -f "$escape"
+
+  # Leftover processes, one of them in a session of its own, are killed and fail the run.
+  if [ "$os" != Windows ]; then
+    run_archive "$R/canaries.tar.zst" "$canaries" \
+      -E 'test(=leaves_process) | test(=leaves_setsid_process)' || true
+    swept=0
+    if sweep; then
+      check "leftover processes are killed and fail the run" FAILED
+    elif [ "$swept" -ge 2 ] && [ -z "$(marked_pids)" ]; then
+      check "leftover processes are killed and fail the run" ok
+    else
+      check "leftover processes are killed and fail the run (swept $swept)" FAILED
+    fi
+  else
+    check "leftover processes are killed and fail the run" "not checked on Windows"
+  fi
+
+  # Started with BASH_ENV, ENV, and GIT_* pointing at a decoy, no test sees them, no startup
+  # file runs, the guard inspects this checkout, and the decoy is untouched.
+  local decoy=$R/decoy
+  git init -q -b main "$decoy"
+  git -C "$decoy" -c user.name=decoy -c user.email=decoy@invalid commit -q --allow-empty -m decoy
+  scripts/repo-guard snapshot "$decoy" "$R/decoy.snapshot"
+  printf 'echo ran >%s\n' "$R/startup-ran" >"$R/startup"
+  status=0
+  out=$(BASH_ENV=$R/startup ENV=$R/startup GIT_DIR=$decoy/.git GIT_WORK_TREE=$decoy \
+    GIT_INDEX_FILE=$decoy/.git/index sh "$root/scripts/test" --env-probe "$R/canaries.tar.zst" \
+    2>&1) || status=$?
+  printf '%s\n' "$out" | sed 's/^/  /' >&2
+  if [ "$status" -eq 0 ] && [ ! -e "$R/startup-ran" ] &&
+    printf '%s\n' "$out" | grep -qxF "top $root" &&
+    scripts/repo-guard verify "$decoy" "$R/decoy.snapshot"; then
+    check "inherited BASH_ENV, ENV, and GIT_* reach nothing" ok
+  else
+    check "inherited BASH_ENV, ENV, and GIT_* reach nothing" FAILED
+  fi
+  return "$failed"
+}
+
+# --- Main ----------------------------------------------------------------------------------
+
+case ${1-} in
+  --env-probe)
+    # Run by the self-check with a hostile environment: what the guard inspects, and the
+    # canary that asserts the environment a test sees.
+    setup_confinement
+    scripts/repo-guard identify "$root"
+    run_archive "$2" "$canaries" -E 'test(=environment_is_clean)'
+    exit
+    ;;
+  --self-check)
+    check_sweep
+    setup_confinement
+    self_check
+    exit
+    ;;
+  "") ;;
+  *)
+    echo "usage: $0 [--self-check]" >&2
+    exit 2
+    ;;
+esac
 
 cargo fmt --all --check
 cargo clippy --all-targets --locked -- -D warnings
+# Windows-only code is linted before CI when mise installed the Windows target.
+windows_target=x86_64-pc-windows-msvc
+if [ "$host" != "$windows_target" ] &&
+  [ -d "$(rustc --print sysroot)/lib/rustlib/$windows_target" ]; then
+  cargo clippy --all-targets --locked --target "$windows_target" -- -D warnings
+fi
+cargo nextest archive --workspace --locked --archive-file "$R/tests.tar.zst"
 
-snapshot=$(mktemp)
-trap 'rm -f "$snapshot"' EXIT
+check_sweep
+setup_confinement
+snapshot=$R/repo.snapshot
 scripts/repo-guard snapshot "$root" "$snapshot"
 
 status=0
-cargo test --locked || status=$?
+run_archive "$R/tests.tar.zst" "$root" || status=$?
+sweep || status=1
 scripts/repo-guard verify "$root" "$snapshot" || status=1
 exit "$status"

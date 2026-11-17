@@ -7,6 +7,10 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+# Doc comments carry no examples to run; cargo-nextest does not run doctests.
+[lib]
+doctest = false
+
 [dependencies]
 assert_cmd.workspace = true
 dunce.workspace = true

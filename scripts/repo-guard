@@ -29,15 +29,16 @@
 
 # POSIX prelude: re-run under bash in a constructed environment. `sh` reads no startup file
 # when it runs a script; `bash --noprofile --norc` with BASH_ENV unset reads none either.
+# PATH finds git; CI selects the mode; TMPDIR keeps temporary files where the caller wants them.
 if [ "${1-}" != --clean-env ]; then
   case $(uname -s) in
     MINGW* | MSYS* | CYGWIN*)
-      exec env -i PATH="$PATH" CI="${CI-}" SYSTEMROOT="${SYSTEMROOT-}" WINDIR="${WINDIR-}" \
+      exec env -i PATH="$PATH" CI="${CI-}" TMPDIR="${TMPDIR:-/tmp}" SYSTEMROOT="${SYSTEMROOT-}" WINDIR="${WINDIR-}" \
         COMSPEC="${COMSPEC-}" PATHEXT="${PATHEXT-}" TEMP="${TEMP-}" TMP="${TMP-}" \
         bash --noprofile --norc "$0" --clean-env "$@"
       ;;
     *)
-      exec env -i PATH="$PATH" CI="${CI-}" bash --noprofile --norc "$0" --clean-env "$@"
+      exec env -i PATH="$PATH" CI="${CI-}" TMPDIR="${TMPDIR:-/tmp}" bash --noprofile --norc "$0" --clean-env "$@"
       ;;
   esac
 fi
@@ -291,7 +292,11 @@ case $mode in
     current=$(state)
     if [ "$current" != "$(cat "$file")" ]; then
       echo "repo-guard: $top changed while the tests ran:" >&2
-      diff -u "$file" <(printf '%s\n' "$current") >&2 || true
+      # Next to the snapshot, where the caller lets the guard write: Apple's diff cannot
+      # read a pipe inside a sandbox.
+      printf '%s\n' "$current" >"$file.now"
+      diff -u "$file" "$file.now" >&2 || true
+      rm -f "$file.now"
       exit 1
     fi
     ;;

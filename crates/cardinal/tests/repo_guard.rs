@@ -143,7 +143,8 @@ fn config_of_a_branch_whose_name_extends_another_worktrees_branch_is_detected() 
     fixture.config_set(&repo, "branch.feature.fix.note", "x");
     let output = guard(&fixture, "verify", &repo, &file);
     assert!(!output.status.success(), "branch.feature.fix was ignored");
-    assert!(String::from_utf8_lossy(&output.stderr).contains("branch.feature.fix.note=x"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("branch.feature.fix.note=x"), "{stderr}");
 }
 
 #[test]
