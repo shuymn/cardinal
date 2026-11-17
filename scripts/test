@@ -12,10 +12,10 @@
 # archived tests with cargo-nextest in a constructed environment under a per-run root R
 # (HOME, XDG dirs, temp dir, and git's global config inside R), each test process confined
 # so that it can write only inside R: sandbox-exec on macOS, bubblewrap on Linux where it
-# works; Windows gets the environment and the guard only. Every test process carries a
-# marker unique to the run (CARDINAL_TEST_RUN=<id>, found in /proc on Linux; an inherited
-# descriptor of $R/marker, found with lsof on macOS); afterwards any process still carrying
-# it is listed, killed, and fails the run.
+# works; Windows gets the environment and the guard only. Afterwards every process the run
+# left behind is listed, killed, and fails the run. A run's processes are those in its
+# sandbox on macOS (found with sandbox-pids from crates/test-support) and those carrying a
+# marker unique to the run, CARDINAL_TEST_RUN=<id>, in /proc on Linux.
 
 # POSIX prelude: start over in a constructed environment before bash reads any startup file.
 # A script run by `sh` reads no startup file, and `bash --noprofile --norc` with BASH_ENV and
@@ -76,9 +76,11 @@ done
 mkdir -p "$R/home/.config" "$R/home/.cache" "$R/home/.local/state" "$R/home/.local/share" \
   "$R/tmp" "$R/archive"
 : >"$R/empty-gitconfig"
-: >"$R/marker"
 run_id=$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')
 marker="CARDINAL_TEST_RUN=$run_id"
+# macOS: the sandbox profile denies looking up this Mach service, which nobody registers, and
+# allows `<name>.allowed`; only this run's sandbox does both.
+sandbox_name=dev.cardinal.test-run.$run_id
 
 cleanup() {
   local status=$?
@@ -95,36 +97,48 @@ export HOME=$R/home XDG_CONFIG_HOME=$R/home/.config XDG_CACHE_HOME=$R/home/.cach
   XDG_STATE_HOME=$R/home/.local/state XDG_DATA_HOME=$R/home/.local/share \
   GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=$R/empty-gitconfig GIT_TERMINAL_PROMPT=0
 
-# --- Supervisor: processes that carry this run's marker -------------------------------
+# --- Supervisor: this run's processes ----------------------------------------------------
 
-# Prints the PIDs of this user's processes that carry the marker, and `?<pid>` for each of
-# them whose marker cannot be read (Linux: a process that is not dumpable hides its
-# environment even from its owner); fails when the process table cannot be read.
+# Where scan reads the process table; the self-check points them elsewhere to show that a
+# table it cannot read fails the sweep.
+sandbox_pids=
+proc_root=/proc
+
+# Builds sandbox-pids on macOS.
+build_scanner() {
+  [ "$os" = Darwin ] || return 0
+  sandbox_pids=$(cargo build --locked -p cardinal-test-support --bin sandbox-pids \
+    --message-format=json-render-diagnostics |
+    sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' | tail -n 1)
+  if [ ! -x "$sandbox_pids" ]; then
+    say "cannot build sandbox-pids"
+    exit 1
+  fi
+}
+
+# Prints the PIDs of this user's processes that belong to the run, and `?<pid>` for each
+# process whose membership cannot be read (Linux: a process that is not dumpable hides its
+# environment even from its owner); fails when the process table cannot be read. On macOS the
+# environment is no help: macOS hides that of platform binaries such as /bin/sleep even from
+# their owner.
 scan() {
   case $os in
     Darwin)
-      # macOS shows a process's environment only to the process itself, so the marker
-      # here is an open descriptor of $R/marker that every test process inherits.
-      local pids status=0
-      pids=$(lsof -t -- "$R/marker" 2>/dev/null) || status=$?
-      # lsof exits 1 both when nothing holds the file and on errors; the probe in
-      # check_sweep shows that it can see a holder.
-      [ "$status" -le 1 ] || return 1
-      [ -z "$pids" ] || printf '%s\n' "$pids"
+      [ -n "$sandbox_pids" ] || return 1
+      "$sandbox_pids" "$sandbox_name.denied" "$sandbox_name.allowed" || return 1
       ;;
     Linux)
-      [ -r /proc/self/environ ] || return 1
-      local proc
+      [ -r "$proc_root/self/environ" ] || return 1
       local proc environ
-      for proc in /proc/[0-9]*; do
+      for proc in "$proc_root"/[0-9]*; do
         [ -O "$proc" ] || continue
         # A process that exits meanwhile has no environment left to read.
         if ! environ=$({ tr '\0' '\n' <"$proc/environ"; } 2>/dev/null); then
-          [ ! -e "$proc" ] || echo "?${proc#/proc/}"
+          [ ! -e "$proc" ] || echo "?${proc##*/}"
           continue
         fi
         if printf '%s\n' "$environ" | grep -qxF "$marker"; then
-          echo "${proc#/proc/}"
+          echo "${proc##*/}"
         fi
       done
       ;;
@@ -134,7 +148,7 @@ scan() {
   esac
 }
 
-# The PIDs that carry the marker.
+# The PIDs that belong to the run.
 marked_pids() {
   local found
   found=$(scan) || return
@@ -142,11 +156,14 @@ marked_pids() {
 }
 
 # Kills and lists every process this run left behind; fails if there was one, if the
-# process table cannot be read, or if a process whose environment cannot be read appeared
-# since check_sweep (it may be a test process that hid its marker). The marker is unique to
-# this run, so each PID found is one this run started.
+# process table cannot be read, or if a process whose membership cannot be read appeared
+# since check_sweep (it may be a test process). Each PID found is in this run's sandbox or
+# carries its marker, so it is one this run started. Nothing to do before the first test
+# process starts.
+started=0
 swept=0
 sweep() {
+  [ "$started" -eq 1 ] || return 0
   local found pids hidden status=0 failed=0
   found=$(scan) || status=$?
   if [ "$status" -eq 2 ]; then
@@ -158,7 +175,7 @@ sweep() {
   pids=$(printf '%s\n' "$found" | grep -v '^?' || true)
   hidden=$(printf '%s\n' "$found" | sed -n 's/^?//p' | sort)
   for pid in $(printf '%s\n' "$hidden" | comm -13 "$R/hidden" - 2>/dev/null); do
-    say "cannot read the environment of process $(ps -o pid= -o command= -p "$pid" 2>/dev/null || echo "$pid"), which started during the run"
+    say "cannot tell whether process $(ps -o pid= -o command= -p "$pid" 2>/dev/null || echo "$pid") belongs to the run; it started during the run"
     failed=1
   done
   [ -n "$pids" ] || return "$failed"
@@ -174,18 +191,25 @@ sweep() {
   return 1
 }
 
-# Starts a process with the marker and checks that the sweep sees it, so a sweep that finds
-# nothing means nothing was left.
+# Starts a process the way a test process starts, confined and with the marker, and checks
+# that the sweep sees it, so a sweep that finds nothing means nothing was left.
 check_sweep() {
+  started=1
   [ "$os" != Windows ] || {
     say "Windows: no process sweep; leftovers are found only by nextest's leak check"
     return 0
   }
-  # Processes that already hide their environment are not this run's.
-  scan | sed -n 's/^?//p' | sort >"$R/hidden"
-  env -i "$marker" sleep 30 9<"$R/marker" &
+  local found
+  if ! found=$(scan); then
+    say "cannot read the process table"
+    return 1
+  fi
+  # Processes whose membership is already hidden are not this run's.
+  printf '%s\n' "$found" | sed -n 's/^?//p' | sort >"$R/hidden"
+  # shellcheck disable=SC2086 # the runner is a command line without spaces
+  env -i PATH="$PATH" "$marker" $runner sleep 30 &
   local probe=$! pids tries=0
-  # The fork shows the marker only once env has run.
+  # The fork shows the marker or the sandbox only once env has run.
   while :; do
     pids=$(marked_pids) || {
       kill "$probe"
@@ -202,7 +226,7 @@ check_sweep() {
   case " $(printf '%s ' $pids)" in
     *" $probe "*) ;;
     *)
-      say "the process sweep cannot see the marker of process $probe"
+      say "the process sweep cannot see process $probe"
       return 1
       ;;
   esac
@@ -215,6 +239,17 @@ check_sweep() {
 runner=
 confinement=
 setup_confinement() {
+  case $R in *' '*)
+    # A target runner is split at spaces.
+    if [ "$os" = Darwin ]; then
+      say "cannot confine the tests: the per-run root $R has a space"
+      exit 1
+    fi
+    confinement="UNCONFINED: the per-run root $R has a space, which a target runner cannot carry"
+    say "$confinement"
+    return
+    ;;
+  esac
   case $os in
     Darwin)
       cat >"$R/sandbox.sb" <<EOF
@@ -231,6 +266,7 @@ setup_confinement() {
 (deny network*)
 (allow network* (local unix-socket (subpath "$R")))
 (allow network* (remote unix-socket (subpath "$R")))
+(deny mach-lookup (global-name "$sandbox_name.denied"))
 EOF
       runner="sandbox-exec -f $R/sandbox.sb"
       confinement="sandbox-exec: writes only under the per-run root, no network"
@@ -251,11 +287,6 @@ EOF
       confinement="UNCONFINED on $os: constructed environment and the repository guard only"
       ;;
   esac
-  case $R in *' '*)
-    runner=
-    confinement="UNCONFINED: the per-run root $R has a space, which a target runner cannot carry"
-    ;;
-  esac
   say "$confinement"
 }
 
@@ -269,6 +300,7 @@ runner_var=CARGO_TARGET_$(printf '%s' "$host" | tr 'a-z-' 'A-Z_')_RUNNER
 run_archive() {
   local archive=$1 workspace=$2
   shift 2
+  started=1
   local extract
   extract=$(mktemp -d "$R/archive/XXXXXX")
   local env=(
@@ -300,7 +332,7 @@ run_archive() {
   fi
   [ -z "${CARGO_TERM_COLOR-}" ] || env+=(CARGO_TERM_COLOR="$CARGO_TERM_COLOR")
   [ -z "$runner" ] || env+=("$runner_var=$runner")
-  env -i "${env[@]}" cargo-nextest nextest run 9<"$R/marker" --archive-file "$archive" \
+  env -i "${env[@]}" cargo-nextest nextest run --archive-file "$archive" \
     --workspace-remap "$workspace" --extract-to "$extract" \
     --config-file "$root/.config/nextest.toml" "$@"
 }
@@ -349,20 +381,35 @@ self_check() {
   fi
   rm -f "$escape"
 
-  # Leftover processes, one of them in a session of its own, are killed and fail the run.
+  # Leftover processes are killed and fail the run: one with its output closed, one in a
+  # session of its own, one that closed every descriptor, and a daemon (forked twice, in a
+  # new session, every descriptor closed).
   if [ "$os" != Windows ]; then
-    run_archive "$R/canaries.tar.zst" "$canaries" \
-      -E 'test(=leaves_process) | test(=leaves_setsid_process)' || true
+    run_archive "$R/canaries.tar.zst" "$canaries" -E 'test(~leaves_)' || true
     swept=0
     if sweep; then
       check "leftover processes are killed and fail the run" FAILED
-    elif [ "$swept" -ge 2 ] && [ -z "$(marked_pids)" ]; then
+    elif [ "$swept" -ge 4 ] && [ -z "$(marked_pids)" ]; then
       check "leftover processes are killed and fail the run" ok
     else
-      check "leftover processes are killed and fail the run (swept $swept)" FAILED
+      check "leftover processes are killed and fail the run (swept $swept of 4)" FAILED
     fi
   else
     check "leftover processes are killed and fail the run" "not checked on Windows"
+  fi
+
+  # A process table that cannot be read fails the sweep instead of reading as empty.
+  if [ "$os" != Windows ]; then
+    if (sandbox_pids=false proc_root=$R/no-proc sweep) 2>"$R/sweep.err"; then
+      check "an unreadable process table fails the run" FAILED
+    elif grep -q 'cannot read the process table' "$R/sweep.err"; then
+      check "an unreadable process table fails the run" ok
+    else
+      cat "$R/sweep.err" >&2
+      check "an unreadable process table fails the run" FAILED
+    fi
+  else
+    check "an unreadable process table fails the run" "not checked on Windows"
   fi
 
   # Started with BASH_ENV, ENV, and GIT_* pointing at a decoy, no test sees them, no startup
@@ -393,14 +440,16 @@ case ${1-} in
   --env-probe)
     # Run by the self-check with a hostile environment: what the guard inspects, and the
     # canary that asserts the environment a test sees.
+    build_scanner
     setup_confinement
     scripts/repo-guard identify "$root"
     run_archive "$2" "$canaries" -E 'test(=environment_is_clean)'
     exit
     ;;
   --self-check)
-    check_sweep
+    build_scanner
     setup_confinement
+    check_sweep
     self_check
     exit
     ;;
@@ -420,9 +469,10 @@ if [ "$host" != "$windows_target" ] &&
   cargo clippy --all-targets --locked --target "$windows_target" -- -D warnings
 fi
 cargo nextest archive --workspace --locked --archive-file "$R/tests.tar.zst"
+build_scanner
 
-check_sweep
 setup_confinement
+check_sweep
 # The checkout's files are compared only where nothing stops a test from writing them: in CI,
 # and when the tests run unconfined. Locally a confined test cannot write there, while the
 # developer may edit files during the run.

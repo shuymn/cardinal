@@ -170,6 +170,7 @@ version = "0.1.0"
 dependencies = [
  "assert_cmd",
  "dunce",
+ "libc",
  "process-wrap",
  "rustix",
  "sysinfo",

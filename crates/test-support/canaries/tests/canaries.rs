@@ -58,22 +58,77 @@ fn leaves_process() {
     std::mem::forget(child);
 }
 
-/// Leaves a child running in a session of its own.
 #[cfg(unix)]
-#[test]
-fn leaves_setsid_process() {
+mod unix {
     use std::os::unix::process::CommandExt;
+
     unsafe extern "C" {
         fn setsid() -> i32;
+        fn fork() -> i32;
+        fn close(fd: i32) -> i32;
+        fn _exit(status: i32) -> !;
     }
-    let mut command = sleeper();
-    // SAFETY: setsid is async-signal-safe and touches no memory of this process.
-    unsafe {
-        command.pre_exec(|| {
-            setsid();
-            Ok(())
-        });
+
+    /// Closes every descriptor a child could have inherited, stdio included, as a daemon
+    /// does (and, from 3 up, `subprocess.Popen` by default).
+    fn close_all() {
+        for fd in 0..1024 {
+            // SAFETY: closing a descriptor touches no memory; one that is not open fails.
+            unsafe { close(fd) };
+        }
     }
-    let child = command.spawn().expect("start a child");
-    std::mem::forget(child);
+
+    /// Leaves a child running in a session of its own.
+    #[test]
+    fn leaves_setsid_process() {
+        let mut command = super::sleeper();
+        // SAFETY: setsid is async-signal-safe and touches no memory of this process.
+        unsafe {
+            command.pre_exec(|| {
+                setsid();
+                Ok(())
+            });
+        }
+        let child = command.spawn().expect("start a child");
+        std::mem::forget(child);
+    }
+
+    /// Leaves a child running that closed every descriptor it inherited.
+    #[test]
+    fn leaves_process_without_descriptors() {
+        let mut command = super::sleeper();
+        // SAFETY: close is async-signal-safe and touches no memory of this process.
+        unsafe {
+            command.pre_exec(|| {
+                close_all();
+                Ok(())
+            });
+        }
+        let child = command.spawn().expect("start a child");
+        std::mem::forget(child);
+    }
+
+    /// Leaves a daemon: forked twice, in a session of its own, every descriptor closed, its
+    /// parent gone.
+    #[test]
+    fn leaves_daemon() {
+        let mut command = super::sleeper();
+        // SAFETY: fork, setsid, close, and _exit are async-signal-safe; the forked children
+        // touch no memory shared with this process and leave only through exec or _exit.
+        unsafe {
+            command.pre_exec(|| {
+                if fork() != 0 {
+                    _exit(0);
+                }
+                setsid();
+                if fork() != 0 {
+                    _exit(0);
+                }
+                close_all();
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().expect("start the daemon");
+        child.wait().expect("the first fork exits");
+    }
 }
