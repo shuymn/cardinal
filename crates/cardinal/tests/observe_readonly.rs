@@ -132,3 +132,69 @@ fn index_and_refs_unchanged() {
         "a plain git status refreshes an index"
     );
 }
+
+/// A worktree with a split index is not read at all: reading a split index freshens its
+/// shared index file inside `.git` even without optional locks. What needs the index is
+/// unknown, so the worktree is never a candidate.
+#[test]
+fn split_index_is_left_unread() {
+    let scene = Scene::new();
+    let wt = scene.worktree("feat", "feat");
+    let head = scene.commit(&wt, "feature.txt");
+    scene.push(&wt, "feat");
+    scene.merge_into_base(&head);
+    scene.fx.git(&wt, &["update-index", "--split-index"]);
+    let shared: Vec<_> = listing(&scene.repo.join(".git"))
+        .keys()
+        .filter(|k| k.contains("sharedindex."))
+        .map(|k| scene.repo.join(".git").join(k))
+        .collect();
+    assert!(!shared.is_empty(), "git wrote a shared index");
+    for file in &shared {
+        age(file);
+    }
+
+    let before = listing(&scene.repo);
+    let output = scene
+        .cardinal()
+        .args(["inventory", "--repo"])
+        .arg(&scene.repo)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let inv = scene.inventory();
+    scene.observe(&wt).unwrap();
+    let after = listing(&scene.repo);
+    let changed: Vec<&String> = before
+        .keys()
+        .chain(after.keys())
+        .filter(|k| before.get(*k) != after.get(*k))
+        .collect();
+    assert!(changed.is_empty(), "observation changed {changed:?}");
+
+    let w = observe_common::worktree(&inv, &wt);
+    assert_eq!(w.facts.dirty, cardinal::contract::Tri::Unknown);
+    assert!(!w.reclaim.candidate);
+    assert!(w.reclaim.failed.contains(&"observed".to_owned()));
+    assert!(
+        inv.errors.iter().any(|e| e.message.contains("split index")),
+        "{:?}",
+        inv.errors
+    );
+
+    // Control: a plain status freshens the shared index, so the comparison above would have
+    // seen it.
+    scene.fx.git(&wt, &["status", "--porcelain"]);
+    let control = listing(&scene.repo);
+    assert!(
+        shared.iter().any(|file| {
+            let key = file
+                .strip_prefix(&scene.repo)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            before.get(&key) != control.get(&key)
+        }),
+        "a plain git status freshens the shared index"
+    );
+}

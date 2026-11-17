@@ -454,17 +454,35 @@ impl<'a> Observer<'a> {
         })
     }
 
-    /// `[git] base`, else the target of `refs/remotes/origin/HEAD`, with its commit. A base
-    /// that git reports missing is `None`; git failing to answer is an error.
+    /// `[git] base`, else the target of `refs/remotes/origin/HEAD`, with its commit. `None`
+    /// only when git answers with the query's documented "absent" status (exit 1 with
+    /// `--quiet`); any other status, a signal, or output that is not a ref name or an object
+    /// ID is an error, a failed step.
     fn base(&self, dir: &Path, configured: Option<&str>) -> Result<Option<BaseRef>, String> {
         let answered = |args: &[&str]| -> Result<Option<String>, String> {
+            let what = format!("git {}", args.join(" "));
             let out = self.git(dir, args).map_err(|err| err.to_string())?;
-            Ok((out.code == Some(0))
-                .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned()))
+            if out.code == Some(1) {
+                return Ok(None);
+            }
+            let out = out.success(&what)?;
+            let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+            if text.is_empty() || text.contains('\n') {
+                return Err(format!("{what} printed {text:?}"));
+            }
+            Ok(Some(text))
         };
         let name = match configured {
             Some(name) => name.to_owned(),
-            None => match answered(&["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])? {
+            None => match answered(&[
+                "symbolic-ref",
+                "--quiet",
+                "--short",
+                "refs/remotes/origin/HEAD",
+            ])? {
+                Some(name) if name.starts_with('-') => {
+                    return Err(format!("unexpected origin/HEAD target {name:?}"));
+                }
                 Some(name) => name,
                 None => return Ok(None),
             },
@@ -476,7 +494,10 @@ impl<'a> Observer<'a> {
         let Some(oid) = answered(&["rev-parse", "--verify", "--quiet", &spec])? else {
             return Ok(None);
         };
-        Ok(git::is_oid(&oid).then_some(BaseRef {
+        if !git::is_oid(&oid) {
+            return Err(format!("git rev-parse printed {oid:?} for {spec}"));
+        }
+        Ok(Some(BaseRef {
             ref_name: name,
             oid,
         }))
@@ -513,8 +534,14 @@ impl<'a> Observer<'a> {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         results.sort_by_key(|(index, _)| *index);
 
-        let mut repo = ctx.repo;
         let mut errors = Vec::new();
+        if let Some(message) = &ctx.failure {
+            errors.push(scoped(
+                &format!("repo:{}", ctx.repo.main_worktree),
+                message.clone(),
+            ));
+        }
+        let mut repo = ctx.repo;
         for (_, result) in results {
             if let Some(message) = result.gh_error {
                 repo.gh = GhStatus::Unknown;
@@ -545,21 +572,7 @@ impl<'a> Observer<'a> {
             .map(|m| m.app.clone())
             .or_else(|| listed.locked.then(|| "git-lock".to_owned()));
 
-        let status = self
-            .git_ok(
-                &path,
-                &[
-                    "status",
-                    "--porcelain=v2",
-                    "-z",
-                    "--branch",
-                    "--untracked-files=all",
-                    "--ignored=matching",
-                ],
-            )
-            .and_then(|out| git::parse_status(&out.stdout))
-            .map_err(&mut note)
-            .ok();
+        let (status, tracked) = self.index_facts(&path, &ctx.patterns, &mut note);
         let (head, branch, upstream) = match &status {
             Some(s) => (s.head.clone(), s.branch.clone(), s.upstream.clone()),
             None => (listed.head.clone(), listed.branch.clone(), None),
@@ -577,7 +590,6 @@ impl<'a> Observer<'a> {
         let ignored = status.as_ref().map_or_else(Vec::new, |s| {
             ignored_entries(&path, &s.ignored, &ctx.patterns, shared.sizes)
         });
-        let tracked = self.tracked(&path, &ctx.patterns).map_err(&mut note).ok();
         let step_failed = !errors.is_empty() || history.gh_error.is_some() || ctx.failure.is_some();
 
         let facts = Facts {
@@ -708,6 +720,78 @@ impl<'a> Observer<'a> {
         }
     }
 
+    /// The facts that need the worktree's index: its status and its tracked files. Neither
+    /// is read when the worktree uses a split index: reading one freshens its shared index
+    /// file inside `.git`, even without optional locks.
+    fn index_facts(
+        &self,
+        path: &Path,
+        patterns: &DataPatterns,
+        note: &mut dyn FnMut(String),
+    ) -> (Option<git::Status>, Option<Tracked>) {
+        match self.split_index(path) {
+            Ok(false) => {}
+            Ok(true) => {
+                note("the worktree uses a split index, which reading would modify; its status and tracked files are not read".to_owned());
+                return (None, None);
+            }
+            Err(message) => {
+                note(message);
+                return (None, None);
+            }
+        }
+        let status = self
+            .git_ok(
+                path,
+                &[
+                    "status",
+                    "--porcelain=v2",
+                    "-z",
+                    "--branch",
+                    "--untracked-files=all",
+                    "--ignored=matching",
+                ],
+            )
+            .and_then(|out| git::parse_status(&out.stdout))
+            .map_err(&mut *note)
+            .ok();
+        let tracked = self.tracked(path, patterns).map_err(note).ok();
+        (status, tracked)
+    }
+
+    /// Whether the worktree at `path` uses a split index: a `sharedindex.*` file in its git
+    /// dir or the common dir, or `core.splitIndex` set. Reads only files and configuration,
+    /// never the index.
+    fn split_index(&self, path: &Path) -> Result<bool, String> {
+        let git_dir = worktree_git_dir(path)
+            .ok_or_else(|| format!("cannot read the .git entry of {}", path.display()))?;
+        let mut dirs = vec![git_dir];
+        dirs.extend(crate::config::git_common_dir(path));
+        for dir in &dirs {
+            let entries =
+                std::fs::read_dir(dir).map_err(|err| format!("{}: {err}", dir.display()))?;
+            for entry in entries {
+                let entry = entry.map_err(|err| format!("{}: {err}", dir.display()))?;
+                if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("sharedindex.")
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        let out = self
+            .git(path, &["config", "--bool", "core.splitIndex"])
+            .map_err(|err| err.to_string())?;
+        // Exit 1: not set.
+        if out.code == Some(1) {
+            return Ok(false);
+        }
+        let out = out.success("git config core.splitIndex")?;
+        Ok(String::from_utf8_lossy(&out.stdout).trim() == "true")
+    }
+
     /// What the index of the worktree at `path` holds that `act` would refuse: a tracked path
     /// covered by a protected pattern, and a gitlink (mode 160000) whose directory has its
     /// own `.git` entry.
@@ -734,6 +818,19 @@ impl<'a> Observer<'a> {
 struct Tracked {
     protected: bool,
     nested: bool,
+}
+
+/// The git dir of the worktree at `path`, read from its `.git` entry without running git:
+/// the `.git` directory itself, or the `gitdir:` a `.git` file names.
+fn worktree_git_dir(path: &Path) -> Option<PathBuf> {
+    let dot_git = path.join(".git");
+    let meta = std::fs::symlink_metadata(&dot_git).ok()?;
+    if meta.is_dir() {
+        return Some(dot_git);
+    }
+    let text = std::fs::read_to_string(&dot_git).ok()?;
+    let gitdir = text.strip_prefix("gitdir:")?.trim();
+    Some(path.join(gitdir))
 }
 
 /// The ignored entries of the worktree at `root`, classified, with sizes of regenerable ones

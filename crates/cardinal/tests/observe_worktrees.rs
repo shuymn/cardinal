@@ -458,41 +458,59 @@ fn a_full_merged_page_without_the_head_is_unknown() {
     assert!(!w.reclaim.candidate);
 }
 
-/// A git step that fails makes `observed` fail even when other evidence would do: here
-/// `merge-base` fails while gh reports the head merged.
+/// A git step that fails makes `observed` fail even when other evidence would do: each of
+/// `merge-base` and the two base queries fails (or prints garbage) while gh reports the head
+/// merged.
 #[cfg(unix)]
 #[test]
 fn a_failed_git_step_fails_observed() {
     use std::os::unix::fs::PermissionsExt;
 
-    let mut scene = Scene::new();
-    let wt = scene.worktree("feat", "feat");
-    let head = scene.commit(&wt, "feature.txt");
-    scene.push(&wt, "feat");
-    scene.set_merged(&head, &merged_json(42, &head));
     let real_git = std::env::split_paths(&std::env::var_os("PATH").unwrap())
         .map(|dir| dir.join("git"))
         .find(|path| path.is_file())
         .expect("git on PATH");
-    let wrapper = scene.fx.path("git-wrapper");
-    std::fs::write(
-        &wrapper,
-        format!(
-            "#!/bin/sh\ncase \" $* \" in *\" merge-base \"*) echo broken >&2; exit 2;; esac\nexec '{}' \"$@\"\n",
-            real_git.display()
+    let cases = [
+        (
+            "merge-base",
+            "*\" merge-base \"*) echo broken >&2; exit 2;;",
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
-    scene.observe_config(&format!("git = '{}'", wrapper.display()));
+        (
+            "symbolic-ref",
+            "*\" symbolic-ref \"*) echo fatal >&2; exit 128;;",
+        ),
+        (
+            "rev-parse",
+            "*\" rev-parse --verify \"*) echo fatal >&2; exit 128;;",
+        ),
+        (
+            "rev-parse output",
+            "*\" rev-parse --verify \"*) echo garbage; exit 0;;",
+        ),
+        ("signal", "*\" symbolic-ref \"*) kill -9 $$;;"),
+    ];
+    for (name, arm) in cases {
+        let mut scene = Scene::new();
+        let wt = scene.worktree("feat", "feat");
+        let head = scene.commit(&wt, "feature.txt");
+        scene.push(&wt, "feat");
+        scene.set_merged(&head, &merged_json(42, &head));
+        let wrapper = scene.fx.path("git-wrapper");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\ncase \" $* \" in {arm} esac\nexec '{}' \"$@\"\n",
+                real_git.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        scene.observe_config(&format!("git = '{}'", wrapper.display()));
 
-    let inv = scene.inventory();
-    let w = worktree(&inv, &wt);
-    assert_eq!(w.facts.merge_evidence, MergeEvidence::MergedPr);
-    assert!(
-        inv.errors.iter().any(|e| e.message.contains("merge-base")),
-        "{:?}",
-        inv.errors
-    );
-    assert_eq!(reclaim(w), (false, vec!["observed"], vec![]));
+        let inv = scene.inventory();
+        let w = worktree(&inv, &wt);
+        assert_eq!(w.facts.merge_evidence, MergeEvidence::MergedPr, "{name}");
+        assert!(!inv.errors.is_empty(), "{name}: the failure is reported");
+        assert_eq!(reclaim(w), (false, vec!["observed"], vec![]), "{name}");
+    }
 }
