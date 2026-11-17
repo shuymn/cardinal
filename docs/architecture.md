@@ -1018,7 +1018,7 @@ CI runs `scripts/test`, `scripts/test --self-check`, and `scripts/test` with `BA
 
 To reproduce the Linux job on another OS, run `scripts/test` in a container:
 
-1. Start `rust:1.100-bookworm` (the Rust version `mise.toml` resolves to) with `--platform linux/amd64` and `--security-opt seccomp=unconfined --security-opt apparmor=unconfined`, which bubblewrap needs for an unprivileged user namespace.
+1. Start `rust:1.100-bookworm` (the Rust version `mise.toml` resolves to) with `--platform linux/amd64`, `--security-opt seccomp=unconfined --security-opt apparmor=unconfined`, which bubblewrap needs for an unprivileged user namespace, and `--init`, so that PID 1 reaps the processes orphaned to it. Without it, a container whose first process does not reap (such as `sleep infinity`) keeps every orphan as a zombie in its process group: tests that wait for a group to empty time out, and the sweep reports the zombies as left by the run.
 2. Install `bubblewrap` and `procps` with apt, add the `rustfmt` and `clippy` components, and put `cargo-nextest` of the version in `mise.lock` (its release tarball) on `PATH`.
 3. Create a user that is not root and give it `CARGO_HOME` and `RUSTUP_HOME`: the sweep looks only at the current user's processes, and root would make the run differ from CI.
 4. Copy the tree in without the files git ignores and without macOS metadata (on macOS, `git ls-files -co --exclude-standard -z | COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata --null -T - -cf src.tar`; otherwise `._*` files fail the layering and config tests), then `git init` and commit it there, since the guard needs a repository.
