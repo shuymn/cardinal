@@ -143,6 +143,11 @@ fn run_pre_tool_use(
             let mut line = serde_json::to_vec(&doc)
                 .map_err(|err| Error::new(ErrorCode::Internal, err.to_string()))?;
             line.push(b'\n');
+            // Rewriting and serializing a large command takes time too.
+            if Instant::now() > settings.deadline {
+                record_pass(Some(&config.host), &input, &hook::missed(start));
+                return Ok(());
+            }
             output
                 .write_all(&line)
                 .map_err(|err| Error::new(ErrorCode::Internal, err.to_string()))

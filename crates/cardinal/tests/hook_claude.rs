@@ -160,8 +160,9 @@ fn hook_process(dirs: &Sandbox) -> std::process::Command {
     command
 }
 
-/// C5: a hook that is still classifying when its deadline passes rewrites nothing and
-/// records why; the same input within the deadline is rewritten.
+/// C5: a hook whose deadline passes after classification, while it rewrites and serializes
+/// the command, writes nothing and records why; the same input within the deadline is
+/// rewritten.
 #[cfg(unix)]
 #[test]
 fn deadline_no_rewrite() {

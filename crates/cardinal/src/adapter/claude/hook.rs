@@ -1,7 +1,8 @@
 //! `hook claude pre-tool-use` (`docs/architecture.md` section 6.3): classify a Bash call
 //! and rewrite its classified stages, or print nothing. The hook writes nothing to the state
 //! dir on the way to a rewrite and takes no reservation (C1); only a configuration error or a
-//! missed deadline leaves a record.
+//! missed deadline leaves a record. The deadline is checked once more after the output is
+//! serialized, right before it is written.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -185,10 +186,10 @@ pub(super) fn evaluate(input: &Call, settings: &Settings<'_>) -> Result<Value, P
         settings.deadline,
     );
 
-    testpoint::hit(testpoint::HOOK_CLASSIFIED).map_err(|err| Pass::Failed(err.to_string()))?;
     if Instant::now() > settings.deadline {
         return Err(missed(settings.start));
     }
+    testpoint::hit(testpoint::HOOK_CLASSIFIED).map_err(|err| Pass::Failed(err.to_string()))?;
 
     let ids = CallIds {
         session_id: input.session_id.as_deref(),
@@ -215,7 +216,7 @@ pub(super) fn evaluate(input: &Call, settings: &Settings<'_>) -> Result<Value, P
     }))
 }
 
-fn missed(start: Instant) -> Pass {
+pub(super) fn missed(start: Instant) -> Pass {
     Pass::DeadlineMissed {
         elapsed_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
     }
