@@ -639,6 +639,14 @@ const CASES: &[Case] = &[
         0,
         0,
     ),
+    // A leading `~` expands to `$HOME`, here `eval`.
+    case(
+        "tilde_command_word",
+        "",
+        "HOME=eval; ~ 'probe() { cd sub; }'; probe x; pwd",
+        0,
+        0,
+    ),
     case("comment", "", "probe a # trailing comment", 1, 1),
     case("multiline", "", "probe one\nprobe two", 2, 2),
     case("env_wrapper", "", "env W=1 probe --env", 1, 1),

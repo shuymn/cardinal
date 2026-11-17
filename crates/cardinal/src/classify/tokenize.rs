@@ -45,6 +45,9 @@ struct Word {
     value: Option<String>,
     /// The word's text after quote removal without its expansions.
     bare: String,
+    /// Starts with an unquoted `~`, which expands to a value of the shell (`$HOME`, `$PWD`,
+    /// `$OLDPWD`, a named directory).
+    tilde: bool,
     /// Expands a parameter whose value the rewrite changes or no two runs share (`$?`,
     /// `$_`, …).
     state: bool,
@@ -372,6 +375,7 @@ impl<'a> Lexer<'a> {
             span: start..self.pos,
             bare: value.clone(),
             value: literal.then_some(value),
+            tilde: self.bytes[start] == b'~',
             state,
             newline,
         })
@@ -675,10 +679,10 @@ fn finish(
     })
 }
 
-/// Refuses keywords in command position, a command word that is not a literal (an expansion
-/// or a pattern can name any command, `eval` included), and builtins that can change what a
-/// later stage means or trace it (`eval`, `.`, `alias`, `trap`, `set -x`, …); each after
-/// quote removal and behind precommand modifiers (`command "eval" …`).
+/// Refuses keywords in command position, a command word that is not a literal (an expansion,
+/// a pattern, or a leading `~` can name any command, `eval` included), and builtins that can
+/// change what a later stage means or trace it (`eval`, `.`, `alias`, `trap`, `set -x`, …);
+/// each after quote removal and behind precommand modifiers (`command "eval" …`).
 fn check_command_position(command: &str, words: &[Word]) -> Result<(), Refusal> {
     let first = &command[words[0].span.clone()];
     if is_refused_keyword(first) {
@@ -687,7 +691,7 @@ fn check_command_position(command: &str, words: &[Word]) -> Result<(), Refusal> 
     let mut i = 0;
     while let Some(word) = words.get(i) {
         let raw = &command[word.span.clone()];
-        let Some(value) = word.value.as_deref() else {
+        let Some(value) = word.value.as_deref().filter(|_| !word.tilde) else {
             return Err(Refusal::NotLiteral(raw.to_owned()));
         };
         let args: Vec<(&str, Option<&str>)> = words[i + 1..]

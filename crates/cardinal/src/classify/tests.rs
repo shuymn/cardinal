@@ -331,6 +331,11 @@ fn refused_commands() {
         "a~b x",
         "command $x",
         "nice -n 5 x && command -p \"$y\"",
+        // A leading `~` expands to `$HOME`, `$PWD` (`~+`), or `$OLDPWD` (`~-`).
+        "~ x",
+        "~/bin/probe x",
+        "~+ x",
+        "command ~- x",
     ] {
         assert!(
             matches!(tokenize(command), Err(Refusal::NotLiteral(_))),
@@ -358,8 +363,8 @@ fn accepted_commands() {
         "echo [x] x[1] 'if' \"then\"",
         "\"if\" true",
         "'pro*be' x \\? \"[a]\"",
-        "[ -f x ] && probe *.txt [ab] ~/x a~b ^c",
-        "~/bin/probe x",
+        "[ -f x ] && probe *.txt [ab] ~/x a~b ^c ~",
+        "'~/bin/probe' x",
         "echo if then fi done",
         "echo é 日本 ü",
         "",
