@@ -592,14 +592,14 @@ Repositories to observe: the main worktrees of profiles with `match.paths`, plus
 | --- | --- |
 | Worktrees | `git worktree list --porcelain -z` (path, HEAD, branch, `locked`, `prunable`) |
 | GitHub repository | `git remote get-url origin`, parsed to `HOST/OWNER/NAME` for `github.com` (or the caller's `GH_HOST`); anything else makes PR facts `unknown`. JSON shows `owner/name`; gh always gets `--repo HOST/OWNER/NAME` |
-| Base | `[git] base`, else `git symbolic-ref --quiet --short refs/remotes/origin/HEAD`, then `git rev-parse --verify --quiet <base>^{commit}`. Exit 1 (absent) makes merge evidence `unknown`; any other status, a signal, or output that is not a ref name or an object ID is a failed step (section 8.1) |
+| Base | `[git] base`, else `git symbolic-ref --quiet refs/remotes/origin/HEAD`, then `git rev-parse --verify --quiet <full ref>^{commit}`. The base is always a full ref, never revision syntax (`:path` would read the index): a configured base must pass the ref-name rules of `git check-ref-format` and is looked up as `refs/remotes/<base>`, then `refs/heads/<base>` (as itself when it starts with `refs/`); `origin/HEAD` must point under `refs/remotes/origin/`. Exit 1 (absent) makes merge evidence `unknown`; an invalid name, any other status, a signal, or output that is not such a ref or an object ID is a failed step (section 8.1) |
 | Open PRs | `gh pr list --repo HOST/O/N --state open --limit 500 --json number,headRefName,headRefOid,isCrossRepository,url`; exactly 500 results makes it `unknown` |
 
 Per worktree:
 
 | Fact | Command | Value |
 | --- | --- | --- |
-| HEAD, branch, upstream, dirty, ignored entries | `git status --porcelain=v2 -z --branch --untracked-files=all --ignored=matching` | `dirty` is any entry other than `!` (ignored) |
+| HEAD, branch, upstream, dirty, ignored entries | `git status --porcelain=v2 -z --branch --ignore-submodules=all --untracked-files=all --ignored=matching` | `dirty` is any entry other than `!` (ignored). Status never enters a submodule, whose own index could be split (section 8.1); a populated gitlink fails `no_nested_repository` anyway |
 | `has_upstream` | `# branch.upstream` header | detached HEAD: `no` |
 | `unpushed` | `git rev-list --count HEAD --not --remotes` | `0` → `no`; otherwise `yes`, unless merge evidence is `merged_pr` (the commits exist on GitHub) |
 | `base_ancestor` | `git merge-base --is-ancestor HEAD <base>` | exit 0 → `yes`, 1 → `no`, else `unknown` |
