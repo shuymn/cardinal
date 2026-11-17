@@ -208,15 +208,13 @@ impl Runner {
 
     /// Steps 3–7 of section 5.2 up to the spawn.
     fn prepare(&mut self, spec_b64: Option<&str>, tty: bool) -> Next {
-        if let Err(fail) = self.load(spec_b64) {
-            return if tty {
-                Next::Passthrough
-            } else {
-                Next::FailOpen(fail)
-            };
-        }
-        let host = &self.ctx.as_ref().expect("loaded").host;
-        let deadline = self.started + wait_cap(self.spec.as_ref(), host);
+        // A configuration or spec error still takes the in-use lock, with the defaults' wait
+        // cap, before failing open; only an unusable state directory runs without it.
+        let loaded = self.load(spec_b64);
+        let deadline = self.started
+            + self.ctx.as_ref().map_or(Duration::ZERO, |ctx| {
+                wait_cap(self.spec.as_ref(), &ctx.host)
+            });
         if let Some(cancel) = self.pending_cancel() {
             return Next::Cancelled(cancel);
         }
@@ -226,6 +224,9 @@ impl Runner {
         if tty {
             self.record(RecordKind::TtyPassthrough, json!({ "cwd": cwd_string() }));
             return Next::Passthrough;
+        }
+        if let Err(fail) = loaded {
+            return Next::FailOpen(fail);
         }
         let group = match self.executor.prepare() {
             Ok(group) => group,
@@ -557,7 +558,7 @@ impl Runner {
     fn finish(mut self, outcome: &ExecOutcome, spawned: Instant, path: &'static str) -> ExitCode {
         let wall_ms = u64::try_from(spawned.elapsed().as_millis()).unwrap_or(u64::MAX);
         if let Some(job) = self.job.take() {
-            if self.group_outlived_parent(&job) {
+            if group_outlived_parent(&self.watch, &job) {
                 job.abandon();
             } else {
                 let _ = job.release();
@@ -592,20 +593,6 @@ impl Runner {
                 ExitCode::from(EXIT_INFRA_FAILURE)
             }
         }
-    }
-
-    /// Whether the runner's parent exited and the job's group still has members besides the
-    /// runner: the supervisor gave up waiting, and the reservation stays for recovery.
-    #[cfg(unix)]
-    fn group_outlived_parent(&self, job: &Job) -> bool {
-        let GroupIdentity::Pgid { pgid, .. } = job.reservation().group;
-        self.watch.parent_exited()
-            && os::unix::other_group_members(pgid).map_or(true, |m| !m.is_empty())
-    }
-
-    #[cfg(not(unix))]
-    fn group_outlived_parent(&self, _job: &Job) -> bool {
-        false
     }
 
     /// The parent exited or a signal arrived before the spawn: release everything and stop
@@ -648,6 +635,19 @@ impl Runner {
         }
         let _ = ctx.recorder.append(&record);
     }
+}
+
+/// Whether the runner's parent exited and the job's group still has members besides the
+/// runner: the supervisor gave up waiting, and the reservation stays for recovery.
+#[cfg(unix)]
+fn group_outlived_parent(watch: &Watch, job: &Job) -> bool {
+    let GroupIdentity::Pgid { pgid, .. } = job.reservation().group;
+    watch.parent_exited() && os::unix::other_group_members(pgid).map_or(true, |m| !m.is_empty())
+}
+
+#[cfg(not(unix))]
+fn group_outlived_parent(_watch: &Watch, _job: &Job) -> bool {
+    false
 }
 
 fn cwd_string() -> String {
@@ -732,12 +732,12 @@ mod tests {
     fn argv_is_cut_to_the_limit_on_a_char_boundary() {
         let long = "é".repeat(ARGV_LIMIT);
         let argv = [
-            OsString::from("cmd"),
+            OsString::from("make"),
             OsString::from(long),
             OsString::from("x"),
         ];
         let cut = truncate_argv(&argv);
-        assert_eq!(cut[0], "cmd");
+        assert_eq!(cut[0], "make");
         assert!(cut.iter().map(String::len).sum::<usize>() <= ARGV_LIMIT);
         assert!(cut[1].chars().all(|c| c == 'é'));
         assert_eq!(cut.len(), 2);
