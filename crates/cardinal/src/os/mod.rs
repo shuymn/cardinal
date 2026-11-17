@@ -32,13 +32,7 @@ impl ProcessInfo {
     #[must_use]
     pub fn command_line(&self, max_bytes: usize) -> String {
         let mut line = self.cmd.join(" ");
-        if line.len() > max_bytes {
-            let mut end = max_bytes;
-            while !line.is_char_boundary(end) {
-                end -= 1;
-            }
-            line.truncate(end);
-        }
+        line.truncate(line.floor_char_boundary(max_bytes));
         line
     }
 }
