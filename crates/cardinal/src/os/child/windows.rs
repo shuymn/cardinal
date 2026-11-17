@@ -15,7 +15,7 @@ use windows_sys::Win32::System::Threading::{CREATE_SUSPENDED, ResumeThread};
 
 /// A Job Object that kills its processes when its last handle closes. The handle is not
 /// inheritable and never duplicated, so this process holds the only one: when this process
-/// ends, by any means, the job's processes end with it. Dropping it closes the handle.
+/// ends, by any means, the processes in the job end with it. Dropping it closes the handle.
 pub(super) struct Job(HANDLE);
 
 impl Job {
@@ -63,7 +63,9 @@ impl Drop for Job {
 }
 
 /// Starts `command` suspended, assigns it to a new [`Job`], then resumes it, so it starts
-/// nothing outside the job.
+/// nothing outside the job. This process ending between the start and the assignment leaves
+/// the child suspended, before it ran anything; starting it inside the job
+/// (`PROC_THREAD_ATTRIBUTE_JOB_LIST`) would need a hand-written `CreateProcessW`.
 pub(super) fn spawn(command: Command) -> io::Result<(Child, Job)> {
     spawn_with(command, enter)
 }
