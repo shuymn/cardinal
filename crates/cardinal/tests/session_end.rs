@@ -6,6 +6,7 @@
 //! "dev server" an agent leaves running), runs the hook as its child, directly or through
 //! `sh -c` as Claude Code does, and then stays alive until the test kills it.
 
+mod hook_support;
 mod support;
 
 use std::path::{Path, PathBuf};
@@ -14,8 +15,8 @@ use std::time::Duration;
 
 use cardinal::contract::{Record, RecordKind, SessionSnapshot};
 use cardinal::state::StateDir;
+use hook_support::Sandbox;
 use serde_json::{Value, json};
-use support::cardinal::Dirs;
 use support::helper::{ChildGuard, Mode, PidGuard, wait_for, wait_for_file};
 
 const AGENT: &str = "CARDINAL_TEST_AGENT";
@@ -66,41 +67,40 @@ fn agent() {
     std::process::exit(0);
 }
 
-/// An agent run: the agent process, its background process, and the work dir.
+/// An agent run: the agent process and its background process.
 struct Run {
-    _work: tempfile::TempDir,
     agent: ChildGuard,
     _background: PidGuard,
     background: u32,
     status: String,
 }
 
-fn run_agent(dirs: &Dirs, event: &str, input: &Value, via_shell: bool) -> Run {
-    let work = tempfile::tempdir().unwrap();
-    std::fs::write(work.path().join("event"), event).unwrap();
-    std::fs::write(work.path().join("input.json"), input.to_string()).unwrap();
+/// Starts the stand-in agent in `dirs`' work dir with its constructed environment, which the
+/// agent's background process, shell, and hook inherit.
+fn run_agent(dirs: &Sandbox, event: &str, input: &Value, via_shell: bool) -> Run {
+    let work = dirs.fixture().root().join("agent");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::write(work.join("event"), event).unwrap();
+    std::fs::write(work.join("input.json"), input.to_string()).unwrap();
     if via_shell {
-        std::fs::write(work.path().join("via-shell"), b"").unwrap();
+        std::fs::write(work.join("via-shell"), b"").unwrap();
     }
-    let agent = Command::new(std::env::current_exe().unwrap())
+    let agent = dirs
+        .command(std::env::current_exe().unwrap())
         .args(["agent", "--exact", "--nocapture", "--test-threads=1"])
-        .env(AGENT, work.path())
-        .env("CARDINAL_STATE_DIR", dirs.state())
-        .env("CARDINAL_CONFIG_DIR", dirs.config())
-        .env_remove("CARDINAL_TEST_DIR")
+        .env(AGENT, &work)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .spawn()
         .unwrap();
     let agent = ChildGuard::new(agent);
-    wait_for_file(&work.path().join("hook.done"), Duration::from_secs(30));
-    let background: u32 = std::fs::read_to_string(work.path().join("background.pid"))
+    wait_for_file(&work.join("hook.done"), Duration::from_secs(30));
+    let background: u32 = std::fs::read_to_string(work.join("background.pid"))
         .unwrap()
         .parse()
         .unwrap();
-    let status = std::fs::read_to_string(work.path().join("hook.done")).unwrap();
+    let status = std::fs::read_to_string(work.join("hook.done")).unwrap();
     Run {
-        _work: work,
         agent,
         _background: PidGuard(background),
         background,
@@ -108,7 +108,7 @@ fn run_agent(dirs: &Dirs, event: &str, input: &Value, via_shell: bool) -> Run {
     }
 }
 
-fn records(dirs: &Dirs) -> Vec<Record> {
+fn records(dirs: &Sandbox) -> Vec<Record> {
     cardinal::record::read_all(&StateDir::open(dirs.state()).unwrap()).unwrap()
 }
 
@@ -128,7 +128,7 @@ fn session_input(cwd: &Path) -> Value {
 }
 
 fn snapshots_and_records(via_shell: bool) {
-    let dirs = Dirs::new();
+    let dirs = Sandbox::new();
     let run = run_agent(
         &dirs,
         "session-end",
@@ -190,7 +190,7 @@ fn session_end_skips_the_shell_between_agent_and_hook() {
 /// C9: subagent stop records and stops nothing; it takes no snapshot.
 #[test]
 fn subagent_stop_records_without_stopping_processes() {
-    let dirs = Dirs::new();
+    let dirs = Sandbox::new();
     let input = json!({
         "session_id": "sess-2",
         "transcript_path": "/tmp/t.jsonl",
@@ -222,7 +222,7 @@ fn subagent_stop_records_without_stopping_processes() {
 /// left alone.
 #[test]
 fn failures_exit_0() {
-    let dirs = Dirs::new();
+    let dirs = Sandbox::new();
     for event in ["session-end", "subagent-stop"] {
         for stdin in [&b""[..], b"not json", b"[]"] {
             let output = dirs
@@ -259,7 +259,7 @@ fn failures_exit_0() {
 /// recorded, also with an invalid configuration.
 #[test]
 fn session_end_without_session_id_or_config_still_records() {
-    let dirs = Dirs::new();
+    let dirs = Sandbox::new();
     std::fs::write(dirs.config().join("host.toml"), "typo = 1\n").unwrap();
     let mut input = session_input(Path::new("/w"));
     input.as_object_mut().unwrap().remove("session_id");

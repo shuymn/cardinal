@@ -17,22 +17,21 @@ use std::time::Duration;
 use cardinal::contract::{Record, RecordKind};
 #[cfg(unix)]
 use cardinal::state::StateDir;
-use hook_support::{PROFILE, RUNNER, cmd, configure, host, input, run_hook};
+use hook_support::{PROFILE, RUNNER, Sandbox, cmd, configure, host, input, run_hook};
 #[cfg(unix)]
 use hook_support::{rewritten, specs};
 use serde_json::Value;
 #[cfg(unix)]
 use serde_json::json;
-use support::cardinal::Dirs;
 
 #[cfg(unix)]
-fn records(dirs: &Dirs) -> Vec<Record> {
+fn records(dirs: &Sandbox) -> Vec<Record> {
     let state = StateDir::open(dirs.state()).expect("open the state dir");
     cardinal::record::read_all(&state).expect("read records")
 }
 
-fn configured(extra_host: &str) -> Dirs {
-    let dirs = Dirs::new();
+fn configured(extra_host: &str) -> Sandbox {
+    let dirs = Sandbox::new();
     configure(&dirs, &host(RUNNER, extra_host), &[("generic", PROFILE)]);
     dirs
 }
@@ -151,12 +150,10 @@ fn other_fields_preserved() {
 }
 
 #[cfg(unix)]
-fn hook_process(dirs: &Dirs) -> std::process::Command {
-    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_cardinal"));
+fn hook_process(dirs: &Sandbox) -> std::process::Command {
+    let mut command = dirs.command(env!("CARGO_BIN_EXE_cardinal"));
     command
         .args(["hook", "claude", "pre-tool-use"])
-        .env("CARDINAL_STATE_DIR", dirs.state())
-        .env("CARDINAL_CONFIG_DIR", dirs.config())
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -173,7 +170,7 @@ fn deadline_no_rewrite() {
     use support::helper::ChildGuard;
     use support::testpoints::TestPoints;
 
-    let dirs = Dirs::new();
+    let dirs = Sandbox::new();
     configure(
         &dirs,
         &format!("[hook]\nrunner = \"{RUNNER}\"\ndeadline_ms = 300\n"),
@@ -214,7 +211,7 @@ fn deadline_no_rewrite() {
     assert_eq!(errors[0].data["reason"], "deadline_missed");
     assert_eq!(errors[0].session_id.as_deref(), Some("session-1"));
 
-    let control = Dirs::new();
+    let control = Sandbox::new();
     configure(
         &control,
         &format!("[hook]\nrunner = \"{RUNNER}\"\ndeadline_ms = 10000\n"),
@@ -261,12 +258,11 @@ mod never_blocks {
     use super::configured;
     #[cfg(unix)]
     use super::hook_support::host;
-    use super::hook_support::{PROFILE, RUNNER, cmd, configure, input, run_hook};
+    use super::hook_support::{PROFILE, RUNNER, Sandbox, cmd, configure, input, run_hook};
     #[cfg(unix)]
     use super::records;
-    use super::support::cardinal::Dirs;
 
-    fn raw(dirs: &Dirs, stdin: Vec<u8>) {
+    fn raw(dirs: &Sandbox, stdin: Vec<u8>) {
         let output = dirs
             .cmd()
             .args(["hook", "claude", "pre-tool-use"])
@@ -329,7 +325,7 @@ mod never_blocks {
 
     #[test]
     fn disabled_hook() {
-        let dirs = Dirs::new();
+        let dirs = Sandbox::new();
         configure(
             &dirs,
             &format!("[hook]\nenabled = false\nrunner = \"{RUNNER}\"\n"),
@@ -341,7 +337,7 @@ mod never_blocks {
     #[cfg(unix)]
     #[test]
     fn invalid_config_is_recorded() {
-        let dirs = Dirs::new();
+        let dirs = Sandbox::new();
         configure(&dirs, "[hook]\ntypo = 1\n", &[("generic", PROFILE)]);
         assert_eq!(run_hook(cmd(&dirs), &input("make", Path::new("/w"))), None);
         let found = records(&dirs);
@@ -363,7 +359,7 @@ mod never_blocks {
             "/opt/with space/cardinal",
             "/opt/$HOME/cardinal",
         ] {
-            let dirs = Dirs::new();
+            let dirs = Sandbox::new();
             configure(&dirs, &host(runner, ""), &[("generic", PROFILE)]);
             assert_eq!(
                 run_hook(cmd(&dirs), &input("make", Path::new("/w"))),
@@ -378,7 +374,7 @@ mod never_blocks {
 
     #[test]
     fn unusable_state_dir() {
-        let dirs = Dirs::new();
+        let dirs = Sandbox::new();
         configure(&dirs, "[hook]\ntypo = 1\n", &[("generic", PROFILE)]);
         let file = dirs.config().join("not-a-dir");
         std::fs::write(&file, b"").unwrap();
@@ -419,6 +415,49 @@ mod never_blocks {
         assert_eq!(found[0].kind, RecordKind::HookError);
         assert_eq!(found[0].data["reason"], "failed");
     }
+}
+
+/// The children of these tests, the hook among them, get a constructed environment and
+/// start inside the fixture: nothing the tests run with (`GIT_*` from a git hook,
+/// `CLAUDE_*`, the Bash timeouts) reaches them but `PATH`.
+#[cfg(unix)]
+#[test]
+fn children_get_a_constructed_environment() {
+    let dirs = Sandbox::new();
+    let output = dirs.command("env").output().unwrap();
+    assert!(output.status.success());
+    let names: Vec<String> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .filter_map(|line| Some(line.split_once('=')?.0.to_owned()))
+        .collect();
+    let allowed = [
+        "PATH",
+        "HOME",
+        "XDG_CONFIG_HOME",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_NOSYSTEM",
+        "GIT_CEILING_DIRECTORIES",
+        "LC_ALL",
+        "CARDINAL_STATE_DIR",
+        "CARDINAL_CONFIG_DIR",
+    ];
+    for name in &names {
+        assert!(
+            allowed.contains(&name.as_str())
+                || name.starts_with("GIT_AUTHOR_")
+                || name.starts_with("GIT_COMMITTER_"),
+            "{name} reached the child"
+        );
+    }
+    let root = dirs.fixture().root();
+    let home = dirs.command("printenv").arg("HOME").output().unwrap();
+    assert!(Path::new(String::from_utf8(home.stdout).unwrap().trim()).starts_with(root));
+    let cwd = dirs.command("pwd").arg("-P").output().unwrap();
+    assert_eq!(
+        Path::new(String::from_utf8(cwd.stdout).unwrap().trim()),
+        dirs.work()
+    );
 }
 
 /// The shipped settings name hook commands the CLI accepts, with explicit timeouts.
@@ -468,9 +507,8 @@ mod repository {
     use std::time::{Duration, Instant};
 
     use super::hook_support::{
-        PROFILE, RUNNER, cmd, configure, executable, input, rewritten, run_hook, specs,
+        PROFILE, RUNNER, Sandbox, cmd, configure, executable, input, rewritten, run_hook, specs,
     };
-    use super::support::cardinal::Dirs;
     use super::support::fixture::Fixture;
     use super::support::helper::PidGuard;
 
@@ -515,7 +553,7 @@ mod repository {
         );
         std::fs::create_dir_all(app.join("sub")).unwrap();
 
-        let dirs = Dirs::new();
+        let dirs = Sandbox::new();
         let decoy_profile = APP
             .replace("o/app", "o/decoy")
             .replace("app-build", "decoy-build");
@@ -562,9 +600,9 @@ mod repository {
 
     #[test]
     fn profile_matched_by_path_needs_no_git() {
-        let dir = tempfile::tempdir().unwrap();
-        let repo = bare_dot_git(dir.path());
-        let dirs = Dirs::new();
+        let dir = Fixture::new();
+        let repo = bare_dot_git(dir.root());
+        let dirs = Sandbox::new();
         let app = format!(
             "[match]\npaths = [\"{}\"]\n[[rule]]\nid = \"build\"\ncommands = [\"make\"]\nclass = \"app-build\"\n",
             repo.display()
@@ -584,9 +622,9 @@ mod repository {
     /// profiles that match without it.
     #[test]
     fn git_runs_only_when_needed_and_failures_fall_back() {
-        let dir = tempfile::tempdir().unwrap();
-        let repo = bare_dot_git(dir.path());
-        let calls = dir.path().join("calls");
+        let dir = Fixture::new();
+        let repo = bare_dot_git(dir.root());
+        let calls = dir.root().join("calls");
         let cases = [
             (
                 "ok",
@@ -598,7 +636,7 @@ mod repository {
             ("two-lines", "printf 'a\\nb\\n'", Some("generic/build")),
         ];
         for (name, body, expected) in cases {
-            let git = dir.path().join(format!("git-{name}"));
+            let git = dir.root().join(format!("git-{name}"));
             executable(
                 &git,
                 &format!(
@@ -606,7 +644,7 @@ mod repository {
                     calls.display()
                 ),
             );
-            let dirs = Dirs::new();
+            let dirs = Sandbox::new();
             configure(
                 &dirs,
                 &host(git.to_str().unwrap(), 10_000),
@@ -637,7 +675,7 @@ mod repository {
                 "{name}"
             );
         }
-        let dirs = Dirs::new();
+        let dirs = Sandbox::new();
         configure(
             &dirs,
             &host("/nonexistent/git", 10_000),
@@ -659,10 +697,10 @@ mod repository {
     /// A git that outlives the deadline is killed and reaped, and the hook rewrites nothing.
     #[test]
     fn slow_git_is_killed_at_the_deadline() {
-        let dir = tempfile::tempdir().unwrap();
-        let repo = bare_dot_git(dir.path());
-        let pid_file = dir.path().join("git.pid");
-        let git = dir.path().join("git-slow");
+        let dir = Fixture::new();
+        let repo = bare_dot_git(dir.root());
+        let pid_file = dir.root().join("git.pid");
+        let git = dir.root().join("git-slow");
         executable(
             &git,
             &format!(
@@ -670,7 +708,7 @@ mod repository {
                 pid_file.display()
             ),
         );
-        let dirs = Dirs::new();
+        let dirs = Sandbox::new();
         configure(
             &dirs,
             &host(git.to_str().unwrap(), DEADLINE_MS),
@@ -694,10 +732,10 @@ mod repository {
     /// deadline.
     #[test]
     fn held_output_pipe_does_not_block_the_hook() {
-        let dir = tempfile::tempdir().unwrap();
-        let repo = bare_dot_git(dir.path());
-        let pid_file = dir.path().join("grandchild.pid");
-        let git = dir.path().join("git-detached");
+        let dir = Fixture::new();
+        let repo = bare_dot_git(dir.root());
+        let pid_file = dir.root().join("grandchild.pid");
+        let git = dir.root().join("git-detached");
         executable(
             &git,
             &format!(
@@ -705,7 +743,7 @@ mod repository {
                 pid_file.display()
             ),
         );
-        let dirs = Dirs::new();
+        let dirs = Sandbox::new();
         configure(
             &dirs,
             &host(git.to_str().unwrap(), DEADLINE_MS),

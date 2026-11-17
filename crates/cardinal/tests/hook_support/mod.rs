@@ -1,18 +1,83 @@
 //! Helpers shared by the hook tests: configuration, hook input, running the hook, and the
 //! fake runner and probe tools that execute rewritten commands (`docs/architecture.md`
 //! section 13.5). A test crate declares `mod support;` and `mod hook_support;`.
+//!
+//! Every child a hook test starts gets a constructed environment and a work dir inside a
+//! fixture ([`Sandbox`]), never the environment or the directory the tests run in.
 
 #![allow(
     dead_code,
     reason = "each test crate uses a different subset of the helpers"
 )]
 
+use std::ffi::OsStr;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 
 use cardinal::contract::RunSpec;
 use serde_json::{Value, json};
 
 use crate::support::cardinal::Dirs;
+use crate::support::fixture::Fixture;
+
+/// cardinal's state and config dirs for a test, and a fixture whose constructed environment
+/// (`docs/architecture.md` section 13.3) and work dir every child of the test gets: nothing
+/// of the environment the tests run in reaches a child but `PATH` (and what Windows needs to
+/// start a program), so no `GIT_*`, `CLAUDE_*`, `CARDINAL_TEST_*`, or Bash timeout variable
+/// does; `HOME` and the git configuration are the fixture's; and the child starts in the
+/// fixture, so a hook that falls back to its own cwd never looks at the repository the tests
+/// run in.
+pub struct Sandbox {
+    dirs: Dirs,
+    fixture: Fixture,
+    work: PathBuf,
+}
+
+impl Sandbox {
+    pub fn new() -> Self {
+        let fixture = Fixture::new();
+        let work = fixture.root().join("work");
+        std::fs::create_dir_all(&work).expect("create the work dir");
+        Self {
+            dirs: Dirs::new(),
+            fixture,
+            work,
+        }
+    }
+
+    pub fn fixture(&self) -> &Fixture {
+        &self.fixture
+    }
+
+    /// The directory children start in, inside the fixture root.
+    pub fn work(&self) -> &Path {
+        &self.work
+    }
+
+    /// `program` started in the work dir with the constructed environment and the cardinal
+    /// dirs.
+    pub fn command(&self, program: impl AsRef<OsStr>) -> std::process::Command {
+        let mut command = self.fixture.command(program, &self.work);
+        command
+            .env("CARDINAL_STATE_DIR", self.dirs.state())
+            .env("CARDINAL_CONFIG_DIR", self.dirs.config());
+        command
+    }
+
+    /// `cardinal`, started as [`Sandbox::command`] starts a program. Shadows [`Dirs::cmd`],
+    /// which inherits the environment.
+    pub fn cmd(&self) -> assert_cmd::Command {
+        assert_cmd::Command::from_std(self.command(env!("CARGO_BIN_EXE_cardinal")))
+    }
+}
+
+impl Deref for Sandbox {
+    type Target = Dirs;
+
+    fn deref(&self) -> &Dirs {
+        &self.dirs
+    }
+}
 
 /// A runner path for tests that only look at the rewritten text.
 pub const RUNNER: &str = "/opt/cardinal/bin/cardinal";
@@ -176,12 +241,8 @@ pub fn runner_path(path: &Path) -> String {
     text
 }
 
-/// `cardinal` for `dirs` without the Bash timeout variables of the environment the tests run
-/// in, so specs get the documented defaults unless a test sets them.
-pub fn cmd(dirs: &Dirs) -> assert_cmd::Command {
-    let mut command = dirs.cmd();
-    command
-        .env_remove("BASH_DEFAULT_TIMEOUT_MS")
-        .env_remove("BASH_MAX_TIMEOUT_MS");
-    command
+/// `cardinal` for `sandbox` ([`Sandbox::cmd`]); no Bash timeout variable is set, so specs get
+/// the documented defaults unless a test sets one.
+pub fn cmd(sandbox: &Sandbox) -> assert_cmd::Command {
+    sandbox.cmd()
 }

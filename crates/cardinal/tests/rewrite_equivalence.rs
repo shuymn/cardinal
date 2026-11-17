@@ -13,15 +13,15 @@ mod hook_support;
 mod support;
 
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use hook_support::{
-    PROFILE, configure, executable, fake_runner, host, input, probe, rewritten, run_hook,
+    PROFILE, Sandbox, configure, executable, fake_runner, host, input, probe, rewritten, run_hook,
     runner_path,
 };
 use proptest::prelude::{Just, Strategy, prop, prop_assert_eq, prop_oneof, proptest};
 use proptest::test_runner::Config as ProptestConfig;
-use support::cardinal::Dirs;
+use support::fixture::Fixture;
 
 /// Printed by the outer shell after the command: its status, its cwd (what Claude Code
 /// keeps for the next call), and its exported environment.
@@ -32,6 +32,10 @@ const TRAILER: &str = "__s=$?; printf '\\n[status] %s\\n[pwd] %s\\n' \"$__s\" \"
 struct Shell {
     name: &'static str,
     path: PathBuf,
+    /// The options that keep the shell from reading startup files: `bash --norc
+    /// --noprofile` and `zsh -f` (zsh still reads `/etc/zshenv`); `sh` reads none when not
+    /// interactive and `ENV` is unset.
+    options: &'static [&'static str],
     /// Whether `set -o pipefail` works.
     pipefail: bool,
 }
@@ -42,18 +46,32 @@ fn find(name: &str) -> Option<PathBuf> {
         .find(|path| path.is_file())
 }
 
-/// `bash` and `zsh` where installed, `sh` always.
-fn shells() -> Vec<Shell> {
-    let mut found: Vec<Shell> = ["bash", "zsh"]
+/// `bash` and `zsh` where installed, `sh` always, checked in `fixture`.
+fn shells(fixture: &Fixture) -> Vec<Shell> {
+    let options: [(&'static str, &'static [&'static str]); 2] =
+        [("bash", &["--norc", "--noprofile"]), ("zsh", &["-f"])];
+    let mut found: Vec<Shell> = options
         .into_iter()
-        .filter_map(|name| Some(shell(name, find(name)?)))
+        .filter_map(|(name, options)| Some(shell(fixture, name, options, find(name)?)))
         .collect();
-    found.push(shell("sh", find("sh").expect("sh is on PATH")));
+    found.push(shell(
+        fixture,
+        "sh",
+        &[],
+        find("sh").expect("sh is on PATH"),
+    ));
     found
 }
 
-fn shell(name: &'static str, path: PathBuf) -> Shell {
-    let pipefail = Command::new(&path)
+fn shell(
+    fixture: &Fixture,
+    name: &'static str,
+    options: &'static [&'static str],
+    path: PathBuf,
+) -> Shell {
+    let pipefail = fixture
+        .command(&path, fixture.root())
+        .args(options)
         .args(["-c", "set -o pipefail"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -62,6 +80,7 @@ fn shell(name: &'static str, path: PathBuf) -> Shell {
     Shell {
         name,
         path,
+        options,
         pipefail,
     }
 }
@@ -74,55 +93,53 @@ struct Outcome {
     status: Option<i32>,
 }
 
-/// A test bench: tools in `bin/`, a fake runner, and two configurations whose runner path
-/// is the fake runner (`present`) or a path that does not exist (`missing`).
+/// A test bench in a fixture, whose constructed environment the shells get: tools in
+/// `bin/`, a fake runner, the shells, and two configurations whose runner path is the fake
+/// runner (`present`) or a path that does not exist (`missing`).
 struct Bench {
-    _dir: tempfile::TempDir,
-    root: PathBuf,
+    fixture: Fixture,
     bin: PathBuf,
     log: PathBuf,
     runner: String,
-    present: Dirs,
-    missing: Dirs,
+    shells: Vec<Shell>,
+    present: Sandbox,
+    missing: Sandbox,
 }
 
 impl Bench {
     fn new() -> Self {
-        let dir = tempfile::Builder::new()
-            .prefix("cardinal-equiv-")
-            .tempdir()
-            .unwrap();
-        let root = dunce::canonicalize(dir.path()).unwrap();
+        let fixture = Fixture::new();
+        let root = fixture.root();
         let bin = root.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
-        std::fs::create_dir_all(root.join("home")).unwrap();
         let log = root.join("runner.log");
         probe(&bin);
         executable(&bin.join("npx"), "#!/bin/sh\nexec \"$@\"\n");
         let runner = runner_path(&fake_runner(&bin, &log));
-        let present = Dirs::new();
+        let present = Sandbox::new();
         configure(&present, &host(&runner, ""), &[("generic", PROFILE)]);
-        let missing = Dirs::new();
+        let missing = Sandbox::new();
         let absent = runner_path(&root.join("absent").join("cardinal"));
         configure(&missing, &host(&absent, ""), &[("generic", PROFILE)]);
+        let shells = shells(&fixture);
         Self {
-            _dir: dir,
-            root,
+            fixture,
             bin,
             log,
             runner,
+            shells,
             present,
             missing,
         }
     }
 
     fn work(&self) -> PathBuf {
-        self.root.join("work")
+        self.fixture.root().join("work")
     }
 
     /// The command as the hook rewrites it with `dirs`' configuration; unchanged when the
     /// hook prints nothing.
-    fn rewrite(&self, dirs: &Dirs, command: &str) -> String {
+    fn rewrite(&self, dirs: &Sandbox, command: &str) -> String {
         run_hook(hook_support::cmd(dirs), &input(command, &self.work()))
             .map_or_else(|| command.to_owned(), |doc| rewritten(&doc).to_owned())
     }
@@ -149,19 +166,18 @@ impl Bench {
                 .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
         )
         .unwrap();
-        let output = Command::new(&shell.path)
+        let output = self
+            .fixture
+            .command(&shell.path, &work)
+            .args(shell.options)
             .arg("-c")
-            // Startup files such as `/etc/zshenv` may reset PATH; the script sets it again.
+            // `/etc/zshenv` may reset PATH; the script sets it again.
             .arg(format!(
                 "PATH='{}'; export PATH\n{setup}\n{command}\n{TRAILER}",
                 path.to_string_lossy()
             ))
-            .current_dir(&work)
-            .env_clear()
             .env("PATH", &path)
-            .env("HOME", self.root.join("home"))
             .env("PWD", &work)
-            .env("LC_ALL", "C")
             .env("EXPORTED", "visible")
             .stdin(Stdio::null())
             .output()
@@ -388,8 +404,8 @@ const CASES: &[Case] = &[
 ];
 
 /// Runs every case in every shell with `dirs`' rewrite and compares it with the original.
-fn check(bench: &Bench, dirs: &Dirs, expect_calls: bool) {
-    let shells = shells();
+fn check(bench: &Bench, dirs: &Sandbox, expect_calls: bool) {
+    let shells = &bench.shells;
     for case in CASES {
         let rewritten = bench.rewrite(dirs, case.command);
         assert_eq!(
@@ -523,7 +539,7 @@ proptest! {
         }
         let bench = Bench::new();
         let rewritten = bench.rewrite(&bench.present, &command);
-        for shell in shells().iter().filter(|s| s.pipefail || !setup.contains("pipefail")) {
+        for shell in bench.shells.iter().filter(|s| s.pipefail || !setup.contains("pipefail")) {
             let (original, _) = bench.run(shell, setup, &command);
             let (outcome, _) = bench.run(shell, setup, &rewritten);
             prop_assert_eq!(outcome, original, "{} in {}:\n{}\n{}", command, shell.name, rewritten, setup);
@@ -550,9 +566,9 @@ fn piped_redirection_stays_unwrapped() {
         "if [ -x {runner} ]; then {runner} run -- {stage}; else {stage}; fi | cat; cat out.log",
         runner = bench.runner
     );
-    for shell in shells() {
-        let (as_written, _) = bench.run(&shell, "", &original);
-        let (as_wrapped, _) = bench.run(&shell, "", &wrapped);
+    for shell in &bench.shells {
+        let (as_written, _) = bench.run(shell, "", &original);
+        let (as_wrapped, _) = bench.run(shell, "", &wrapped);
         if shell.name == "zsh" {
             assert_ne!(
                 as_wrapped, as_written,
