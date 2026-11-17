@@ -357,8 +357,28 @@ fn nested_included_config_is_detected() {
     append(&nested, "# changed\n");
     assert!(
         !guard(&fixture, "verify", &repo, &file).status.success(),
-        "a change in a nested included config file was not detected"
+        "a change in a nested included config file was not detected; {} should be among the \
+         files the snapshot hashed:\n{}",
+        nested.display(),
+        config_sections(&file)
     );
+}
+
+/// The config entries and hashed config files of a snapshot, for a failure message.
+fn config_sections(snapshot: &Path) -> String {
+    let text = std::fs::read_to_string(snapshot).expect("read the snapshot");
+    let mut out = String::new();
+    let mut inside = false;
+    for line in text.lines() {
+        if line.starts_with("## ") {
+            inside = line == "## config" || line == "## config files";
+        }
+        if inside {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
 }
 
 #[test]

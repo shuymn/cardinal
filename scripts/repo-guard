@@ -263,11 +263,16 @@ state() {
 
   echo "## config files"
   # Comments and empty sections too. The common config is left out: other worktrees change
-  # it, and its entries are above.
+  # it, and its entries are above. git names each file relative to the worktree or as an
+  # absolute path in its own form (`C:/...` with Git for Windows), so the shell resolves it
+  # from the worktree; a directory it cannot find fails the guard rather than reading as a
+  # missing file.
+  local dir
   printf '%s' "$config" | awk -v RS=$'\1' 'NR % 2 == 1 && sub(/^file:/, "")' | sort -u |
     while IFS= read -r path; do
-      case $path in /*) ;; *) path=$top/$path ;; esac
-      [ "$(canonical "$(dirname "$path")")/$(basename "$path")" != "$common/config" ] || continue
+      dir=$(cd "$top" && canonical "$(dirname "$path")")
+      path=$dir/$(basename "$path")
+      [ "$path" != "$common/config" ] || continue
       printf '%s %s\n' "$path" "$(content "$path")"
     done
 
