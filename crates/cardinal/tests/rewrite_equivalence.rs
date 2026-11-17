@@ -403,6 +403,28 @@ const CASES: &[Case] = &[
         1,
     ),
     case("builtin_stays", "", "command probe x", 0, 0),
+    // Without a match the pattern vanishes and `cd sub` runs in the calling shell; wrapped,
+    // the runner would run it as a program.
+    Case {
+        only: &["bash"],
+        ..case(
+            "nullglob_command_word",
+            "shopt -s nullglob",
+            "./absent*/probe cd sub; pwd",
+            0,
+            0,
+        )
+    },
+    Case {
+        only: &["zsh"],
+        ..case(
+            "zsh_nullglob_command_word",
+            "setopt nullglob",
+            "./absent*/probe cd sub; pwd",
+            0,
+            0,
+        )
+    },
     case(
         "function_from_rc",
         "greet() { printf 'hi %s\\n' \"$1\"; }",

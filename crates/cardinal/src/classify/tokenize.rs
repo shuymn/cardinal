@@ -21,6 +21,8 @@ pub enum Refusal {
     Keyword(String),
     #[error("`{0}` in command position")]
     Eval(String),
+    #[error("command word `{0}` is not a literal")]
+    NotLiteral(String),
     #[error("empty command before `{0}`")]
     EmptyStage(&'static str),
     #[error("the command ends with `{0}`")]
@@ -33,7 +35,8 @@ pub enum Refusal {
 #[derive(Clone, Debug)]
 struct Word {
     span: Range<usize>,
-    /// The word after quote removal; `None` when it contains an expansion.
+    /// The word after quote removal; `None` when it contains an expansion or an unquoted
+    /// pattern character.
     value: Option<String>,
     /// Expands shell state the fallback test could change (`$?`, `$_`, …).
     state: bool,
@@ -346,6 +349,7 @@ impl<'a> Lexer<'a> {
                 b'$' => self.dollar(false, &mut value, &mut literal, &mut state)?,
                 _ => {
                     let ch = self.char_at(self.pos);
+                    literal &= !self.is_pattern(ch, start);
                     value.push(ch);
                     self.pos += ch.len_utf8();
                 }
@@ -357,6 +361,22 @@ impl<'a> Lexer<'a> {
             state,
             newline,
         })
+    }
+
+    /// Whether the unquoted `ch` at `self.pos`, in a word that starts at `start`, makes the
+    /// word a pathname pattern, which the shell may expand to anything or (with `nullglob`)
+    /// to nothing: `*`, `?`, a `[` closed later in the word, and zsh's extended `^`, and `#`
+    /// or `~` after the word's start.
+    fn is_pattern(&self, ch: char, start: usize) -> bool {
+        match ch {
+            '*' | '?' | '^' => true,
+            '#' | '~' => self.pos > start,
+            '[' => self.bytes[self.pos + 1..]
+                .iter()
+                .take_while(|&&b| !is_meta(b))
+                .any(|&b| b == b']'),
+            _ => false,
+        }
     }
 
     /// The body of a double-quoted string; `self.pos` is just after the opening quote.
@@ -638,31 +658,35 @@ fn finish(
     })
 }
 
-/// Refuses keywords in command position, and `eval` or `alias` in command position, also
-/// behind precommand modifiers (`command eval …`).
+/// Refuses keywords in command position, a command word that is not a literal (an expansion
+/// or a pattern can name any command, `eval` included), and `eval` or `alias` in command
+/// position; each also behind precommand modifiers (`command eval …`).
 fn check_command_position(command: &str, words: &[Word]) -> Result<(), Refusal> {
     let first = &command[words[0].span.clone()];
     if is_refused_keyword(first) {
         return Err(Refusal::Keyword(first.to_owned()));
     }
-    let mut rest = words.iter().map(|w| &command[w.span.clone()]);
-    while let Some(word) = rest.next() {
-        if word == "eval" || word == "alias" {
-            return Err(Refusal::Eval(word.to_owned()));
+    let mut i = 0;
+    while let Some(word) = words.get(i) {
+        let raw = &command[word.span.clone()];
+        let Some(value) = word.value.as_deref() else {
+            return Err(Refusal::NotLiteral(raw.to_owned()));
+        };
+        if raw == "eval" || raw == "alias" {
+            return Err(Refusal::Eval(raw.to_owned()));
         }
-        if !is_precommand(word) {
+        if !is_precommand(value) {
             break;
         }
         // Skip the modifier's options, then look at the word it runs.
-        let mut peek = rest.clone();
-        while let Some(next) = peek.clone().next() {
-            if next.starts_with('-') && next != "-" {
-                peek.next();
-            } else {
-                break;
-            }
+        i += 1;
+        while words
+            .get(i)
+            .and_then(|w| w.value.as_deref())
+            .is_some_and(|v| v.starts_with('-') && v != "-")
+        {
+            i += 1;
         }
-        rest = peek;
     }
     Ok(())
 }

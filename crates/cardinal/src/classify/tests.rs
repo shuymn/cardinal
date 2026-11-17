@@ -139,7 +139,7 @@ fn comments_blank_lines_and_trailing_separators() {
         spans("a 1 # c && b\n\n  b 2 ;\nc&&\n d #e\n"),
         ["a 1", "b 2", "c", "d"]
     );
-    assert_eq!(spans("a#b c"), ["a#b c"]);
+    assert_eq!(spans("c a#b"), ["c a#b"]);
     assert_eq!(spans("a;#c"), ["a"]);
     // Found by `any_input_gives_well_formed_stages`: an escaped blank ends the span.
     assert_eq!(spans("t a\\  # c"), ["t a\\ "]);
@@ -263,6 +263,26 @@ fn refused_commands() {
         assert!(tokenize(command).is_err(), "{command:?} was accepted");
     }
     assert_eq!(tokenize("make x | |"), Err(Refusal::EmptyStage("|")));
+    // A command word with an expansion or a pattern can name any command, `eval` too, or
+    // vanish (`nullglob`).
+    for command in [
+        "$TOOL test",
+        "\"$X\" test",
+        "make && ${CC:-cc} x",
+        "./absent*/probe cd sub",
+        "pro?be x",
+        "x[ab] y",
+        "^probe x",
+        "a~b x",
+        "command $x",
+        "nice -n 5 x && command -p \"$y\"",
+    ] {
+        assert!(
+            matches!(tokenize(command), Err(Refusal::NotLiteral(_))),
+            "{command:?}: {:?}",
+            tokenize(command)
+        );
+    }
 }
 
 #[test]
@@ -282,6 +302,9 @@ fn accepted_commands() {
         "a &>f &>>g",
         "echo [x] x[1] 'if' \"then\"",
         "\"if\" true",
+        "'pro*be' x \\? \"[a]\"",
+        "[ -f x ] && probe *.txt [ab] ~/x a~b ^c",
+        "~/bin/probe x",
         "echo if then fi done",
         "echo é 日本 ü",
         "",
@@ -342,7 +365,6 @@ fn normalization_examples() {
         [["bash", "-x", "-c", "make"]]
     );
     for unclassifiable in [
-        "\"$X\" test",
         "env -i vitest",
         "env --",
         "nice -5 vitest",
@@ -432,8 +454,8 @@ fn rule_matching_and_precedence() {
 #[test]
 fn unwrapped_stages() {
     use Skip::{
-        Assignments, Background, Multiline, NoCommand, NotLiteral, PipedRedirect, SharedPipeline,
-        ShellCommand, ShellState, Skipped, Sleep, Unclassified,
+        Assignments, Background, Multiline, NoCommand, PipedRedirect, SharedPipeline, ShellCommand,
+        ShellState, Skipped, Sleep, Unclassified,
     };
     let cases: &[(&str, &[Option<Skip>])] = &[
         ("pnpm test", &[None]),
@@ -470,7 +492,6 @@ fn unwrapped_stages() {
             "make | tail && vitest | tail",
             &[None, Some(Unclassified), None, Some(Unclassified)],
         ),
-        ("$TOOL test", &[Some(NotLiteral)]),
         ("X=1", &[Some(NoCommand)]),
         ("> out", &[Some(NoCommand)]),
         ("npx vitest --watch", &[Some(Unclassified)]),
@@ -535,7 +556,8 @@ fn config() -> ProptestConfig {
 /// A word part: its text and its value after quote removal (`None` for an expansion).
 fn part() -> impl Strategy<Value = (String, Option<String>)> {
     prop_oneof![
-        "[A-Za-z0-9._/,:@%+=~*?-]{1,6}".prop_map(|s| (s.clone(), Some(s))),
+        "[A-Za-z0-9._/,:@%+=-]{1,6}".prop_map(|s| (s.clone(), Some(s))),
+        "[a-z]{0,2}[*?][a-z]{0,2}".prop_map(|s| (s, None)),
         "[^']{0,8}".prop_map(|s| (format!("'{s}'"), Some(s))),
         "[^\"\\\\$`]{0,8}".prop_map(|s| (format!("\"{s}\""), Some(s))),
         "[ ;|&<>(){}#!'\"$`\\\\a]".prop_map(|c| (format!("\\{c}"), Some(c))),
@@ -996,4 +1018,16 @@ fn trace_of_another_classifier_has_no_profile_rule() {
         Some("unit/x")
     );
     assert_eq!(found[0].skip, None);
+}
+
+/// Pattern characters that are quoted or escaped leave the command word a literal.
+#[test]
+fn quoted_pattern_characters_still_wrap() {
+    let profiles = [profile(
+        "generic",
+        "[[rule]]\nid = \"p\"\ncommands = [\"pro*be\"]\nclass = \"c\"\n",
+    )];
+    let found = outcomes("'pro*be' x; \"pro*be\" y; pro\\*be z", &profiles);
+    assert_eq!(found.len(), 3);
+    assert!(found.iter().all(StageOutcome::wrap), "{found:?}");
 }
