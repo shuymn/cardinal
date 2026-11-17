@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# The completion check of every change: formatting, clippy, and the tests, with the
+# repository guard around the tests (docs/architecture.md section 13.4). Run it as
+# `mise exec -- scripts/test`.
+set -euo pipefail
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+cd "$root"
+
+cargo fmt --all --check
+cargo clippy --all-targets --locked -- -D warnings
+
+snapshot=$(mktemp)
+trap 'rm -f "$snapshot"' EXIT
+scripts/repo-guard snapshot "$root" "$snapshot"
+
+status=0
+cargo test --locked || status=$?
+scripts/repo-guard verify "$root" "$snapshot" || status=1
+exit "$status"

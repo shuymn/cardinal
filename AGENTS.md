@@ -14,15 +14,15 @@ Rust and the development tools are pinned with mise (`mise.toml`, exact versions
 mise install
 mise exec -- lefthook install
 mise exec -- cargo build
-mise exec -- cargo test
-mise exec -- cargo clippy --all-targets -- -D warnings
-mise exec -- cargo fmt --all --check
+mise exec -- scripts/test
 ```
 
-The hooks in `lefthook.yml` check formatting, workflows (actionlint, ghalint), and staged secrets (betterleaks) on commit, the commit message (pommitlint, Conventional Commits) on commit-msg, and run clippy and the tests on push. CI (`.github/workflows/ci.yml`) runs formatting, clippy, and the tests on all three platforms; its `Check` job is the required status check.
+`scripts/test` is the completion check of every change: formatting, clippy with `-D warnings`, and the tests between a snapshot and a verify of `scripts/repo-guard`, which fails the run when the tests changed the repository they run in. The hooks in `lefthook.yml` check formatting, workflows (actionlint, ghalint), and staged secrets (betterleaks) on commit, the commit message (pommitlint, Conventional Commits) on commit-msg, and run `scripts/test` on push. CI (`.github/workflows/ci.yml`) runs `scripts/test` on all three platforms, a second time with `GIT_DIR`, `GIT_WORK_TREE`, and `GIT_INDEX_FILE` exported as a git hook would; its `Check` job is the required status check.
 
 ## Conventions
 
 - Commit messages follow Conventional Commits.
+- `docs/architecture.md` fixes the module layout, contracts, and test strategy; `tests/layering.rs` enforces its module dependency table.
+- Tests run git only through `crates/cardinal/tests/support/fixture.rs`, in fixtures outside any repository with a constructed environment.
 - Pin every GitHub Action by full commit SHA with a version comment, and add any new action or reusable workflow to `selected_actions.patterns_allowed` in `.github/infra.yaml`.
 - `mise.lock` is updated by `.github/workflows/mise-update.yml`, not by Renovate.
