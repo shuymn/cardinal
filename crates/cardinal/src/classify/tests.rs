@@ -181,6 +181,10 @@ fn shell_state_and_newlines_are_flagged() {
         "t $BASH_COMMAND",
         "t \"$BASH_EXECUTION_STRING\" $ZSH_EXECUTION_STRING",
         "t $ERRNO",
+        // A literal integer subscript is plain; the parameter still decides.
+        "t ${PIPESTATUS[0]}",
+        "t \"$pipestatus[1]\"",
+        "t ${pipestatus[-1]}",
         "t $RANDOM",
         "t ${SECONDS}",
         "t $EPOCHREALTIME",
@@ -202,6 +206,7 @@ fn shell_state_and_newlines_are_flagged() {
         "t \\$?",
         "t $statusx",
         "t $HOME:/x \"$PATH:$HOME\"",
+        "t ${arr[0]} $x[1] \"${a[12]}\" $a[-1]",
     ] {
         assert!(!stages(command)[0].shell_state, "{command}");
     }
@@ -225,7 +230,18 @@ fn non_plain_expansions_refuse_the_command() {
         ": \"${U:-$[functions[probe]=1]}\"; probe x",
         "echo \"${arr[i=3]}\" && make",
         "echo $arr[i=3] && make",
-        "make \"$x[1]\"",
+        "make \"$x[i]\"",
+        "make ${x[i]}",
+        "make ${x[1,2]} $x[1,2]",
+        "make ${x[1]:-y}",
+        "make ${x[+1]}",
+        "make ${x[1a]}",
+        "make ${x[]}",
+        "make $x[-]",
+        "make ${1[2]}",
+        "make $x[1][2]",
+        "make $x[1]:h",
+        "make ${#x[1]}",
         "make $x:h",
         "make \"$x:u\"",
         "make $@[1] $1:t",
@@ -236,7 +252,6 @@ fn non_plain_expansions_refuse_the_command() {
         "make ${!name}",
         "make ${(e)x}",
         "make ${x@P}",
-        "make ${PIPESTATUS[0]}",
         "make \"${arr[@]}\"",
         "make ${HOME:-/tmp}",
         "make ${x/a/b}",
@@ -594,6 +609,12 @@ fn unwrapped_stages() {
             &[None, Some(Unclassified), Some(ShellCommand)],
         ),
         ("echo a && make; make", &[Some(ShellCommand), None, None]),
+        // A literal integer subscript leaves the decision to the parameter.
+        (
+            "make | tail; make \"${PIPESTATUS[0]}\" $pipestatus[1]",
+            &[None, Some(Unclassified), Some(ShellState)],
+        ),
+        ("make ${arr[0]} $x[-1]", &[None]),
     ];
     for (command, expected) in cases {
         assert_eq!(skips(command), *expected, "{command}");

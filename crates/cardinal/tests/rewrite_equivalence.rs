@@ -448,6 +448,25 @@ const CASES: &[Case] = &[
         0,
     ),
     case("current_command_stays", "", "probe \"$BASH_COMMAND\"", 0, 0),
+    // A literal integer subscript is plain syntax: the pipeline before it is still wrapped,
+    // and the stage that reads the statuses stays unwrapped. sh (dash) has no arrays.
+    Case {
+        only: &["bash", "zsh"],
+        ..case(
+            "pipeline_status_element",
+            "",
+            "probe --exit 3 | cat; probe \"${pipestatus[1]}\" \"$pipestatus[1]\" \"${PIPESTATUS[0]}\"",
+            1,
+            1,
+        )
+    },
+    case(
+        "pipeline_status_element_stays",
+        "",
+        "false; probe \"${pipestatus[1]}\"",
+        0,
+        0,
+    ),
     // An operator can evaluate arithmetic that reads the fallback test's status (section
     // 7.2), so every expansion but a plain parameter refuses the command.
     case(

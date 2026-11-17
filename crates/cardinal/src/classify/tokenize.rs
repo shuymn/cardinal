@@ -152,6 +152,24 @@ fn is_state_parameter(name: &str) -> bool {
     )
 }
 
+/// The length of a subscript that is a literal integer (`[0]`, `[-1]`) at the start of
+/// `bytes`, which evaluates nothing; 0 when there is none.
+fn integer_subscript_len(bytes: &[u8]) -> usize {
+    if bytes.first() != Some(&b'[') {
+        return 0;
+    }
+    let sign = usize::from(bytes.get(1) == Some(&b'-'));
+    let digits = bytes[1 + sign..]
+        .iter()
+        .take_while(|b| b.is_ascii_digit())
+        .count();
+    if digits > 0 && bytes.get(1 + sign + digits) == Some(&b']') {
+        2 + sign + digits
+    } else {
+        0
+    }
+}
+
 /// The length of the parameter at the start of a `${…}` body that is all parameter: a name,
 /// digits, or one special parameter. 0 when there is none.
 fn plain_parameter_len(body: &[u8]) -> usize {
@@ -439,8 +457,9 @@ impl<'a> Lexer<'a> {
     }
 
     /// A `$` at `self.pos`, unquoted or inside double quotes. Only plain parameter
-    /// expansions pass (section 7.2): `$NAME` and `${NAME}`, and the same for positional
-    /// and special parameters (`$1`, `${#}`, `$?`); every other expansion refuses the command.
+    /// expansions pass (section 7.2): `$NAME` and `${NAME}`, the same with a literal integer
+    /// subscript (`${NAME[0]}`, zsh's `$NAME[1]`), and positional and special parameters
+    /// (`$1`, `${#}`, `$?`); every other expansion refuses the command.
     fn dollar(
         &mut self,
         quoted: bool,
@@ -457,20 +476,27 @@ impl<'a> Lexer<'a> {
             Some(b'{') => {
                 let body = start + 2;
                 let len = plain_parameter_len(&self.bytes[body..]);
-                if len == 0 || self.bytes.get(body + len) != Some(&b'}') {
+                let subscript = if self.bytes.get(body).copied().is_some_and(is_name_start) {
+                    integer_subscript_len(&self.bytes[body + len..])
+                } else {
+                    0
+                };
+                if len == 0 || self.bytes.get(body + len + subscript) != Some(&b'}') {
                     return Err(self.expansion(start, braced_end(self.bytes, start)));
                 }
-                self.pos = body + len + 1;
+                self.pos = body + len + subscript + 1;
                 &src[body..body + len]
             }
             Some(b) if is_name_start(b) => {
-                self.pos = start + 1 + plain_parameter_len(&self.bytes[start + 1..]);
+                let end = start + 1 + plain_parameter_len(&self.bytes[start + 1..]);
+                self.pos = end;
                 // zsh reads letters beyond ASCII as part of a name.
                 if self.peek(0).is_some_and(|b| !b.is_ascii()) {
                     return Err(self.expansion(start, self.pos + self.char_at(self.pos).len_utf8()));
                 }
+                self.pos += integer_subscript_len(&self.bytes[end..]);
                 self.unbraced_suffix(start)?;
-                &src[start + 1..self.pos]
+                &src[start + 1..end]
             }
             Some(b) if is_special_parameter(b) => {
                 self.pos = start + 2;
@@ -507,7 +533,8 @@ impl<'a> Lexer<'a> {
     }
 
     /// Refuses what zsh reads after an unbraced parameter that ends at `self.pos`, which
-    /// started at `start`: a subscript (`$name[…]`) or a modifier (`$name:h`).
+    /// started at `start`: a subscript (`$name[…]`) other than a literal integer one, which
+    /// the caller has passed, or a modifier (`$name:h`).
     fn unbraced_suffix(&self, start: usize) -> Result<(), Refusal> {
         match (self.peek(0), self.peek(1)) {
             (Some(b'['), _) => Err(self.expansion(start, self.pos + 1)),
