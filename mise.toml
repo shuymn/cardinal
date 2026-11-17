@@ -10,7 +10,8 @@ locked = true
 # Each tool tracks its major version; mise.lock pins the exact versions and
 # .github/workflows/mise-update.yml advances it.
 [tools]
-rust = { version = "1", profile = "minimal", components = "rustfmt,clippy" }
+rust = { version = "1", profile = "minimal", components = "rustfmt,clippy", targets = "x86_64-pc-windows-msvc" }
+"github:nextest-rs/nextest" = { version = "0", version_prefix = "cargo-nextest-" }
 lefthook = "2"
 actionlint = "1"
 betterleaks = "1"

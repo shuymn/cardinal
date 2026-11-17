@@ -68,6 +68,32 @@ checksum = "sha256:4fe63eacd4c70f80d33d211802f96a66c83b860e3666af0cc6096fe932b50
 url = "https://github.com/babarot/gh-infra/releases/download/v0.20.0/gh-infra_windows_amd64.zip"
 url_api = "https://api.github.com/repos/babarot/gh-infra/releases/assets/730122221"
 
+[[tools."github:nextest-rs/nextest"]]
+version = "0.9.152"
+backend = "github:nextest-rs/nextest"
+specifiers = ["0"]
+
+[tools."github:nextest-rs/nextest".options]
+version_prefix = "cargo-nextest-"
+
+[tools."github:nextest-rs/nextest"."platforms.linux-x64"]
+checksum = "sha256:d039b43c3e0958441b6ad0a39c8884d018b3d2e8fb9928f209074b1100b5e17a"
+url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.152/cargo-nextest-0.9.152-x86_64-unknown-linux-gnu.tar.gz"
+url_api = "https://api.github.com/repos/nextest-rs/nextest/releases/assets/745393873"
+provenance = "github-attestations"
+
+[tools."github:nextest-rs/nextest"."platforms.macos-arm64"]
+checksum = "sha256:2fadf57df4243e691f088ee3bff4f4ab9af16da0c95a1db84b5cb1685e098a76"
+url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.152/cargo-nextest-0.9.152-universal-apple-darwin.tar.gz"
+url_api = "https://api.github.com/repos/nextest-rs/nextest/releases/assets/745423352"
+provenance = "github-attestations"
+
+[tools."github:nextest-rs/nextest"."platforms.windows-x64"]
+checksum = "sha256:cc6bf4b6a7ac18e462cd6c9bae67e26921b888249c2988c6acabf3df387ed9d6"
+url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.152/cargo-nextest-0.9.152-x86_64-pc-windows-msvc.zip"
+url_api = "https://api.github.com/repos/nextest-rs/nextest/releases/assets/745407477"
+provenance = "github-attestations"
+
 [[tools."github:shuymn/pommitlint"]]
 version = "2.0.4"
 backend = "github:shuymn/pommitlint"
@@ -139,3 +165,4 @@ specifiers = ["1"]
 [tools.rust.options]
 components = "clippy,rustfmt"
 profile = "minimal"
+targets = "x86_64-pc-windows-msvc"

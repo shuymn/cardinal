@@ -1,0 +1,8 @@
+# cargo-nextest, run by scripts/test (docs/architecture.md section 13.4).
+[profile.default]
+fail-fast = false
+# A test whose children still hold its stdout or stderr a second after it ends fails. A
+# child that closed them is found by the process sweep of scripts/test instead.
+leak-timeout = { period = "1s", result = "fail" }
+# No test waits forever: after 5 minutes it is killed.
+slow-timeout = { period = "60s", terminate-after = 5 }

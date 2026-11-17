@@ -1,32 +1,27 @@
 //! Driving the pause points of `cardinal::testpoint` (`docs/architecture.md` section 13.1).
 //! A contended test waits for the second actor's `.reached` file before releasing the first.
 
-use std::path::Path;
-use std::process::Command;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use cardinal::testpoint::{reached_file, release_file};
-use tempfile::TempDir;
+use cardinal_test_support::process::wait_for;
+use cardinal_test_support::{Command, Scope};
 
-use super::helper::wait_for;
-
-/// A test-point directory.
+/// A test-point directory inside a scope.
 pub struct TestPoints {
-    dir: TempDir,
+    dir: PathBuf,
 }
 
 impl TestPoints {
-    pub fn new() -> Self {
-        Self {
-            dir: tempfile::Builder::new()
-                .prefix("cardinal-points-")
-                .tempdir()
-                .expect("create the test-point dir"),
-        }
+    pub fn new(scope: &Scope) -> Self {
+        let dir = scope.path("points");
+        std::fs::create_dir_all(&dir).expect("create the test-point dir");
+        Self { dir }
     }
 
     pub fn dir(&self) -> &Path {
-        self.dir.path()
+        &self.dir
     }
 
     /// Sets the test-point variables on `command`: pause at `pause`, fail at `fail`.

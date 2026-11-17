@@ -7,6 +7,10 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+# Doc comments carry no examples to run; cargo-nextest does not run doctests.
+[lib]
+doctest = false
+
 [dependencies]
 base64.workspace = true
 clap.workspace = true
@@ -22,6 +26,7 @@ windows-sys.workspace = true
 
 [dev-dependencies]
 assert_cmd.workspace = true
+cardinal-test-support.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
 

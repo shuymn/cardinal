@@ -1,0 +1,34 @@
+[package]
+name = "cardinal-test-support"
+description = "The spawn API, git fixtures, and process cleanup of cardinal's tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# Doc comments carry no examples to run; cargo-nextest does not run doctests.
+[lib]
+doctest = false
+
+[dependencies]
+assert_cmd.workspace = true
+dunce.workspace = true
+sysinfo.workspace = true
+tempfile.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
+# pidfd polling for the process sweep (src/bin/run-processes.rs).
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { workspace = true, features = ["event"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+process-wrap.workspace = true
+
+[lints]
+workspace = true

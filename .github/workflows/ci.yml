@@ -29,7 +29,8 @@ jobs:
         shell: bash
     env:
       CARGO_TERM_COLOR: always
-      # Only rust is installed; `mise exec` must not install the other tools.
+      # Only rust and cargo-nextest are installed; `mise exec` must not install the other
+      # tools.
       MISE_EXEC_AUTO_INSTALL: "false"
     steps:
       - name: Checkout code
@@ -41,7 +42,7 @@ jobs:
         uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5.2.9
         with:
           version: 2026.11.8
-          install_args: rust
+          install_args: rust github:nextest-rs/nextest
 
       # The toolchain is part of the key through mise.lock, so a toolchain
       # update starts a fresh target directory.
@@ -70,15 +71,27 @@ jobs:
       - name: Run checks
         run: mise exec -- scripts/test
 
-      # A second run with the variables git exports to hooks, so a test that lets them
-      # reach git would write to this checkout and fail the repository guard.
-      - name: Run checks as a git hook would
+      # The isolation mechanisms themselves: each canary escape must fail or be caught.
+      - name: Self-check the test harness
+        run: mise exec -- scripts/test --self-check
+
+      # A second run started the way a careless caller would: BASH_ENV names a script that
+      # leaves a mark, and GIT_DIR, GIT_WORK_TREE, and GIT_INDEX_FILE point at a decoy
+      # repository. No startup file may run, and neither the decoy nor this checkout may
+      # change.
+      - name: Run checks with a hostile environment
         run: |
-          GIT_DIR=$(git rev-parse --absolute-git-dir)
-          GIT_WORK_TREE=$(git rev-parse --show-toplevel)
-          GIT_INDEX_FILE=$(git rev-parse --path-format=absolute --git-path index)
-          export GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
-          mise exec -- scripts/test
+          decoy="$RUNNER_TEMP/decoy"
+          git init -q -b main "$decoy"
+          git -C "$decoy" -c user.name=decoy -c user.email=decoy@example.invalid \
+            commit -q --allow-empty -m decoy
+          scripts/repo-guard snapshot "$decoy" "$RUNNER_TEMP/decoy.snapshot"
+          printf 'echo ran >"%s"\n' "$RUNNER_TEMP/startup-ran" >"$RUNNER_TEMP/startup"
+          BASH_ENV="$RUNNER_TEMP/startup" ENV="$RUNNER_TEMP/startup" \
+            GIT_DIR="$decoy/.git" GIT_WORK_TREE="$decoy" GIT_INDEX_FILE="$decoy/.git/index" \
+            mise exec -- scripts/test
+          test ! -e "$RUNNER_TEMP/startup-ran"
+          scripts/repo-guard verify "$decoy" "$RUNNER_TEMP/decoy.snapshot"
 
   test-linux:
     name: Test (ubuntu-latest)
@@ -91,7 +104,8 @@ jobs:
         shell: bash
     env:
       CARGO_TERM_COLOR: always
-      # Only rust is installed; `mise exec` must not install the other tools.
+      # Only rust and cargo-nextest are installed; `mise exec` must not install the other
+      # tools.
       MISE_EXEC_AUTO_INSTALL: "false"
     steps:
       - name: Checkout code
@@ -103,7 +117,7 @@ jobs:
         uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5.2.9
         with:
           version: 2026.11.8
-          install_args: rust
+          install_args: rust github:nextest-rs/nextest
 
       # The toolchain is part of the key through mise.lock, so a toolchain
       # update starts a fresh target directory.
@@ -129,18 +143,40 @@ jobs:
             target/
           key: ${{ steps.cache-key.outputs.key }}
 
+      # bubblewrap confines each test process. Ubuntu restricts unprivileged user
+      # namespaces through AppArmor, which bubblewrap needs; lift that on the runner.
+      - name: Install bubblewrap
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends bubblewrap
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+
       - name: Run checks
         run: mise exec -- scripts/test
 
-      # A second run with the variables git exports to hooks, so a test that lets them
-      # reach git would write to this checkout and fail the repository guard.
-      - name: Run checks as a git hook would
+      # The isolation mechanisms themselves: each canary escape must fail or be caught.
+      - name: Self-check the test harness
+        run: mise exec -- scripts/test --self-check
+
+      # A second run started the way a careless caller would: BASH_ENV names a script that
+      # leaves a mark, and GIT_DIR, GIT_WORK_TREE, and GIT_INDEX_FILE point at a decoy
+      # repository. No startup file may run, and neither the decoy nor this checkout may
+      # change.
+      - name: Run checks with a hostile environment
         run: |
-          GIT_DIR=$(git rev-parse --absolute-git-dir)
-          GIT_WORK_TREE=$(git rev-parse --show-toplevel)
-          GIT_INDEX_FILE=$(git rev-parse --path-format=absolute --git-path index)
-          export GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
-          mise exec -- scripts/test
+          decoy="$RUNNER_TEMP/decoy"
+          git init -q -b main "$decoy"
+          git -C "$decoy" -c user.name=decoy -c user.email=decoy@example.invalid \
+            commit -q --allow-empty -m decoy
+          scripts/repo-guard snapshot "$decoy" "$RUNNER_TEMP/decoy.snapshot"
+          printf 'echo ran >"%s"\n' "$RUNNER_TEMP/startup-ran" >"$RUNNER_TEMP/startup"
+          BASH_ENV="$RUNNER_TEMP/startup" ENV="$RUNNER_TEMP/startup" \
+            GIT_DIR="$decoy/.git" GIT_WORK_TREE="$decoy" GIT_INDEX_FILE="$decoy/.git/index" \
+            mise exec -- scripts/test
+          test ! -e "$RUNNER_TEMP/startup-ran"
+          scripts/repo-guard verify "$decoy" "$RUNNER_TEMP/decoy.snapshot"
 
   test-windows:
     name: Test (windows-latest)
@@ -153,7 +189,8 @@ jobs:
         shell: bash
     env:
       CARGO_TERM_COLOR: always
-      # Only rust is installed; `mise exec` must not install the other tools.
+      # Only rust and cargo-nextest are installed; `mise exec` must not install the other
+      # tools.
       MISE_EXEC_AUTO_INSTALL: "false"
     steps:
       - name: Checkout code
@@ -165,7 +202,7 @@ jobs:
         uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5.2.9
         with:
           version: 2026.11.8
-          install_args: rust
+          install_args: rust github:nextest-rs/nextest
 
       # The toolchain is part of the key through mise.lock, so a toolchain
       # update starts a fresh target directory.
@@ -191,19 +228,31 @@ jobs:
             target/
           key: ${{ steps.cache-key.outputs.key }}
 
-      # Windows cannot start an extensionless script directly, so bash runs it.
+      # Windows cannot start an extensionless script directly, so sh runs it.
       - name: Run checks
-        run: mise exec -- bash scripts/test
+        run: mise exec -- sh scripts/test
 
-      # A second run with the variables git exports to hooks, so a test that lets them
-      # reach git would write to this checkout and fail the repository guard.
-      - name: Run checks as a git hook would
+      # The isolation mechanisms themselves: each canary escape must fail or be caught.
+      - name: Self-check the test harness
+        run: mise exec -- sh scripts/test --self-check
+
+      # A second run started the way a careless caller would: BASH_ENV names a script that
+      # leaves a mark, and GIT_DIR, GIT_WORK_TREE, and GIT_INDEX_FILE point at a decoy
+      # repository. No startup file may run, and neither the decoy nor this checkout may
+      # change.
+      - name: Run checks with a hostile environment
         run: |
-          GIT_DIR=$(git rev-parse --absolute-git-dir)
-          GIT_WORK_TREE=$(git rev-parse --show-toplevel)
-          GIT_INDEX_FILE=$(git rev-parse --path-format=absolute --git-path index)
-          export GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
-          mise exec -- bash scripts/test
+          decoy="$RUNNER_TEMP/decoy"
+          git init -q -b main "$decoy"
+          git -C "$decoy" -c user.name=decoy -c user.email=decoy@example.invalid \
+            commit -q --allow-empty -m decoy
+          scripts/repo-guard snapshot "$decoy" "$RUNNER_TEMP/decoy.snapshot"
+          printf 'echo ran >"%s"\n' "$RUNNER_TEMP/startup-ran" >"$RUNNER_TEMP/startup"
+          BASH_ENV="$RUNNER_TEMP/startup" ENV="$RUNNER_TEMP/startup" \
+            GIT_DIR="$decoy/.git" GIT_WORK_TREE="$decoy" GIT_INDEX_FILE="$decoy/.git/index" \
+            mise exec -- sh scripts/test
+          test ! -e "$RUNNER_TEMP/startup-ran"
+          scripts/repo-guard verify "$decoy" "$RUNNER_TEMP/decoy.snapshot"
 
   # The required status check: passes only when every test job succeeded; a
   # failed, cancelled or skipped job, or a missing result, fails it.

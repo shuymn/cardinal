@@ -1,28 +1,30 @@
 //! The git fixture guard (`docs/architecture.md` section 13.3): git runs only inside the
-//! fixture root, with a constructed environment.
-
-mod support;
+//! fixture root, through typed operations, with a constructed environment.
 
 use std::ffi::OsString;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 
-use support::fixture::Fixture;
+use cardinal_test_support::fixture::Fixture;
+
+fn panic_message(run: impl FnOnce()) -> Option<String> {
+    let err = catch_unwind(AssertUnwindSafe(run)).err()?;
+    Some(
+        err.downcast_ref::<String>()
+            .cloned()
+            .or_else(|| err.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+            .unwrap_or_default(),
+    )
+}
 
 fn refuses(what: &str, run: impl FnOnce()) {
-    let result = catch_unwind(AssertUnwindSafe(run));
-    let err = result.expect_err(&format!("{what} was not refused"));
-    let message = err
-        .downcast_ref::<String>()
-        .cloned()
-        .or_else(|| err.downcast_ref::<&str>().map(|s| (*s).to_owned()))
-        .unwrap_or_default();
+    let message = panic_message(run).unwrap_or_else(|| panic!("{what} was not refused"));
     assert!(message.contains("refusing git"), "{what}: {message}");
 }
 
 /// The state of a repository that a refused call must leave alone.
 fn state(fixture: &Fixture, repo: &Path) -> String {
-    let refs = fixture.git(repo, &["show-ref", "--head"]);
+    let refs = fixture.show_ref(repo);
     let config = std::fs::read_to_string(repo.join(".git/config")).unwrap();
     let index = std::fs::read(repo.join(".git/index")).unwrap();
     format!("{refs}\n{config}\n{}", index.len())
@@ -34,7 +36,7 @@ fn named_operations_work_inside_the_fixture() {
     let repo = fixture.init("repo");
     let head = fixture.commit_file(&repo, "dir/a.txt", "a\n", "first");
     assert_eq!(head.len(), 40);
-    let author = fixture.git(&repo, &["log", "-1", "--format=%an <%ae> %cn"]);
+    let author = fixture.log(&repo, "%an <%ae> %cn");
     assert_eq!(
         author.trim(),
         "Fixture Author <author@fixture.invalid> Fixture Committer"
@@ -43,10 +45,13 @@ fn named_operations_work_inside_the_fixture() {
     assert!(wt.join("dir/a.txt").exists());
     let bare = fixture.init_bare("remote.git");
     fixture.push(&repo, &bare, "main");
+    assert_eq!(fixture.rev_parse(bare.path(), "main"), head);
+    fixture.config_set(&repo, "branch.main.note", "x");
     assert_eq!(
-        fixture.git(bare.path(), &["rev-parse", "main"]).trim(),
-        head
+        fixture.config_get(&repo, "branch.main.note").as_deref(),
+        Some("x")
     );
+    assert_eq!(fixture.config_get(&repo, "branch.main.missing"), None);
 }
 
 #[test]
@@ -55,30 +60,56 @@ fn plain_git_has_no_transport() {
     let repo = fixture.init("repo");
     fixture.commit_file(&repo, "a.txt", "a\n", "first");
     let bare = fixture.init_bare("remote.git");
-    let url = bare.path().to_string_lossy().into_owned();
-    fixture.git(&repo, &["remote", "add", "origin", &url]);
+    fixture.remote_add(&repo, "origin", &bare);
 
-    let output = fixture.git_output(&repo, &["push", "-q", "origin", "main"]);
-    assert!(!output.status.success(), "a push to {url} went through");
+    let output = fixture.push_remote(&repo, "origin", "main");
+    assert!(
+        !output.status.success(),
+        "a push through a remote went through"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("not allowed"), "{stderr}");
-    refuses("re-enabling the file transport", || {
-        fixture.git(
-            &repo,
-            &[
-                "-c",
-                "protocol.file.allow=always",
-                "push",
-                "-q",
-                "origin",
-                "main",
-            ],
-        );
+    assert_eq!(fixture.for_each_ref(bare.path()), "");
+}
+
+#[test]
+fn config_outside_the_allowed_sections_is_refused() {
+    let fixture = Fixture::new();
+    let repo = fixture.init("repo");
+    fixture.commit_file(&repo, "a.txt", "a\n", "first");
+    let before = state(&fixture, &repo);
+    for key in [
+        "protocol.allow",
+        "protocol.file.allow",
+        "core.hooksPath",
+        "core.fsmonitor",
+        "alias.x",
+        "include.path",
+        "remote.origin.url",
+        "credential.helper",
+        "branch",
+    ] {
+        refuses(key, || fixture.config_set(&repo, key, "always"));
+    }
+    assert_eq!(state(&fixture, &repo), before);
+}
+
+#[test]
+fn names_that_read_as_options_or_paths_are_refused() {
+    let fixture = Fixture::new();
+    let repo = fixture.init("repo");
+    fixture.commit_file(&repo, "a.txt", "a\n", "first");
+    refuses("an option as a branch", || {
+        fixture.branch(&repo, "--git-dir=/tmp");
     });
-    refuses("re-enabling transports in config", || {
-        fixture.git(&repo, &["config", "protocol.allow", "always"]);
+    refuses("a climb in a ref", || {
+        fixture.update_ref(&repo, "refs/heads/../../x", "HEAD");
     });
-    assert_eq!(fixture.git(bare.path(), &["for-each-ref"]), "");
+    refuses("an option as a revision", || {
+        fixture.rev_parse(&repo, "--git-dir");
+    });
+    refuses("a space in a tag", || fixture.tag(&repo, "a b"));
+    refuses("an option as a path", || fixture.add(&repo, "--all"));
 }
 
 #[test]
@@ -91,64 +122,39 @@ fn push_into_another_fixture_is_refused() {
     refuses("a push into another fixture", || {
         fixture.push(&repo, &outside, "main");
     });
-    assert_eq!(other.git(outside.path(), &["for-each-ref"]), "");
+    refuses("a remote in another fixture", || {
+        fixture.remote_add(&repo, "origin", &outside);
+    });
+    assert_eq!(other.for_each_ref(outside.path()), "");
 }
 
 #[cfg(unix)]
-fn symlink(target: &Path, link: &Path, _dir: bool) {
+fn symlink(target: &Path, link: &Path) {
     std::os::unix::fs::symlink(target, link).unwrap();
 }
 
 #[cfg(windows)]
-fn symlink(target: &Path, link: &Path, dir: bool) {
-    if dir {
-        std::os::windows::fs::symlink_dir(target, link).unwrap();
-    } else {
-        std::os::windows::fs::symlink_file(target, link).unwrap();
-    }
+fn symlink(target: &Path, link: &Path) {
+    std::os::windows::fs::symlink_dir(target, link).unwrap();
 }
 
 #[test]
-fn symbolic_links_out_of_the_root_are_refused() {
+fn paths_through_links_out_of_the_root_are_refused() {
     let fixture = Fixture::new();
     let repo = fixture.init("repo");
     let other = Fixture::new();
-    let target = other.path("config");
-    std::fs::write(&target, "").unwrap();
-    let outside_dir = other.path("dir");
-    std::fs::create_dir(&outside_dir).unwrap();
-    symlink(&target, &repo.join("link-to-outside"), false);
-    symlink(&other.path("missing"), &repo.join("dangling"), false);
-    symlink(&outside_dir, &repo.join("dir-link"), true);
-    let cases: &[(&str, &[&str])] = &[
-        (
-            "config --file",
-            &["config", "--file", "link-to-outside", "a.b", "c"],
-        ),
-        (
-            "config --file=",
-            &["config", "--file=link-to-outside", "a.b", "c"],
-        ),
-        (
-            "a dangling link",
-            &["config", "--file", "dangling", "a.b", "c"],
-        ),
-        ("a path below a link", &["init", "-q", "dir-link/new"]),
-        (
-            "a climb after a link",
-            &["init", "-q", "dir-link/../escape"],
-        ),
-        ("-C through a link", &["-C", "dir-link", "init", "-q"]),
-    ];
-    for (what, args) in cases {
-        refuses(what, || {
-            fixture.git(&repo, args);
-        });
-    }
-    assert_eq!(std::fs::read_to_string(&target).unwrap(), "");
-    for name in ["missing", "escape", "dir/new", "dir/.git"] {
-        assert!(!other.path(name).exists(), "{name} was created outside");
-    }
+    let outside_repo = other.init("repo");
+    symlink(&outside_repo, &repo.join("dir-link"));
+    refuses("a file below a link", || {
+        fixture.commit_file(&repo, "dir-link/x.txt", "x\n", "escape");
+    });
+    refuses("a climb after a link", || {
+        fixture.commit_file(&repo, "dir-link/../../../escape.txt", "x\n", "escape");
+    });
+    refuses("a link as the repository", || {
+        fixture.status(&repo.join("dir-link"));
+    });
+    assert!(!outside_repo.join("x.txt").exists());
 }
 
 #[test]
@@ -164,8 +170,8 @@ fn isolated_config_disables_signing_and_hooks() {
     }
     fixture.commit_file(&repo, "a.txt", "a\n", "hooks do not run");
     assert_eq!(
-        fixture.git(&repo, &["config", "commit.gpgsign"]).trim(),
-        "false"
+        fixture.config_get(&repo, "commit.gpgsign").as_deref(),
+        Some("false")
     );
 }
 
@@ -175,71 +181,11 @@ fn directory_outside_the_root_is_refused() {
     let other = Fixture::new();
     let outside = other.init("repo");
     refuses("a directory outside", || {
-        fixture.git(&outside, &["status"]);
+        fixture.status(&outside);
     });
     refuses("a relative directory that climbs out", || {
-        fixture.git(&fixture.root().join(".."), &["status"]);
+        fixture.status(&fixture.root().join(".."));
     });
-}
-
-#[test]
-fn path_arguments_outside_the_root_are_refused() {
-    let fixture = Fixture::new();
-    let repo = fixture.init("repo");
-    let other = Fixture::new();
-    let outside_repo = other.init("repo");
-    other.commit_file(&outside_repo, "a.txt", "a\n", "first");
-    let before = state(&other, &outside_repo);
-    let outside = outside_repo.to_string_lossy().into_owned();
-    let git_dir = outside_repo.join(".git").to_string_lossy().into_owned();
-    let cases: Vec<(&str, Vec<String>)> = vec![
-        (
-            "-C",
-            vec![
-                "-C".into(),
-                outside.clone(),
-                "commit".into(),
-                "--allow-empty".into(),
-                "-m".into(),
-                "x".into(),
-            ],
-        ),
-        ("-C attached", vec![format!("-C{outside}"), "status".into()]),
-        (
-            "--git-dir=",
-            vec![format!("--git-dir={git_dir}"), "status".into()],
-        ),
-        (
-            "--git-dir",
-            vec!["--git-dir".into(), git_dir.clone(), "status".into()],
-        ),
-        (
-            "--work-tree=",
-            vec![format!("--work-tree={outside}"), "status".into()],
-        ),
-        ("absolute init", vec!["init".into(), outside.clone()]),
-        (
-            "worktree add",
-            vec!["worktree".into(), "add".into(), format!("{outside}/wt")],
-        ),
-        ("relative climb", vec!["init".into(), "../../escape".into()]),
-        ("home", vec!["init".into(), "~/escape".into()]),
-        (
-            "config value",
-            vec!["config".into(), format!("core.hooksPath={outside}")],
-        ),
-    ];
-    for (what, args) in cases {
-        let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        refuses(what, || {
-            fixture.git(&repo, &args);
-        });
-    }
-    assert_eq!(
-        state(&other, &outside_repo),
-        before,
-        "the outside repository is untouched"
-    );
 }
 
 #[test]
@@ -258,17 +204,36 @@ fn decoy_git_file_pointing_outside_is_refused() {
     )
     .unwrap();
     std::fs::write(decoy.join("b.txt"), "b\n").unwrap();
+    refuses("a decoy .git file", || fixture.add(&decoy, "b.txt"));
     refuses("a decoy .git file", || {
-        fixture.git(&decoy, &["add", "--", "b.txt"]);
-    });
-    refuses("a decoy .git file", || {
-        fixture.git(&decoy, &["commit", "--allow-empty", "-m", "x"]);
+        fixture.commit(&decoy, "x");
     });
     assert_eq!(
         state(&other, &outside),
         before,
         "the decoy's target is untouched"
     );
+}
+
+#[test]
+fn not_a_repository_is_told_apart_from_other_failures() {
+    let fixture = Fixture::new();
+    let plain = fixture.path("plain");
+    std::fs::create_dir(&plain).unwrap();
+    let message = panic_message(|| {
+        fixture.status(&plain);
+    })
+    .expect("status outside a repository");
+    assert!(message.contains("is not a repository"), "{message}");
+
+    let broken = fixture.path("broken");
+    std::fs::create_dir(&broken).unwrap();
+    std::fs::write(broken.join(".git"), "not a gitdir line\n").unwrap();
+    let message = panic_message(|| {
+        fixture.status(&broken);
+    })
+    .expect("status with a broken .git file");
+    assert!(message.contains("cannot resolve"), "{message}");
 }
 
 #[test]
@@ -284,7 +249,12 @@ fn environment_is_constructed_not_inherited() {
         ("GIT_CONFIG_COUNT", "1"),
         ("HOME", "/home/real"),
         ("XDG_CONFIG_HOME", "/home/real/.config"),
+        ("TMPDIR", "/real/tmp"),
+        ("TEMP", "C:\\real\\tmp"),
         ("SSH_AUTH_SOCK", "/tmp/agent"),
+        ("BASH_ENV", "/real/startup"),
+        ("CARDINAL_TEST_HELPER", "spawn"),
+        ("CARDINAL_TEST_RUN", "run-1"),
     ]
     .iter()
     .map(|(k, v)| ((*k).into(), (*v).into()))
@@ -296,6 +266,7 @@ fn environment_is_constructed_not_inherited() {
             .map(|(_, v)| v.to_string_lossy().into_owned())
     };
     assert_eq!(get("PATH").as_deref(), Some("/usr/bin"));
+    assert_eq!(get("CARDINAL_TEST_RUN").as_deref(), Some("run-1"));
     for name in [
         "GIT_DIR",
         "GIT_WORK_TREE",
@@ -304,17 +275,33 @@ fn environment_is_constructed_not_inherited() {
         "GIT_CONFIG_PARAMETERS",
         "GIT_CONFIG_COUNT",
         "SSH_AUTH_SOCK",
+        "BASH_ENV",
+        "CARDINAL_TEST_HELPER",
     ] {
         assert_eq!(get(name), None, "{name} must not pass");
     }
     let root = fixture.root().to_string_lossy().into_owned();
-    for name in ["HOME", "XDG_CONFIG_HOME", "GIT_CONFIG_GLOBAL"] {
+    let mut inside = vec![
+        "HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_STATE_HOME",
+        "XDG_DATA_HOME",
+        "GIT_CONFIG_GLOBAL",
+    ];
+    inside.extend(if cfg!(windows) {
+        ["TEMP", "TMP"].as_slice()
+    } else {
+        ["TMPDIR"].as_slice()
+    });
+    for name in inside {
         assert!(
-            get(name).unwrap().starts_with(&root),
+            get(name).is_some_and(|value| value.starts_with(&root)),
             "{name} points inside the fixture"
         );
     }
     assert_eq!(get("GIT_CONFIG_NOSYSTEM").as_deref(), Some("1"));
+    assert_eq!(get("GIT_TERMINAL_PROMPT").as_deref(), Some("0"));
     assert_eq!(
         get("GIT_CEILING_DIRECTORIES").as_deref(),
         fixture

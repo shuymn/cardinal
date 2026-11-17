@@ -1,9 +1,8 @@
 //! Shared test helpers. Each integration test crate declares `mod support;` and uses the
-//! parts it needs.
+//! parts it needs. Processes start and git runs only through `cardinal_test_support`
+//! (`docs/architecture.md` section 13.3); these modules build on it.
 //!
-//! - [`fixture`]: git fixtures, the only way tests run git (`docs/architecture.md` section 13.3).
-//! - [`helper`]: helper processes started by re-running the test binary, and guards that kill
-//!   what a test started.
+//! - [`helper`]: helper processes started by re-running the test binary.
 //! - [`cardinal`]: the `cardinal` binary with its own state and config directories.
 //! - [`testpoints`]: driving the pause points of `cardinal::testpoint`.
 
@@ -13,6 +12,5 @@
 )]
 
 pub mod cardinal;
-pub mod fixture;
 pub mod helper;
 pub mod testpoints;
