@@ -3,8 +3,8 @@
 //! leaves the target's contents, the worktree's `.git`, Git's administrative data for the
 //! worktree, and the plan unclaimed and unchanged.
 //!
-//! Each `act` runs in its own process: the helper, which reaches observation through the fake
-//! until the integration gate wires it into the binary, and the `cardinal` binary itself.
+//! Each `act` runs in its own process: the helper, which observes through the fake, and the
+//! `cardinal` binary itself, which observes the fixture through git.
 
 mod fakes;
 mod support;
@@ -142,7 +142,14 @@ fn repeated_act_changes_nothing() {
                 before.assert_unchanged(&s, &wt, &plan.id, &case);
             }
 
-            // The binary observes through the real sources, which refuse until the gate.
+            // The binary observes the fixture itself, through git. The branch was pushed to a
+            // path, not to a remote, so the worktree has no upstream and counts as unpushed:
+            // a worktree plan is refused for both, whatever the approval, and a directory plan
+            // reports as it does through the fake.
+            let (code, status) = match kind {
+                PlanKind::ReclaimDir => (0, "dry_run"),
+                PlanKind::ReclaimWorktree => (3, "rejected"),
+            };
             fakes::assert_plans_inside(s.fx.root(), &s.state, &plan.id);
             for _ in 0..2 {
                 let mut cardinal = s.cardinal();
@@ -150,10 +157,20 @@ fn repeated_act_changes_nothing() {
                 if owner_approved {
                     cardinal.arg("--owner-approved");
                 }
-                let assert = cardinal.assert().code(3);
+                let assert = cardinal.assert().code(code);
                 let doc: serde_json::Value =
                     serde_json::from_slice(&assert.get_output().stdout).unwrap();
-                assert_eq!(doc["status"], "rejected", "{case}: {doc:#}");
+                assert_eq!(doc["status"], status, "{case}: {doc:#}");
+                if kind == PlanKind::ReclaimWorktree {
+                    for check in ["no_unpushed", "has_upstream"] {
+                        assert!(
+                            doc["reasons"]
+                                .as_array()
+                                .is_some_and(|reasons| reasons.iter().any(|r| r == check)),
+                            "{case}: refused for {check}: {doc:#}"
+                        );
+                    }
+                }
                 before.assert_unchanged(&s, &wt, &plan.id, &case);
             }
         }

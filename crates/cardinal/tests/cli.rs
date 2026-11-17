@@ -66,11 +66,8 @@ fn unimplemented_commands_answer_not_implemented_with_exit_1() {
     let dirs = Dirs::new();
     // Commands with written bodies are tested with their modules (`tests/act_single.rs`,
     // `tests/inbox.rs`, `tests/explain.rs`, and `tests/plan_act.rs`, which runs `plan` only
-    // on a fixture repository); these still wait for the modules they call.
-    let commands: &[&[&str]] = &[
-        &["inbox"],
-        &["explain", "command", "--cwd", "/w", "--", "pnpm test"],
-    ];
+    // on a fixture repository); this one still waits for the classifier it calls.
+    let commands: &[&[&str]] = &[&["explain", "command", "--cwd", "/w", "--", "pnpm test"]];
     for args in commands {
         let assert = dirs.cmd().args(*args).assert().code(1);
         let output = assert.get_output();

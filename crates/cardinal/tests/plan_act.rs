@@ -669,8 +669,9 @@ fn plan_is_stored_and_recorded() {
     );
 }
 
-/// Through the binary, only on the fixture repository: `plan --repo` answers
-/// `not_implemented` until observation is wired in (`docs/architecture.md` section 14.1).
+/// Through the binary, only on the fixture repository: `plan --repo` observes it through git,
+/// and its main worktree alone, which is never reclaimed and holds no ignored data, gets no
+/// plan.
 #[test]
 fn cli_plan_on_a_fixture_repo() {
     let s = Setup::new();
@@ -679,7 +680,9 @@ fn cli_plan_on_a_fixture_repo() {
         .cardinal()
         .args(["plan", "--repo", &main])
         .assert()
-        .code(1);
+        .code(0);
     let doc: serde_json::Value = serde_json::from_slice(&assert.get_output().stdout).unwrap();
-    assert_eq!(doc["error"]["code"], "not_implemented");
+    assert_eq!(doc["schema"], "cardinal.plan-list.v1", "{doc:#}");
+    assert_eq!(doc["plans"], serde_json::json!([]), "{doc:#}");
+    assert_eq!(doc["errors"], serde_json::json!([]), "{doc:#}");
 }
