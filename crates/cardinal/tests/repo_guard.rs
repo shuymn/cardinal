@@ -19,8 +19,18 @@ fn guard_with(
     repo: &Path,
     file: Option<&Path>,
 ) -> Output {
+    guard_args(fixture, env, &[mode], repo, file)
+}
+
+fn guard_args(
+    fixture: &Fixture,
+    env: &[(&str, &str)],
+    args: &[&str],
+    repo: &Path,
+    file: Option<&Path>,
+) -> Output {
     let mut command = fixture.command("bash", fixture.root());
-    command.arg(script()).arg(mode).arg(repo);
+    command.arg(script()).args(args).arg(repo);
     if let Some(file) = file {
         command.arg(file);
     }
@@ -254,6 +264,169 @@ fn worktree_git_dir_files_are_detected() {
     let git_dir = fixture.path("repo/.git/worktrees/wt");
     std::fs::write(git_dir.join("config.worktree"), "[cardinal]\n\tx = y\n").unwrap();
     assert!(!guard(&fixture, "verify", &wt, &file).status.success());
+}
+
+/// With `--checkout`, a test that writes into the checkout through a relative path changes
+/// what the guard sees.
+#[test]
+fn checkout_change_is_detected_with_checkout() {
+    for (name, mutate) in [
+        ("an overwritten tracked file", "a.txt"),
+        ("a new untracked file", "new.txt"),
+    ] {
+        let fixture = Fixture::new();
+        let repo = fixture.init("repo");
+        fixture.commit_file(&repo, "a.txt", "a\n", "first");
+        let file = fixture.path("snapshot");
+        let snapshot = ["snapshot", "--checkout"];
+        assert_ok(&guard_args(&fixture, &[], &snapshot, &repo, Some(&file)));
+        std::fs::write(repo.join(mutate), "escaped\n").unwrap();
+        let verify = ["verify", "--checkout"];
+        let output = guard_args(&fixture, &[], &verify, &repo, Some(&file));
+        assert!(!output.status.success(), "{name} was not detected");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(mutate), "{name}: {stderr}");
+    }
+}
+
+/// A file that already differs from HEAD before the snapshot is compared by content.
+#[test]
+fn checkout_change_to_a_modified_file_is_detected() {
+    let fixture = Fixture::new();
+    let repo = fixture.init("repo");
+    fixture.commit_file(&repo, "a.txt", "a\n", "first");
+    std::fs::write(repo.join("a.txt"), "edited before the run\n").unwrap();
+    let file = fixture.path("snapshot");
+    assert_ok(&guard_args(
+        &fixture,
+        &[],
+        &["snapshot", "--checkout"],
+        &repo,
+        Some(&file),
+    ));
+    std::fs::write(repo.join("a.txt"), "edited during the run\n").unwrap();
+    let output = guard_args(&fixture, &[], &["verify", "--checkout"], &repo, Some(&file));
+    assert!(!output.status.success(), "a second edit was not detected");
+}
+
+/// Locally and confined, the checkout is the developer's to edit while the tests run; in CI
+/// it is compared without `--checkout`.
+#[test]
+fn checkout_is_compared_in_ci_only_without_checkout() {
+    for (env, detected) in [(&[][..], false), (&[("CI", "true")][..], true)] {
+        let fixture = Fixture::new();
+        let repo = fixture.init("repo");
+        fixture.commit_file(&repo, "a.txt", "a\n", "first");
+        let file = fixture.path("snapshot");
+        assert_ok(&guard_with(&fixture, env, "snapshot", &repo, Some(&file)));
+        std::fs::write(repo.join("a.txt"), "escaped\n").unwrap();
+        let output = guard_with(&fixture, env, "verify", &repo, Some(&file));
+        assert_eq!(!output.status.success(), detected, "{env:?}");
+    }
+}
+
+/// Appends `text` to a file.
+fn append(path: &Path, text: &str) {
+    let mut contents = std::fs::read_to_string(path).unwrap_or_default();
+    contents.push_str(text);
+    std::fs::write(path, contents).unwrap();
+}
+
+/// Outside the git dir, so only the include graph leads to them; git resolves the nested
+/// relative path against the including file.
+#[test]
+fn nested_included_config_is_detected() {
+    let fixture = Fixture::new();
+    let repo = fixture.init("repo");
+    let includes = fixture.path("includes");
+    std::fs::create_dir_all(&includes).unwrap();
+    let first = includes.join("a.config");
+    append(
+        &repo.join(".git/config"),
+        &format!(
+            "[include]\n\tpath = {}\n",
+            first.to_string_lossy().replace('\\', "/")
+        ),
+    );
+    std::fs::write(&first, "[include]\n\tpath = b.config\n").unwrap();
+    let nested = includes.join("b.config");
+    std::fs::write(&nested, "[cardinal]\n\tnested = 1\n").unwrap();
+    let file = fixture.path("snapshot");
+    assert_ok(&guard(&fixture, "snapshot", &repo, &file));
+    // A comment changes no entry; the file's content still counts.
+    append(&nested, "# changed\n");
+    assert!(
+        !guard(&fixture, "verify", &repo, &file).status.success(),
+        "a change in a nested included config file was not detected"
+    );
+}
+
+#[test]
+fn hooks_path_set_through_an_include_is_detected() {
+    let fixture = Fixture::new();
+    let repo = fixture.init("repo");
+    let hooks = fixture.path("hooks-elsewhere");
+    std::fs::create_dir_all(&hooks).unwrap();
+    append(
+        &repo.join(".git/config"),
+        "[include]\n\tpath = hooks.config\n",
+    );
+    std::fs::write(
+        repo.join(".git/hooks.config"),
+        format!(
+            "[core]\n\thooksPath = {}\n",
+            hooks.to_string_lossy().replace('\\', "/")
+        ),
+    )
+    .unwrap();
+    let file = fixture.path("snapshot");
+    assert_ok(&guard(&fixture, "snapshot", &repo, &file));
+    std::fs::write(hooks.join("pre-commit"), "#!/bin/sh\n").unwrap();
+    assert!(
+        !guard(&fixture, "verify", &repo, &file).status.success(),
+        "a hook in the directory an included core.hooksPath names was not detected"
+    );
+}
+
+/// A relative `core.hooksPath` is relative to the worktree the hooks run in.
+#[test]
+fn worktree_relative_hooks_path_is_detected() {
+    let (fixture, repo, _) = snapshotted();
+    append(
+        &repo.join(".git/config"),
+        "[core]\n\thooksPath = githooks\n",
+    );
+    let wt = fixture.path("wt");
+    let file = fixture.path("wt-snapshot");
+    assert_ok(&guard(&fixture, "snapshot", &wt, &file));
+    std::fs::create_dir_all(wt.join("githooks")).unwrap();
+    std::fs::write(wt.join("githooks/pre-commit"), "#!/bin/sh\n").unwrap();
+    assert!(
+        !guard(&fixture, "verify", &wt, &file).status.success(),
+        "a hook in the worktree's relative core.hooksPath was not detected"
+    );
+}
+
+/// The reflog of the branch a worktree has checked out counts; another worktree's does not.
+#[test]
+fn reflog_of_the_checked_out_branch_is_detected() {
+    let (fixture, repo, file) = snapshotted();
+    std::fs::write(repo.join(".git/logs/refs/heads/feature"), "").unwrap();
+    assert_ok(&guard(&fixture, "verify", &repo, &file));
+    std::fs::write(repo.join(".git/logs/refs/heads/main"), "").unwrap();
+    assert!(
+        !guard(&fixture, "verify", &repo, &file).status.success(),
+        "the main worktree's branch reflog was not detected"
+    );
+
+    let wt = fixture.path("wt");
+    let wt_file = fixture.path("wt-snapshot");
+    assert_ok(&guard(&fixture, "snapshot", &wt, &wt_file));
+    std::fs::write(repo.join(".git/logs/refs/heads/feature"), "rewritten\n").unwrap();
+    assert!(
+        !guard(&fixture, "verify", &wt, &wt_file).status.success(),
+        "the linked worktree's branch reflog was not detected"
+    );
 }
 
 #[test]

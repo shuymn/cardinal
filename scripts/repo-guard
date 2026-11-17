@@ -2,9 +2,11 @@
 # Records or checks the state of a git worktree and its repository, so a test run that
 # writes to the repository it runs in fails (docs/architecture.md section 13.4).
 #
-#   scripts/repo-guard snapshot <worktree> <file>   write the state to <file>
-#   scripts/repo-guard verify <worktree> <file>     fail if the state no longer matches <file>
-#   scripts/repo-guard identify <worktree>          print which repository the guard inspects
+#   scripts/repo-guard snapshot [--checkout] <worktree> <file>   write the state to <file>
+#   scripts/repo-guard verify [--checkout] <worktree> <file>     fail if the state no longer
+#                                                                matches <file>
+#   scripts/repo-guard identify <worktree>                       print which repository the
+#                                                                guard inspects
 #
 # The guard starts over in a constructed environment before bash reads any startup file, so
 # no inherited GIT_DIR, GIT_WORK_TREE, GIT_INDEX_FILE, GIT_CONFIG_*, GIT_TRACE*, or BASH_ENV
@@ -14,11 +16,18 @@
 # The state is a manifest of files, walked without following symbolic links (type, mode,
 # size, and checksum, or the target of a link), plus what git reports:
 #
-# - the common git dir's `config` (as entries), the config files it includes, `hooks/` (or
-#   the directory `core.hooksPath` names), `info/`, `packed-refs`, the stash list, the refs
-#   with HEAD, the worktree list, and each `worktrees/<name>/gitdir`;
+# - every config entry git sees in the worktree (the common `config`, `config.worktree`, and
+#   the files they include, as git resolves them) with the file it comes from, and the
+#   content of each such file but the common `config`;
+# - the hooks directory git resolves (`core.hooksPath` from wherever it is set, relative to
+#   the worktree, or `hooks/`), `info/`, `packed-refs`, the stash list, the refs with HEAD,
+#   the worktree list, and each `worktrees/<name>/gitdir`;
 # - this worktree's git dir: HEAD, index, `sharedindex.*`, `config.worktree`, logs, and any
-#   other file in it, sockets included (an fsmonitor daemon's).
+#   other file in it, sockets included (an fsmonitor daemon's), and the reflog of the branch
+#   it has checked out;
+# - with --checkout or CI=true, the checkout's files as git status sees them: each tracked
+#   file that differs from the index or HEAD and each untracked file git does not ignore,
+#   with its content.
 #
 # Other worktrees of the same repository change legitimately while the tests run, so by
 # default their work is left out: the branches they have checked out (refs, remote-tracking
@@ -29,14 +38,15 @@
 
 # POSIX prelude: re-run under bash in a constructed environment. `sh` reads no startup file
 # when it runs a script; `bash --noprofile --norc` with BASH_ENV unset reads none either.
-# PATH finds git; CI selects the mode; TMPDIR (and on Windows TEMP and TMP) keeps temporary
-# files where the caller wants them; on Windows, what programs need to start
+# PATH finds git; CI selects the mode; HOME lets git expand `~/` in the repository's config
+# as it does for the caller (no global config is read); TMPDIR (and on Windows TEMP and TMP)
+# keeps temporary files where the caller wants them; on Windows, what programs need to start
 # (scripts/clean-env.sh).
 if [ "${1-}" != --clean-env ]; then
   TMPDIR=${TMPDIR:-/tmp}
   export TMPDIR
   . "$(dirname "$0")/clean-env.sh"
-  clean_exec 'PATH CI TMPDIR TEMP TMP' bash --noprofile --norc "$0" --clean-env "$@"
+  clean_exec 'PATH CI HOME TMPDIR TEMP TMP' bash --noprofile --norc "$0" --clean-env "$@"
 fi
 shift
 
@@ -46,7 +56,7 @@ export LC_ALL=C GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_P
   GIT_OPTIONAL_LOCKS=0
 
 usage() {
-  echo "usage: $0 snapshot|verify <worktree> <file> | identify <worktree>" >&2
+  echo "usage: $0 snapshot|verify [--checkout] <worktree> <file> | identify <worktree>" >&2
   exit 2
 }
 
@@ -56,16 +66,27 @@ die() {
 }
 
 mode=${1-}
+shift || usage
+checkout=no
 case $mode in
-  snapshot | verify) [ "$#" -eq 3 ] || usage ;;
-  identify) [ "$#" -eq 2 ] || usage ;;
+  snapshot | verify)
+    if [ "${1-}" = --checkout ]; then
+      checkout=yes
+      shift
+    fi
+    [ "$#" -eq 2 ] || usage
+    ;;
+  identify) [ "$#" -eq 1 ] || usage ;;
   *) usage ;;
 esac
-[ -d "$2" ] || die "$2 is not a directory"
-top=$(cd "$2" && pwd -P)
-file=${3-}
+[ -d "$1" ] || die "$1 is not a directory"
+top=$(cd "$1" && pwd -P)
+file=${2-}
 strict=no
-[ "${CI-}" = true ] && strict=yes
+if [ "${CI-}" = true ]; then
+  strict=yes
+  checkout=yes
+fi
 
 g() {
   git -C "$top" -c safe.directory='*' -c core.fsmonitor=false "$@"
@@ -139,10 +160,14 @@ manifest() {
   ) | sort
 }
 
-# The checksum and size of one file, or `missing`.
+# The checksum and size of one file, the target of a link, or `missing`.
 content() {
-  if [ -f "$1" ]; then
+  if [ -L "$1" ]; then
+    printf -- '-> %s\n' "$(readlink "$1")"
+  elif [ -f "$1" ]; then
     cksum <"$1"
+  elif [ -e "$1" ]; then
+    echo "not a file"
   else
     echo "missing"
   fi
@@ -216,40 +241,40 @@ state() {
   done
 
   echo "## config"
-  # With -z each entry is the key, a newline, and the value, ended by NUL, so the branch
-  # name in a `branch.<name>.<var>` key is everything between `branch.` and the last dot,
-  # even when the name itself contains dots. Entries print as `key=value`.
-  { g config --file "$common/config" --list -z || [ "$?" -eq 1 ]; } |
-    while IFS= read -r -d '' entry; do
-      key=${entry%%"$nl"*}
-      case $key in
-        branch.*.*)
-          name=${key#branch.}
-          name=${name%.*}
-          case "$nl$other_names$nl" in *"$nl$name$nl"*) continue ;; esac
-          ;;
-      esac
-      printf '%s\n' "${entry/"$nl"/=}"
-    done
+  # Every entry git reads in this worktree, includes resolved by git itself, as
+  # `origin key=value`; the guard's own `-c` entries are left out. With -z each entry is the
+  # origin and NUL, then the key, a newline, and the value, ended by NUL, so the branch name
+  # in a `branch.<name>.<var>` key is everything between `branch.` and the last dot, even
+  # when the name itself contains dots.
+  local config origin entry key name path
+  config=$({ g config --list --show-origin --includes -z || [ "$?" -eq 1 ]; } | tr '\0' '\1')
+  printf '%s' "$config" | while IFS= read -r -d $'\1' origin && IFS= read -r -d $'\1' entry; do
+    [ "$origin" != "command line:" ] || continue
+    key=${entry%%"$nl"*}
+    case $key in
+      branch.*.*)
+        name=${key#branch.}
+        name=${name%.*}
+        case "$nl$other_names$nl" in *"$nl$name$nl"*) continue ;; esac
+        ;;
+    esac
+    printf '%s %s\n' "$origin" "${entry/"$nl"/=}"
+  done
 
-  echo "## included config files"
-  { g config --file "$common/config" --get-regexp '^include(if\..*)?\.path$' || [ "$?" -eq 1 ]; } |
-    while read -r _ path; do
-      case $path in
-        /*) ;;
-        "~/"*) path="(home)/${path#\~/}" ;;
-        *) path=$common/$path ;;
-      esac
+  echo "## config files"
+  # Comments and empty sections too. The common config is left out: other worktrees change
+  # it, and its entries are above.
+  printf '%s' "$config" | awk -v RS=$'\1' 'NR % 2 == 1 && sub(/^file:/, "")' | sort -u |
+    while IFS= read -r path; do
+      case $path in /*) ;; *) path=$top/$path ;; esac
+      [ "$(canonical "$(dirname "$path")")/$(basename "$path")" != "$common/config" ] || continue
       printf '%s %s\n' "$path" "$(content "$path")"
     done
 
   echo "## hooks"
   local hooks
-  hooks=$(g config --file "$common/config" --get core.hooksPath || echo hooks)
-  case $hooks in
-    /*) ;;
-    *) hooks=$common/$hooks ;;
-  esac
+  # Where git runs hooks from: `core.hooksPath` wherever it is set, relative to the worktree.
+  hooks=$(g rev-parse --path-format=absolute --git-path hooks)
   echo "$hooks"
   manifest "$hooks" content
 
@@ -267,6 +292,37 @@ state() {
     manifest "$gitdir/logs" content ./refs
   else
     manifest "$gitdir" content
+  fi
+
+  echo "## reflog of the checked-out branch"
+  local branch
+  if branch=$(g symbolic-ref -q HEAD); then
+    printf '%s %s\n' "$branch" "$(content "$common/logs/$branch")"
+  else
+    echo "(detached)"
+  fi
+
+  if [ "$checkout" = yes ]; then
+    echo "## checkout"
+    # git status --porcelain=v2 -z: an entry of type 1 has 8 fields before the path, 2 has 9
+    # and the original path after the next NUL, u has 10, ? has 1.
+    local fields orig
+    g status --porcelain=v2 -z --untracked-files=all | while IFS= read -r -d '' entry; do
+      case $entry in
+        "1 "*) fields=8 ;;
+        "2 "*) fields=9 ;;
+        "u "*) fields=10 ;;
+        "? "*) fields=1 ;;
+        *) continue ;;
+      esac
+      path=$entry
+      while [ "$fields" -gt 0 ]; do
+        path=${path#* }
+        fields=$((fields - 1))
+      done
+      case $entry in "2 "*) IFS= read -r -d '' orig ;; esac
+      printf '%s %s\n' "$entry" "$(content "$top/$path")"
+    done
   fi
 
   if [ "$strict" = yes ]; then

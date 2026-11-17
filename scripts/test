@@ -423,11 +423,16 @@ cargo nextest archive --workspace --locked --archive-file "$R/tests.tar.zst"
 
 check_sweep
 setup_confinement
+# The checkout's files are compared only where nothing stops a test from writing them: in CI,
+# and when the tests run unconfined. Locally a confined test cannot write there, while the
+# developer may edit files during the run.
+checkout=
+[ -n "$runner" ] || checkout=--checkout
 snapshot=$R/repo.snapshot
-scripts/repo-guard snapshot "$root" "$snapshot"
+scripts/repo-guard snapshot $checkout "$root" "$snapshot"
 
 status=0
 run_archive "$R/tests.tar.zst" "$root" || status=$?
 sweep || status=1
-scripts/repo-guard verify "$root" "$snapshot" || status=1
+scripts/repo-guard verify $checkout "$root" "$snapshot" || status=1
 exit "$status"
