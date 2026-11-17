@@ -15,7 +15,8 @@ use std::ffi::{OsStr, OsString};
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 use std::process::{ChildStderr, ChildStdin, ChildStdout, ExitStatus, Output, Stdio};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, mpsc};
+use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 
@@ -453,6 +454,44 @@ impl Command {
     /// Runs the child to completion with stdin closed and stdout and stderr captured, unless
     /// set otherwise.
     pub fn output(&mut self) -> io::Result<Output> {
+        self.capture();
+        self.spawn()?.wait_with_output()
+    }
+
+    /// [`Command::output`] with one deadline, `limit` from now, for the child to exit and for
+    /// its output to end. A child still running then is killed as [`Child::kill`] kills it;
+    /// either way the result is a [`io::ErrorKind::TimedOut`] error. Output that a process
+    /// outside the child's group or job holds open is left to the process that holds it.
+    pub fn output_within(&mut self, limit: Duration) -> io::Result<Output> {
+        let deadline = Instant::now() + limit;
+        self.capture();
+        let mut child = self.spawn()?;
+        drop(child.stdin.take());
+        let readers = Readers::start(child.stdout.take(), child.stderr.take());
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                child.kill();
+                return Err(timed_out(&format!(
+                    "the child did not exit within {limit:?}"
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let (stdout, stderr) = readers.collect(Some(deadline))?.ok_or_else(|| {
+            timed_out(&format!("the child's output did not end within {limit:?}"))
+        })?;
+        Ok(Output {
+            status,
+            stdout,
+            stderr,
+        })
+    }
+
+    /// Stdin closed and stdout and stderr piped, unless set otherwise.
+    fn capture(&mut self) {
         if !self.stdin_set {
             self.inner.stdin(Stdio::null());
         }
@@ -462,7 +501,6 @@ impl Command {
         if !self.stderr_set {
             self.inner.stderr(Stdio::piped());
         }
-        self.spawn()?.wait_with_output()
     }
 
     /// Runs the child to completion and returns its status.
@@ -594,36 +632,74 @@ impl Child {
     /// Waits as [`Child::wait`] and collects the piped stdout and stderr.
     pub fn wait_with_output(mut self) -> io::Result<Output> {
         drop(self.stdin.take());
-        let read = |pipe: Option<Box<dyn Read + Send>>| {
-            std::thread::spawn(move || {
-                let mut buf = Vec::new();
-                if let Some(mut pipe) = pipe {
-                    pipe.read_to_end(&mut buf).map(|_| buf)
-                } else {
-                    Ok(buf)
-                }
-            })
-        };
-        let stdout = read(
-            self.stdout
-                .take()
-                .map(|p| Box::new(p) as Box<dyn Read + Send>),
-        );
-        let stderr = read(
-            self.stderr
-                .take()
-                .map(|p| Box::new(p) as Box<dyn Read + Send>),
-        );
+        let readers = Readers::start(self.stdout.take(), self.stderr.take());
         let status = self.wait()?;
-        let join = |handle: std::thread::JoinHandle<io::Result<Vec<u8>>>| {
-            handle.join().expect("pipe reader panicked")
-        };
+        let (stdout, stderr) = readers
+            .collect(None)?
+            .expect("without a deadline the readers finish");
         Ok(Output {
             status,
-            stdout: join(stdout)?,
-            stderr: join(stderr)?,
+            stdout,
+            stderr,
         })
     }
+}
+
+/// A child's piped stdout and stderr, each read to its end on a thread of its own.
+struct Readers {
+    stdout: mpsc::Receiver<io::Result<Vec<u8>>>,
+    stderr: mpsc::Receiver<io::Result<Vec<u8>>>,
+}
+
+impl Readers {
+    fn start(stdout: Option<ChildStdout>, stderr: Option<ChildStderr>) -> Self {
+        Self {
+            stdout: read_to_end(stdout),
+            stderr: read_to_end(stderr),
+        }
+    }
+
+    /// Both outputs once they end, or `None` if one has not ended by `deadline`. A reader left
+    /// waiting finishes when its pipe closes.
+    fn collect(self, deadline: Option<Instant>) -> io::Result<Option<(Vec<u8>, Vec<u8>)>> {
+        let receive = |rx: &mpsc::Receiver<io::Result<Vec<u8>>>| {
+            let result = match deadline {
+                None => rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+                Some(deadline) => {
+                    rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                }
+            };
+            match result {
+                Ok(read) => read.map(Some),
+                Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    Err(io::Error::other("a pipe reader ended without its result"))
+                }
+            }
+        };
+        let (Some(stdout), Some(stderr)) = (receive(&self.stdout)?, receive(&self.stderr)?) else {
+            return Ok(None);
+        };
+        Ok(Some((stdout, stderr)))
+    }
+}
+
+/// Reads `pipe` to its end on a new thread; no pipe reads as empty.
+fn read_to_end(pipe: Option<impl Read + Send + 'static>) -> mpsc::Receiver<io::Result<Vec<u8>>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let read = match pipe {
+            Some(mut pipe) => pipe.read_to_end(&mut buf).map(|_| buf),
+            None => Ok(buf),
+        };
+        let _ = tx.send(read);
+    });
+    rx
+}
+
+fn timed_out(what: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::TimedOut, what)
 }
 
 impl Drop for Child {
@@ -909,7 +985,46 @@ fn canonical_prefix(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::io;
+    #[cfg(unix)]
+    use std::time::{Duration, Instant};
+
     use super::Scope;
+
+    /// A child that has not exited by the deadline is killed, and the result says so.
+    #[cfg(unix)]
+    #[test]
+    fn output_within_kills_a_child_that_runs_on() {
+        let scope = Scope::new();
+        let mut command = scope.command("sleep", scope.root());
+        command.arg("30");
+        let started = Instant::now();
+        let err = command
+            .output_within(Duration::from_millis(300))
+            .expect_err("the child runs on");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// Output that a process outside the child's cleanup holds open ends the wait at the
+    /// deadline: the joined shell is cleaned up alone, and its background `sleep` keeps stdout.
+    #[cfg(unix)]
+    #[test]
+    fn output_within_stops_at_output_held_by_another_process() {
+        let scope = Scope::new();
+        let mut leader = scope.command("sleep", scope.root());
+        leader.arg("30");
+        let leader = leader.spawn().expect("start the group's leader");
+        let mut command = scope.shell("sleep 30 & echo started", scope.root());
+        command.join_group(&leader);
+        let started = Instant::now();
+        let err = command
+            .output_within(Duration::from_millis(500))
+            .expect_err("the output stays open");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
 
     /// A second kill leaves the reaped child's status in place for `wait`.
     #[test]

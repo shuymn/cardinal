@@ -353,33 +353,10 @@ pub fn spec(cpu: u64, timeout_ms: u64) -> RunSpec {
     }
 }
 
-/// Runs `command` to completion with captured output, panicking after [`WAIT`] (the child is
-/// then cleaned up as it is dropped).
+/// Runs `command` to completion with captured output, panicking when it has not exited and
+/// closed its output within [`WAIT`] (it is killed then).
 pub fn output(command: &mut Command) -> Output {
-    let mut child = command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("start");
-    let read = |pipe: Option<Box<dyn std::io::Read + Send>>| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            if let Some(mut pipe) = pipe {
-                pipe.read_to_end(&mut buf).expect("read the child's output");
-            }
-            buf
-        })
-    };
-    let stdout = read(child.stdout.take().map(|p| Box::new(p) as _));
-    let stderr = read(child.stderr.take().map(|p| Box::new(p) as _));
-    let status = wait_for("the command to finish", WAIT, || {
-        child.try_wait().expect("wait")
-    });
-    Output {
-        status,
-        stdout: stdout.join().expect("stdout reader"),
-        stderr: stderr.join().expect("stderr reader"),
-    }
+    command.output_within(WAIT).expect("run the command")
 }
 
 /// Waits until `pid` is no longer alive with `start_s`.
