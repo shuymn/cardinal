@@ -119,6 +119,23 @@ fn pushes_and_upstreams_of_other_worktrees_are_ignored() {
 }
 
 #[test]
+fn config_of_a_branch_whose_name_extends_another_worktrees_branch_is_detected() {
+    // The linked worktree has `feature` checked out; `feature.fix` is a different branch.
+    let (fixture, repo, file) = snapshotted();
+    fixture.git(&repo, &["config", "branch.feature.note", "x"]);
+    let output = guard(&fixture, "verify", &repo, &file);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fixture.git(&repo, &["config", "branch.feature.fix.note", "x"]);
+    let output = guard(&fixture, "verify", &repo, &file);
+    assert!(!output.status.success(), "branch.feature.fix was ignored");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("branch.feature.fix.note=x"));
+}
+
+#[test]
 fn new_ref_is_detected() {
     assert_detected("a new branch", |fixture, repo| {
         fixture.git(repo, &["branch", "other"]);
