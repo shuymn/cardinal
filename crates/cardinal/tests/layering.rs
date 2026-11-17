@@ -89,6 +89,7 @@ const PLATFORM_CRATES: &[(&str, &[&str])] = &[
     ("sysinfo", &["os"]),
     ("signal_hook", &["os"]),
     ("rustix", &["os", "act"]),
+    ("windows_sys", &["os"]),
 ];
 
 /// Parts of `std` a module may not use: admission neither talks to the network nor starts

@@ -77,6 +77,7 @@ fn child_identity_cwd_and_death() {
         "another start time is another process"
     );
 
+    // On Windows the guard still holds a handle to the killed child, which keeps it listed.
     child.kill();
     assert!(!os::is_alive(pid, info.start_s));
     assert_eq!(os::start_time_s(pid), None);

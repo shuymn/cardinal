@@ -63,7 +63,7 @@ Everything lives in the single crate `crates/cardinal` (library plus the `cardin
 | `state` | State paths, atomic writes, lock helpers with deadlines, IDs and keys, JSONL append and read | `contract` |
 | `record` | Record appending, rotation, reading | `state`, `contract` |
 | `testpoint` | Pause points and failure injection for tests ([section 13.1](#131-deterministic-concurrency)) | std |
-| `os` | Platform backends behind one API: process table, start times, parent PID, process working directories, boot time; process-group setup and signals (Unix) | std, rustix, signal-hook, sysinfo |
+| `os` | Platform backends behind one API: process table, start times, parent PID, process working directories, boot time; process-group setup and signals (Unix) | std, rustix, signal-hook, sysinfo, windows-sys |
 | `sensor` | Phase 2 seam: `Sensors` trait, `Unavailable` implementation | `contract` |
 | `exec` | `Invocation` (argv; cwd and env by inheritance), `Placement::Local`, `Executor` trait, local executor | `os`, `contract` |
 | `admission` | Budget math (pure), reservation store, liveness and the recovery pass, worktree in-use query | `state`, `config`, `os`, `sensor`, `record`, `contract` |
@@ -884,7 +884,7 @@ These names are reserved and not registered in phase 0 (an unregistered command 
 | `base64` | Use | `--spec-b64` encoding |
 | `thiserror` | Use | Typed errors where callers branch (before or after the start boundary, config vs state) |
 | `dunce` | Use | Canonical Windows paths without `\\?\`, so they compare equal to paths from git |
-| `windows-sys` | Skip (phase 3) | Job Object FFI; preferred over `windows` (design candidate) for its smaller compile |
+| `windows-sys` (`Win32_Foundation`, `Win32_System_Threading`) | Use (Windows) | Telling an exited process from a running one: Windows lists an exited process until its last handle closes, and sysinfo reports every Windows process as running. Job Object FFI follows in phase 3. Preferred over `windows` (design candidate) for its smaller compile |
 | `fs4` | Skip | std has file locks since Rust 1.89 with the same `flock`/`LockFileEx` semantics; the reserve file is written with zeros |
 | `jobserver` | Skip (phase 2) | Only needed when cardinal shares a jobserver with Cargo |
 | `anyhow` | Skip | Typed errors are needed for JSON error codes anyway |

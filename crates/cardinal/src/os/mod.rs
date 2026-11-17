@@ -4,7 +4,12 @@
 //! Process-group setup and signals (Unix) live in `os/unix.rs`, owned by the runner work unit.
 //!
 //! A process is identified by its PID and start time (`start_s`, Unix seconds as the OS
-//! reports it), so a reused PID never passes for the original process.
+//! reports it), so a reused PID never passes for the original process. A process that has
+//! exited is not alive even while the OS still lists it: a zombie on Unix, a process kept by
+//! an open handle on Windows.
+
+#[cfg(windows)]
+mod windows;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -22,7 +27,8 @@ pub struct ProcessInfo {
     pub cmd: Vec<String>,
     /// The working directory, if requested and readable.
     pub cwd: Option<PathBuf>,
-    /// Exited but not yet reaped. A zombie is not alive.
+    /// Exited but still listed: not yet reaped (Unix), or kept by an open handle (Windows).
+    /// A zombie is not alive.
     pub zombie: bool,
 }
 
@@ -95,7 +101,7 @@ fn convert(pid: Pid, process: &sysinfo::Process) -> Option<ProcessInfo> {
         zombie: matches!(
             process.status(),
             ProcessStatus::Zombie | ProcessStatus::Dead
-        ),
+        ) || exited(pid.as_u32()),
     })
 }
 
@@ -189,6 +195,18 @@ impl ProcessTable {
         }
         found
     }
+}
+
+/// Whether a listed process has exited although its status says otherwise: sysinfo reports
+/// every Windows process as running.
+#[cfg(windows)]
+fn exited(pid: u32) -> bool {
+    windows::has_exited(pid)
+}
+
+#[cfg(not(windows))]
+fn exited(_pid: u32) -> bool {
+    false
 }
 
 /// Reads one process. `None` if it does not exist or cannot be read.
