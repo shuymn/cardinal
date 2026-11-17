@@ -1195,3 +1195,73 @@ fn caller_changing_builtins_refuse_the_command() {
         );
     }
 }
+
+/// Builtins, assignments, and words that can write the shells' tables of functions, aliases,
+/// command paths, or options, or a name that is not a plain identifier (a subscript is
+/// arithmetic, which can assign anything), refuse the whole command; the same builtins with
+/// plain names, and table names that are not elements, do not.
+#[test]
+fn table_writers_refuse_the_command() {
+    for command in [
+        "printf -v 'functions[probe]' 'cd sub'",
+        "printf -vfunctions x",
+        "printf \"$fmt\" \"$name\" x",
+        "print -v 'functions[probe]' x",
+        "print -u 2 -v \"$n\" x",
+        "read 'functions[probe]' < defs",
+        "read -A functions",
+        "read \"$name\"",
+        "getopts ab 'aliases[x]'",
+        "emulate zsh -c 'probe() { cd sub; }'",
+        "emulate -c x",
+        "emulate sh -o xtrace",
+        "emulate \"$mode\"",
+        "set -A functions probe 'cd sub'",
+        "typeset -- 'functions[probe]=cd sub'",
+        "typeset 'x[1]'",
+        "declare 'x[1]'=v",
+        "local functions",
+        "declare -n r='BASH_ALIASES[probe]'",
+        "let 'a[1]=2'",
+        "let \"$expr\"",
+        "mapfile -C cb lines < f",
+        "readarray lines < f",
+        "vared x",
+        "zparseopts -A opts a",
+        "arr[i]=x make",
+        "arr[functions[probe]=1]=x",
+        "printf '%d' 'functions[probe]=0'",
+        "shift 'functions[probe]=0'",
+        "integer n=\"aliases[x]\"",
+        "echo a && return BASH_ALIASES[x]=1",
+    ] {
+        assert!(
+            matches!(tokenize(command), Err(Refusal::ChangesShell(_))),
+            "{command:?}: {:?}",
+            tokenize(command)
+        );
+    }
+    for command in [
+        "printf '%s\\n' \"$x\" \"$y\"",
+        "printf -v out '%s' x",
+        "printf -- -v x",
+        "print -rn -- x",
+        "print -u2 -v out x",
+        "read -r line",
+        "read -r 'line?Prompt: '",
+        "getopts ab: opt",
+        "emulate",
+        "emulate -L zsh",
+        "emulate -LR sh",
+        "set -A arr a b",
+        "export -n FOO",
+        "let i++",
+        "echo functions commands my_options[1] subcommands[2]",
+    ] {
+        assert!(
+            tokenize(command).is_ok(),
+            "{command:?}: {:?}",
+            tokenize(command)
+        );
+    }
+}

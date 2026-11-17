@@ -9,7 +9,8 @@ use std::ops::Range;
 
 use super::Stage;
 use super::words::{
-    assigns_caller_array, changes_caller, is_assignment, is_precommand, is_refused_keyword,
+    assigns_unsafe_name, changes_caller, is_assignment, is_precommand, is_refused_keyword,
+    names_table_element,
 };
 
 /// Why a command is left unrewritten as a whole.
@@ -42,6 +43,8 @@ struct Word {
     /// The word after quote removal; `None` when it contains an expansion or an unquoted
     /// pattern character.
     value: Option<String>,
+    /// The word's text after quote removal without its expansions.
+    bare: String,
     /// Expands a parameter whose value the rewrite changes or no two runs share (`$?`,
     /// `$_`, …).
     state: bool,
@@ -367,6 +370,7 @@ impl<'a> Lexer<'a> {
         }
         Ok(Word {
             span: start..self.pos,
+            bare: value.clone(),
             value: literal.then_some(value),
             state,
             newline,
@@ -635,9 +639,14 @@ fn finish(
     if let Some(word) = builder.words[..assignments]
         .iter()
         .map(|w| &command[w.span.clone()])
-        .find(|raw| assigns_caller_array(raw))
+        .find(|raw| assigns_unsafe_name(raw))
     {
         return Err(Refusal::ChangesShell(word.to_owned()));
+    }
+    // Arithmetic evaluates words such as zsh's `printf %d` and `shift` arguments, and an
+    // element assignment there defines a function or an alias as well.
+    if let Some(word) = builder.words.iter().find(|w| names_table_element(&w.bare)) {
+        return Err(Refusal::ChangesShell(command[word.span.clone()].to_owned()));
     }
     let command_word = (assignments < builder.words.len()).then_some(assignments);
     if let Some(i) = command_word {
