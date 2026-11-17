@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use cardinal::admission::{list_reservations, recovery_pass};
 use cardinal::config::HostConfig;
 use cardinal::contract::{DerivedState, RecordKind};
-use cardinal::os::unix::{SIGCONT, SIGSTOP, signal_process};
+use cardinal::os::unix::{SIGCONT, signal_process};
 use cardinal::testpoint::{ADMISSION_WAITING, RUN_AFTER_SPAWN, RUN_BEFORE_STARTING};
 use runner_support::{Env, GroupGuard, Pty, WAIT, output, wait_gone};
 use support::helper::{ChildGuard, Mode, kill_pid, wait_for, wait_for_file};
@@ -201,16 +201,10 @@ fn parent_exit_after_the_child_exited_stops_its_descendants() {
 fn a_stopped_runner_cancels_once_continued_and_leaves_its_group_alone() {
     for path in ["fail_open", "tty"] {
         let env = Env::with_budget(1);
-        let job = StoppedJob::start(&env, path, Caller::Group, "");
-        // A member whose parent, this test, is outside the group keeps the group from
-        // becoming orphaned when the runner's parent exits, so the kernel does not continue it.
-        let mut sibling = env.isolated("sleep");
-        sibling.arg("30").process_group(job.parent.cast_signed());
-        let sibling = ChildGuard::new(sibling.spawn().unwrap());
-        // This test's unreaped child: its PID is pinned.
-        signal_process(sibling.id(), SIGSTOP).unwrap();
+        let job = StoppedJob::start(&env, path, Caller::Anchored, "");
+        let sibling = job.member.expect("an anchored group has a stopped member");
         wait_for("the sibling to stop", WAIT, || {
-            stopped(&env, sibling.id()).then_some(())
+            stopped(&env, sibling).then_some(())
         });
 
         kill_pid(job.parent);
@@ -218,18 +212,23 @@ fn a_stopped_runner_cancels_once_continued_and_leaves_its_group_alone() {
         // Long enough for anything that watches the parent to act.
         std::thread::sleep(Duration::from_secs(1));
         for (what, pid) in [
-            ("sibling", sibling.id()),
+            ("sibling", sibling),
             ("runner", job.runner),
             ("stage", job.stage),
         ] {
-            assert!(stopped(&env, pid), "{path}: the {what} stays stopped");
+            assert!(
+                stopped(&env, pid),
+                "{path}: the {what} stays stopped; {}",
+                job.layout(&env)
+            );
         }
         // The runner only. It stays stopped until this signal, so the PID is still its own.
         signal_process(job.runner, SIGCONT).unwrap();
         job.wait_cancelled(&env, path);
         assert!(
-            stopped(&env, sibling.id()),
-            "{path}: the sibling stays stopped"
+            stopped(&env, sibling),
+            "{path}: the sibling stays stopped; {}",
+            job.layout(&env)
         );
     }
 }
@@ -248,16 +247,20 @@ fn orphaning_a_stopped_runner_cancels_its_stage() {
     }
 }
 
-/// Where the runner's parent shell runs. It leads a group of its own either way, as a
-/// job-control shell gives a job.
+/// The session the runner's parent shell runs in, always a session of its own: the parent
+/// leads a group of its own, as a job-control shell gives a job, and its parent leads the
+/// session.
 #[derive(Clone, Copy)]
 enum Caller {
-    /// In this test's session; this test is the parent's parent.
-    Group,
-    /// In a session of its own, whose leader is the parent's parent: once the parent exits, no
-    /// member of the group has a parent in another group of the session, so the group becomes
-    /// orphaned wherever the runner is adopted (a container's init may share this test's
-    /// session).
+    /// The session leader also starts a stopped member in the parent's group. That member's
+    /// parent, the session leader, is in another group of the session, so the group does not
+    /// become orphaned when the parent exits. A member whose parent is this test would not do
+    /// on every host: when this test runs in launchd's session, macOS orphans the group once
+    /// the runner, adopted by launchd, exits.
+    Anchored,
+    /// Once the parent exits, no member of the group has a parent in another group of the
+    /// session, so the group becomes orphaned wherever the runner is adopted (a container's
+    /// init may share this test's session).
     Session,
 }
 
@@ -270,6 +273,10 @@ struct StoppedJob {
     runner_start: u64,
     /// The runner's parent shell, which leads the caller's group.
     parent: u32,
+    /// The session leader.
+    leader: u32,
+    /// The stopped member of the caller's group on [`Caller::Anchored`].
+    member: Option<u32>,
     _group: GroupGuard,
     _caller: ChildGuard,
     _pty: Pty,
@@ -284,41 +291,48 @@ impl StoppedJob {
         );
         let fail = (path == "fail_open").then_some(RUN_BEFORE_STARTING);
         let runner = env.run_at(None, &["sh", "-c", &script], &[], fail);
-        let mut parent = env.in_shell(&runner, "; exit $?");
-        let mut caller = match caller {
-            Caller::Group => {
-                parent.process_group(0);
-                parent
+        let parent = env.in_shell(&runner, "; exit $?");
+        let argv = std::iter::once(parent.get_program())
+            .chain(parent.get_args())
+            .map(|arg| arg.to_str().unwrap().to_owned())
+            .collect();
+        let member_file = env.file("member");
+        let mut lead = support::helper::command(&match caller {
+            Caller::Anchored => Mode::AnchorGroup {
+                argv,
+                member: member_file.clone(),
+            },
+            Caller::Session => Mode::LeadGroup { argv },
+        });
+        lead.envs(
+            parent
+                .get_envs()
+                .filter_map(|(key, value)| Some((key, value?))),
+        );
+        let mut leader = match caller {
+            // The helper leads the session and starts the parent.
+            Caller::Anchored => {
+                env.isolate(&mut lead);
+                lead
             }
-            Caller::Session => {
-                let argv = std::iter::once(parent.get_program())
-                    .chain(parent.get_args())
-                    .map(|arg| arg.to_str().unwrap().to_owned())
-                    .collect();
-                let mut lead = support::helper::command(&Mode::LeadGroup { argv });
-                lead.envs(
-                    parent
-                        .get_envs()
-                        .filter_map(|(key, value)| Some((key, value?))),
-                );
-                let mut leader = env.in_shell(&lead, "; exit $?");
-                // SAFETY: `setsid` is async-signal-safe.
-                unsafe {
-                    leader.pre_exec(|| {
-                        rustix::process::setsid()?;
-                        Ok(())
-                    });
-                }
-                leader
-            }
+            // A shell leads the session, and the helper becomes the parent by `exec`: a
+            // session leader cannot lead a new group.
+            Caller::Session => env.in_shell(&lead, "; exit $?"),
         };
+        // SAFETY: `setsid` is async-signal-safe.
+        unsafe {
+            leader.pre_exec(|| {
+                rustix::process::setsid()?;
+                Ok(())
+            });
+        }
         let pty = Pty::open();
         if path == "tty" {
-            caller.stdin(pty.stdin());
+            leader.stdin(pty.stdin());
         }
         // The helper's test harness prints its banner.
-        caller.stdout(Stdio::null());
-        let caller = ChildGuard::new(caller.spawn().unwrap());
+        leader.stdout(Stdio::null());
+        let leader = ChildGuard::new(leader.spawn().unwrap());
         let stage: u32 = wait_for("the stage PID", WAIT, || {
             std::fs::read_to_string(&pid_file).ok()?.trim().parse().ok()
         });
@@ -326,6 +340,11 @@ impl StoppedJob {
         let parent = cardinal::os::parent_pid(runner).unwrap();
         let group = GroupGuard(parent);
         assert_eq!(cardinal::os::unix::pgid_of(runner), Some(parent), "{path}");
+        let member = matches!(caller, Caller::Anchored).then(|| {
+            wait_for("the member PID", WAIT, || {
+                std::fs::read_to_string(&member_file).ok()?.parse().ok()
+            })
+        });
         wait_for("the runner to stop", WAIT, || {
             stopped(env, runner).then_some(())
         });
@@ -335,10 +354,39 @@ impl StoppedJob {
             runner,
             runner_start: cardinal::os::start_time_s(runner).unwrap(),
             parent,
+            leader: leader.id(),
+            member,
             _group: group,
-            _caller: caller,
+            _caller: leader,
             _pty: pty,
         }
+    }
+
+    /// Each process's parent, group, session, and state, for a failure message.
+    fn layout(&self, env: &Env) -> String {
+        let mut processes = vec![
+            ("test", std::process::id()),
+            ("leader", self.leader),
+            ("parent", self.parent),
+            ("runner", self.runner),
+            ("stage", self.stage),
+        ];
+        processes.extend(self.member.map(|member| ("member", member)));
+        processes
+            .into_iter()
+            .map(|(what, pid)| {
+                let session = rustix::process::Pid::from_raw(pid.cast_signed())
+                    .and_then(|pid| rustix::process::getsid(Some(pid)).ok())
+                    .map(rustix::process::Pid::as_raw_nonzero);
+                format!(
+                    "{what} {pid}: parent {:?}, group {:?}, session {session:?}, state {:?}",
+                    cardinal::os::parent_pid(pid),
+                    cardinal::os::unix::pgid_of(pid),
+                    state(env, pid),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
     }
 
     /// Waits for the runner to end the stage by SIGTERM within the bound and to exit, and
@@ -358,7 +406,12 @@ impl StoppedJob {
 
 /// Whether `pid` is stopped, from `ps`.
 fn stopped(env: &Env, pid: u32) -> bool {
+    state(env, pid).starts_with('T')
+}
+
+/// The state of `pid` as `ps` shows it; empty when the process is gone.
+fn state(env: &Env, pid: u32) -> String {
     let mut ps = env.isolated("ps");
     ps.args(["-o", "stat=", "-p", &pid.to_string()]);
-    output(&mut ps).stdout.trim_ascii_start().starts_with(b"T")
+    String::from_utf8_lossy(output(&mut ps).stdout.trim_ascii()).into_owned()
 }
