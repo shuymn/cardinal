@@ -406,11 +406,52 @@ fn check_data_pattern(pattern: &str) -> Result<(), String> {
     }
 }
 
+/// Which `[data]` list a pattern comes from; the lists match paths differently.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DataList {
+    /// A name matches a component at any depth; a path (with `/`) matches that
+    /// worktree-relative path.
+    Regenerable,
+    /// A name, or the components of a path (with `/`), match at any depth, so `fuzz/corpus`
+    /// also protects `target/a/b/fuzz/corpus`.
+    Protected,
+}
+
+/// Whether the worktree-relative path `rel` is, or is inside, a match of `pattern` from
+/// `list`. Components are compared exactly; a component that is not UTF-8 matches nothing.
+#[must_use]
+pub fn data_pattern_covers(list: DataList, pattern: &str, rel: &Path) -> bool {
+    let words: Vec<&str> = pattern.split('/').filter(|w| !w.is_empty()).collect();
+    if words.is_empty() {
+        return false;
+    }
+    let parts: Vec<Option<&str>> = rel
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(name) => Some(name.to_str()),
+            _ => None,
+        })
+        .collect();
+    let matches_at = |start: usize| {
+        parts.len() >= start + words.len()
+            && words
+                .iter()
+                .zip(&parts[start..])
+                .all(|(word, part)| *part == Some(*word))
+    };
+    match list {
+        DataList::Regenerable if words.len() > 1 => matches_at(0),
+        _ => (0..parts.len()).any(matches_at),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use super::{Profile, Selection, git_common_dir, normalize_remote};
+    use super::{
+        DataList, Profile, Selection, data_pattern_covers, git_common_dir, normalize_remote,
+    };
 
     /// An absolute home directory on every OS.
     fn home() -> PathBuf {
@@ -581,5 +622,32 @@ mod tests {
         .unwrap();
         assert!(profile.matches_common_dir(&expected));
         assert!(!profile.matches_common_dir(tmp.path()));
+    }
+
+    #[test]
+    fn data_patterns_cover_their_matches_and_what_is_inside() {
+        let covers = |list, pattern, rel: &str| data_pattern_covers(list, pattern, Path::new(rel));
+        let (r, p) = (DataList::Regenerable, DataList::Protected);
+        assert!(covers(r, "node_modules", "node_modules"));
+        assert!(covers(r, "node_modules", "pkg/a/node_modules/x"));
+        assert!(covers(r, "fuzz/target", "fuzz/target/debug"));
+        assert!(
+            !covers(r, "fuzz/target", "sub/fuzz/target"),
+            "regenerable paths are worktree-relative"
+        );
+        assert!(!covers(r, "fuzz/target", "fuzz"));
+        assert!(covers(p, "fuzz/corpus", "fuzz/corpus"));
+        assert!(
+            covers(p, "fuzz/corpus", "target/a/b/fuzz/corpus/seed"),
+            "protected paths match at any depth"
+        );
+        assert!(!covers(p, "fuzz/corpus", "target/fuzz/corpusx"));
+        assert!(!covers(p, "fuzz/corpus", "fuzz"));
+        assert!(covers(
+            p,
+            "proptest-regressions",
+            "crate/proptest-regressions/x.txt"
+        ));
+        assert!(!covers(p, "target", "targets"));
     }
 }

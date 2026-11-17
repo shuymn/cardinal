@@ -2,12 +2,14 @@
 //! working directories, and boot time (`docs/architecture.md` section 2.2).
 //!
 //! Process-group setup and signals (Unix) live in `os/unix.rs`, owned by the runner work unit.
+//! Short-lived children whose output the caller reads run through [`child`].
 //!
 //! A process is identified by its PID and start time (`start_s`, Unix seconds as the OS
 //! reports it), so a reused PID never passes for the original process. A process that has
 //! exited is not alive even while the OS still lists it: a zombie on Unix, a process kept by
 //! an open handle on Windows.
 
+pub mod child;
 #[cfg(unix)]
 pub mod unix;
 #[cfg(windows)]
@@ -269,6 +271,12 @@ pub fn boot_time_s() -> Result<u64, OsError> {
 #[must_use]
 pub fn current_pid() -> u32 {
     std::process::id()
+}
+
+/// This host's name, if the OS reports one.
+#[must_use]
+pub fn hostname() -> Option<String> {
+    System::host_name().ok()
 }
 
 #[cfg(test)]

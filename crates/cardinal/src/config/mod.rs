@@ -14,7 +14,10 @@ pub use host::{
     Admission, Hook, HostConfig, Managed, Observe, Records, Unit, logical_cpus, validate_runner,
 };
 pub use locations::{Base, config_dir, resolve, state_dir};
-pub use profile::{Matcher, Pattern, Profile, Rule, Selection, git_common_dir, normalize_remote};
+pub use profile::{
+    DataList, Matcher, Pattern, Profile, Rule, Selection, data_pattern_covers, git_common_dir,
+    normalize_remote,
+};
 
 use crate::contract::{Error, ErrorCode};
 

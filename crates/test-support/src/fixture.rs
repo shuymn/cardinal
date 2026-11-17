@@ -41,6 +41,32 @@ impl BareRepo {
     }
 }
 
+/// A filesystem monitor configured for one fixture repository by [`Fixture::fsmonitor`].
+/// Dropping it stops the monitor daemon running for the repository, if any
+/// (`git fsmonitor--daemon stop`), and removes the setting, but only while the directory
+/// still resolves to the git dirs it had when the monitor was configured: a `.git` replaced
+/// meanwhile (say, by a gitfile naming another repository) is left alone, and a daemon left
+/// running is the scope's to clean up.
+pub struct Fsmonitor<'a> {
+    fixture: &'a Fixture,
+    repo: PathBuf,
+    dirs: Vec<PathBuf>,
+}
+
+impl Drop for Fsmonitor<'_> {
+    fn drop(&mut self) {
+        if self.fixture.git_dirs(&self.repo).as_ref() != Some(&self.dirs) {
+            return;
+        }
+        self.fixture
+            .output(&self.repo, &["fsmonitor--daemon", "stop"]);
+        self.fixture.output(
+            &self.repo,
+            &["config", "--local", "--unset", "core.fsmonitor"],
+        );
+    }
+}
+
 /// Which repository git would use in a directory.
 enum Resolution {
     Repository,
@@ -163,6 +189,20 @@ impl Fixture {
         self.git(repo, &["remote", "add", name, &path]);
     }
 
+    /// `git remote add name url`, for a remote that git only reports, such as a GitHub URL a
+    /// test needs as `origin`. `url` must be `https://` with a plain host and path; no
+    /// transport is enabled, so git never reaches it.
+    pub fn remote_add_url(&self, repo: &Path, name: &str, url: &str) {
+        let name = checked_name("remote", name);
+        self.git(repo, &["remote", "add", name, checked_url(url)]);
+    }
+
+    /// `git remote set-url name url`, with `url` checked as in [`Fixture::remote_add_url`].
+    pub fn remote_set_url(&self, repo: &Path, name: &str, url: &str) {
+        let name = checked_name("remote", name);
+        self.git(repo, &["remote", "set-url", name, checked_url(url)]);
+    }
+
     /// `git push -q remote branch` through a named remote, with no transport enabled: the
     /// output shows git refusing it.
     pub fn push_remote(&self, repo: &Path, remote: &str, branch: &str) -> Output {
@@ -202,6 +242,75 @@ impl Fixture {
                 checked_name("revision", rev),
             ],
         );
+    }
+
+    /// `git symbolic-ref name target`: points the ref `name` at the ref `target`.
+    pub fn symbolic_ref(&self, repo: &Path, name: &str, target: &str) {
+        self.git(
+            repo,
+            &[
+                "symbolic-ref",
+                checked_name("ref", name),
+                checked_name("ref", target),
+            ],
+        );
+    }
+
+    /// `git symbolic-ref --delete name`.
+    pub fn symbolic_ref_delete(&self, repo: &Path, name: &str) {
+        self.git(
+            repo,
+            &["symbolic-ref", "--delete", checked_name("ref", name)],
+        );
+    }
+
+    /// `git branch --set-upstream-to=upstream branch`: records `upstream`, a branch or
+    /// remote-tracking branch, as `branch`'s upstream.
+    pub fn set_upstream(&self, repo: &Path, branch: &str, upstream: &str) {
+        let upstream = format!("--set-upstream-to={}", checked_name("upstream", upstream));
+        self.git(
+            repo,
+            &["branch", &upstream, "--", checked_name("branch", branch)],
+        );
+    }
+
+    /// `git worktree lock -- worktree`: marks a linked worktree of `repo` as locked.
+    pub fn worktree_lock(&self, repo: &Path, worktree: &Path) {
+        self.assert_inside(worktree, "worktree");
+        let target = worktree.to_string_lossy();
+        self.git(repo, &["worktree", "lock", "--", &target]);
+    }
+
+    /// `git update-index --split-index`: the index of `repo` becomes a split index, whose
+    /// entries live in a `sharedindex.*` file of the git dir.
+    pub fn split_index(&self, repo: &Path) {
+        self.git(repo, &["update-index", "--split-index"]);
+    }
+
+    /// Sets `core.fsmonitor=true` in `repo`'s local config, overriding the scope's
+    /// `core.fsmonitor=false`, until the returned guard is dropped. Meanwhile a git command that
+    /// reads the index of `repo` may start git's filesystem monitor daemon (macOS and Windows),
+    /// which runs inside the fixture repository and leaves the process group of the git that
+    /// started it.
+    pub fn fsmonitor(&self, repo: &Path) -> Fsmonitor<'_> {
+        self.git(repo, &["config", "--local", "core.fsmonitor", "true"]);
+        let dirs = self
+            .git_dirs(repo)
+            .expect("resolve the repository a monitor is configured for");
+        Fsmonitor {
+            fixture: self,
+            repo: repo.to_path_buf(),
+            dirs,
+        }
+    }
+
+    /// Whether git's filesystem monitor daemon runs for the repository at `dir`:
+    /// `git fsmonitor--daemon status`. Where git has no built-in monitor (Linux), none runs.
+    pub fn fsmonitor_running(&self, dir: &Path) -> bool {
+        self.require_repo(dir);
+        self.output(dir, &["fsmonitor--daemon", "status"])
+            .status
+            .success()
     }
 
     /// `git stash push -q`.
@@ -311,6 +420,26 @@ impl Fixture {
         }
     }
 
+    /// The git dir and common dir git would use in `dir`, or `None` when it cannot resolve
+    /// them. Never panics for a directory inside the root.
+    fn git_dirs(&self, dir: &Path) -> Option<Vec<PathBuf>> {
+        let output = self.output(
+            dir,
+            &[
+                "rev-parse",
+                "--path-format=absolute",
+                "--absolute-git-dir",
+                "--git-common-dir",
+            ],
+        );
+        output.status.success().then(|| {
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(|line| PathBuf::from(line.trim()))
+                .collect()
+        })
+    }
+
     /// Asks git which git dir and common dir it would use in `dir`, and refuses any outside
     /// the root. Panics on any failure other than "not a git repository".
     fn resolve(&self, dir: &Path) -> Resolution {
@@ -367,4 +496,19 @@ fn checked_name<'a>(what: &str, name: &'a str) -> &'a str {
         "refusing git: {what} {name:?} is not a plain name"
     );
     name
+}
+
+/// A remote URL git only reports: `https://`, then a host and path of plain characters.
+fn checked_url(url: &str) -> &str {
+    let rest = url.strip_prefix("https://").unwrap_or_default();
+    assert!(
+        rest.contains('/')
+            && !rest.starts_with('/')
+            && !rest.contains("..")
+            && rest
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-')),
+        "refusing git: remote URL {url:?} is not a plain https URL"
+    );
+    url
 }

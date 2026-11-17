@@ -52,6 +52,12 @@ fn named_operations_work_inside_the_fixture() {
         Some("x")
     );
     assert_eq!(fixture.config_get(&repo, "branch.main.missing"), None);
+    let url = "https://github.com/acme/app.git";
+    fixture.remote_add_url(&repo, "github", url);
+    assert_eq!(
+        fixture.config_get(&repo, "remote.github.url").as_deref(),
+        Some(url)
+    );
 }
 
 #[test]
@@ -110,6 +116,14 @@ fn names_that_read_as_options_or_paths_are_refused() {
     });
     refuses("a space in a tag", || fixture.tag(&repo, "a b"));
     refuses("an option as a path", || fixture.add(&repo, "--all"));
+    for url in [
+        "/tmp/remote.git",
+        "file:///tmp/remote.git",
+        "ext::sh -c x",
+        "https://",
+    ] {
+        refuses(url, || fixture.remote_add_url(&repo, "origin", url));
+    }
 }
 
 #[test]
@@ -323,4 +337,30 @@ fn fixture_root_is_outside_any_repository() {
         "{}",
         fixture.root().display()
     );
+}
+
+/// Cleaning up a filesystem monitor touches only the repository it was configured for, also
+/// when a test replaced that repository's `.git` with a gitfile naming another one.
+#[test]
+fn fsmonitor_cleanup_follows_no_replaced_git_dir() {
+    let fixture = Fixture::new();
+    let repo = fixture.init("repo");
+    let other = fixture.init("other");
+    let other_monitor = fixture.fsmonitor(&other);
+    let monitor = fixture.fsmonitor(&repo);
+    std::fs::rename(repo.join(".git"), repo.join("moved.git")).unwrap();
+    std::fs::write(
+        repo.join(".git"),
+        format!("gitdir: {}\n", other.join(".git").display()),
+    )
+    .unwrap();
+    drop(monitor);
+    assert_eq!(
+        fixture.config_get(&other, "core.fsmonitor").as_deref(),
+        Some("true"),
+        "the other repository's setting was removed"
+    );
+    std::fs::remove_file(repo.join(".git")).unwrap();
+    std::fs::rename(repo.join("moved.git"), repo.join(".git")).unwrap();
+    drop(other_monitor);
 }
