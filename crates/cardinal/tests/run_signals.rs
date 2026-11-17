@@ -1,0 +1,132 @@
+//! Signals (A13, `docs/architecture.md` sections 5.5 and 5.6): a stage that dies by a signal
+//! makes the runner die by the same signal, so the calling shell sees the same status and
+//! message; signals sent to the runner reach the stage's group.
+
+#![cfg(unix)]
+
+mod runner_support;
+mod support;
+
+use std::os::unix::process::ExitStatusExt as _;
+use std::process::Command;
+
+use cardinal::testpoint::RUN_BEFORE_STARTING;
+use runner_support::{Env, WAIT, output};
+use support::helper::{ChildGuard, wait_for_file};
+
+#[test]
+fn helper() {
+    support::helper::run_if_requested();
+}
+
+/// `bash -c` (or `sh -c` without bash) running `inner; :`, so the shell reports a signal death
+/// of `inner` instead of exec'ing it.
+fn shell() -> &'static str {
+    if Command::new("bash")
+        .arg("-c")
+        .arg(":")
+        .status()
+        .is_ok_and(|s| s.success())
+    {
+        "bash"
+    } else {
+        "sh"
+    }
+}
+
+#[test]
+fn same_signal_death() {
+    let env = Env::with_budget(4);
+    let runner = env.run(None, &[]);
+    let runner_path = runner.get_program().to_str().unwrap().to_owned();
+    for (signal, name, expected) in [("TERM", "Terminated", 143), ("KILL", "Killed", 137)] {
+        let stage = format!("sh -c 'kill -{signal} $$'");
+        let direct = output(
+            Command::new(shell())
+                .args(["-c", &format!("{stage}; echo status=$?")])
+                .current_dir(env.worktree()),
+        );
+        let through = output(
+            Command::new(shell())
+                .args([
+                    "-c",
+                    &format!("\"$0\" run -- {stage}; echo status=$?"),
+                    &runner_path,
+                ])
+                .current_dir(env.worktree())
+                .env("CARDINAL_STATE_DIR", env.dirs.state())
+                .env("CARDINAL_CONFIG_DIR", env.dirs.config()),
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&direct.stdout),
+            format!("status={expected}\n")
+        );
+        assert_eq!(through.stdout, direct.stdout, "{signal}");
+        let direct_err = String::from_utf8_lossy(&direct.stderr);
+        let through_err = String::from_utf8_lossy(&through.stderr);
+        // The message names the command that died, which differs; the signal text matches.
+        assert!(direct_err.contains(name), "{direct_err}");
+        assert!(through_err.contains(name), "{through_err}");
+    }
+
+    // SIGPIPE, which the Rust runtime ignores in the runner, still ends it.
+    let out = output(&mut env.run(None, &["sh", "-c", "kill -PIPE $$"]));
+    assert_eq!(out.status.signal(), Some(13));
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "");
+}
+
+/// SIGTERM sent to the runner on the admitted path reaches the whole group; the runner does
+/// not die by its own forwarded copy, and exits with the stage's status.
+#[test]
+fn signals_are_forwarded_to_the_group() {
+    let env = Env::with_budget(4);
+    let ready = env.file("ready");
+    let got = env.file("got");
+    let script = format!(
+        "trap 'echo stage >> \"{got}\"; exit 5' TERM; \
+         (trap 'echo grandchild >> \"{got}\"; exit 0' TERM; : > \"{ready}\"; \
+          while :; do sleep 0.02; done) & \
+         while :; do sleep 0.02; done",
+        got = got.display(),
+        ready = ready.display()
+    );
+    let mut runner = ChildGuard::new(env.run(None, &["sh", "-c", &script]).spawn().unwrap());
+    let _group = runner_support::GroupGuard(runner.id());
+    wait_for_file(&ready, WAIT);
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    cardinal::os::unix::signal_process(runner.id(), cardinal::os::unix::SIGTERM).unwrap();
+    let status = runner.child().wait().unwrap();
+    assert_eq!(status.code(), Some(5), "{status:?}");
+    support::helper::wait_for("both trap lines", WAIT, || {
+        (env.lines("got").len() == 2).then_some(())
+    });
+    let mut lines = env.lines("got");
+    lines.sort();
+    assert_eq!(lines, ["grandchild", "stage"]);
+}
+
+/// On the fail-open path the stage shares the caller's group and gets terminal signals
+/// itself; the runner ignores SIGINT, as `system()` does, and forwards SIGTERM.
+#[test]
+fn fail_open_ignores_sigint_and_forwards_sigterm() {
+    let env = Env::with_budget(4);
+    let ready = env.file("ready");
+    let script = format!(
+        "trap '' INT; trap 'exit 6' TERM; : > '{}'; while :; do sleep 0.02; done",
+        ready.display()
+    );
+    let mut runner = ChildGuard::new(
+        env.run_at(None, &["sh", "-c", &script], &[], Some(RUN_BEFORE_STARTING))
+            .spawn()
+            .unwrap(),
+    );
+    wait_for_file(&ready, WAIT);
+    cardinal::os::unix::signal_process(runner.id(), cardinal::os::unix::SIGINT).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(
+        runner.child().try_wait().unwrap().is_none(),
+        "SIGINT does not end the runner"
+    );
+    cardinal::os::unix::signal_process(runner.id(), cardinal::os::unix::SIGTERM).unwrap();
+    assert_eq!(runner.child().wait().unwrap().code(), Some(6));
+}

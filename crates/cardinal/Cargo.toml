@@ -34,5 +34,9 @@ cardinal-test-support.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
 
+[target.'cfg(unix)'.dev-dependencies]
+# Pseudo-terminals for the TTY passthrough tests.
+rustix = { workspace = true, features = ["pty"] }
+
 [lints]
 workspace = true
