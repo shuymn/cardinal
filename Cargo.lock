@@ -154,6 +154,7 @@ dependencies = [
  "cardinal-test-support",
  "clap",
  "dunce",
+ "libc",
  "proptest",
  "rustix",
  "serde",

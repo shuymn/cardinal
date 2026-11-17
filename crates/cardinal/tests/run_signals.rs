@@ -11,7 +11,7 @@ use std::os::unix::process::ExitStatusExt as _;
 use std::process::Command;
 
 use cardinal::testpoint::{ADMISSION_WAITING, RUN_BEFORE_STARTING};
-use runner_support::{Env, WAIT, output};
+use runner_support::{Env, Pty, WAIT, output};
 use support::helper::{ChildGuard, wait_for_file};
 
 #[test]
@@ -68,6 +68,51 @@ fn same_signal_death() {
     let out = output(&mut env.run(None, &["sh", "-c", "kill -PIPE $$"]));
     assert_eq!(out.status.signal(), Some(13));
     assert_eq!(String::from_utf8_lossy(&out.stderr), "");
+}
+
+/// A signal the caller ignores stays ignored for the stage, as when the stage runs directly:
+/// the runner installs no handler for it, on the admitted, fail-open, and TTY paths.
+#[test]
+fn ignored_signals_stay_ignored() {
+    let env = Env::with_budget(4);
+    let stage = ["sh", "-c", "kill -TERM $$; kill -HUP $$; printf survived"];
+    let ignoring = |inner: &Command| {
+        let mut shell = env.isolated("sh");
+        shell
+            .args(["-c", "trap '' TERM HUP; exec \"$@\"", "sh"])
+            .arg(inner.get_program())
+            .args(inner.get_args());
+        for (key, value) in inner.get_envs() {
+            match value {
+                Some(value) => shell.env(key, value),
+                None => shell.env_remove(key),
+            };
+        }
+        shell
+    };
+    let mut direct = env.isolated(stage[0]);
+    direct.args(&stage[1..]);
+    let direct = output(&mut ignoring(&direct));
+    assert_eq!(direct.status.code(), Some(0));
+    assert_eq!(direct.stdout, b"survived");
+
+    for path in ["admitted", "fail_open", "tty"] {
+        let fail = (path == "fail_open").then_some(RUN_BEFORE_STARTING);
+        let mut runner = ignoring(&env.run_at(None, &stage, &[], fail));
+        let pty = Pty::open();
+        if path == "tty" {
+            runner.stdin(pty.stdin());
+        }
+        let out = output(&mut runner);
+        assert_eq!(out.status.code(), Some(0), "{path}: {:?}", out.status);
+        assert_eq!(out.stdout, direct.stdout, "{path}");
+    }
+    let paths: Vec<_> = env
+        .records_of(cardinal::contract::RecordKind::JobStarted)
+        .iter()
+        .map(|r| r.data["path"].clone())
+        .collect();
+    assert_eq!(paths, ["admitted", "fail_open", "tty"]);
 }
 
 /// SIGTERM sent to the runner on the admitted path reaches the whole group; the runner does

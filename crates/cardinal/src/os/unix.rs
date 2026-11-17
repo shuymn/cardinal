@@ -3,7 +3,8 @@
 //! The runner leads its job's process group, so the group ID is the runner's PID and is known
 //! before any reservation names it. A group is empty when `kill(-pgid, 0)` fails with `ESRCH`.
 //! Signal handlers are installed through `signal-hook`; a handler is reset to the default
-//! action by `exec`, so the stage starts with default dispositions for the handled signals.
+//! action by `exec`, so the stage starts with default dispositions for the handled signals. A
+//! signal the caller ignores gets no handler and stays ignored for the stage.
 
 use std::io::{self, Read as _};
 use std::sync::Arc;
@@ -158,9 +159,22 @@ pub fn wait_exited_unreaped(raw_pid: u32) -> io::Result<()> {
     }
 }
 
+/// Whether this process ignores `sig` (`SIG_IGN`, inherited across `exec` from the caller).
+/// Reads the disposition without changing it.
+#[must_use]
+pub fn ignored(sig: i32) -> bool {
+    let mut current = std::mem::MaybeUninit::<libc::sigaction>::zeroed();
+    // SAFETY: without a new action, `sigaction` only writes the current one into `current`,
+    // which is valid for writes.
+    let read = unsafe { libc::sigaction(sig, std::ptr::null(), current.as_mut_ptr()) };
+    // SAFETY: `current` is zero-initialized, a valid `sigaction`, and filled on success.
+    read == 0 && unsafe { current.assume_init() }.sa_sigaction == libc::SIG_IGN
+}
+
 /// Calls `on_signal` on a background thread for every delivery of one of `signals`. The
 /// signals no longer take their default action in this process; `exec` restores it for
-/// children.
+/// children. A signal this process ignores is skipped: it stays ignored here and in the
+/// children, as it would for a stage started directly.
 ///
 /// Each signal's handler writes one byte to an OS pipe of its own, read by a thread that calls
 /// `on_signal`; a pipe, unlike the socket pair `signal-hook`'s iterator uses, keeps the runner
@@ -170,7 +184,7 @@ pub fn watch_signals(
     on_signal: impl Fn(i32) + Send + Sync + 'static,
 ) -> io::Result<()> {
     let on_signal = Arc::new(on_signal);
-    for &sig in signals {
+    for &sig in signals.iter().filter(|&&sig| !ignored(sig)) {
         let (mut reader, writer) = io::pipe()?;
         signal_hook::low_level::pipe::register(sig, writer)?;
         let on_signal = Arc::clone(&on_signal);
@@ -202,7 +216,7 @@ pub fn die_by_signal(sig: i32) -> ! {
 
 #[cfg(test)]
 mod tests {
-    use super::{group_exists, parent_pid, pgid_of};
+    use super::{SIGKILL, group_exists, ignored, parent_pid, pgid_of};
 
     #[test]
     fn own_group_exists_and_is_reported() {
@@ -210,6 +224,11 @@ mod tests {
         let pgid = pgid_of(me).expect("own pgid");
         assert!(group_exists(pgid));
         assert!(parent_pid().is_some());
+    }
+
+    #[test]
+    fn default_dispositions_are_not_ignored() {
+        assert!(!ignored(SIGKILL));
     }
 
     #[test]
