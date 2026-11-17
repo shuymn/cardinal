@@ -123,17 +123,21 @@ pub fn other_group_members(pgid: u32) -> io::Result<Vec<ProcessInfo>> {
     Ok(members)
 }
 
-/// Sends SIGKILL to every live member of group `pgid` except this process, one by one, so this
-/// process survives. Each PID's group is checked again right before its signal. Returns how
-/// many members were found.
-pub fn kill_other_group_members(pgid: u32) -> io::Result<usize> {
-    let members = other_group_members(pgid)?;
-    for member in &members {
-        if pgid_of(member.pid) == Some(pgid) {
-            let _ = signal_process(member.pid, SIGKILL);
+/// Whether child `pid` has exited, without waiting and without reaping it, so its PID stays
+/// reserved while the caller may still signal it. Fails when the child cannot be waited for,
+/// for example because the parent ignores SIGCHLD and the system reaped the child already.
+pub fn child_exited(raw_pid: u32) -> io::Result<bool> {
+    let id = pid(raw_pid)?;
+    loop {
+        match rustix::process::waitid(
+            WaitId::Pid(id),
+            WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG,
+        ) {
+            Ok(status) => return Ok(status.is_some()),
+            Err(rustix::io::Errno::INTR) => {}
+            Err(err) => return Err(err.into()),
         }
     }
-    Ok(members.len())
 }
 
 /// Blocks until child `pid` has exited without reaping it, so the caller can still reap it

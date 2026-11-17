@@ -65,9 +65,8 @@ pub trait Running {
 /// parent has exited.
 pub const PARENT_EXIT_KILL_AFTER: Duration = Duration::from_secs(5);
 
-/// How long the runner keeps sending SIGKILL to a group that does not empty (a member in
-/// uninterruptible sleep) before it stops waiting. The runner then exits without releasing
-/// the reservation, which the recovery pass handles as for a runner that died.
+/// How long after its parent exited the runner waits for a child that shares the caller's
+/// group and outlived SIGKILL (a process in uninterruptible sleep) before it stops waiting.
 #[cfg(unix)]
 const PARENT_EXIT_GIVE_UP: Duration = Duration::from_secs(30);
 
@@ -110,6 +109,11 @@ struct WatchInner {
     tx: Sender<Event>,
     rx: Mutex<Receiver<Event>>,
     parent_exited: std::sync::atomic::AtomicBool,
+    /// The parent when the watch started.
+    #[cfg(unix)]
+    parent: Option<u32>,
+    /// Set by the supervisor: the group outlived the SIGTERM sent after the parent exited.
+    group_kill_due: std::sync::atomic::AtomicBool,
     /// Per handled signal: copies the runner sent to its own group and has not seen yet.
     #[cfg(unix)]
     own: [std::sync::atomic::AtomicU32; 4],
@@ -133,6 +137,9 @@ impl Watch {
                 rx: Mutex::new(rx),
                 parent_exited: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(unix)]
+                parent: os::unix::parent_pid(),
+                group_kill_due: std::sync::atomic::AtomicBool::new(false),
+                #[cfg(unix)]
                 own: Default::default(),
             }),
         };
@@ -147,18 +154,15 @@ impl Watch {
                 }
                 let _ = inner.tx.send(Event::Signal(sig));
             });
-            if let Some(parent) = os::unix::parent_pid() {
-                let inner = Arc::clone(&watch.inner);
+            if watch.inner.parent.is_some() {
+                let poller = watch.clone();
                 let _ = std::thread::Builder::new()
                     .name("cardinal-parent".into())
                     .spawn(move || {
-                        while os::unix::parent_pid() == Some(parent) {
+                        while !poller.parent_exited() {
                             std::thread::sleep(PARENT_POLL);
                         }
-                        inner
-                            .parent_exited
-                            .store(true, std::sync::atomic::Ordering::SeqCst);
-                        let _ = inner.tx.send(Event::ParentExited);
+                        let _ = poller.inner.tx.send(Event::ParentExited);
                     });
             }
         }
@@ -176,11 +180,25 @@ impl Watch {
         rx.recv_timeout(timeout).ok()
     }
 
-    /// Whether the runner's parent has exited.
+    /// Whether the runner's parent has exited, from the parent PID now: the watcher thread's
+    /// event can lag by its polling interval.
     #[must_use]
     pub fn parent_exited(&self) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        #[cfg(unix)]
+        if self.inner.parent.is_some() && os::unix::parent_pid() != self.inner.parent {
+            self.inner.parent_exited.store(true, SeqCst);
+        }
+        self.inner.parent_exited.load(SeqCst)
+    }
+
+    /// Whether the supervisor found the group still alive [`PARENT_EXIT_KILL_AFTER`] after the
+    /// SIGTERM it sent when the parent exited. The runner then records the job and sends
+    /// SIGKILL to the group, itself included if it is still a member.
+    #[must_use]
+    pub fn group_kill_due(&self) -> bool {
         self.inner
-            .parent_exited
+            .group_kill_due
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
@@ -348,19 +366,27 @@ impl LocalRunning {
     /// - in the caller's group: SIGINT and SIGQUIT are ignored, as `system()` does, because the
     ///   child receives terminal signals itself; SIGTERM and SIGHUP go to the child.
     ///
-    /// When the runner's parent exits, the group (or the child) gets SIGTERM and, 5 s later,
-    /// SIGKILL; the wait then ends only once no other member of the group is left, or after
+    /// The child is reaped only when the wait ends, so its PID stays reserved while the runner
+    /// may signal it; the group's ID is the runner's own PID and stays reserved while the
+    /// runner lives.
+    ///
+    /// Once the runner's parent has exited, found before the wait ends even when the child
+    /// exited first, the group (or the child) gets SIGTERM, and the wait ends when the child
+    /// has exited and no other member of the group is left. When the group is still alive
+    /// [`PARENT_EXIT_KILL_AFTER`] later, the wait ends with [`Watch::group_kill_due`] set; a
+    /// child in the caller's group gets SIGKILL instead and is waited for up to
     /// [`PARENT_EXIT_GIVE_UP`].
     #[cfg(unix)]
     fn supervise(mut self) -> ExecOutcome {
-        use std::os::unix::process::ExitStatusExt as _;
-
-        let mut status = None;
-        let mut parent_exited: Option<Instant> = None;
+        let pid = self.identity.pid;
+        let mut exited = false;
+        // When the runner's parent exited: the time SIGTERM went out.
+        let mut stopping: Option<Instant> = None;
+        let mut killed = false;
         loop {
-            if status.is_none() {
-                match self.child.try_wait() {
-                    Ok(found) => status = found,
+            if !exited {
+                match os::unix::child_exited(pid) {
+                    Ok(found) => exited = found,
                     Err(err) => {
                         return ExecOutcome::InfraFailure(format!(
                             "cannot wait for the command: {err}"
@@ -368,44 +394,77 @@ impl LocalRunning {
                     }
                 }
             }
-            let gave_up = parent_exited.is_some_and(|since| since.elapsed() >= PARENT_EXIT_GIVE_UP);
-            if let Some(exit) = status {
-                let members_left = match (parent_exited, self.group) {
-                    (Some(_), Some(pgid)) if !gave_up => {
-                        os::unix::other_group_members(pgid).map_or(true, |m| !m.is_empty())
-                    }
-                    _ => false,
-                };
-                if !members_left {
-                    return match (exit.code(), exit.signal()) {
-                        (Some(code), _) => ExecOutcome::Exited(code),
-                        (None, Some(sig)) => ExecOutcome::Signaled(sig),
-                        (None, None) => ExecOutcome::InfraFailure(format!(
-                            "the command ended without an exit status: {exit}"
-                        )),
-                    };
+            if stopping.is_none() && self.watch.parent_exited() {
+                stopping = Some(Instant::now());
+                self.forward_stop(os::unix::SIGTERM, !exited);
+            }
+            let Some(since) = stopping else {
+                if exited {
+                    return self.reap();
                 }
-            } else if gave_up {
-                return ExecOutcome::InfraFailure("the command did not stop after SIGKILL".into());
-            }
-            if parent_exited.is_some_and(|since| since.elapsed() >= PARENT_EXIT_KILL_AFTER) {
-                self.kill_all(status.is_none());
-            }
-            let timeout = if parent_exited.is_some() || status.is_some() {
-                GROUP_POLL
-            } else {
                 // The waiter thread wakes the loop when the child exits; the timeout only
                 // covers a waiter that could not be started.
-                Duration::from_secs(1)
-            };
-            match self.watch.next(timeout) {
-                Some(Event::Signal(sig)) => self.forward(sig, status.is_none()),
-                Some(Event::ParentExited) if parent_exited.is_none() => {
-                    parent_exited = Some(Instant::now());
-                    self.forward_stop(os::unix::SIGTERM, status.is_none());
+                if let Some(Event::Signal(sig)) = self.watch.next(Duration::from_secs(1)) {
+                    self.forward(sig, true);
                 }
-                Some(_) | None => {}
+                continue;
+            };
+            if exited && self.group_stopped() {
+                return self.reap();
             }
+            if since.elapsed() >= PARENT_EXIT_KILL_AFTER {
+                if self.group.is_some() {
+                    self.watch
+                        .inner
+                        .group_kill_due
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    return if exited {
+                        self.reap()
+                    } else {
+                        ExecOutcome::InfraFailure(
+                            "the command did not stop within 5 s of SIGTERM".into(),
+                        )
+                    };
+                }
+                if !exited && !killed {
+                    killed = true;
+                    let _ = os::unix::signal_process(pid, os::unix::SIGKILL);
+                }
+                if since.elapsed() >= PARENT_EXIT_GIVE_UP {
+                    return ExecOutcome::InfraFailure(
+                        "the command did not stop after SIGKILL".into(),
+                    );
+                }
+            }
+            if let Some(Event::Signal(sig)) = self.watch.next(GROUP_POLL) {
+                self.forward(sig, !exited);
+            }
+        }
+    }
+
+    /// Whether nothing of the stage is left once its child has exited: no other member of the
+    /// runner's group, or, in the caller's group, the child alone.
+    #[cfg(unix)]
+    fn group_stopped(&self) -> bool {
+        self.group.is_none_or(|pgid| {
+            os::unix::other_group_members(pgid).is_ok_and(|members| members.is_empty())
+        })
+    }
+
+    /// Reaps the exited child.
+    #[cfg(unix)]
+    fn reap(&mut self) -> ExecOutcome {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        match self.child.wait() {
+            Ok(exit) => match (exit.code(), exit.signal()) {
+                (Some(code), _) => ExecOutcome::Exited(code),
+                (None, Some(sig)) => ExecOutcome::Signaled(sig),
+                (None, None) => ExecOutcome::InfraFailure(format!(
+                    "the command ended without an exit status: {exit}"
+                )),
+            },
+            Err(err) => ExecOutcome::InfraFailure(format!("cannot wait for the command: {err}")),
         }
     }
 
@@ -426,19 +485,6 @@ impl LocalRunning {
             Some(pgid) => self.watch.signal_own_group(pgid, sig),
             None if child_unreaped => {
                 let _ = os::unix::signal_process(self.identity.pid, sig);
-            }
-            None => {}
-        }
-    }
-
-    #[cfg(unix)]
-    fn kill_all(&self, child_unreaped: bool) {
-        match self.group {
-            Some(pgid) => {
-                let _ = os::unix::kill_other_group_members(pgid);
-            }
-            None if child_unreaped => {
-                let _ = os::unix::signal_process(self.identity.pid, os::unix::SIGKILL);
             }
             None => {}
         }

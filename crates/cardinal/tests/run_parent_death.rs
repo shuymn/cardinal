@@ -1,6 +1,6 @@
 //! Parent death (A12, `docs/architecture.md` section 5.5): when the runner's parent exits (the
 //! Bash call was cancelled), the runner does not start the stage, or, after the spawn, stops
-//! the group and holds its reservation until the group is empty.
+//! the group, and its reservation stays until the group is empty.
 
 #![cfg(unix)]
 
@@ -9,7 +9,9 @@ mod support;
 
 use std::time::{Duration, Instant};
 
-use cardinal::contract::RecordKind;
+use cardinal::admission::{list_reservations, recovery_pass};
+use cardinal::config::HostConfig;
+use cardinal::contract::{DerivedState, RecordKind};
 use cardinal::testpoint::{ADMISSION_WAITING, RUN_AFTER_SPAWN};
 use runner_support::{Env, GroupGuard, WAIT, wait_gone};
 use support::helper::{ChildGuard, wait_for, wait_for_file};
@@ -46,8 +48,17 @@ fn parent_exit_before_the_spawn_leaves_nothing() {
     assert_eq!(finished[0].data["cancelled"], "parent_exited");
 }
 
+/// Waits until the runner is no longer `parent`'s child.
+fn wait_orphaned(runner: u32, parent: u32) {
+    wait_for("the runner to lose its parent", WAIT, || {
+        let now = cardinal::os::process(runner, cardinal::os::Detail::default())?.parent;
+        (now != Some(parent)).then_some(())
+    });
+}
+
 /// After the spawn: SIGTERM to the group; a grandchild that ignores it keeps the group, and
-/// the reservation, alive until SIGKILL 5 s later.
+/// the reservation, alive until the runner sends SIGKILL to the group 5 s later. The
+/// reservation is left for recovery, which releases it now that the group is empty.
 #[test]
 fn parent_exit_after_the_spawn_stops_the_group() {
     let env = Env::with_budget(1);
@@ -97,6 +108,53 @@ fn parent_exit_after_the_spawn_stops_the_group() {
     );
     wait_gone(runner_pid, runner_start);
     assert!(!cardinal::os::unix::group_exists(runner_pid));
-    assert_eq!(env.reservations(), []);
     assert!(env.worktree_lock_free());
+    let finished = env.records_of(RecordKind::JobFinished);
+    assert_eq!(finished.len(), 1, "recorded before SIGKILL");
+    let views = list_reservations(&env.state()).unwrap();
+    assert_eq!(views.len(), 1);
+    assert_eq!(views[0].derived, DerivedState::Stale);
+    let report = recovery_pass(&env.state(), &HostConfig::defaults()).unwrap();
+    assert_eq!(report.released, [finished[0].job_id.clone().unwrap()]);
+    assert_eq!(env.reservations(), []);
+}
+
+/// The direct child exited and left a descendant in the group when the parent exits: the
+/// runner takes in the parent's exit before it returns, stops the group with SIGTERM, and
+/// releases the reservation once the group is empty.
+#[test]
+fn parent_exit_after_the_child_exited_stops_its_descendants() {
+    let env = Env::with_budget(1);
+    let pids = env.file("pids");
+    let script = format!(
+        "sleep 30 </dev/null >/dev/null 2>&1 & echo $! > '{}'",
+        pids.display()
+    );
+    let runner = env.run_at(None, &["sh", "-c", &script], &[RUN_AFTER_SPAWN], None);
+    let mut parent = ChildGuard::new(env.in_shell(&runner, "; exit $?").spawn().unwrap());
+    let runner_pid = env.wait_any_reached(RUN_AFTER_SPAWN);
+    let _group = GroupGuard(runner_pid);
+    let runner_start = cardinal::os::start_time_s(runner_pid).unwrap();
+    let descendant: u32 = wait_for("the descendant PID", WAIT, || {
+        std::fs::read_to_string(&pids).ok()?.trim().parse().ok()
+    });
+    let descendant_start = cardinal::os::start_time_s(descendant).unwrap();
+    let child = env.reservations()[0].child.unwrap();
+    wait_gone(child.pid, child.start_s);
+
+    let parent_pid = parent.id();
+    parent.kill();
+    wait_orphaned(runner_pid, parent_pid);
+    env.points.release(RUN_AFTER_SPAWN);
+
+    wait_for(
+        "the descendant to stop on SIGTERM",
+        Duration::from_secs(4),
+        || (!cardinal::os::is_alive(descendant, descendant_start)).then_some(()),
+    );
+    wait_gone(runner_pid, runner_start);
+    assert_eq!(env.reservations(), [], "released: the group is empty");
+    assert!(env.worktree_lock_free());
+    let finished = env.records_of(RecordKind::JobFinished);
+    assert_eq!(finished[0].data["exit"], 0);
 }

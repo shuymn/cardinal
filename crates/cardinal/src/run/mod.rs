@@ -559,10 +559,14 @@ impl Runner {
     /// which releases it once the group is empty (section 4.5).
     fn finish(mut self, outcome: &ExecOutcome, spawned: Instant, path: &'static str) -> ExitCode {
         let wall_ms = u64::try_from(spawned.elapsed().as_millis()).unwrap_or(u64::MAX);
+        // The group that outlived the SIGTERM sent when the parent exited.
+        let mut kill = None;
         if let Some(job) = self.job.take() {
             if self.group_is_empty(&job) {
                 let _ = job.release();
             } else {
+                let GroupIdentity::Pgid { pgid, .. } = job.reservation().group;
+                kill = self.watch.group_kill_due().then_some(pgid);
                 job.abandon();
             }
         }
@@ -583,6 +587,9 @@ impl Runner {
             }),
         );
         drop(self.inuse.take());
+        if let Some(pgid) = kill {
+            kill_group(pgid);
+        }
         match outcome {
             ExecOutcome::Exited(code) => exit_code(*code),
             ExecOutcome::Signaled(sig) => die_by_signal(*sig),
@@ -662,6 +669,18 @@ impl Runner {
         let _ = ctx.recorder.append(&record);
     }
 }
+
+/// Sends SIGKILL to the job's group once the job is recorded and its reservation left for
+/// recovery. Nobody waits for the runner any more: when it is still a member, it ends here
+/// too, and the reservation is released once the group is empty.
+#[cfg(unix)]
+fn kill_group(pgid: u32) {
+    let _ = std::io::stderr().flush();
+    let _ = os::unix::signal_group(pgid, os::unix::SIGKILL);
+}
+
+#[cfg(not(unix))]
+fn kill_group(_pgid: u32) {}
 
 fn cwd_string() -> String {
     std::env::current_dir().map_or_default(|cwd| cwd.to_string_lossy().into_owned())
