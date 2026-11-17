@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 #[cfg(unix)]
-use crate::marker::{FileId, Marker};
+use crate::marker::Marker;
 
 /// The variable the test harness sets to a value unique to each harness run. A scope passes
 /// it to every child, so the harness can find what a test left running.
@@ -113,10 +113,12 @@ impl Scope {
         &self.root
     }
 
-    /// The file every child of this scope holds open (see [`Marker`]).
+    /// The file every child of this scope holds open (see [`Marker`]). A guard keeps it open
+    /// for as long as it may signal, so the file's inode cannot be given to another file while
+    /// the guard compares against it, even after the scope is gone.
     #[cfg(unix)]
-    pub(crate) fn marker(&self) -> FileId {
-        self.marker.id()
+    pub(crate) fn marker(&self) -> Arc<Marker> {
+        Arc::clone(&self.marker)
     }
 
     /// `root/rel`; panics if `rel` leaves the root.

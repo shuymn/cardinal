@@ -21,7 +21,7 @@ fn owned_by(scope: &Scope) -> impl Fn(u32) -> bool + use<> {
     #[cfg(unix)]
     {
         let marker = scope.marker();
-        move |pid| marker::holds(pid, marker)
+        move |pid| marker::holds(pid, marker.id())
     }
     #[cfg(windows)]
     {
@@ -107,7 +107,7 @@ impl Drop for PidGuard {
 #[cfg(unix)]
 pub struct GroupGuard {
     pgid: u32,
-    marker: marker::FileId,
+    marker: std::sync::Arc<marker::Marker>,
 }
 
 #[cfg(unix)]
@@ -124,7 +124,7 @@ impl GroupGuard {
 #[cfg(unix)]
 impl Drop for GroupGuard {
     fn drop(&mut self) {
-        let left = kill_group_members(self.pgid, self.marker);
+        let left = kill_group_members(self.pgid, self.marker.id());
         if !std::thread::panicking() {
             assert_eq!(
                 left,
@@ -165,7 +165,7 @@ fn kill_group_members(pgid: u32, marker: marker::FileId) -> Vec<u32> {
 pub struct LeftoverGuard {
     root: PathBuf,
     #[cfg(unix)]
-    marker: marker::FileId,
+    marker: std::sync::Arc<marker::Marker>,
 }
 
 impl LeftoverGuard {
@@ -183,7 +183,7 @@ impl LeftoverGuard {
     fn owns(&self, pid: u32) -> bool {
         #[cfg(unix)]
         {
-            marker::holds(pid, self.marker)
+            marker::holds(pid, self.marker.id())
         }
         #[cfg(windows)]
         {
@@ -467,6 +467,25 @@ mod tests {
     use crate::{Child, Scope};
 
     const WAIT: Duration = Duration::from_secs(5);
+
+    /// A guard that outlives its scope still holds the marker open, so the marker's inode is
+    /// not given to another file that an unrelated process could hold while the guard selects.
+    #[cfg(unix)]
+    #[test]
+    fn a_guard_keeps_the_scope_marker_open_after_the_scope() {
+        let scope = Scope::new();
+        let leftovers = LeftoverGuard::new(&scope);
+        let group = GroupGuard::new(&scope, u32::MAX);
+        let raw = leftovers.marker.raw();
+        drop(scope);
+        // SAFETY: only the flags of `raw` are read; a closed descriptor fails.
+        let fd = unsafe { rustix::fd::BorrowedFd::borrow_raw(raw) };
+        assert!(
+            rustix::io::fcntl_getfd(fd).is_ok(),
+            "the marker closed with its scope"
+        );
+        assert!(std::sync::Arc::ptr_eq(&leftovers.marker, &group.marker));
+    }
 
     fn sleeper(scope: &Scope) -> Child {
         let mut command = scope.command("sleep", scope.root());
