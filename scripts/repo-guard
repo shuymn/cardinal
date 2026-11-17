@@ -1,34 +1,172 @@
-#!/usr/bin/env bash
-# Records or checks the state of a git repository, so a test run that writes to the
-# repository it runs in fails (docs/architecture.md section 13.4).
+#!/bin/sh
+# Records or checks the state of a git worktree and its repository, so a test run that
+# writes to the repository it runs in fails (docs/architecture.md section 13.4).
 #
-#   scripts/repo-guard snapshot <repo> <file>   write the state of <repo> to <file>
-#   scripts/repo-guard verify <repo> <file>     fail if <repo> no longer matches <file>
+#   scripts/repo-guard snapshot <worktree> <file>   write the state to <file>
+#   scripts/repo-guard verify <worktree> <file>     fail if the state no longer matches <file>
+#   scripts/repo-guard identify <worktree>          print which repository the guard inspects
 #
-# The state is: refs with HEAD, the worktree list, the local config, the stash list, and
-# the hash of the index. Work in other worktrees of the same repository is left out: the
-# branches those worktrees have checked out (their refs, remote-tracking refs, and
-# `branch.<name>.*` config) and their HEAD lines. Refs outside git's own namespaces (heads,
-# tags, remotes, notes, stash), which other tools keep for themselves, are left out too.
-# Adding or removing a worktree, any other new ref or config entry, or a stash still counts
-# as a change.
+# The guard starts over in a constructed environment before bash reads any startup file, so
+# no inherited GIT_DIR, GIT_WORK_TREE, GIT_INDEX_FILE, GIT_CONFIG_*, GIT_TRACE*, or BASH_ENV
+# reaches it or git. Before reading anything it checks that git resolves <worktree> to the
+# top level, git dir, and common dir that its `.git` entry names.
+#
+# The state is a manifest of files, walked without following symbolic links (type, mode,
+# size, and checksum, or the target of a link), plus what git reports:
+#
+# - the common git dir's `config` (as entries), the config files it includes, `hooks/` (or
+#   the directory `core.hooksPath` names), `info/`, `packed-refs`, the stash list, the refs
+#   with HEAD, the worktree list, and each `worktrees/<name>/gitdir`;
+# - this worktree's git dir: HEAD, index, `sharedindex.*`, `config.worktree`, logs, and any
+#   other file in it, sockets included (an fsmonitor daemon's).
+#
+# Other worktrees of the same repository change legitimately while the tests run, so by
+# default their work is left out: the branches they have checked out (refs, remote-tracking
+# refs, `branch.<name>.*` config, `packed-refs` lines), their HEAD lines, their git dirs, and
+# the objects. Refs outside git's own namespaces (heads, tags, remotes, notes, stash), which
+# other tools keep for themselves, are left out too. With CI=true there are no other
+# worktrees, and the state is the whole common git dir (objects by name) and every ref.
+
+# POSIX prelude: re-run under bash in a constructed environment. `sh` reads no startup file
+# when it runs a script; `bash --noprofile --norc` with BASH_ENV unset reads none either.
+if [ "${1-}" != --clean-env ]; then
+  case $(uname -s) in
+    MINGW* | MSYS* | CYGWIN*)
+      exec env -i PATH="$PATH" CI="${CI-}" SYSTEMROOT="${SYSTEMROOT-}" WINDIR="${WINDIR-}" \
+        COMSPEC="${COMSPEC-}" PATHEXT="${PATHEXT-}" TEMP="${TEMP-}" TMP="${TMP-}" \
+        bash --noprofile --norc "$0" --clean-env "$@"
+      ;;
+    *)
+      exec env -i PATH="$PATH" CI="${CI-}" bash --noprofile --norc "$0" --clean-env "$@"
+      ;;
+  esac
+fi
+shift
+
 set -euo pipefail
 shopt -s inherit_errexit 2>/dev/null || true
+export LC_ALL=C GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \
+  GIT_OPTIONAL_LOCKS=0
 
 usage() {
-  echo "usage: $0 snapshot|verify <repo> <file>" >&2
+  echo "usage: $0 snapshot|verify <worktree> <file> | identify <worktree>" >&2
   exit 2
 }
 
-[ "$#" -eq 3 ] || usage
-mode=$1
-repo=$2
-file=$3
+die() {
+  echo "repo-guard: $*" >&2
+  exit 1
+}
+
+mode=${1-}
+case $mode in
+  snapshot | verify) [ "$#" -eq 3 ] || usage ;;
+  identify) [ "$#" -eq 2 ] || usage ;;
+  *) usage ;;
+esac
+[ -d "$2" ] || die "$2 is not a directory"
+top=$(cd "$2" && pwd -P)
+file=${3-}
+strict=no
+[ "${CI-}" = true ] && strict=yes
+
+g() {
+  git -C "$top" -c safe.directory='*' -c core.fsmonitor=false "$@"
+}
+
+canonical() {
+  (cd "$1" 2>/dev/null && pwd -P) || die "$1 does not exist"
+}
+
+# The git dir and common dir that `<top>/.git` names, read without git, then compared with
+# what git resolves.
+identify() {
+  local dotgit=$top/.git line commondir
+  if [ -d "$dotgit" ] && [ ! -L "$dotgit" ]; then
+    gitdir=$dotgit
+  elif [ -f "$dotgit" ]; then
+    IFS= read -r line <"$dotgit" || true
+    case $line in
+      "gitdir: "*) gitdir=$(cd "$top" && canonical "${line#gitdir: }") ;;
+      *) die "$dotgit is not a gitdir file" ;;
+    esac
+  else
+    die "$top is not the top level of a worktree (no .git)"
+  fi
+  common=$gitdir
+  if [ -f "$gitdir/commondir" ]; then
+    IFS= read -r commondir <"$gitdir/commondir" || true
+    common=$(cd "$gitdir" && canonical "$commondir")
+  fi
+  local git_top git_dir git_common
+  # As git prints it, for comparing with `git worktree list`.
+  own=$(g rev-parse --show-toplevel)
+  git_top=$(canonical "$own")
+  git_dir=$(canonical "$(g rev-parse --path-format=absolute --absolute-git-dir)")
+  git_common=$(canonical "$(g rev-parse --path-format=absolute --git-common-dir)")
+  [ "$git_top" = "$top" ] || die "git resolves $top to the worktree $git_top"
+  [ "$git_dir" = "$gitdir" ] || die "git resolves $top to the git dir $git_dir, .git names $gitdir"
+  [ "$git_common" = "$common" ] || die "git resolves $top to the common dir $git_common, not $common"
+}
+
+# A manifest of <dir>, without following symbolic links: `d` directories, `l` links with
+# their targets, `o` sockets and other special files, `f` files with checksum and size (or
+# only their names with `names`), `x` executable files. Entries matching the find(1) -path
+# patterns after <dir> are left out with everything below them.
+manifest() {
+  local dir=$1 content=$2
+  shift 2
+  if [ ! -e "$dir" ] && [ ! -L "$dir" ]; then
+    echo "(missing)"
+    return
+  fi
+  local prune=()
+  for pattern in "$@"; do
+    prune+=(-path "$pattern" -prune -o)
+  done
+  (
+    cd "$dir"
+    find . "${prune[@]}" -type d -print | sed 's/^/d /'
+    find . "${prune[@]}" -type l -print | while IFS= read -r path; do
+      printf 'l %s -> %s\n' "$path" "$(readlink "$path")"
+    done
+    find . "${prune[@]}" ! -type d ! -type l ! -type f -print | sed 's/^/o /'
+    if [ "$content" = names ]; then
+      find . "${prune[@]}" -type f -print | sed 's/^/f /'
+    else
+      find . "${prune[@]}" -type f -exec cksum {} + |
+        awk '{ sum = $1; size = $2; $1 = ""; $2 = ""; sub(/^  /, ""); print "f " $0 " " sum " " size }'
+    fi
+    find . "${prune[@]}" -type f -perm -u+x -print | sed 's/^/x /'
+  ) | sort
+}
+
+# The checksum and size of one file, or `missing`.
+content() {
+  if [ -f "$1" ]; then
+    cksum <"$1"
+  else
+    echo "missing"
+  fi
+}
 
 state() {
-  local own worktrees other_branches other_names refs index nl=$'\n'
-  # awk prelude: drop[] holds the full refs in $SKIP, names[] their branch names.
-  local branch_names='BEGIN {
+  local worktrees other_branches other_names nl=$'\n'
+  identify
+  echo "## identity"
+  printf 'top %s\ngit dir %s\ncommon dir %s\n' "$top" "$gitdir" "$common"
+
+  worktrees=$(g worktree list --porcelain)
+  other_branches=
+  if [ "$strict" = no ]; then
+    other_branches=$(printf '%s\n' "$worktrees" | OWN="$own" awk '
+      /^worktree / { other = (substr($0, 10) != ENVIRON["OWN"]) }
+      other && /^branch / { print substr($0, 8) }')
+  fi
+  other_names=$(printf '%s\n' "$other_branches" | sed -n 's|^refs/heads/||p')
+  # awk prelude: drop[] holds the full refs in $SKIP, names[] their branch names; keep(ref)
+  # says whether a ref is part of the state.
+  local filter='BEGIN {
     n = split(ENVIRON["SKIP"], skip, "\n")
     for (i = 1; i <= n; i++) {
       if (skip[i] == "") continue
@@ -37,37 +175,53 @@ state() {
       sub(/^refs\/heads\//, "", name)
       names[name] = 1
     }
+    strict = (ENVIRON["STRICT"] == "yes")
+  }
+  function keep(ref,   name) {
+    if (strict) return 1
+    if (!(ref == "HEAD" || ref ~ /^refs\/(heads|tags|remotes|notes)\// || ref == "refs/stash")) return 0
+    if (ref in drop) return 0
+    if (ref ~ /^refs\/remotes\//) {
+      name = ref
+      sub(/^refs\/remotes\/[^\/]+\//, "", name)
+      return !(name in names)
+    }
+    return 1
   }'
-  # Empty for a bare repository, whose worktrees all count as other worktrees.
-  own=$(git -C "$repo" rev-parse --show-toplevel 2>/dev/null || true)
-  worktrees=$(git -C "$repo" worktree list --porcelain)
-  other_branches=$(printf '%s\n' "$worktrees" | OWN="$own" awk '
-    /^worktree / { other = (substr($0, 10) != ENVIRON["OWN"]) }
-    other && /^branch / { print substr($0, 8) }')
-  other_names=$(printf '%s\n' "$other_branches" | sed -n 's|^refs/heads/||p')
 
   echo "## show-ref --head"
+  local refs
   # Exit 1 means no refs at all, which is a state too.
-  refs=$(git -C "$repo" show-ref --head) || [ "$?" -eq 1 ]
-  printf '%s\n' "$refs" | SKIP="$other_branches" awk "$branch_names"'
-    {
-      keep = ($2 == "HEAD" || $2 ~ /^refs\/(heads|tags|remotes|notes)\// || $2 == "refs/stash") && !($2 in drop)
-      if (keep && $2 ~ /^refs\/remotes\//) {
-        name = $2
-        sub(/^refs\/remotes\/[^\/]+\//, "", name)
-        keep = !(name in names)
-      }
-    }
-    keep'
+  refs=$(g show-ref --head) || [ "$?" -eq 1 ]
+  printf '%s\n' "$refs" | SKIP="$other_branches" STRICT=$strict awk "$filter"'
+    keep($2)'
+
+  echo "## packed-refs"
+  if [ -f "$common/packed-refs" ]; then
+    SKIP="$other_branches" STRICT=$strict awk "$filter"'
+      /^#/ { print; next }
+      /^\^/ { if (kept) print; next }
+      { kept = keep($2); if (kept) print }' "$common/packed-refs"
+  else
+    echo "missing"
+  fi
+
   echo "## worktree list --porcelain"
-  printf '%s\n' "$worktrees" | OWN="$own" awk '
+  printf '%s\n' "$worktrees" | OWN="$own" STRICT=$strict awk '
     /^worktree / { other = (substr($0, 10) != ENVIRON["OWN"]) }
-    !(other && /^HEAD /)'
-  echo "## config --local --list"
+    ENVIRON["STRICT"] == "yes" || !(other && /^HEAD /)'
+
+  echo "## worktrees/*/gitdir"
+  for entry in "$common"/worktrees/*/; do
+    [ -d "$entry" ] || continue
+    printf '%s %s\n' "$(basename "$entry")" "$(cat "$entry/gitdir" 2>/dev/null || echo missing)"
+  done
+
+  echo "## config"
   # With -z each entry is the key, a newline, and the value, ended by NUL, so the branch
   # name in a `branch.<name>.<var>` key is everything between `branch.` and the last dot,
   # even when the name itself contains dots. Entries print as `key=value`.
-  { git -C "$repo" config --local --list -z || [ "$?" -eq 1 ]; } |
+  { g config --file "$common/config" --list -z || [ "$?" -eq 1 ]; } |
     while IFS= read -r -d '' entry; do
       key=${entry%%"$nl"*}
       case $key in
@@ -79,30 +233,66 @@ state() {
       esac
       printf '%s\n' "${entry/"$nl"/=}"
     done
+
+  echo "## included config files"
+  { g config --file "$common/config" --get-regexp '^include(if\..*)?\.path$' || [ "$?" -eq 1 ]; } |
+    while read -r _ path; do
+      case $path in
+        /*) ;;
+        "~/"*) path="(home)/${path#\~/}" ;;
+        *) path=$common/$path ;;
+      esac
+      printf '%s %s\n' "$path" "$(content "$path")"
+    done
+
+  echo "## hooks"
+  local hooks
+  hooks=$(g config --file "$common/config" --get core.hooksPath || echo hooks)
+  case $hooks in
+    /*) ;;
+    *) hooks=$common/$hooks ;;
+  esac
+  echo "$hooks"
+  manifest "$hooks" content
+
+  echo "## info"
+  manifest "$common/info" content
+
   echo "## stash list"
-  git -C "$repo" stash list
-  echo "## index"
-  index=$(git -C "$repo" rev-parse --path-format=absolute --git-path index)
-  if [ -e "$index" ]; then
-    git -C "$repo" hash-object --no-filters -- "$index"
+  g stash list
+
+  echo "## worktree git dir"
+  if [ "$gitdir" = "$common" ]; then
+    # The main worktree: its own files sit at the top of the common dir.
+    manifest "$gitdir" content './*/*' ./config ./packed-refs ./objects ./refs ./hooks \
+      ./info ./worktrees ./modules ./lfs ./rr-cache ./branches
+    manifest "$gitdir/logs" content ./refs
   else
-    echo "missing"
+    manifest "$gitdir" content
+  fi
+
+  if [ "$strict" = yes ]; then
+    echo "## common dir"
+    manifest "$common" content ./objects
+    echo "## objects"
+    manifest "$common/objects" names
   fi
 }
 
-case "$mode" in
+case $mode in
+  identify)
+    identify
+    printf 'top %s\ngit dir %s\ncommon dir %s\n' "$top" "$gitdir" "$common"
+    ;;
   snapshot)
     state >"$file"
     ;;
   verify)
     current=$(state)
     if [ "$current" != "$(cat "$file")" ]; then
-      echo "repo-guard: $repo changed while the tests ran:" >&2
+      echo "repo-guard: $top changed while the tests ran:" >&2
       diff -u "$file" <(printf '%s\n' "$current") >&2 || true
       exit 1
     fi
-    ;;
-  *)
-    usage
     ;;
 esac

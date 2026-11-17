@@ -1,27 +1,45 @@
 //! `scripts/repo-guard` detects writes to a repository (`docs/architecture.md` section 13.4):
-//! snapshot a fixture, mutate it, and verify must fail; without a mutation it passes. On
-//! Windows the script runs in Git Bash, as `scripts/test` does.
-
-mod support;
+//! snapshot a fixture, change it the way a test that escaped its fixture would, and verify
+//! must fail; without a change it passes. On Windows the script runs in Git Bash, as
+//! `scripts/test` does.
 
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
-use support::fixture::Fixture;
+use cardinal_test_support::fixture::Fixture;
 
 fn script() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/repo-guard")
 }
 
+fn guard_with(
+    fixture: &Fixture,
+    env: &[(&str, &str)],
+    mode: &str,
+    repo: &Path,
+    file: Option<&Path>,
+) -> Output {
+    let mut command = fixture.command("bash", fixture.root());
+    command.arg(script()).arg(mode).arg(repo);
+    if let Some(file) = file {
+        command.arg(file);
+    }
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    command.output().expect("run repo-guard")
+}
+
 fn guard(fixture: &Fixture, mode: &str, repo: &Path, file: &Path) -> Output {
-    fixture
-        .command("bash", fixture.root())
-        .arg(script())
-        .arg(mode)
-        .arg(repo)
-        .arg(file)
-        .output()
-        .expect("run repo-guard")
+    guard_with(fixture, &[], mode, repo, Some(file))
+}
+
+fn assert_ok(output: &Output) {
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 /// A repository with one commit, a linked worktree, and a snapshot of it.
@@ -31,12 +49,7 @@ fn snapshotted() -> (Fixture, PathBuf, PathBuf) {
     fixture.commit_file(&repo, "a.txt", "a\n", "first");
     fixture.worktree_add(&repo, "wt", "feature");
     let file = fixture.path("snapshot");
-    let output = guard(&fixture, "snapshot", &repo, &file);
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_ok(&guard(&fixture, "snapshot", &repo, &file));
     (fixture, repo, file)
 }
 
@@ -56,14 +69,9 @@ fn assert_detected(name: &str, mutate: impl FnOnce(&Fixture, &Path)) {
 fn unchanged_repository_verifies() {
     let (fixture, repo, file) = snapshotted();
     // Reads do not count as changes.
-    fixture.git(&repo, &["status", "--porcelain"]);
-    fixture.git(&repo, &["log", "--oneline"]);
-    let output = guard(&fixture, "verify", &repo, &file);
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    fixture.status(&repo);
+    fixture.log(&repo, "%H");
+    assert_ok(&guard(&fixture, "verify", &repo, &file));
 }
 
 #[test]
@@ -78,21 +86,35 @@ fn commits_in_other_worktrees_are_ignored() {
     let (fixture, repo, file) = snapshotted();
     let wt = fixture.path("wt");
     fixture.commit_file(&wt, "w.txt", "w\n", "in the other worktree");
-    let output = guard(&fixture, "verify", &repo, &file);
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_ok(&guard(&fixture, "verify", &repo, &file));
 
     // Seen from the linked worktree, a commit on its own branch counts, one in the main
     // worktree does not.
     let wt_file = fixture.path("wt-snapshot");
-    assert!(guard(&fixture, "snapshot", &wt, &wt_file).status.success());
+    assert_ok(&guard(&fixture, "snapshot", &wt, &wt_file));
     fixture.commit_file(&repo, "m.txt", "m\n", "in the main worktree");
-    assert!(guard(&fixture, "verify", &wt, &wt_file).status.success());
+    assert_ok(&guard(&fixture, "verify", &wt, &wt_file));
     fixture.commit_file(&wt, "w2.txt", "w\n", "in this worktree");
     assert!(!guard(&fixture, "verify", &wt, &wt_file).status.success());
+}
+
+#[test]
+fn in_ci_other_worktrees_count_too() {
+    let fixture = Fixture::new();
+    let repo = fixture.init("repo");
+    fixture.commit_file(&repo, "a.txt", "a\n", "first");
+    let wt = fixture.worktree_add(&repo, "wt", "feature");
+    let file = fixture.path("snapshot");
+    let ci = [("CI", "true")];
+    assert_ok(&guard_with(&fixture, &ci, "snapshot", &repo, Some(&file)));
+    assert_ok(&guard_with(&fixture, &ci, "verify", &repo, Some(&file)));
+    fixture.commit_file(&wt, "w.txt", "w\n", "in the other worktree");
+    assert!(
+        !guard_with(&fixture, &ci, "verify", &repo, Some(&file))
+            .status
+            .success(),
+        "a commit in another worktree was ignored with CI=true"
+    );
 }
 
 #[test]
@@ -103,14 +125,9 @@ fn pushes_and_upstreams_of_other_worktrees_are_ignored() {
     // The push sets the upstream config; a push or fetch through a named remote also
     // writes the remote-tracking ref.
     fixture.push(&wt, &bare, "feature");
-    fixture.git(&wt, &["update-ref", "refs/remotes/origin/feature", "HEAD"]);
-    fixture.git(&wt, &["config", "branch.feature.note", "x"]);
-    let output = guard(&fixture, "verify", &repo, &file);
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    fixture.update_ref(&wt, "refs/remotes/origin/feature", "HEAD");
+    fixture.config_set(&wt, "branch.feature.note", "x");
+    assert_ok(&guard(&fixture, "verify", &repo, &file));
 
     // The same for this worktree's own branch is a change.
     fixture.push(&repo, &bare, "main");
@@ -121,14 +138,9 @@ fn pushes_and_upstreams_of_other_worktrees_are_ignored() {
 fn config_of_a_branch_whose_name_extends_another_worktrees_branch_is_detected() {
     // The linked worktree has `feature` checked out; `feature.fix` is a different branch.
     let (fixture, repo, file) = snapshotted();
-    fixture.git(&repo, &["config", "branch.feature.note", "x"]);
-    let output = guard(&fixture, "verify", &repo, &file);
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    fixture.git(&repo, &["config", "branch.feature.fix.note", "x"]);
+    fixture.config_set(&repo, "branch.feature.note", "x");
+    assert_ok(&guard(&fixture, "verify", &repo, &file));
+    fixture.config_set(&repo, "branch.feature.fix.note", "x");
     let output = guard(&fixture, "verify", &repo, &file);
     assert!(!output.status.success(), "branch.feature.fix was ignored");
     assert!(String::from_utf8_lossy(&output.stderr).contains("branch.feature.fix.note=x"));
@@ -137,36 +149,28 @@ fn config_of_a_branch_whose_name_extends_another_worktrees_branch_is_detected() 
 #[test]
 fn new_ref_is_detected() {
     assert_detected("a new branch", |fixture, repo| {
-        fixture.git(repo, &["branch", "other"]);
+        fixture.branch(repo, "other");
     });
 }
 
 #[test]
 fn new_tag_is_detected() {
     assert_detected("a new tag", |fixture, repo| {
-        fixture.git(repo, &["tag", "v1"]);
+        fixture.tag(repo, "v1");
     });
 }
 
 #[test]
 fn refs_outside_git_namespaces_are_ignored() {
     let (fixture, repo, file) = snapshotted();
-    fixture.git(
-        repo.as_path(),
-        &["update-ref", "refs/tool/checkpoint", "HEAD"],
-    );
-    let output = guard(&fixture, "verify", &repo, &file);
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    fixture.update_ref(&repo, "refs/tool/checkpoint", "HEAD");
+    assert_ok(&guard(&fixture, "verify", &repo, &file));
 }
 
 #[test]
 fn local_config_is_detected() {
     assert_detected("a local config entry", |fixture, repo| {
-        fixture.git(repo, &["config", "--local", "cardinal.probe", "x"]);
+        fixture.config_set(repo, "cardinal.probe", "x");
     });
 }
 
@@ -174,7 +178,7 @@ fn local_config_is_detected() {
 fn stash_is_detected() {
     assert_detected("a stash", |fixture, repo| {
         std::fs::write(repo.join("a.txt"), "changed\n").unwrap();
-        fixture.git(repo, &["stash", "push", "-q"]);
+        fixture.stash_push(repo);
     });
 }
 
@@ -189,8 +193,111 @@ fn worktree_change_is_detected() {
 fn index_change_is_detected() {
     assert_detected("a staged file", |fixture, repo| {
         std::fs::write(repo.join("c.txt"), "c\n").unwrap();
-        fixture.git(repo, &["add", "--", "c.txt"]);
+        fixture.add(repo, "c.txt");
     });
+}
+
+#[test]
+fn hook_content_is_detected() {
+    assert_detected("a new hook", |_, repo| {
+        std::fs::write(repo.join(".git/hooks/pre-commit"), "#!/bin/sh\n").unwrap();
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn hook_mode_is_detected() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new();
+    let repo = fixture.init("repo");
+    let hook = repo.join(".git/hooks/pre-commit");
+    std::fs::write(&hook, "#!/bin/sh\n").unwrap();
+    let file = fixture.path("snapshot");
+    assert_ok(&guard(&fixture, "snapshot", &repo, &file));
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(!guard(&fixture, "verify", &repo, &file).status.success());
+}
+
+#[test]
+fn info_is_detected() {
+    assert_detected("info/exclude", |_, repo| {
+        std::fs::write(repo.join(".git/info/exclude"), "escaped\n").unwrap();
+    });
+}
+
+#[test]
+fn included_config_is_detected() {
+    let fixture = Fixture::new();
+    let repo = fixture.init("repo");
+    let included = repo.join(".git/extra.config");
+    std::fs::write(&included, "").unwrap();
+    let config = repo.join(".git/config");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str("[include]\n\tpath = extra.config\n");
+    std::fs::write(&config, text).unwrap();
+    let file = fixture.path("snapshot");
+    assert_ok(&guard(&fixture, "snapshot", &repo, &file));
+    std::fs::write(&included, "[cardinal]\n\tprobe = x\n").unwrap();
+    assert!(
+        !guard(&fixture, "verify", &repo, &file).status.success(),
+        "a change in an included config file was not detected"
+    );
+}
+
+#[test]
+fn worktree_git_dir_files_are_detected() {
+    let (fixture, _, _) = snapshotted();
+    let wt = fixture.path("wt");
+    let file = fixture.path("wt-snapshot");
+    assert_ok(&guard(&fixture, "snapshot", &wt, &file));
+    let git_dir = fixture.path("repo/.git/worktrees/wt");
+    std::fs::write(git_dir.join("config.worktree"), "[cardinal]\n\tx = y\n").unwrap();
+    assert!(!guard(&fixture, "verify", &wt, &file).status.success());
+}
+
+#[test]
+fn inherited_git_variables_do_not_redirect_the_guard() {
+    let fixture = Fixture::new();
+    let repo = fixture.init("repo");
+    fixture.commit_file(&repo, "a.txt", "a\n", "first");
+    let decoy = fixture.init("decoy");
+    fixture.commit_file(&decoy, "d.txt", "d\n", "decoy");
+    let decoy_git = decoy.join(".git");
+    let decoy_git = decoy_git.to_string_lossy();
+    let decoy_index = decoy.join(".git/index");
+    let decoy_index = decoy_index.to_string_lossy();
+    let decoy_top = decoy.to_string_lossy();
+    let env = [
+        ("GIT_DIR", &*decoy_git),
+        ("GIT_WORK_TREE", &*decoy_top),
+        ("GIT_INDEX_FILE", &*decoy_index),
+        ("GIT_COMMON_DIR", &*decoy_git),
+    ];
+    let output = guard_with(&fixture, &env, "identify", &repo, None);
+    assert_ok(&output);
+    let identity = String::from_utf8_lossy(&output.stdout);
+    assert!(identity.contains("/repo/.git"), "{identity}");
+    assert!(!identity.contains("decoy"), "{identity}");
+
+    // The snapshot is of the repository, so a change in it is seen through the variables.
+    let file = fixture.path("snapshot");
+    assert_ok(&guard_with(&fixture, &env, "snapshot", &repo, Some(&file)));
+    fixture.branch(&repo, "other");
+    assert!(
+        !guard_with(&fixture, &env, "verify", &repo, Some(&file))
+            .status
+            .success()
+    );
+}
+
+#[test]
+fn a_directory_below_the_top_level_is_refused() {
+    let fixture = Fixture::new();
+    let repo = fixture.init("repo");
+    fixture.commit_file(&repo, "sub/a.txt", "a\n", "first");
+    let output = guard_with(&fixture, &[], "identify", &repo.join("sub"), None);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("not the top level"));
 }
 
 #[test]

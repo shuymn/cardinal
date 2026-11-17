@@ -8,14 +8,19 @@
 //! }
 //! ```
 //!
-//! Every process a test starts is killed by its PID in a drop guard.
+//! The mode and its paths travel only as command-line arguments that [`command`] builds,
+//! never as environment variables, so nothing a test run inherits can turn a test into a
+//! helper or point a helper elsewhere. Helpers start through the spawn API, so the scope that
+//! started one kills it.
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-const MODE: &str = "CARDINAL_TEST_HELPER";
-const ARGS: &str = "CARDINAL_TEST_HELPER_ARGS";
+use cardinal_test_support::{Child, Command, Scope};
+
+/// Marks the arguments after libtest's `--` as a helper request. libtest reads them as name
+/// filters, which with `--exact` match no test but `helper`.
+const TAG: &str = "cardinal-test-helper:";
 
 /// How long a helper sleeps before exiting on its own, so a crashed test leaks nothing for
 /// long.
@@ -28,8 +33,8 @@ pub enum Mode {
     Sleep,
     /// Exit with status 0 after half a second, long enough to be seen running.
     Exit,
-    /// Optionally take an exclusive lock on `lock`, start a sleeping grandchild, write its PID
-    /// to `pid_file`, create `ready`, then sleep.
+    /// Optionally take an exclusive lock on `lock`, start a sleeping grandchild in a process
+    /// group of its own, write its PID to `pid_file`, create `ready`, then sleep.
     Spawn {
         ready: PathBuf,
         pid_file: PathBuf,
@@ -47,17 +52,14 @@ pub enum Mode {
     },
 }
 
-/// Runs the helper mode requested through the environment, then exits; returns at once in a
-/// normal test run.
+/// Runs the helper mode named on the command line, then exits; returns at once in a normal
+/// test run.
 pub fn run_if_requested() {
-    let Ok(mode) = std::env::var(MODE) else {
+    let mut request = std::env::args().filter_map(|arg| arg.strip_prefix(TAG).map(str::to_owned));
+    let Some(mode) = request.next() else {
         return;
     };
-    let args: Vec<String> = std::env::var(ARGS)
-        .unwrap_or_default()
-        .split('\n')
-        .map(str::to_owned)
-        .collect();
+    let args: Vec<String> = request.collect();
     match mode.as_str() {
         "sleep" => std::thread::sleep(LIFETIME),
         "exit" => std::thread::sleep(Duration::from_millis(500)),
@@ -70,13 +72,15 @@ pub fn run_if_requested() {
                 )
                 .expect("take the lock")
             });
-            // Killed only if this helper lives out its lifetime; a test that kills the
-            // helper kills the grandchild by PID.
-            let grandchild = spawn(&Mode::Sleep, None);
+            // The grandchild has a group of its own, so killing this helper leaves it running;
+            // a test that kills the helper kills the grandchild with a `PidGuard`. If this
+            // helper lives out its lifetime, its scope kills the grandchild.
+            let scope = Scope::new();
+            let grandchild = spawn(&scope, &Mode::Sleep, scope.root());
             std::fs::write(&args[1], grandchild.id().to_string()).expect("write the pid");
             std::fs::write(&args[0], b"").expect("write the ready file");
             std::thread::sleep(LIFETIME);
-            drop((lock, grandchild));
+            drop((lock, grandchild, scope));
         }
         "testpoint" => {
             let point: &'static str = Box::leak(args[0].clone().into_boxed_str());
@@ -104,14 +108,9 @@ pub fn run_if_requested() {
     std::process::exit(0);
 }
 
-/// A command that runs this test binary in `mode`.
-pub fn command(mode: &Mode) -> Command {
+/// A command that runs this test binary in `mode`, in `cwd` inside `scope`.
+pub fn command(scope: &Scope, mode: &Mode, cwd: &Path) -> Command {
     let exe = std::env::current_exe().expect("current test binary");
-    let mut command = Command::new(exe);
-    command
-        .args(["helper", "--exact", "--nocapture", "--test-threads=1"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null());
     let (name, args): (&str, Vec<String>) = match mode {
         Mode::Sleep => ("sleep", vec![]),
         Mode::Exit => ("exit", vec![]),
@@ -144,84 +143,19 @@ pub fn command(mode: &Mode) -> Command {
             ],
         ),
     };
-    command.env(MODE, name).env(ARGS, args.join("\n"));
+    let mut command = scope.command(exe, cwd);
+    command
+        .args(["helper", "--exact", "--nocapture", "--test-threads=1", "--"])
+        .arg(format!("{TAG}{name}"))
+        .args(args.iter().map(|arg| format!("{TAG}{arg}")))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null());
     command
 }
 
-/// Starts a helper in `cwd` (or this process's cwd).
-pub fn spawn(mode: &Mode, cwd: Option<&Path>) -> ChildGuard {
-    let mut command = command(mode);
-    if let Some(cwd) = cwd {
-        command.current_dir(cwd);
-    }
-    ChildGuard(command.spawn().expect("start a helper process"))
-}
-
-/// Kills and reaps its child when dropped.
-pub struct ChildGuard(Child);
-
-impl ChildGuard {
-    pub fn new(child: Child) -> Self {
-        Self(child)
-    }
-
-    pub fn id(&self) -> u32 {
-        self.0.id()
-    }
-
-    pub fn child(&mut self) -> &mut Child {
-        &mut self.0
-    }
-
-    /// Kills the child (SIGKILL on Unix, `TerminateProcess` on Windows) and reaps it.
-    pub fn kill(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        self.kill();
-    }
-}
-
-/// Kills a process that is not this process's child, by PID, when dropped.
-pub struct PidGuard(pub u32);
-
-impl Drop for PidGuard {
-    fn drop(&mut self) {
-        kill_pid(self.0);
-    }
-}
-
-/// Kills `pid` (SIGKILL on Unix, `TerminateProcess` on Windows) if it exists.
-pub fn kill_pid(pid: u32) {
-    let Ok(mut system) = sysinfo::System::new() else {
-        return;
-    };
-    let pid = sysinfo::Pid::from_u32(pid);
-    system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
-    if let Some(process) = system.process(pid) {
-        process.kill();
-    }
-}
-
-/// Waits until `check` returns `Some`, polling every 10 ms; panics after `timeout`.
-pub fn wait_for<T>(what: &str, timeout: Duration, mut check: impl FnMut() -> Option<T>) -> T {
-    let start = Instant::now();
-    loop {
-        if let Some(value) = check() {
-            return value;
-        }
-        assert!(start.elapsed() < timeout, "timed out waiting for {what}");
-        std::thread::sleep(Duration::from_millis(10));
-    }
-}
-
-/// Waits until `path` exists.
-pub fn wait_for_file(path: &Path, timeout: Duration) {
-    wait_for(&path.display().to_string(), timeout, || {
-        path.exists().then_some(())
-    });
+/// Starts a helper in `cwd` inside `scope`.
+pub fn spawn(scope: &Scope, mode: &Mode, cwd: &Path) -> Child {
+    command(scope, mode, cwd)
+        .spawn()
+        .expect("start a helper process")
 }

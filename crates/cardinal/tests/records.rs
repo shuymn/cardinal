@@ -12,8 +12,9 @@ use cardinal::contract::{Record, RecordKind};
 use cardinal::record::{Recorder, read_all};
 use cardinal::state::{self, LockMode, StateDir, try_lock};
 use cardinal::testpoint::RECORD_OPENED;
+use cardinal_test_support::Scope;
 use proptest::prelude::*;
-use support::helper::{self, ChildGuard, Mode};
+use support::helper::{self, Mode};
 use support::testpoints::TestPoints;
 
 #[test]
@@ -222,15 +223,20 @@ fn a_paused_appender_loses_nothing_across_two_rotations() {
     recorder.append(&numbered(&recorder, 0, 0)).unwrap();
     assert!(state.rotated_records(1).exists());
 
-    let points = TestPoints::new();
-    let mut command = helper::command(&Mode::Append {
-        state: dir.path().to_path_buf(),
-        seq: 1,
-        max_bytes,
-        keep,
-    });
+    let scope = Scope::new();
+    let points = TestPoints::new(&scope);
+    let mut command = helper::command(
+        &scope,
+        &Mode::Append {
+            state: dir.path().to_path_buf(),
+            seq: 1,
+            max_bytes,
+            keep,
+        },
+        scope.root(),
+    );
     points.apply(&mut command, &[RECORD_OPENED], None);
-    let mut paused = ChildGuard::new(command.spawn().unwrap());
+    let mut paused = command.spawn().unwrap();
     points.wait_reached(RECORD_OPENED, paused.id(), Duration::from_secs(30));
 
     // Two appends that would each rotate.
@@ -247,7 +253,7 @@ fn a_paused_appender_loses_nothing_across_two_rotations() {
     );
 
     points.release(RECORD_OPENED);
-    let status = paused.child().wait().unwrap();
+    let status = paused.wait().unwrap();
     assert!(status.success(), "the paused append failed: {status}");
     let seqs: Vec<u64> = read_all(&state).unwrap().iter().map(seq).collect();
     assert_eq!(seqs, [2, 3, 1], "the paused record survives");

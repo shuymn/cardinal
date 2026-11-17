@@ -151,6 +151,7 @@ version = "0.1.0"
 dependencies = [
  "assert_cmd",
  "base64",
+ "cardinal-test-support",
  "clap",
  "dunce",
  "proptest",
@@ -161,6 +162,18 @@ dependencies = [
  "thiserror",
  "toml",
  "windows-sys",
+]
+
+[[package]]
+name = "cardinal-test-support"
+version = "0.1.0"
+dependencies = [
+ "assert_cmd",
+ "dunce",
+ "process-wrap",
+ "rustix",
+ "sysinfo",
+ "tempfile",
 ]
 
 [[package]]
@@ -352,6 +365,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "nix"
+version = "0.31.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2bc81ce8148d3b4f3274da811f11cdd824ae661ee4ef732cdb229825cf5be7f7"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
+]
+
+[[package]]
 name = "ntapi"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -443,6 +468,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "process-wrap"
+version = "10.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1f21b97672d2dc848e7b25701ab4535618b92f4861c13cc3f7f7bed52ad3c8da"
+dependencies = [
+ "indexmap",
+ "nix",
+ "windows",
 ]
 
 [[package]]

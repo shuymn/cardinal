@@ -8,7 +8,9 @@ use std::time::Duration;
 
 use cardinal::os;
 use cardinal::state::{LockMode, Probe, probe, try_lock};
-use support::helper::{self, Mode, PidGuard, wait_for, wait_for_file};
+use cardinal_test_support::Scope;
+use cardinal_test_support::process::{PidGuard, wait_for, wait_for_file};
+use support::helper::{self, Mode};
 
 #[test]
 fn helper() {
@@ -19,21 +21,22 @@ const WAIT: Duration = Duration::from_secs(10);
 
 #[test]
 fn lock_is_released_when_the_holder_dies_and_its_child_does_not_hold_it() {
-    let dir = tempfile::tempdir().unwrap();
-    let lock = dir.path().join("live.lock");
-    let ready = dir.path().join("ready");
-    let pid_file = dir.path().join("pid");
+    let scope = Scope::new();
+    let lock = scope.path("live.lock");
+    let ready = scope.path("ready");
+    let pid_file = scope.path("pid");
     let mut holder = helper::spawn(
+        &scope,
         &Mode::Spawn {
             ready: ready.clone(),
             pid_file: pid_file.clone(),
             lock: Some(lock.clone()),
         },
-        None,
+        scope.root(),
     );
     wait_for_file(&ready, WAIT);
     let child: u32 = std::fs::read_to_string(&pid_file).unwrap().parse().unwrap();
-    let _child = PidGuard(child);
+    let _child = PidGuard::new(child);
     let child_start = wait_for("the holder's child", WAIT, || os::start_time_s(child));
 
     assert_eq!(probe(&lock).unwrap(), Probe::Held);

@@ -3,30 +3,30 @@
 
 use std::path::{Path, PathBuf};
 
-use tempfile::TempDir;
+use cardinal_test_support::{Command, Scope};
 
-/// A state and a config directory in a fresh temp dir.
+/// A state and a config directory inside a scope of their own.
 pub struct Dirs {
-    _dir: TempDir,
+    scope: Scope,
     state: PathBuf,
     config: PathBuf,
 }
 
 impl Dirs {
     pub fn new() -> Self {
-        let dir = tempfile::Builder::new()
-            .prefix("cardinal-dirs-")
-            .tempdir()
-            .expect("create temp dirs");
-        let root = dunce::canonicalize(dir.path()).expect("canonical temp dir");
-        let state = root.join("state");
-        let config = root.join("config");
+        let scope = Scope::new();
+        let state = scope.path("state");
+        let config = scope.path("config");
         std::fs::create_dir_all(&config).expect("create the config dir");
         Self {
-            _dir: dir,
+            scope,
             state,
             config,
         }
+    }
+
+    pub fn scope(&self) -> &Scope {
+        &self.scope
     }
 
     pub fn state(&self) -> &Path {
@@ -37,16 +37,15 @@ impl Dirs {
         &self.config
     }
 
-    /// `cardinal` with `CARDINAL_STATE_DIR` and `CARDINAL_CONFIG_DIR` set to these directories
-    /// and no test-point variables inherited.
-    pub fn cmd(&self) -> assert_cmd::Command {
-        let mut command = assert_cmd::Command::new(env!("CARGO_BIN_EXE_cardinal"));
+    /// `cardinal` in the scope root, with `CARDINAL_STATE_DIR` and `CARDINAL_CONFIG_DIR` set
+    /// to these directories.
+    pub fn cmd(&self) -> Command {
+        let mut command = self
+            .scope
+            .command(env!("CARGO_BIN_EXE_cardinal"), self.scope.root());
         command
             .env("CARDINAL_STATE_DIR", &self.state)
-            .env("CARDINAL_CONFIG_DIR", &self.config)
-            .env_remove("CARDINAL_TEST_DIR")
-            .env_remove("CARDINAL_TEST_PAUSE")
-            .env_remove("CARDINAL_TEST_FAIL");
+            .env("CARDINAL_CONFIG_DIR", &self.config);
         command
     }
 }

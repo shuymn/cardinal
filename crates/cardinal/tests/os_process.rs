@@ -6,7 +6,9 @@ mod support;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cardinal::os::{self, Detail, ProcessTable};
-use support::helper::{self, Mode, PidGuard, wait_for, wait_for_file};
+use cardinal_test_support::Scope;
+use cardinal_test_support::process::{PidGuard, wait_for, wait_for_file};
+use support::helper::{self, Mode};
 
 #[test]
 fn helper() {
@@ -46,9 +48,11 @@ fn own_process_is_listed_with_parent_start_time_and_cwd() {
 
 #[test]
 fn child_identity_cwd_and_death() {
-    let dir = tempfile::tempdir().unwrap();
+    let scope = Scope::new();
+    let dir = scope.path("cwd");
+    std::fs::create_dir(&dir).unwrap();
     let before = now_s();
-    let mut child = helper::spawn(&Mode::Sleep, Some(dir.path()));
+    let mut child = helper::spawn(&scope, &Mode::Sleep, &dir);
     let after = now_s();
     let pid = child.id();
 
@@ -62,7 +66,7 @@ fn child_identity_cwd_and_death() {
         "start {} outside [{before}, {after}]",
         info.start_s
     );
-    let expected_cwd = dunce::canonicalize(dir.path()).unwrap();
+    let expected_cwd = dunce::canonicalize(&dir).unwrap();
     let cwd = wait_for("the child's cwd", WAIT, || os::cwd(pid));
     assert_eq!(dunce::canonicalize(cwd).unwrap(), expected_cwd);
 
@@ -85,20 +89,21 @@ fn child_identity_cwd_and_death() {
 
 #[test]
 fn descendants_and_ancestors_cover_grandchildren() {
-    let dir = tempfile::tempdir().unwrap();
-    let ready = dir.path().join("ready");
-    let pid_file = dir.path().join("pid");
+    let scope = Scope::new();
+    let ready = scope.path("ready");
+    let pid_file = scope.path("pid");
     let child = helper::spawn(
+        &scope,
         &Mode::Spawn {
             ready: ready.clone(),
             pid_file: pid_file.clone(),
             lock: None,
         },
-        None,
+        scope.root(),
     );
     wait_for_file(&ready, WAIT);
     let grandchild: u32 = std::fs::read_to_string(&pid_file).unwrap().parse().unwrap();
-    let _grandchild = PidGuard(grandchild);
+    let _grandchild = PidGuard::new(grandchild);
 
     let table = wait_for("both helpers in the table", WAIT, || {
         let table = ProcessTable::snapshot(Detail::default()).unwrap();
@@ -125,7 +130,8 @@ fn boot_time_is_stable_and_in_the_past() {
 #[cfg(unix)]
 #[test]
 fn zombie_is_not_alive() {
-    let mut child = helper::spawn(&Mode::Exit, None);
+    let scope = Scope::new();
+    let mut child = helper::spawn(&scope, &Mode::Exit, scope.root());
     let pid = child.id();
     let start_s = wait_for("the child in the table", WAIT, || os::start_time_s(pid));
     wait_for("the child to exit", WAIT, || {
@@ -143,6 +149,6 @@ fn zombie_is_not_alive() {
     // Only this test reaps the child, so it was unreaped until now. macOS drops an exiting
     // process from the table a moment before it can be reaped.
     wait_for("the child to be reapable", WAIT, || {
-        child.child().try_wait().unwrap()
+        child.try_wait().unwrap()
     });
 }
