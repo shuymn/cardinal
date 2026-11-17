@@ -1,0 +1,333 @@
+//! Signals (A13, `docs/architecture.md` sections 5.5 and 5.6): a stage that dies by a signal
+//! makes the runner die by the same signal, so the calling shell sees the same status and
+//! message; signals sent to the runner reach the stage's group.
+
+#![cfg(unix)]
+
+mod runner_support;
+mod support;
+
+use std::os::unix::process::ExitStatusExt as _;
+
+use cardinal::os::unix::{ChildState, Until, wait_unreaped};
+use cardinal::testpoint::{ADMISSION_WAITING, RUN_BEFORE_STARTING};
+use cardinal_test_support::Command;
+use cardinal_test_support::process::{GroupGuard, is_stopped, wait_for, wait_for_file};
+use cardinal_test_support::pty::Pty;
+use runner_support::{Env, WAIT, output};
+use support::helper::Mode;
+
+#[test]
+fn helper() {
+    support::helper::run_if_requested();
+}
+
+/// `bash --norc --noprofile` (or `sh` without bash) in the worktree; it runs
+/// `inner; echo …`, so it reports a signal death of `inner` instead of exec'ing it.
+fn shell(env: &Env) -> Command {
+    let bash = || {
+        let mut bash = env.in_worktree("bash");
+        bash.args(["--norc", "--noprofile"]);
+        bash
+    };
+    if bash().args(["-c", ":"]).status().is_ok_and(|s| s.success()) {
+        bash()
+    } else {
+        env.in_worktree("sh")
+    }
+}
+
+#[test]
+fn same_signal_death() {
+    let env = Env::with_budget(4);
+    let runner = env.run(None, &[]);
+    let runner_path = runner.get_program().to_str().unwrap().to_owned();
+    for (signal, name, expected) in [("TERM", "Terminated", 143), ("KILL", "Killed", 137)] {
+        let stage = format!("sh -c 'kill -{signal} $$'");
+        let direct = output(shell(&env).args(["-c", &format!("{stage}; echo status=$?")]));
+        let through = output(
+            shell(&env)
+                .args([
+                    "-c",
+                    &format!("\"$0\" run -- {stage}; echo status=$?"),
+                    &runner_path,
+                ])
+                .env("CARDINAL_STATE_DIR", env.dirs.state())
+                .env("CARDINAL_CONFIG_DIR", env.dirs.config()),
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&direct.stdout),
+            format!("status={expected}\n")
+        );
+        assert_eq!(through.stdout, direct.stdout, "{signal}");
+        let direct_err = String::from_utf8_lossy(&direct.stderr);
+        let through_err = String::from_utf8_lossy(&through.stderr);
+        // The message names the command that died, which differs; the signal text matches.
+        assert!(direct_err.contains(name), "{direct_err}");
+        assert!(through_err.contains(name), "{through_err}");
+    }
+
+    // SIGPIPE, which the Rust runtime ignores in the runner, still ends it.
+    let out = output(&mut env.run(None, &["sh", "-c", "kill -PIPE $$"]));
+    assert_eq!(out.status.signal(), Some(13));
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "");
+}
+
+/// A signal the caller ignores stays ignored for the stage, as when the stage runs directly:
+/// the runner installs no handler for it, on the admitted, fail-open, and TTY paths.
+#[test]
+fn ignored_signals_stay_ignored() {
+    let env = Env::with_budget(4);
+    let stage = ["sh", "-c", "kill -TERM $$; kill -HUP $$; printf survived"];
+    let ignoring = |inner: &Command| {
+        let mut shell = env.in_worktree("sh");
+        shell
+            .args(["-c", "trap '' TERM HUP; exec \"$@\"", "sh"])
+            .arg(inner.get_program())
+            .args(inner.get_args())
+            .copy_env(inner);
+        shell
+    };
+    let mut direct = env.in_worktree(stage[0]);
+    direct.args(&stage[1..]);
+    let direct = output(&mut ignoring(&direct));
+    assert_eq!(direct.status.code(), Some(0));
+    assert_eq!(direct.stdout, b"survived");
+
+    for path in ["admitted", "fail_open", "tty"] {
+        let fail = (path == "fail_open").then_some(RUN_BEFORE_STARTING);
+        let mut runner = ignoring(&env.run_at(None, &stage, &[], fail));
+        env.in_caller_group(&mut runner);
+        let pty = Pty::open();
+        if path == "tty" {
+            runner.stdin(pty.stdin());
+        }
+        let out = output(&mut runner);
+        assert_eq!(out.status.code(), Some(0), "{path}: {:?}", out.status);
+        assert_eq!(out.stdout, direct.stdout, "{path}");
+    }
+    let paths: Vec<_> = env
+        .records_of(cardinal::contract::RecordKind::JobStarted)
+        .iter()
+        .map(|r| r.data["path"].clone())
+        .collect();
+    assert_eq!(paths, ["admitted", "fail_open", "tty"]);
+}
+
+/// A caller that ignores SIGCHLD would have the kernel reap the runner's children (Linux),
+/// leaving the runner nothing to wait for: the runner runs with SIGCHLD at its default, so it
+/// learns the stage's status on every path, and the stage still starts with SIGCHLD ignored.
+/// The stage reads its disposition with `sigaction`, because not every shell lists a signal
+/// ignored at entry in `trap` output (bash 3.2 does not).
+#[test]
+fn an_ignored_sigchld_is_reset_for_the_runner_and_kept_for_the_stage() {
+    let env = Env::with_budget(4);
+    // Writes SIGCHLD's disposition to the file `out` and exits 3.
+    let stage = |out: &str| {
+        let mode = Mode::ChildSignal { out: env.file(out) };
+        support::helper::command(env.scope(), &mode, &env.worktree())
+    };
+    let read = |out: &str| std::fs::read_to_string(env.file(out)).unwrap();
+    // bash, because dash does not pass an ignored SIGCHLD on to the program it execs.
+    let ignoring = |inner: &Command| {
+        let mut shell = env.in_worktree("bash");
+        shell
+            .args([
+                "--norc",
+                "--noprofile",
+                "-c",
+                "trap '' CHLD; exec \"$@\"",
+                "bash",
+            ])
+            .arg(inner.get_program())
+            .args(inner.get_args())
+            .copy_env(inner);
+        shell
+    };
+    let mut plain = stage("plain");
+    assert_eq!(output(&mut plain).status.code(), Some(3));
+    assert_eq!(read("plain"), "default");
+    let direct = output(&mut ignoring(&stage("direct")));
+    assert_eq!(direct.status.code(), Some(3));
+    assert_eq!(read("direct"), "ignored");
+
+    for path in ["admitted", "fail_open", "tty"] {
+        let fail = (path == "fail_open").then_some(RUN_BEFORE_STARTING);
+        let probe = stage(path);
+        let argv: Vec<&str> = std::iter::once(probe.get_program())
+            .chain(probe.get_args())
+            .map(|arg| arg.to_str().unwrap())
+            .collect();
+        let mut inner = env.run_at(None, &argv, &[], fail);
+        inner.copy_env(&probe);
+        let mut runner = ignoring(&inner);
+        env.in_caller_group(&mut runner);
+        let pty = Pty::open();
+        if path == "tty" {
+            runner.stdin(pty.stdin());
+        }
+        let out = output(&mut runner);
+        assert_eq!(out.status.code(), Some(3), "{path}: {:?}", out.status);
+        assert_eq!(out.stderr, b"", "{path}");
+        assert_eq!(read(path), "ignored", "{path}");
+    }
+    let records = |kind| env.records_of(kind);
+    assert_eq!(records(cardinal::contract::RecordKind::JobInfraFailure), []);
+    let finished: Vec<_> = records(cardinal::contract::RecordKind::JobFinished)
+        .iter()
+        .map(|r| r.data["exit"].clone())
+        .collect();
+    assert_eq!(finished, [3, 3, 3]);
+    let paths: Vec<_> = records(cardinal::contract::RecordKind::JobStarted)
+        .iter()
+        .map(|r| r.data["path"].clone())
+        .collect();
+    assert_eq!(paths, ["admitted", "fail_open", "tty"]);
+}
+
+/// SIGTERM sent to the runner on the admitted path reaches the whole group; the runner does
+/// not die by its own forwarded copy, and exits with the stage's status.
+#[test]
+fn signals_are_forwarded_to_the_group() {
+    let env = Env::with_budget(4);
+    let ready = env.file("ready");
+    let got = env.file("got");
+    let script = format!(
+        "trap 'echo stage >> \"{got}\"; exit 5' TERM; \
+         (trap 'echo grandchild >> \"{got}\"; exit 0' TERM; : > \"{ready}\"; \
+          while :; do sleep 0.02; done) & \
+         while :; do sleep 0.02; done",
+        got = got.display(),
+        ready = ready.display()
+    );
+    let mut runner = env.run(None, &["sh", "-c", &script]).spawn().unwrap();
+    let _group = GroupGuard::new(env.scope(), runner.id());
+    wait_for_file(&ready, WAIT);
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    cardinal::os::unix::signal_process(runner.id(), cardinal::os::unix::SIGTERM).unwrap();
+    let status = runner.wait().unwrap();
+    assert_eq!(status.code(), Some(5), "{status:?}");
+    wait_for("both trap lines", WAIT, || {
+        (env.lines("got").len() == 2).then_some(())
+    });
+    let mut lines = env.lines("got");
+    lines.sort();
+    assert_eq!(lines, ["grandchild", "stage"]);
+}
+
+/// A runner that already leads its group, as the first command of a job-control shell's
+/// pipeline does, shares that group with the rest of the job: it runs the stage in that group
+/// without admission, as on the fail-open path, so SIGTERM to the runner reaches the stage
+/// alone and leaves another member of the group running.
+#[test]
+fn a_runner_leading_its_callers_group_signals_only_its_stage() {
+    let env = Env::with_budget(4);
+    let ready = env.file("ready");
+    let script = format!(
+        "trap 'exit 6' TERM; : > '{}'; while :; do sleep 0.02; done",
+        ready.display()
+    );
+    let mut runner = env
+        .run_leading_its_group(None, &["sh", "-c", &script])
+        .spawn()
+        .unwrap();
+    let mut member = support::helper::command(env.scope(), &Mode::Sleep, &env.worktree());
+    let mut member = member.join_group(&runner).spawn().unwrap();
+    assert_eq!(cardinal::os::unix::pgid_of(member.id()), Some(runner.id()));
+    wait_for_file(&ready, WAIT);
+
+    cardinal::os::unix::signal_process(runner.id(), cardinal::os::unix::SIGTERM).unwrap();
+    // Unreaped: reaping the runner through its `Child` would kill the rest of its group.
+    assert_eq!(
+        wait_unreaped(runner.id(), Until::Ended).unwrap(),
+        ChildState::Ended
+    );
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(
+        member.try_wait().unwrap().is_none(),
+        "the other member of the group is still running"
+    );
+    assert_eq!(runner.wait().unwrap().code(), Some(6));
+    let reasons: Vec<_> = env
+        .records_of(cardinal::contract::RecordKind::JobFailOpen)
+        .iter()
+        .map(|r| r.data["reason"].clone())
+        .collect();
+    assert_eq!(reasons, ["group_setup"]);
+    assert_eq!(env.reservations(), []);
+}
+
+/// A stopped stage is still supervised: a signal to the runner reaches its group, and the stage
+/// gets it once continued. (macOS also reports a stopped child to a wait for exits.)
+#[test]
+fn signals_reach_a_stopped_stage() {
+    let env = Env::with_budget(4);
+    let pid_file = env.file("pid");
+    let script = format!(
+        "trap 'exit 7' TERM; echo $$ > '{}'; kill -STOP $$; sleep 1; exit 3",
+        pid_file.display()
+    );
+    let mut runner = env.run(None, &["sh", "-c", &script]).spawn().unwrap();
+    let _group = GroupGuard::new(env.scope(), runner.id());
+    let stage: u32 = wait_for("the stage PID", WAIT, || {
+        std::fs::read_to_string(&pid_file).ok()?.trim().parse().ok()
+    });
+    wait_for("the stage to stop", WAIT, || {
+        is_stopped(stage).then_some(())
+    });
+    cardinal::os::unix::signal_process(runner.id(), cardinal::os::unix::SIGTERM).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    cardinal::os::unix::signal_process(stage, cardinal::os::unix::SIGCONT).unwrap();
+    let status = runner.wait().unwrap();
+    assert_eq!(status.code(), Some(7), "{status:?}");
+}
+
+/// On the fail-open path the stage shares the caller's group and gets terminal signals
+/// itself; the runner ignores SIGINT, as `system()` does, and forwards SIGTERM.
+#[test]
+fn fail_open_ignores_sigint_and_forwards_sigterm() {
+    let env = Env::with_budget(4);
+    let ready = env.file("ready");
+    let script = format!(
+        "trap '' INT; trap 'exit 6' TERM; : > '{}'; while :; do sleep 0.02; done",
+        ready.display()
+    );
+    let mut runner = env
+        .run_at(None, &["sh", "-c", &script], &[], Some(RUN_BEFORE_STARTING))
+        .spawn()
+        .unwrap();
+    wait_for_file(&ready, WAIT);
+    cardinal::os::unix::signal_process(runner.id(), cardinal::os::unix::SIGINT).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(
+        runner.try_wait().unwrap().is_none(),
+        "SIGINT does not end the runner"
+    );
+    cardinal::os::unix::signal_process(runner.id(), cardinal::os::unix::SIGTERM).unwrap();
+    assert_eq!(runner.wait().unwrap().code(), Some(6));
+}
+
+/// A signal before the spawn cancels the run: the stage never starts, the runner leaves
+/// nothing behind, and it dies by that signal.
+#[test]
+fn signal_before_the_spawn_cancels_the_run() {
+    let env = Env::with_budget(1);
+    let _full = env.hold_budget(1);
+    let script = format!("echo run >> '{}'", env.file("counter").display());
+    let mut runner = env
+        .run_at(None, &["sh", "-c", &script], &[ADMISSION_WAITING], None)
+        .spawn()
+        .unwrap();
+    env.points
+        .wait_reached(ADMISSION_WAITING, runner.id(), WAIT);
+    cardinal::os::unix::signal_process(runner.id(), cardinal::os::unix::SIGTERM).unwrap();
+    env.points.release(ADMISSION_WAITING);
+    let status = runner.wait().unwrap();
+    assert_eq!(status.signal(), Some(15), "{status:?}");
+    assert_eq!(env.lines("counter"), Vec::<String>::new());
+    assert_eq!(env.reservations().len(), 1, "only the held reservation");
+    assert_eq!(env.live_locks().len(), 1, "the runner's live lock is gone");
+    assert!(env.worktree_lock_free());
+    let finished = env.records_of(cardinal::contract::RecordKind::JobFinished);
+    assert_eq!(finished[0].data["cancelled"], "signal 15");
+}

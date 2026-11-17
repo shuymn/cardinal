@@ -21,6 +21,13 @@ sysinfo.workspace = true
 thiserror.workspace = true
 toml.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+# Reading a signal's disposition (`sigaction` without a new action), and blocking signals while
+# their handlers are installed (`pthread_sigmask`).
+libc.workspace = true
+rustix.workspace = true
+signal-hook.workspace = true
+
 [target.'cfg(windows)'.dependencies]
 windows-sys.workspace = true
 
@@ -29,6 +36,12 @@ assert_cmd.workspace = true
 cardinal-test-support.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
+
+[target.'cfg(unix)'.dev-dependencies]
+# Reading a signal's disposition in a helper process, independently of the product.
+libc.workspace = true
+# Reading a stopped child's report, and the sessions of a test's processes.
+rustix.workspace = true
 
 [lints]
 workspace = true

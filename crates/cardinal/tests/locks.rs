@@ -36,7 +36,7 @@ fn lock_is_released_when_the_holder_dies_and_its_child_does_not_hold_it() {
     );
     wait_for_file(&ready, WAIT);
     let child: u32 = std::fs::read_to_string(&pid_file).unwrap().parse().unwrap();
-    let _child = PidGuard::new(child);
+    let _child = PidGuard::new(&scope, child);
     let child_start = wait_for("the holder's child", WAIT, || os::start_time_s(child));
 
     assert_eq!(probe(&lock).unwrap(), Probe::Held);

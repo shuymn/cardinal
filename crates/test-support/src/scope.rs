@@ -2,18 +2,28 @@
 //!
 //! Every child starts with `env_clear()` and the scope's constructed environment, in a working
 //! directory inside the root, in a process group of its own (Unix) or a job object of its own
-//! (Windows). Its cleanup slot is registered before it starts. When the child exits, is
-//! killed, or its [`Child`] or the [`Scope`] is dropped, whatever is left of its group or job
-//! is killed. A group is signalled only while its leader is unreaped, so its ID cannot have
-//! been reused; a job holds only processes started inside it.
+//! (Windows). On Unix it holds no descriptor of the test process but the standard streams it is
+//! given and the scope's marker (`crate::marker`), which the guards of `crate::process` go by.
+//! Its cleanup slot is registered before it starts. When the child exits, is killed, or its
+//! [`Child`] or the [`Scope`] is dropped, whatever is left of its group or job is killed. A group is signalled only while its leader is unreaped, so its ID cannot have
+//! been reused; a job holds only processes started inside it. On Unix a child can instead
+//! lead a new session ([`Command::new_session`]), whose group it leads too, or join the group
+//! another child leads ([`Command::join_group`]); a child that joined a group is cleaned up
+//! alone, and its group goes with its leader.
 
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 use std::process::{ChildStderr, ChildStdin, ChildStdout, ExitStatus, Output, Stdio};
-use std::sync::{Arc, Mutex, PoisonError};
+#[cfg(unix)]
+use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::{Arc, Mutex, PoisonError, mpsc};
+use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
+
+#[cfg(unix)]
+use crate::marker::Marker;
 
 /// The variable the test harness sets to a value unique to each harness run. A scope passes
 /// it to every child, so the harness can find what a test left running.
@@ -38,6 +48,8 @@ const MAX_LINKS: u32 = 40;
 pub struct Scope {
     registry: Arc<Registry>,
     root: PathBuf,
+    #[cfg(unix)]
+    marker: Arc<Marker>,
     // Removed after the registry's children are gone (see `Drop`).
     _dir: TempDir,
 }
@@ -88,6 +100,8 @@ impl Scope {
         .expect("write the scope git config");
         Self {
             registry: Arc::default(),
+            #[cfg(unix)]
+            marker: Arc::new(Marker::create(&root)),
             root,
             _dir: dir,
         }
@@ -97,6 +111,14 @@ impl Scope {
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The file every child of this scope holds open (see [`Marker`]). A guard keeps it open
+    /// for as long as it may signal, so the file's inode cannot be given to another file while
+    /// the guard compares against it, even after the scope is gone.
+    #[cfg(unix)]
+    pub(crate) fn marker(&self) -> Arc<Marker> {
+        Arc::clone(&self.marker)
     }
 
     /// `root/rel`; panics if `rel` leaves the root.
@@ -171,10 +193,30 @@ impl Scope {
         let mut inner = std::process::Command::new(program);
         inner.env_clear().envs(self.env()).current_dir(cwd);
         #[cfg(unix)]
-        std::os::unix::process::CommandExt::process_group(&mut inner, 0);
+        let highest = Arc::new(AtomicI32::new(2));
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            let highest = Arc::clone(&highest);
+            let marker = Arc::clone(&self.marker);
+            // SAFETY: the closure runs in the child between fork and exec. It reads integers
+            // and makes system calls that only read and set descriptor flags, all
+            // async-signal-safe, and allocates nothing.
+            unsafe {
+                inner.pre_exec(move || {
+                    unix::close_others_on_exec(highest.load(Ordering::Relaxed), marker.keep());
+                    unix::inherit(marker.raw());
+                    Ok(())
+                });
+            }
+        }
         Command {
             inner,
             registry: Arc::clone(&self.registry),
+            #[cfg(unix)]
+            group: Group::New,
+            #[cfg(unix)]
+            highest,
             stdin_set: false,
             stdout_set: false,
             stderr_set: false,
@@ -231,9 +273,27 @@ impl Drop for Scope {
 pub struct Command {
     inner: std::process::Command,
     registry: Arc<Registry>,
+    #[cfg(unix)]
+    group: Group,
+    /// The highest descriptor this process held when the child last started, for the child's
+    /// `pre_exec` (see `unix::close_others_on_exec`).
+    #[cfg(unix)]
+    highest: Arc<AtomicI32>,
     stdin_set: bool,
     stdout_set: bool,
     stderr_set: bool,
+}
+
+/// The process group a Unix child starts in.
+#[cfg(unix)]
+#[derive(Clone, Copy, PartialEq)]
+enum Group {
+    /// A new group the child leads.
+    New,
+    /// A new session, whose group the child leads.
+    Session,
+    /// The group of the given unreaped child, which leads it.
+    Join(i32),
 }
 
 impl Command {
@@ -260,6 +320,69 @@ impl Command {
     /// Removes one variable of the constructed environment.
     pub fn env_remove(&mut self, key: impl AsRef<OsStr>) -> &mut Self {
         self.inner.env_remove(key);
+        self
+    }
+
+    /// Sets every variable `other` sets and removes every one it removes, as [`Command::env`]
+    /// and [`Command::env_remove`] would: for a program, such as a shell, that starts the
+    /// program `other` was built for and passes its environment on. Arguments, working
+    /// directory, and stdio stay this command's.
+    pub fn copy_env(&mut self, other: &Command) -> &mut Self {
+        for (key, value) in other.get_envs() {
+            match value {
+                Some(value) => self.inner.env(key, value),
+                None => self.inner.env_remove(key),
+            };
+        }
+        self
+    }
+
+    /// Starts the child as the leader of a new session (`setsid`) instead of a new group in
+    /// the test's session; it leads the session's first group, which is cleaned up as any
+    /// child's group. For a test that needs a session of its own, such as one in which a
+    /// job-control shell gives a job its own group, independent of the session the test runs
+    /// in (a terminal's, launchd's on macOS, a container's).
+    #[cfg(unix)]
+    pub fn new_session(&mut self) -> &mut Self {
+        assert!(
+            self.group != Group::Session,
+            "refusing: new_session was already called"
+        );
+        assert!(
+            self.group == Group::New,
+            "refusing: a child that joins a group cannot lead a session"
+        );
+        self.group = Group::Session;
+        // SAFETY: the closure runs between `fork` and `exec` and calls only `setsid`, which
+        // is async-signal-safe; it allocates nothing.
+        unsafe {
+            std::os::unix::process::CommandExt::pre_exec(&mut self.inner, || {
+                rustix::process::setsid()?;
+                Ok(())
+            });
+        }
+        self
+    }
+
+    /// Starts the child in the process group `leader` leads instead of a new one, as a shell
+    /// without job control runs a command in its own group. `leader` must be unreaped and lead
+    /// its group, so the group's ID is still its own when the child starts. The group
+    /// is `leader`'s: cleaning up this child kills and reaps it alone, and the group is killed
+    /// with its leader. A group this child makes later (`setpgid(0, 0)`) is not cleaned up
+    /// here; a [`crate::process::GroupGuard`] or the harness's sweep covers it.
+    #[cfg(unix)]
+    pub fn join_group(&mut self, leader: &Child) -> &mut Self {
+        assert!(
+            self.group == Group::New,
+            "refusing: a child joins one group and does not lead a session"
+        );
+        let leads = matches!(&*lock(&leader.slot), Slot::Running(process) if process.leads_group);
+        assert!(
+            leads,
+            "refusing: join the group of child {}, which was reaped or does not lead a group",
+            leader.pid
+        );
+        self.group = Group::Join(i32::try_from(leader.pid).expect("PIDs fit in i32"));
         self
     }
 
@@ -323,13 +446,31 @@ impl Command {
 
     #[cfg(unix)]
     fn start(&mut self) -> io::Result<Started> {
+        use std::os::unix::process::CommandExt as _;
+        // A session leader's `setsid` runs in `pre_exec` (see `new_session`) and would fail
+        // in a process that already leads a group.
+        match self.group {
+            Group::New => {
+                self.inner.process_group(0);
+            }
+            Group::Join(pgid) => {
+                self.inner.process_group(pgid);
+            }
+            Group::Session => {}
+        }
+        self.highest
+            .store(unix::highest_descriptor(), Ordering::Relaxed);
         #[expect(
             clippy::disallowed_methods,
             reason = "the spawn API: the one place tests start a process"
         )]
         let mut child = self.inner.spawn()?;
         let pipes = (child.stdin.take(), child.stdout.take(), child.stderr.take());
-        Ok((Process { child }, pipes.0, pipes.1, pipes.2))
+        let process = Process {
+            child,
+            leads_group: !matches!(self.group, Group::Join(_)),
+        };
+        Ok((process, pipes.0, pipes.1, pipes.2))
     }
 
     #[cfg(windows)]
@@ -355,6 +496,44 @@ impl Command {
     /// Runs the child to completion with stdin closed and stdout and stderr captured, unless
     /// set otherwise.
     pub fn output(&mut self) -> io::Result<Output> {
+        self.capture();
+        self.spawn()?.wait_with_output()
+    }
+
+    /// [`Command::output`] with one deadline, `limit` from now, for the child to exit and for
+    /// its output to end. A child still running then is killed as [`Child::kill`] kills it;
+    /// either way the result is a [`io::ErrorKind::TimedOut`] error. Output that a process
+    /// outside the child's group or job holds open is left to the process that holds it.
+    pub fn output_within(&mut self, limit: Duration) -> io::Result<Output> {
+        let deadline = Instant::now() + limit;
+        self.capture();
+        let mut child = self.spawn()?;
+        drop(child.stdin.take());
+        let readers = Readers::start(child.stdout.take(), child.stderr.take());
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                child.kill();
+                return Err(timed_out(&format!(
+                    "the child did not exit within {limit:?}"
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let (stdout, stderr) = readers.collect(Some(deadline))?.ok_or_else(|| {
+            timed_out(&format!("the child's output did not end within {limit:?}"))
+        })?;
+        Ok(Output {
+            status,
+            stdout,
+            stderr,
+        })
+    }
+
+    /// Stdin closed and stdout and stderr piped, unless set otherwise.
+    fn capture(&mut self) {
         if !self.stdin_set {
             self.inner.stdin(Stdio::null());
         }
@@ -364,7 +543,6 @@ impl Command {
         if !self.stderr_set {
             self.inner.stderr(Stdio::piped());
         }
-        self.spawn()?.wait_with_output()
     }
 
     /// Runs the child to completion and returns its status.
@@ -411,7 +589,8 @@ fn placeholder() -> std::process::Command {
     std::process::Command::new("")
 }
 
-/// A started child. Dropping it kills what is left of its process group or job.
+/// A started child. Dropping it kills what is left of its process group or job (a child that
+/// joined another child's group: the child alone).
 pub struct Child {
     pid: u32,
     slot: Arc<Mutex<Slot>>,
@@ -426,7 +605,8 @@ impl Child {
         self.pid
     }
 
-    /// Waits for the child to exit, kills what is left of its group or job, and reaps it.
+    /// Waits for the child to exit, kills what is left of its group or job (unless it joined
+    /// another child's group), and reaps it.
     pub fn wait(&mut self) -> io::Result<ExitStatus> {
         drop(self.stdin.take());
         if let Slot::Done(status) = &*lock(&self.slot) {
@@ -476,7 +656,7 @@ impl Child {
     }
 
     /// Kills the child with its group or job (SIGKILL on Unix, `TerminateJobObject` on
-    /// Windows) and reaps it.
+    /// Windows) and reaps it. A child that joined another child's group is killed alone.
     pub fn kill(&mut self) {
         lock(&self.slot).kill();
     }
@@ -494,36 +674,74 @@ impl Child {
     /// Waits as [`Child::wait`] and collects the piped stdout and stderr.
     pub fn wait_with_output(mut self) -> io::Result<Output> {
         drop(self.stdin.take());
-        let read = |pipe: Option<Box<dyn Read + Send>>| {
-            std::thread::spawn(move || {
-                let mut buf = Vec::new();
-                if let Some(mut pipe) = pipe {
-                    pipe.read_to_end(&mut buf).map(|_| buf)
-                } else {
-                    Ok(buf)
-                }
-            })
-        };
-        let stdout = read(
-            self.stdout
-                .take()
-                .map(|p| Box::new(p) as Box<dyn Read + Send>),
-        );
-        let stderr = read(
-            self.stderr
-                .take()
-                .map(|p| Box::new(p) as Box<dyn Read + Send>),
-        );
+        let readers = Readers::start(self.stdout.take(), self.stderr.take());
         let status = self.wait()?;
-        let join = |handle: std::thread::JoinHandle<io::Result<Vec<u8>>>| {
-            handle.join().expect("pipe reader panicked")
-        };
+        let (stdout, stderr) = readers
+            .collect(None)?
+            .expect("without a deadline the readers finish");
         Ok(Output {
             status,
-            stdout: join(stdout)?,
-            stderr: join(stderr)?,
+            stdout,
+            stderr,
         })
     }
+}
+
+/// A child's piped stdout and stderr, each read to its end on a thread of its own.
+struct Readers {
+    stdout: mpsc::Receiver<io::Result<Vec<u8>>>,
+    stderr: mpsc::Receiver<io::Result<Vec<u8>>>,
+}
+
+impl Readers {
+    fn start(stdout: Option<ChildStdout>, stderr: Option<ChildStderr>) -> Self {
+        Self {
+            stdout: read_to_end(stdout),
+            stderr: read_to_end(stderr),
+        }
+    }
+
+    /// Both outputs once they end, or `None` if one has not ended by `deadline`. A reader left
+    /// waiting finishes when its pipe closes.
+    fn collect(self, deadline: Option<Instant>) -> io::Result<Option<(Vec<u8>, Vec<u8>)>> {
+        let receive = |rx: &mpsc::Receiver<io::Result<Vec<u8>>>| {
+            let result = match deadline {
+                None => rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+                Some(deadline) => {
+                    rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                }
+            };
+            match result {
+                Ok(read) => read.map(Some),
+                Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    Err(io::Error::other("a pipe reader ended without its result"))
+                }
+            }
+        };
+        let (Some(stdout), Some(stderr)) = (receive(&self.stdout)?, receive(&self.stderr)?) else {
+            return Ok(None);
+        };
+        Ok(Some((stdout, stderr)))
+    }
+}
+
+/// Reads `pipe` to its end on a new thread; no pipe reads as empty.
+fn read_to_end(pipe: Option<impl Read + Send + 'static>) -> mpsc::Receiver<io::Result<Vec<u8>>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let read = match pipe {
+            Some(mut pipe) => pipe.read_to_end(&mut buf).map(|_| buf),
+            None => Ok(buf),
+        };
+        let _ = tx.send(read);
+    });
+    rx
+}
+
+fn timed_out(what: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::TimedOut, what)
 }
 
 impl Drop for Child {
@@ -580,6 +798,10 @@ impl Slot {
 struct Process {
     #[cfg(unix)]
     child: std::process::Child,
+    /// Whether the child leads its group; one that joined another child's group is cleaned up
+    /// alone.
+    #[cfg(unix)]
+    leads_group: bool,
     /// The child in a job object it joined before it ran (`process-wrap` starts it suspended,
     /// assigns it, then resumes it).
     #[cfg(windows)]
@@ -603,7 +825,9 @@ impl Process {
     fn finish(mut self) -> io::Result<ExitStatus> {
         #[cfg(unix)]
         {
-            unix::kill_group(self.child.id());
+            if self.leads_group {
+                unix::kill_group(self.child.id());
+            }
             self.child.wait()
         }
         #[cfg(windows)]
@@ -632,7 +856,9 @@ impl Process {
     fn kill(mut self) -> io::Result<ExitStatus> {
         #[cfg(unix)]
         {
-            unix::kill_group(self.child.id());
+            if self.leads_group {
+                unix::kill_group(self.child.id());
+            }
             let _ = self.child.kill();
             self.child.wait()
         }
@@ -708,6 +934,79 @@ mod unix {
     pub(super) fn kill_group(raw: u32) {
         let _ = rustix::process::kill_process_group(pid(raw), Signal::KILL);
     }
+
+    /// The highest descriptor this process holds, listed from `/dev/fd`; no flag changes.
+    pub(super) fn highest_descriptor() -> i32 {
+        std::fs::read_dir("/dev/fd")
+            .expect("list this process's descriptors")
+            .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
+            .max()
+            .unwrap_or(2)
+    }
+
+    /// Run in a child between fork and exec: marks every descriptor from 3 up but those in
+    /// `keep` (sorted) close-on-exec, so the child keeps only the standard streams set up for
+    /// it and the scope's markers, never a descriptor that whatever started the test run left
+    /// open. The test process's own flags never change. With `close_range` (Linux 5.11 and
+    /// later) one call covers each run between kept descriptors; otherwise each descriptor up to
+    /// `highest`, the highest the test process held when the child started: the descriptors it
+    /// inherited are among those, and the ones it opened since are close-on-exec already, as the
+    /// standard library opens them. Async-signal-safe: system calls only, nothing allocated.
+    pub(super) fn close_others_on_exec(highest: i32, keep: &[i32]) {
+        #[cfg(target_os = "linux")]
+        {
+            let mut first = 3_u32;
+            let mut set = true;
+            for &kept in keep {
+                let kept = kept.cast_unsigned();
+                if kept > first {
+                    set &= cloexec_range(first, kept - 1);
+                }
+                first = first.max(kept + 1);
+            }
+            if set && cloexec_range(first, u32::MAX) {
+                return;
+            }
+        }
+        for raw in 3..=highest {
+            if keep.contains(&raw) {
+                continue;
+            }
+            // SAFETY: only the descriptor flags of `raw` are read and set; a number that is
+            // not open fails with EBADF.
+            let fd = unsafe { rustix::fd::BorrowedFd::borrow_raw(raw) };
+            if let Ok(flags) = rustix::io::fcntl_getfd(fd) {
+                let _ = rustix::io::fcntl_setfd(fd, flags | rustix::io::FdFlags::CLOEXEC);
+            }
+        }
+    }
+
+    /// `close_range(first, last, CLOSE_RANGE_CLOEXEC)`: whether it set the flag.
+    #[cfg(target_os = "linux")]
+    fn cloexec_range(first: u32, last: u32) -> bool {
+        // SAFETY: with `CLOSE_RANGE_CLOEXEC` the call closes nothing; it only sets the
+        // close-on-exec flag of the descriptors in the range.
+        let set = unsafe {
+            libc::syscall(
+                libc::SYS_close_range,
+                first,
+                last,
+                libc::CLOSE_RANGE_CLOEXEC,
+            )
+        };
+        set == 0
+    }
+
+    /// Run in a child between fork and exec: clears close-on-exec on `raw`, the scope's marker,
+    /// so the program the child runs holds it. Async-signal-safe.
+    pub(super) fn inherit(raw: i32) {
+        // SAFETY: only the descriptor flags of `raw` are read and set; the marker is open in
+        // the test process, and so in the child.
+        let fd = unsafe { rustix::fd::BorrowedFd::borrow_raw(raw) };
+        if let Ok(flags) = rustix::io::fcntl_getfd(fd) {
+            let _ = rustix::io::fcntl_setfd(fd, flags - rustix::io::FdFlags::CLOEXEC);
+        }
+    }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -781,7 +1080,71 @@ fn canonical_prefix(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::io;
+    #[cfg(unix)]
+    use std::time::{Duration, Instant};
+
     use super::Scope;
+
+    /// A child does not get a descriptor of this process that is not close-on-exec, and
+    /// starting it leaves that descriptor's flags as they were.
+    #[cfg(unix)]
+    #[test]
+    fn a_child_starts_without_the_parents_descriptors_and_leaves_their_flags() {
+        use std::os::fd::{AsFd as _, AsRawFd as _};
+
+        use rustix::io::{FdFlags, fcntl_getfd, fcntl_setfd};
+
+        let scope = Scope::new();
+        let file = std::fs::File::open(scope.root()).expect("open the root");
+        let fd = file.as_fd();
+        fcntl_setfd(fd, fcntl_getfd(fd).unwrap() - FdFlags::CLOEXEC).unwrap();
+        let raw = fd.as_raw_fd();
+        let status = scope
+            .shell(&format!("[ ! -e /dev/fd/{raw} ]"), scope.root())
+            .status()
+            .expect("run the shell");
+        assert!(status.success(), "the child holds descriptor {raw}");
+        assert!(
+            !fcntl_getfd(fd).unwrap().contains(FdFlags::CLOEXEC),
+            "the parent's descriptor flags changed"
+        );
+    }
+
+    /// A child that has not exited by the deadline is killed, and the result says so.
+    #[cfg(unix)]
+    #[test]
+    fn output_within_kills_a_child_that_runs_on() {
+        let scope = Scope::new();
+        let mut command = scope.command("sleep", scope.root());
+        command.arg("30");
+        let started = Instant::now();
+        let err = command
+            .output_within(Duration::from_millis(300))
+            .expect_err("the child runs on");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// Output that a process outside the child's cleanup holds open ends the wait at the
+    /// deadline: the joined shell is cleaned up alone, and its background `sleep` keeps stdout.
+    #[cfg(unix)]
+    #[test]
+    fn output_within_stops_at_output_held_by_another_process() {
+        let scope = Scope::new();
+        let mut leader = scope.command("sleep", scope.root());
+        leader.arg("30");
+        let leader = leader.spawn().expect("start the group's leader");
+        let mut command = scope.shell("sleep 30 & echo started", scope.root());
+        command.join_group(&leader);
+        let started = Instant::now();
+        let err = command
+            .output_within(Duration::from_millis(500))
+            .expect_err("the output stays open");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
 
     /// A second kill leaves the reaped child's status in place for `wait`.
     #[test]

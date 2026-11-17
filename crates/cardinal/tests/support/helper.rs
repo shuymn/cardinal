@@ -31,6 +31,9 @@ const LIFETIME: Duration = Duration::from_secs(60);
 pub enum Mode {
     /// Sleep, then exit.
     Sleep,
+    /// Write this process's PID to `out`, then sleep: once `out` holds the PID, this process
+    /// is past its `execve`.
+    Pid { out: PathBuf },
     /// Exit with status 0 after half a second, long enough to be seen running.
     Exit,
     /// Optionally take an exclusive lock on `lock`, start a sleeping grandchild in a process
@@ -50,6 +53,13 @@ pub enum Mode {
         max_bytes: u64,
         keep: u32,
     },
+    /// Write SIGCHLD's disposition as this process found it (`ignored`, `default`, or
+    /// `handled`, read with `sigaction`) to `out`, then exit 3.
+    #[cfg(unix)]
+    ChildSignal { out: PathBuf },
+    /// Write this process's process group ID to `out`.
+    #[cfg(unix)]
+    Group { out: PathBuf },
 }
 
 /// Runs the helper mode named on the command line, then exits; returns at once in a normal
@@ -62,6 +72,10 @@ pub fn run_if_requested() {
     let args: Vec<String> = request.collect();
     match mode.as_str() {
         "sleep" => std::thread::sleep(LIFETIME),
+        "pid" => {
+            std::fs::write(&args[0], std::process::id().to_string()).expect("write the pid");
+            std::thread::sleep(LIFETIME);
+        }
         "exit" => std::thread::sleep(Duration::from_millis(500)),
         "spawn" => {
             let lock = (!args[2].is_empty()).then(|| {
@@ -103,9 +117,36 @@ pub fn run_if_requested() {
                 std::process::exit(3);
             }
         }
+        #[cfg(unix)]
+        "child-signal" => {
+            std::fs::write(&args[0], child_signal()).expect("write the disposition");
+            std::process::exit(3);
+        }
+        #[cfg(unix)]
+        "group" => {
+            // SAFETY: `getpgrp` cannot fail and touches no memory of this process.
+            let group = unsafe { libc::getpgrp() };
+            std::fs::write(&args[0], group.to_string()).expect("write the group");
+        }
         other => panic!("unknown helper mode {other}"),
     }
     std::process::exit(0);
+}
+
+/// SIGCHLD's disposition in this process, read without changing it.
+#[cfg(unix)]
+fn child_signal() -> &'static str {
+    let mut current = std::mem::MaybeUninit::<libc::sigaction>::zeroed();
+    // SAFETY: without a new action, `sigaction` only writes the current one into `current`,
+    // which is valid for writes.
+    let read = unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), current.as_mut_ptr()) };
+    assert_eq!(read, 0, "sigaction: {}", std::io::Error::last_os_error());
+    // SAFETY: zero-initialized, a valid `sigaction`, and filled on success.
+    match unsafe { current.assume_init() }.sa_sigaction {
+        libc::SIG_IGN => "ignored",
+        libc::SIG_DFL => "default",
+        _ => "handled",
+    }
 }
 
 /// A command that runs this test binary in `mode`, in `cwd` inside `scope`.
@@ -113,6 +154,7 @@ pub fn command(scope: &Scope, mode: &Mode, cwd: &Path) -> Command {
     let exe = std::env::current_exe().expect("current test binary");
     let (name, args): (&str, Vec<String>) = match mode {
         Mode::Sleep => ("sleep", vec![]),
+        Mode::Pid { out } => ("pid", vec![out.to_string_lossy().into_owned()]),
         Mode::Exit => ("exit", vec![]),
         Mode::Spawn {
             ready,
@@ -142,6 +184,10 @@ pub fn command(scope: &Scope, mode: &Mode, cwd: &Path) -> Command {
                 keep.to_string(),
             ],
         ),
+        #[cfg(unix)]
+        Mode::ChildSignal { out } => ("child-signal", vec![out.to_string_lossy().into_owned()]),
+        #[cfg(unix)]
+        Mode::Group { out } => ("group", vec![out.to_string_lossy().into_owned()]),
     };
     let mut command = scope.command(exe, cwd);
     command

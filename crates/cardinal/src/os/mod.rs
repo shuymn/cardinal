@@ -8,6 +8,8 @@
 //! exited is not alive even while the OS still lists it: a zombie on Unix, a process kept by
 //! an open handle on Windows.
 
+#[cfg(unix)]
+pub mod unix;
 #[cfg(windows)]
 mod windows;
 
