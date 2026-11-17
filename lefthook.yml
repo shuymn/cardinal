@@ -21,9 +21,6 @@ pre-commit:
 commit-msg:
   commands:
     pommitlint:
-      # pommitlint has no Windows release (mise.toml).
-      skip:
-        - run: test "${OS:-}" = Windows_NT
       run: mise exec -- pommitlint lint --edit {1}
 
 pre-push:

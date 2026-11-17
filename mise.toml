@@ -15,6 +15,7 @@ lefthook = "2"
 actionlint = "1"
 betterleaks = "1"
 "github:suzuki-shunsuke/ghalint" = "1"
-# No Windows release; the commit-msg hook skips on Windows.
+# No Windows release. Windows is a CI-only runtime target, and without this
+# restriction mise on Windows still resolves the tool while installing rust.
 "github:shuymn/pommitlint" = { version = "2", os = ["macos", "linux"] }
 "github:babarot/gh-infra" = "0"

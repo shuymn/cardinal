@@ -2,6 +2,10 @@
 
 A single Rust binary (CLI and per-job runner) that arbitrates local compute resources for parallel coding agents on macOS (arm64), Linux (x64), and Windows (x64).
 
+## Platforms
+
+Develop on macOS or Linux. Windows (x64) is a supported runtime target, built and tested in CI, but not a development environment: the development tools and hooks are not set up for it.
+
 ## Commands
 
 Rust and the development tools are pinned with mise (`mise.toml`, exact versions in `mise.lock`). Run `cargo` through `mise exec --` to get the pinned toolchain.
