@@ -2,7 +2,8 @@
 //!
 //! Every child starts with `env_clear()` and the scope's constructed environment, in a working
 //! directory inside the root, in a process group of its own (Unix) or a job object of its own
-//! (Windows). Its cleanup slot is registered before it starts. When the child exits, is
+//! (Windows). On Unix it holds no descriptor of the test process but the standard streams it is
+//! given. Its cleanup slot is registered before it starts. When the child exits, is
 //! killed, or its [`Child`] or the [`Scope`] is dropped, whatever is left of its group or job
 //! is killed. A group is signalled only while its leader is unreaped, so its ID cannot have
 //! been reused; a job holds only processes started inside it. On Unix a child can instead
@@ -415,6 +416,7 @@ impl Command {
             }
             Group::Session => {}
         }
+        unix::close_others_on_exec();
         #[expect(
             clippy::disallowed_methods,
             reason = "the spawn API: the one place tests start a process"
@@ -813,6 +815,26 @@ mod unix {
     /// SIGKILL to the process group led by unreaped child `raw`. The group may be empty.
     pub(super) fn kill_group(raw: u32) {
         let _ = rustix::process::kill_process_group(pid(raw), Signal::KILL);
+    }
+
+    /// Marks every descriptor of this process past the standard streams close-on-exec, so a
+    /// child gets only the streams the test gives it: none that whatever started the test run
+    /// left open, which the child would otherwise hold as its own. The standard library opens
+    /// its descriptors close-on-exec, and a child's streams are set up after the fork.
+    pub(super) fn close_others_on_exec() {
+        let fds: Vec<i32> = std::fs::read_dir("/dev/fd")
+            .expect("list this process's descriptors")
+            .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
+            .filter(|&fd| fd > 2)
+            .collect();
+        for raw in fds {
+            // SAFETY: only the descriptor flags of `raw` are read and set; one closed since the
+            // listing (such as the listing's own) fails with EBADF.
+            let fd = unsafe { rustix::fd::BorrowedFd::borrow_raw(raw) };
+            if let Ok(flags) = rustix::io::fcntl_getfd(fd) {
+                let _ = rustix::io::fcntl_setfd(fd, flags | rustix::io::FdFlags::CLOEXEC);
+            }
+        }
     }
 }
 
