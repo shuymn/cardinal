@@ -339,10 +339,13 @@ fn plan_shows_its_provenance() {
         "no_open_pr: worktree.facts.open_pr = \"no\""
     ));
     assert!(observed("gh", "error: HTTP 502"), "{:#?}", doc.sources);
+    // The profile path as the config loader lists it: one component per join, so the
+    // separators are the platform's.
     let profile = s
         .dirs
         .config()
-        .join("repos/generic.toml")
+        .join("repos")
+        .join("generic.toml")
         .display()
         .to_string();
     assert!(
