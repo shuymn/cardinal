@@ -14,8 +14,8 @@
 # so that it can write only inside R: sandbox-exec on macOS, bubblewrap on Linux where it
 # works; Windows gets the environment and the guard only. Afterwards every process the run
 # left behind is listed, killed, and fails the run. A run's processes are those in its
-# sandbox on macOS (found with sandbox-pids from crates/test-support) and those carrying a
-# marker unique to the run, CARDINAL_TEST_RUN=<id>, in /proc on Linux.
+# sandbox on macOS and those carrying a marker unique to the run, CARDINAL_TEST_RUN=<id>, on
+# Linux; run-processes from crates/test-support finds and kills them.
 
 # POSIX prelude: start over in a constructed environment before bash reads any startup file.
 # A script run by `sh` reads no startup file, and `bash --noprofile --norc` with BASH_ENV and
@@ -82,14 +82,10 @@ marker="CARDINAL_TEST_RUN=$run_id"
 # allows `<name>.allowed`; only this run's sandbox does both.
 sandbox_name=dev.cardinal.test-run.$run_id
 
-# Background processes the self-check starts outside the tests, killed on every exit.
-helpers=()
+# On every exit: the sweep, then R. The self-check's listener at $R.sock exits once its
+# socket is gone.
 cleanup() {
   local status=$?
-  local pid
-  for pid in ${helpers[@]+"${helpers[@]}"}; do
-    kill "$pid" 2>/dev/null || true
-  done
   if ! sweep; then
     status=1
   fi
@@ -105,52 +101,37 @@ export HOME=$R/home XDG_CONFIG_HOME=$R/home/.config XDG_CACHE_HOME=$R/home/.cach
 
 # --- Supervisor: this run's processes ----------------------------------------------------
 
-# Where scan reads the process table; the self-check points them elsewhere to show that a
-# table it cannot read fails the sweep.
-sandbox_pids=
-proc_root=/proc
+# run-processes, built on macOS and Linux. The self-check sets table_fault to
+# --empty-table to show that a process table that lists nothing fails the sweep.
+run_processes=
+table_fault=
 
-# Builds sandbox-pids on macOS.
 build_scanner() {
-  [ "$os" = Darwin ] || return 0
-  sandbox_pids=$(cargo build --locked -p cardinal-test-support --bin sandbox-pids \
+  case $os in Darwin | Linux) ;; *) return 0 ;; esac
+  run_processes=$(cargo build --locked -p cardinal-test-support --bin run-processes \
     --message-format=json-render-diagnostics |
     sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' | tail -n 1)
-  if [ ! -x "$sandbox_pids" ]; then
-    say "cannot build sandbox-pids"
+  if [ ! -x "$run_processes" ]; then
+    say "cannot build run-processes"
     exit 1
   fi
 }
 
-# Prints the PIDs of this user's processes that belong to the run, and `?<pid>` for each
-# process whose membership cannot be read (Linux: a process that is not dumpable hides its
-# environment even from its owner); fails when the process table cannot be read. On macOS the
-# environment is no help: macOS hides that of platform binaries such as /bin/sleep even from
-# their owner.
+# run-processes list|kill for this run.
+run_processes() {
+  [ -n "$run_processes" ] || return 1
+  # shellcheck disable=SC2086 # table_fault is empty or one word
+  "$run_processes" "$1" "$sandbox_name" "$marker" $table_fault
+}
+
+# Prints the PIDs of the processes that belong to the run, and `?<pid>` for each process
+# whose membership cannot be read (Linux: a process that is not dumpable hides its
+# environment even from its owner); fails when the process table cannot be read, and returns
+# 2 on Windows, which has no sweep.
 scan() {
   case $os in
-    Darwin)
-      [ -n "$sandbox_pids" ] || return 1
-      "$sandbox_pids" "$sandbox_name.denied" "$sandbox_name.allowed" || return 1
-      ;;
-    Linux)
-      [ -r "$proc_root/self/environ" ] || return 1
-      local proc environ
-      for proc in "$proc_root"/[0-9]*; do
-        [ -O "$proc" ] || continue
-        # A process that exits meanwhile has no environment left to read.
-        if ! environ=$({ tr '\0' '\n' <"$proc/environ"; } 2>/dev/null); then
-          [ ! -e "$proc" ] || echo "?${proc##*/}"
-          continue
-        fi
-        if printf '%s\n' "$environ" | grep -qxF "$marker"; then
-          echo "${proc##*/}"
-        fi
-      done
-      ;;
-    *)
-      return 2
-      ;;
+    Darwin | Linux) run_processes list || return 1 ;;
+    *) return 2 ;;
   esac
 }
 
@@ -178,8 +159,8 @@ marked_pids() {
 # Kills and lists every process this run left behind; fails if there was one, if the
 # process table cannot be read, or if a process whose membership cannot be read appeared
 # since check_sweep (it may be a test process). Each PID found is in this run's sandbox or
-# carries its marker, so it is one this run started. Nothing to do before the first test
-# process starts.
+# carries its marker, so it is one this run started; run-processes signals a PID only while
+# it still names that process. Nothing to do before the first test process starts.
 started=0
 swept=0
 sweep() {
@@ -201,13 +182,15 @@ sweep() {
   [ -n "$pids" ] || return "$failed"
   for pid in $pids; do
     say "leftover test process $(describe "$pid")"
-    kill -KILL "$pid" 2>/dev/null || true
     swept=$((swept + 1))
   done
-  sleep 0.2
-  if [ -n "$(marked_pids)" ]; then
-    say "leftover test processes survived SIGKILL: $(marked_pids | tr '\n' ' ')"
-  fi
+  status=0
+  run_processes kill >/dev/null || status=$?
+  case $status in
+    0) ;;
+    3) say "leftover test processes survived SIGKILL" ;;
+    *) say "cannot read the process table to kill leftover test processes" ;;
+  esac
   return 1
 }
 
@@ -217,8 +200,9 @@ sweep() {
 #
 # The probe reports its PID from inside the runner, and the check waits for that process,
 # not the runner: bubblewrap forks the command and sets it to die with bubblewrap only right
-# before the exec, so killing bubblewrap during its setup would orphan the command. The
-# command is killed first, and bubblewrap exits with it.
+# before the exec, so killing bubblewrap during its setup would orphan the command. Once the
+# probe has reported, run-processes kills it and the runner, which carry the run's sandbox or
+# marker; a probe the sweep cannot see is not signalled and ends by itself.
 check_sweep() {
   started=1
   [ "$os" != Windows ] || {
@@ -254,8 +238,12 @@ check_sweep() {
     tries=$((tries + 1))
     sleep 0.1
   done
-  [ -z "$pid" ] || kill -KILL "$pid" 2>/dev/null || true
-  kill -KILL "$probe" 2>/dev/null || true
+  if [ "$seen" -eq 1 ]; then
+    local status=0
+    run_processes kill >/dev/null || status=$?
+    # 3: something survived, which the check below reports.
+    [ "$status" -eq 0 ] || [ "$status" -eq 3 ] || unreadable=1
+  fi
   wait "$probe" 2>/dev/null || true
   if [ "$unreadable" -eq 1 ]; then
     say "cannot read the process table"
@@ -464,18 +452,19 @@ self_check() {
     check "leftover processes are killed and fail the run" "not checked on Windows"
   fi
 
-  # A process table that cannot be read fails the sweep instead of reading as empty.
+  # A process table that lists nothing (proc_listallpids returns 0 when it fails) fails the
+  # sweep instead of reading as empty: the scanner itself is always in it.
   if [ "$os" != Windows ]; then
-    if (sandbox_pids=false proc_root=$R/no-proc sweep) 2>"$R/sweep.err"; then
-      check "an unreadable process table fails the run" FAILED
+    if (table_fault=--empty-table sweep) 2>"$R/sweep.err"; then
+      check "an empty process table fails the run" FAILED
     elif grep -q 'cannot read the process table' "$R/sweep.err"; then
-      check "an unreadable process table fails the run" ok
+      check "an empty process table fails the run" ok
     else
       cat "$R/sweep.err" >&2
-      check "an unreadable process table fails the run" FAILED
+      check "an empty process table fails the run" FAILED
     fi
   else
-    check "an unreadable process table fails the run" "not checked on Windows"
+    check "an empty process table fails the run" "not checked on Windows"
   fi
 
   # Started with BASH_ENV, ENV, and GIT_* pointing at a decoy, no test sees them, no startup
@@ -500,18 +489,18 @@ self_check() {
   return "$failed"
 }
 
-# The socket part of the self-check: a listener (the canaries' `listen` example, which exits
-# by itself after two minutes and is killed on every exit of this script) at $R.sock.
+# The socket part of the self-check: a listener (the canaries' `listen` example) at $R.sock.
+# It is never signalled: it exits once the socket is removed, here or by cleanup, once this
+# script is gone, or after two minutes.
 socket_check() {
   local name="a Unix socket outside the per-run root is unreachable"
   CARGO_TARGET_DIR=$canary_target cargo build --locked --quiet \
     --manifest-path "$canaries/Cargo.toml" --example listen
   "$canary_target/debug/examples/listen" "$R.sock" 120 &
   local listener=$! tries=0 inside=0 outside=0 control=0
-  helpers+=("$listener")
   while [ ! -S "$R.sock" ]; do
     tries=$((tries + 1))
-    if [ "$tries" -ge 100 ] || ! kill -0 "$listener" 2>/dev/null; then
+    if [ "$tries" -ge 100 ]; then
       check "$name (the listener did not start)" FAILED
       return
     fi
@@ -521,9 +510,8 @@ socket_check() {
   run_archive "$R/canaries.tar.zst" "$canaries" -E 'test(=connects_outside_root)' || outside=$?
   runner='' run_archive "$R/canaries.tar.zst" "$canaries" \
     -E 'test(=connects_outside_root)' || control=$?
-  kill "$listener" 2>/dev/null || true
-  wait "$listener" 2>/dev/null || true
   rm -f "$R.sock"
+  wait "$listener" 2>/dev/null || true
   if [ "$inside" -ne 0 ]; then
     check "a Unix socket inside the per-run root is reachable" FAILED
   else
