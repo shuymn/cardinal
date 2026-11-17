@@ -1,0 +1,35 @@
+assert_lefthook_installed: true
+glob_matcher: doublestar
+no_tty: true
+output: [summary, failure, execution_out]
+
+pre-commit:
+  parallel: true
+  commands:
+    rustfmt:
+      glob: "**/*.rs"
+      run: mise exec -- rustfmt --check --edition 2024 {staged_files}
+    actionlint:
+      glob: ".github/workflows/*.{yml,yaml}"
+      run: mise exec -- actionlint
+    ghalint:
+      glob: ".github/workflows/*.{yml,yaml}"
+      run: mise exec -- ghalint run
+    betterleaks:
+      run: mise exec -- betterleaks git --pre-commit --staged --redact --no-banner --verbose
+
+commit-msg:
+  commands:
+    pommitlint:
+      # pommitlint has no Windows release (mise.toml).
+      skip:
+        - run: test "${OS:-}" = Windows_NT
+      run: mise exec -- pommitlint lint --edit {1}
+
+pre-push:
+  piped: true
+  commands:
+    clippy:
+      run: mise exec -- cargo clippy --all-targets -- -D warnings
+    test:
+      run: mise exec -- cargo test
