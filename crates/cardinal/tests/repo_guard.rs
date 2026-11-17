@@ -222,11 +222,74 @@ fn stash_is_detected() {
     });
 }
 
+/// Locally, a sibling worktree added or removed between snapshot and verify, as another agent
+/// does while the tests run, leaves both states alike, seen from the main worktree and from a
+/// linked one; with `CI=true` the whole worktree list counts.
 #[test]
-fn worktree_change_is_detected() {
-    assert_detected("a new worktree", |fixture, repo| {
-        fixture.worktree_add(repo, "wt2", "feature2");
-    });
+fn sibling_worktrees_coming_and_going_are_ignored_locally() {
+    let mut wrong = Vec::new();
+    for (env, detected) in [(&[][..], false), (&[("CI", "true")][..], true)] {
+        for guarded in ["repo", "wt"] {
+            for change in ["added", "removed"] {
+                let (fixture, repo, _) = snapshotted();
+                let sibling = fixture.worktree_add(&repo, "sibling", "sibling");
+                let dir = fixture.path(guarded);
+                let file = fixture.path("snapshot");
+                assert_ok(&guard_with(&fixture, env, "snapshot", &dir, Some(&file)));
+                if change == "added" {
+                    fixture.worktree_add(&repo, "wt2", "feature2");
+                } else {
+                    fixture.worktree_remove(&repo, &sibling);
+                }
+                let output = guard_with(&fixture, env, "verify", &dir, Some(&file));
+                let seen = !output.status.success();
+                if seen != detected {
+                    wrong.push(format!(
+                        "a sibling worktree {change}, seen from {guarded}, {env:?}, detected: {seen}\n{}",
+                        String::from_utf8_lossy(&output.stderr)
+                    ));
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// This worktree's own entry in the worktree list and its own `gitdir` line still count
+/// locally: the diff shows the line of that section, not only the git dir's manifest.
+#[test]
+fn own_worktree_entry_is_detected() {
+    let (fixture, repo, _) = snapshotted();
+    let wt = fixture.path("wt");
+    let file = fixture.path("wt-snapshot");
+
+    assert_ok(&guard(&fixture, "snapshot", &wt, &file));
+    fixture.worktree_lock(&repo, &wt);
+    let output = guard(&fixture, "verify", &wt, &file);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "a lock was not detected");
+    assert!(stderr.lines().any(|line| line == "+locked"), "{stderr}");
+
+    assert_ok(&guard(&fixture, "snapshot", &wt, &file));
+    let moved = fixture
+        .path("moved/.git")
+        .to_string_lossy()
+        .replace('\\', "/");
+    std::fs::write(
+        fixture.path("repo/.git/worktrees/wt/gitdir"),
+        format!("{moved}\n"),
+    )
+    .unwrap();
+    let output = guard(&fixture, "verify", &wt, &file);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "a rewritten gitdir was not detected"
+    );
+    assert!(
+        stderr.lines().any(|line| line == format!("+wt {moved}")),
+        "{stderr}"
+    );
 }
 
 #[test]
