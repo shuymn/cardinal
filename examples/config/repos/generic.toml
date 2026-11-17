@@ -1,0 +1,28 @@
+# A generic profile: no [match] table, so it applies to every repository. Profiles in
+# repos/ are read in file-name order; a profile with [match] takes precedence over generic
+# ones. Nothing here is built in: these are starting rules to copy and adjust.
+
+[classify]
+# Words that start a tool through another tool; the wrapped command is classified.
+wrappers = [["npx"], ["pnpm", "exec"], ["pnpm", "dlx"], ["npm", "exec"], ["bunx"], ["mise", "exec", "--"], ["mise", "x", "--"]]
+# Command words never rewritten, for example a tool your shell shadows with an alias.
+skip = []
+
+[[rule]]
+id = "test"
+commands = ["cargo test", "cargo nextest run", "pnpm test", "pnpm -r test", "vitest"]
+except = ["--watch", "-w"]
+class = "test"
+resources = { cpu = 4 }
+
+[[rule]]
+id = "build"
+commands = ["cargo build", "cargo clippy", "pnpm build"]
+class = "build"
+resources = { cpu = 4 }
+
+[data]
+# Ignored entries safe to delete and rebuild.
+regenerable = ["node_modules", "target", ".DS_Store"]
+# Ignored entries that are never deleted, nor anything containing them.
+protected = ["fuzz/corpus", "fuzz/artifacts", "proptest-regressions"]

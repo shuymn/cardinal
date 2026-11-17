@@ -1,0 +1,31 @@
+# A starting host.toml. Copy it to the config directory ($XDG_CONFIG_HOME/cardinal,
+# ~/.config/cardinal, or %LOCALAPPDATA%\cardinal\config) and keep what you want; every
+# key is optional and unknown keys are rejected.
+
+[budget]                 # admission budgets; a resource without a budget is unlimited
+# cpu = 8                # default: logical CPUs
+# memory_mb = 24000      # default: unset
+# gpu = 1                # any other name is a resource too
+
+[admission]
+# default_resources = { cpu = 4 }  # for rules without `resources`; default: half the logical CPUs
+# lock_timeout_ms = 2000           # admission lock deadline
+# max_wait_ms = 30000              # upper bound of the synchronous wait
+# wait_fraction = 0.25             # share of the Bash timeout the wait may use
+
+[hook]
+# enabled = true
+# runner = "/usr/local/bin/cardinal"  # absolute path written into rewrites; default: the hook's own executable
+# deadline_ms = 500                   # classification deadline
+
+[observe]
+# git = "git"
+# gh = "gh"
+# git_timeout_ms = 10000
+# gh_timeout_ms = 20000
+# repos = ["~/src/other"]             # extra main worktrees to inventory
+# managed = [{ app = "t3code", root = "/path/to/worktrees" }]  # worktrees that are only reported
+
+[records]
+# max_bytes = 8388608
+# keep = 4
