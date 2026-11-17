@@ -453,7 +453,7 @@ The explicit `timeout` keeps a stuck hook from stalling Bash calls for the 600 s
 ### 6.3 `hook claude pre-tool-use`
 
 1. On Windows (section 5.5), exit 0 with empty stdout at once, before reading the input or the configuration, so the hook records nothing there. Elsewhere, read stdin (bounded at 1 MiB) as JSON. Exit 0 with empty stdout, rewriting nothing, if `tool_name` is not `Bash`, `tool_input.command` is not a string, `hook.enabled` is false, `permission_mode` is `auto` (section 6.5), or anything fails.
-2. Find and classify stages (section 7) within `hook.deadline_ms`, measured from process start. Past the deadline: no rewrite.
+2. Find and classify stages (section 7) within `hook.deadline_ms`, measured from process start. The deadline is checked after classification and again after the output is serialized, right before it is written; past it: no rewrite.
 3. If at least one stage is classified, rewrite each classified stage (section 6.4) and print:
 
 ```json
@@ -464,14 +464,14 @@ The explicit `timeout` keeps a stuck hook from stalling Bash calls for the 600 s
 
 4. The effective timeout written into each spec: `tool_input.timeout` if it is a positive number, else `BASH_DEFAULT_TIMEOUT_MS` from the hook's environment (the hook inherits Claude Code's), else 120000; capped at `max(BASH_MAX_TIMEOUT_MS or 600000, default)`. `run_in_background: true` sets the spec's background flag.
 
-On the way to a rewrite the hook writes nothing to the state dir and takes no reservation (C1); a configuration error appends `config_error`, and a missed deadline or failure appends `hook_error`. It never exits non-zero: panics are caught at the top level and turned into "no rewrite".
+On the way to a rewrite the hook writes nothing to the state dir and takes no reservation (C1). A configuration error, a runner path that is a directory included, appends `config_error`; input the hook cannot use (unreadable, not a JSON object, over 1 MiB, or a Bash call without a string command), a missed deadline, or another failure appends `hook_error` with reason `invalid_input`, `deadline_missed`, or `failed`. It never exits non-zero: panics are caught at the top level and turned into "no rewrite".
 
 ### 6.4 Rewritten command
 
 The hook replaces only the span of each classified stage, in place, and leaves every other byte of the command alone. For a stage `S`, the replacement is
 
 ```sh
-if [ -x R ]; then S'; else S; fi
+if [ -f R ] && [ -x R ]; then S'; else S; fi
 ```
 
 where `R` is the runner path, the `else` branch is the stage as written, and `S'` is `S` with `R run --spec-b64 <spec> --` inserted immediately before its command word. Example:
@@ -480,16 +480,18 @@ where `R` is the runner path, the `else` branch is the stage as written, and `S'
 # original
 cd packages/app && pnpm test 2>&1 | tail -50 || echo failed
 # rewritten
-cd packages/app && if [ -x /usr/local/bin/cardinal ]; then /usr/local/bin/cardinal run --spec-b64 eyJzY2hlbWEiOi… -- pnpm test 2>&1; else pnpm test 2>&1; fi | tail -50 || echo failed
+cd packages/app && if [ -f /usr/local/bin/cardinal ] && [ -x /usr/local/bin/cardinal ]; then /usr/local/bin/cardinal run --spec-b64 eyJzY2hlbWEiOi… -- pnpm test 2>&1; else pnpm test 2>&1; fi | tail -50 || echo failed
 ```
 
 - **Everything else stays in the calling shell:** pipes, `&&`/`||`/`;` lists and their short-circuiting, a leading `cd` and the cwd it leaves for later Bash calls, shell options such as `pipefail` and `errexit`, functions used by other stages, and the command's first word unless its first stage is classified. Claude Code's timeout handling depends only on a leading `sleep`, and a `sleep` stage is never wrapped (section 7.2).
 - **Both branches carry the stage's own words,** so variables, globs, `~`, and quoting are expanded by the calling shell either way, and exactly one branch runs. The `if` returns the status of the branch that ran, so pipeline and list semantics are unchanged.
-- **`[ -x R ]`** is the fallback test: if the runner path is missing or not executable (uninstalled, moved, upgraded to another path), the `else` branch runs the original stage.
+- **`[ -f R ] && [ -x R ]`** is the fallback test: if the runner path is missing, not a regular file (a directory passes `-x`), or not executable (uninstalled, moved, upgraded to another path), the `else` branch runs the original stage. The hook also refuses a directory runner path as a configuration error (section 6.3).
 - **Several classified stages** in one command are each wrapped and reserved separately; the spec's stage index tells them apart. Scripts started inside a stage are not controlled separately; their weight is learned for the stage (design §6).
 - **One-line form:** a wrapped stage's span never contains a newline or a comment (section 7.2), so the replacement stays on one line and the rest of the line follows `fi` unchanged.
 
-In bash, zsh, and sh this form gives the original's stdout, stderr, and status for lists, `pipefail`, non-exported variables, globs, and redirections, with the runner present and missing; `tests/rewrite_equivalence.rs` keeps these cases (section 13.5). The exception is a stage that redirects a stream its pipeline connects (`cmd > log | tail`, `x | cmd < file`): zsh's `MULTIOS` sends such a stream to both the redirection and the pipe only while both belong to the same simple command, and in the rewrite the pipe belongs to the `if`. Section 7.2 leaves those stages unwrapped.
+In bash, zsh, and sh this form gives the original's stdout, stderr, and status for lists, `pipefail`, non-exported variables, globs, and redirections, with the runner present, missing, or a directory; `tests/rewrite_equivalence.rs` keeps these cases (section 13.5). The exception is a stage that redirects a stream its pipeline connects (`cmd > log | tail`, `x | cmd < file`): zsh's `MULTIOS` sends such a stream to both the redirection and the pipe only while both belong to the same simple command, and in the rewrite the pipe belongs to the `if`. Section 7.2 leaves those stages unwrapped.
+
+The fallback test and the runner are commands of the calling shell, so a trap or tracing that is active when the command starts (a `DEBUG` trap or `xtrace` from the owner's shell startup) sees them, the way an rc alias that shadows a tool changes what the runner runs (section 7.5); both are outside this equivalence. A command that sets a trap or tracing itself is not rewritten (section 7.2).
 
 ### 6.5 Permissions
 
@@ -523,12 +525,19 @@ A stage is one simple command: a pipeline element or a list element, with its ow
 
 The hand-written tokenizer accepts a conservative subset of POSIX shell syntax: words with `'…'`, `"…"` (backslash escapes inside), and `\x` escapes; `$NAME` and `${…}` inside words as opaque text; the operators `&&`, `||`, `;`, `|`, `&`, and newlines; redirections (`>`, `>>`, `<`, `2>&1`, `N>file`, `&>`); and `#` comments.
 
-**The whole command is left unrewritten** when a stage span cannot be delimited with certainty or the outer shell could change what a stage means: a here-document or here-string, `$(`, backticks, `$((`, `$[`, `$'…'`, `<(`, `>(`, `(`, `)`, `{` and `}` outside `${…}` (which may contain neither quotes nor newlines), `[[`, `!` outside `$!` and `${…}`, `|&`, a line continuation, a keyword in command position (`if then else elif fi for while until do done case esac function select`, and bash's and zsh's `coproc repeat foreach end`), a function definition, `eval` or `alias` anywhere in command position, or unbalanced quotes.
+**The whole command is left unrewritten** when a stage span cannot be delimited with certainty or the outer shell could change what a stage means: a here-document or here-string, `$(`, backticks, `$((`, `$[`, `$'…'`, `<(`, `>(`, `(`, `)`, `{` and `}` outside `${…}` (which may contain neither quotes nor newlines), `[[`, `!` outside `$!` and `${…}`, `|&`, a line continuation, a keyword in command position (`if then else elif fi for while until do done case esac function select`, and bash's and zsh's `coproc repeat foreach end`), a function definition, or unbalanced quotes.
+
+**The whole command is also left unrewritten when one of its stages can change what a later stage means or trace it,** because a later wrapped stage would then run something else than the same stage unwrapped, or its fallback test and runner would show in the trace. Command words are read after quote removal (`"eval"`, `\eval`) and behind precommand modifiers (`command`, `builtin`, `exec`, `noglob`, `nocorrect`, `-`, `time`). The command is refused for:
+
+- a command word that is not a literal: one with an expansion (`$TOOL`, `"$X"`) or an unquoted pattern character (`*`, `?`, `[…]`, and zsh's `^`, and `#` or `~` after the word's start), which can name any command, `eval` among them, or with `nullglob` vanish and leave its arguments to run in the calling shell (`./absent*/tool cd sub`);
+- a builtin that defines, removes, or redirects commands or sources code into the calling shell: `eval`, `.`, `source`, `alias`, `unalias`, `unset` (bash falls back to functions), `functions`, `unfunction`, `autoload`, `enable`, `disable`, `hash`, `unhash`, and the `f` option of `typeset`, `declare`, `local`, `export`, and `readonly`;
+- an assignment to the shells' tables of functions, aliases, command paths, or options: `functions[…]`, `aliases[…]` (also `galiases`, `saliases`, and the `dis_` variants), `commands[…]`, `options[…]`, `BASH_ALIASES[…]`, `BASH_CMDS[…]`;
+- `trap`, and options that trace commands: `set -x`, `-v`, `-T`, `set -o xtrace|verbose|functrace`, `setopt`/`unsetopt` of `xtrace` or `verbose` (zsh spellings included), and `shopt -s extdebug`; an option word with an expansion counts as one of these.
 
 **A single stage is left unwrapped** (other stages may still be wrapped) when:
 
 - its command word is a shell builtin, keyword, or precommand modifier (`time`, `command`, `builtin`, `exec`, `noglob`, `nocorrect`, and the rest of the shell's builtins), `sleep`, or in `[classify] skip`;
-- it expands shell state (`$?`, `${?}`, `$_`, `$!`, `$-`, `$$`, `PIPESTATUS`, `pipestatus`), some of which the fallback test changes;
+- it reads shell state anywhere in its words, also nested in the operands of `${…}` (`"${UNSET:-$?}"`): the fallback test changes `$?` (zsh's `$status`), `$_` (the test's last word, `]`), `PIPESTATUS` and `pipestatus`, and bash's `BASH_COMMAND` (the command text); `$!`, `$-`, and `$$`, which it leaves alone, count too. zsh parameter flags (`${(e)…}`), bash indirection (`${!name}`), and prompt expansion (`${x@P}`) can reach any parameter and count as state. Positional parameters, `LINENO`, `RANDOM`, `SECONDS`, and `BASHPID` keep their values inside the `if` and do not count;
 - it has assignment prefixes: in front of the runner they defeat its permission rule (section 6.1), and as `env` arguments they would change meaning (`A=one B="$A" cmd`, readonly variables). Phase 0 therefore does not limit stages such as `CI=1 pnpm test`;
 - it runs asynchronously (followed by `&`), because its runner would outlive the calling shell;
 - its pipeline contains another classified stage, because a stage waiting for admission could block a running one through the pipe;
