@@ -419,8 +419,8 @@ Hypotheses derived from the purpose layer. Test names are filled in during imple
 
 | Phase | Contents | Conditions verified |
 | --- | --- | --- |
-| 0 | The core (hook adapter, runner, admission and reservation, observation, records, `plan`, `act`, and invariants, the inbox, the CLI for the arbiter), the Claude Code adapter, the first version of the arbiter's skill | G4, G5, G10, G14 |
-| 1 | The arbiter cleans up disk and worktrees with `inventory`, `plan`, and `act`. On the code side, threshold detection, inbox entries, and starting the arbiter. Start on macOS against a real TypeScript monorepo's data. A read-only web UI (push only) | G2, G3, G6, G7, G8 |
+| 0 | The core (hook adapter, runner, admission and reservation, observation, records, `plan`, report-only `act`, and invariants, the inbox, the CLI for the arbiter), the Claude Code adapter, the first version of the arbiter's skill | G4, G5, G10, G14 |
+| 1 | The arbiter cleans up disk and worktrees with `inventory`, `plan`, and `act`, which gains deletion with a race-free method. On the code side, threshold detection, inbox entries, and starting the arbiter. Start on macOS against a real TypeScript monorepo's data. A read-only web UI (push only) | G2, G3, G6, G7, G8 |
 | 2 | Admission for heavy commands (memory, priority classes, recorded measurements), accepted jobs and `wait`, job specs, the loopback executor | G1, G9, G13 |
 | 3 | Promote judgments the arbiter keeps repeating into units (for example, reclaiming merged, clean worktrees). Windows support (Job Object, commit charge, WSL admission requests and virtual disks). Answering pending decisions from the web UI | G1–G8, G13, G14 also on Windows; G12 |
 | 4 | More executors (SSH hosts, control plane relay and a resident connector, CI). Control of cross-host resources | G9, G11 |
