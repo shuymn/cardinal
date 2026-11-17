@@ -252,18 +252,18 @@ fn snapshot_dir(
         };
         let child = entry(rel.join(&name), &st);
         let enter = child.kind == EntryKind::Dir && child.dev == dev;
-        let child_rel = child.rel.clone();
-        let snapshot = child.clone();
+        let index = out.len();
         out.push(child);
         if enter {
             match open_dir_at(fd, &name) {
                 Ok(child_fd) => {
-                    let opened = entry(child_rel.clone(), &rustix::fs::fstat(&child_fd)?);
+                    let opened = entry(PathBuf::new(), &rustix::fs::fstat(&child_fd)?);
                     // Replaced between the stat and the open: the entry stays as the stat
                     // saw it, and nothing below the replacement is recorded.
-                    if snapshot.same_identity(&opened)
+                    if out[index].same_identity(&opened)
                         && mount::of_dir(&child_fd).map_err(io::Error::other)? == on_mount
                     {
+                        let child_rel = out[index].rel.clone();
                         snapshot_dir(&child_fd, &child_rel, dev, on_mount, out)?;
                     }
                 }
