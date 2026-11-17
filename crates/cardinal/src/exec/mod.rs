@@ -251,9 +251,6 @@ pub struct LocalExecutor {
     watch: Watch,
     #[cfg(unix)]
     group: std::cell::Cell<Option<os::unix::GroupSetup>>,
-    /// Started with the first child in the caller's group.
-    #[cfg(unix)]
-    watchdog: std::cell::RefCell<Option<os::unix::Watchdog>>,
 }
 
 impl LocalExecutor {
@@ -263,27 +260,7 @@ impl LocalExecutor {
             watch,
             #[cfg(unix)]
             group: std::cell::Cell::new(None),
-            #[cfg(unix)]
-            watchdog: std::cell::RefCell::new(None),
         }
-    }
-
-    /// In the caller's group, where the runner stops with a stopped child, starts the watchdog
-    /// that continues the group once the runner's parent has exited, so that a stopped runner
-    /// still stops the child. Returns whether a watchdog runs: without one the runner does not
-    /// follow the child's stops.
-    #[cfg(unix)]
-    fn job_control(&self) -> bool {
-        if self.group.get().is_some() {
-            return false;
-        }
-        let mut slot = self.watchdog.borrow_mut();
-        if slot.is_none()
-            && let Some(parent) = self.watch.inner.parent
-        {
-            *slot = os::unix::Watchdog::start(parent).ok();
-        }
-        slot.is_some()
     }
 
     /// Moves the runner back into the group it was in before [`Executor::prepare`], so a stage
@@ -314,8 +291,6 @@ impl LocalExecutor {
         command.args(args);
         #[cfg(unix)]
         os::unix::restore_child_signal(&mut command);
-        #[cfg(unix)]
-        let job_control = self.job_control();
         let child = command.spawn()?;
         let pid = child.id();
         #[cfg(unix)]
@@ -324,8 +299,8 @@ impl LocalExecutor {
             // nor kills.
             drop(child);
             let tx = self.watch.sender();
-            // A child under the caller's job control: its stops are reported.
-            let stops = job_control;
+            // A child in the caller's group is under its job control: its stops are reported.
+            let stops = self.group.get().is_none();
             // Without the waiter thread the supervisor still polls the child.
             let _ = std::thread::Builder::new()
                 .name("cardinal-child".into())
@@ -354,8 +329,6 @@ impl LocalExecutor {
             watch: self.watch.clone(),
             #[cfg(unix)]
             group: self.group.get().map(|g| g.pgid),
-            #[cfg(unix)]
-            job_control,
         })
     }
 
@@ -369,7 +342,6 @@ impl LocalExecutor {
             pid,
             watch: self.watch.clone(),
             group: self.group.get().map(|g| g.pgid),
-            job_control: self.job_control(),
         });
         #[cfg(not(unix))]
         {
@@ -418,10 +390,6 @@ pub struct LocalRunning {
     /// caller's group.
     #[cfg(unix)]
     group: Option<u32>,
-    /// Whether the runner follows the child's stops: in the caller's group, with the watchdog
-    /// running.
-    #[cfg(unix)]
-    job_control: bool,
 }
 
 impl Running for LocalRunning {
@@ -447,8 +415,8 @@ impl LocalRunning {
     /// - in the caller's group: SIGINT and SIGQUIT are ignored, as `system()` does, because the
     ///   child receives terminal signals itself; SIGTERM and SIGHUP go to the child. When the
     ///   child stops, the runner stops with the same signal, so the caller's job control sees
-    ///   the stop, and continues the child once it is continued itself; the watchdog continues
-    ///   a stopped runner whose parent has exited.
+    ///   the stop, and continues the child once it is continued itself. The runner signals
+    ///   only the child, never the caller's group.
     ///
     /// The child is reaped only when the wait ends, so its PID stays reserved while the runner
     /// may signal it; the group's ID is the runner's own PID and stays reserved while the
@@ -459,7 +427,9 @@ impl LocalRunning {
     /// has exited and no other member of the group is left. When the group is still alive
     /// [`PARENT_EXIT_KILL_AFTER`] later, the wait ends with [`Watch::group_kill_due`] set; a
     /// child in the caller's group gets SIGKILL instead and is waited for up to
-    /// [`PARENT_EXIT_GIVE_UP`].
+    /// [`PARENT_EXIT_GIVE_UP`]. A runner stopped with its child sees the parent's exit only
+    /// once it is continued, for example by the kernel, which sends SIGHUP and SIGCONT to every
+    /// member of a group with a stopped member when the group becomes orphaned.
     #[cfg(unix)]
     fn supervise(self) -> ExecOutcome {
         let pid = self.pid;
@@ -479,14 +449,13 @@ impl LocalRunning {
                 }
             }
             if !exited
-                && self.job_control
+                && self.group.is_none()
                 && let Ok(Some(sig)) = os::unix::take_stop(pid)
             {
                 // Once the parent is gone nobody would continue the runner; the child only
-                // goes on.
-                // A parent that exits after this look is the watchdog's to see.
+                // goes on. A parent that exits after this look is seen once the runner is
+                // continued.
                 if stopping.is_none() && !self.watch.parent_exited() {
-                    let _ = testpoint::hit(testpoint::RUN_STOPPING);
                     os::unix::stop_self(sig);
                 }
                 let _ = os::unix::signal_process(pid, os::unix::SIGCONT);

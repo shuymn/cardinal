@@ -54,6 +54,9 @@ pub enum Mode {
     /// `handled`, read with `sigaction`) to `out`, then exit 3.
     #[cfg(unix)]
     ChildSignal { out: PathBuf },
+    /// Exec `argv` as the leader of a new process group, without the helper's variables.
+    #[cfg(unix)]
+    LeadGroup { argv: Vec<String> },
 }
 
 /// Runs the helper mode named on the command line, then exits; returns at once in a normal
@@ -112,6 +115,17 @@ pub fn run_if_requested() {
             std::fs::write(&args[0], child_signal()).expect("write the disposition");
             std::process::exit(3);
         }
+        #[cfg(unix)]
+        "lead-group" => {
+            use std::os::unix::process::CommandExt as _;
+            let err = Command::new(&args[0])
+                .args(&args[1..])
+                .env_remove(MODE)
+                .env_remove(ARGS)
+                .process_group(0)
+                .exec();
+            panic!("exec {}: {err}", args[0]);
+        }
         other => panic!("unknown helper mode {other}"),
     }
     std::process::exit(0);
@@ -169,6 +183,8 @@ pub fn command(scope: &Scope, mode: &Mode, cwd: &Path) -> Command {
         ),
         #[cfg(unix)]
         Mode::ChildSignal { out } => ("child-signal", vec![out.to_string_lossy().into_owned()]),
+        #[cfg(unix)]
+        Mode::LeadGroup { argv } => ("lead-group", argv.clone()),
     };
     let mut command = scope.command(exe, cwd);
     command

@@ -27,9 +27,6 @@ pub const RUN_SPAWNING: &str = "run.spawning";
 pub const RUN_SPAWNED: &str = "run.spawned";
 /// The child has been spawned.
 pub const RUN_AFTER_SPAWN: &str = "run.after_spawn";
-/// The stage stopped in the caller's group and the runner, having found its parent alive, is
-/// about to stop itself.
-pub const RUN_STOPPING: &str = "run.stopping";
 /// The stage's child has been reaped and its status not read; an injected failure stands for
 /// a status the wait could not get.
 pub const RUN_REAPED: &str = "run.reaped";
@@ -54,7 +51,6 @@ pub const POINTS: &[&str] = &[
     RUN_SPAWNING,
     RUN_SPAWNED,
     RUN_AFTER_SPAWN,
-    RUN_STOPPING,
     RUN_REAPED,
     ACT_LOCKED,
     ACT_SNAPSHOTTED,
