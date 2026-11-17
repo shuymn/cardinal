@@ -24,7 +24,7 @@ This document fixes the contracts that the phase 0 pieces build against: the cra
 
 ## 1. Phase 0 scope
 
-Phase 0 builds the core (hook adapter, runner, admission and reservations, observation, records, `plan`/`act`/invariants, the inbox, the CLI for the arbiter), the Claude Code adapter, and the first arbiter skill. It is accepted by G4, G5, G10, and G14 (design §12).
+Phase 0 builds the core (hook adapter, runner, admission and reservations, observation, records, `plan`/`act`/invariants, the inbox, the CLI for the arbiter), the Claude Code adapter, and the first arbiter skill. It is accepted by G4, G5, G10, and G14 (design §12) on macOS and Linux; on Windows the hook does not rewrite (section 5.5).
 
 **Phase 0 admission decides with exactly this:** the resources of every reservation that is live or recovery-needed, plus the new job's resources, compared per resource against the budgets in `host.toml`; a job gets all of its resources or none. There are no sensors, no priority classes, no queue order, and no measured weights. Resource amounts come from the matching classification rule. This is the design's "sensor read failed, decide from reservations alone" case (design §7), made permanent until phase 2.
 
@@ -63,7 +63,7 @@ Everything lives in the single crate `crates/cardinal` (library plus the `cardin
 | `state` | State paths, atomic writes, lock helpers with deadlines, IDs and keys, JSONL append and read | `contract` |
 | `record` | Record appending, rotation, reading | `state`, `contract` |
 | `testpoint` | Pause points and failure injection for tests ([section 13.1](#131-deterministic-concurrency)) | std |
-| `os` | Platform backends behind one API: process table, start times, parent PID, process working directories, boot time (all OSes); process-group setup and signals (Unix); Job Objects (Windows) | std, rustix, signal-hook, windows-sys, sysinfo |
+| `os` | Platform backends behind one API: process table, start times, parent PID, process working directories, boot time; process-group setup and signals (Unix) | std, rustix, signal-hook, sysinfo |
 | `sensor` | Phase 2 seam: `Sensors` trait, `Unavailable` implementation | `contract` |
 | `exec` | `Invocation` (argv; cwd and env by inheritance), `Placement::Local`, `Executor` trait, local executor | `os`, `contract` |
 | `admission` | Budget math (pure), reservation store, liveness and the recovery pass, worktree in-use query | `state`, `config`, `os`, `sensor`, `record`, `contract` |
@@ -72,7 +72,7 @@ Everything lives in the single crate `crates/cardinal` (library plus the `cardin
 | `adapter::claude` | Hook input and output, stage rewriting, session-end snapshot | `classify`, `config`, `record`, `state`, `os` |
 | `observe` | git and gh invocation with constructed environments and deadlines, repository and worktree facts, merge evidence, ignored-data classification, disk usage, outlived processes | `config`, `state`, `admission` (read-only queries), `os`, `contract` |
 | `plan` | Plan generation, identity binding | `observe`, `admission`, `state`, `record`, `contract` |
-| `act` | Plan execution: move to trash, inspection, deletion | `plan`, `observe`, `admission`, `state`, `record`, `contract`, `testpoint` |
+| `act` | Plan execution: inspection, snapshot, snapshot-checked deletion | `plan`, `observe`, `admission`, `state`, `record`, `contract`, `testpoint` |
 | `inbox` | Inbox store, dedup, refresh (recovery pass and built-in raisers) | `admission`, `observe`, `state`, `record`, `contract` |
 | `explain` | Explanation documents | `classify`, `record`, `plan`, `inbox`, `state`, `contract` |
 | `cli` | clap definitions and thin handlers that print JSON | everything |
@@ -162,7 +162,7 @@ keep = 4
 # honored key is `act` for callers that identify as a unit (section 9.6).
 ```
 
-`[hook] runner` must be absolute and consist only of `A–Z a–z 0–9 / . _ + -` (plus a drive prefix such as `C:` on Windows); otherwise the hook does not rewrite and records `config_error`. The path is the only configuration value that appears in shell text, and this rule means it never needs quoting.
+`[hook] runner` must be absolute and consist only of `A–Z a–z 0–9 / . _ + -`; otherwise the hook does not rewrite and records `config_error`. The path is the only configuration value that appears in shell text, and this rule means it never needs quoting.
 
 ### 3.3 `repos/*.toml` profiles
 
@@ -211,7 +211,7 @@ protected = ["fuzz/corpus", "fuzz/artifacts", "proptest-regressions"]
   inbox/.lock                 # empty; serializes inbox upserts
   inbox/<key-hash>.json       # one per inbox item
   plans/<plan>/plan.json      # immutable after creation
-  plans/<plan>/claim          # created once by the act that executes the plan; progress appended
+  plans/<plan>/claim          # created once by the act that executes the plan
   plans/<plan>/result.json    # act result
   records/records.jsonl       # current record file
   records/records.<n>.jsonl   # rotated files, n = 1..keep-1
@@ -229,14 +229,14 @@ protected = ["fuzz/corpus", "fuzz/artifacts", "proptest-regressions"]
 | `sessions/<session>.json` | `cardinal.session-snapshot.v1` | `hook claude session-end` | inbox refresh |
 | `inbox/<key-hash>.json` | `cardinal.inbox-item.v1` | inbox raise, refresh, resolve | `inbox`, `explain` |
 | `plans/<plan>/plan.json` | `cardinal.plan.v1` | `plan` | `act`, `explain` |
-| `plans/<plan>/claim` | JSON lines: `{"pid","claimed_ms","trash"}`, then `{"step":"renamed"\|"inspected"\|"restored"}` | `act` (create-new, then append) | `act`, `plan`, `explain` |
+| `plans/<plan>/claim` | `{"pid":…,"claimed_ms":…}` | `act` (create-new) | `act`, `explain` |
 | `plans/<plan>/result.json` | `cardinal.act-result.v1` | `act` | `act`, `explain` |
 | `records/*.jsonl` | one `cardinal.record.v1` object per line | every command | `explain`, `inventory` |
 
 ### 4.2 Write discipline
 
 - **Atomic replace:** write to `tmp/<name>.<pid>.<n>`, flush, rename over the target. Readers see the old or the new file, never a mix. Leftover temp files older than one hour are removed by `plan` and `inbox` runs.
-- **fsync policy:** reservations, live locks, and records are not fsynced; they are meaningless after a power loss (reservations from an earlier boot are released, section 4.5). Plan claims, act results, and inbox items are fsynced (file, then parent directory on Unix), because losing them could run a plan twice, lose track of a target moved to trash, or bring back a resolved item. On Windows, `FlushFileBuffers` on the file only.
+- **fsync policy:** reservations, live locks, and records are not fsynced; they are meaningless after a power loss (reservations from an earlier boot are released, section 4.5). Plan claims, act results, and inbox items are fsynced (file, then parent directory on Unix), because losing them could run a plan twice or bring back a resolved item. On Windows, `FlushFileBuffers` on the file only.
 - **Exclusive creation for uniqueness:** a job ID is claimed by creating `live/<job>.lock` with `create_new`, a plan ID by creating `plans/<plan>/` with `create_dir`; a collision retries with a new ID.
 - **IDs:** 16 lowercase hex characters from a randomly keyed SipHash (`std::hash::RandomState`) of time, PID, and a counter. No RNG crate. The CLI accepts any unique prefix of at least 4 characters.
 - **Keys:** worktree keys and inbox key hashes are FNV-1a 64 of the canonical path or key, as 16 hex characters (hand-written, stable across Rust releases unlike `DefaultHasher`). A worktree-key collision only makes two worktrees share an in-use lock (more conservative); inbox files store the full key and probe `-1`, `-2`, … on collision.
@@ -258,7 +258,7 @@ The critical section only reads small files and writes one; process probes are a
 
 1. Take `admission.lock` exclusively (deadline `lock_timeout_ms`; on timeout, fail open).
 2. On the runner's first pass only: create `live/<job>.lock` with `create_new` and take it exclusively. The runner holds it until it exits.
-3. Run the **recovery pass**: read every `reservations/*.json` (a file that vanished meanwhile is skipped) and evaluate each one (section 4.5). Delete `stale` ones and their live lock files, and delete live lock files that are free and have no reservation. Send SIGTERM to each verified `recovery_needed` group on Unix, and SIGKILL when a later pass finds it still alive at least 2 s after the SIGTERM recorded in the reservation.
+3. Run the **recovery pass**: read every `reservations/*.json` (a file that vanished meanwhile is skipped) and evaluate each one (section 4.5). Delete `stale` ones and their live lock files, and delete live lock files that are free and have no reservation. Send SIGTERM to each verified `recovery_needed` group, and SIGKILL when a later pass finds it still alive at least 2 s after the SIGTERM recorded in the reservation.
 4. Sum the resources of `live` and `recovery_needed` reservations. If, for every resource the new job needs, `sum + need ≤ budget` (resources without a budget always fit), write `reservations/<job>.json` (atomic) with `state: "reserved"` and the runner's group identity (section 5.5).
 5. Release `admission.lock`.
 
@@ -270,25 +270,23 @@ The liveness lock is held before the reservation becomes visible, so another adm
 reserved ──(written immediately before spawn)──> starting ──(after spawn)──> running ──> deleted at release
 ```
 
-The group identity is fixed before the reservation exists: on Unix the runner makes itself a process-group leader, so the PGID is the runner's PID; on Windows the runner creates and joins a named Job Object (section 5.5). A reservation's derived state is computed by whoever reads it; it is never stored:
+The group identity is fixed before the reservation exists: the runner makes itself a process-group leader, so the PGID is the runner's PID (section 5.5). A reservation's derived state is computed by whoever reads it; it is never stored:
 
 | Condition (evaluated in order) | Derived state |
 | --- | --- |
 | `try_lock` on `live/<job>.lock` fails (the owner holds it) | `live` |
 | `boot_s` differs from the current boot time by more than 2 s | `stale`: no process survives a reboot |
-| The group is empty. Unix: `kill(-pgid, 0)` fails with `ESRCH`, or a process whose PID equals the PGID has a start time other than the runner's (POSIX does not reuse a PID while a process group with that ID exists, so the job's group must have emptied first). Windows: the named Job Object cannot be opened or reports no active processes | `stale` |
+| The group is empty: `kill(-pgid, 0)` fails with `ESRCH`, or a process whose PID equals the PGID has a start time other than the runner's (POSIX does not reuse a PID while a process group with that ID exists, so the job's group must have emptied first) | `stale` |
 | Otherwise | `recovery_needed` |
 
-A `recovery_needed` group is **verified** when the recorded child (PID and start time) is alive and still has the recorded PGID. The recovery pass signals only verified groups. An unverified group (the runner died at `starting`, the child exited while descendants remain, or the PGID was reused by an unrelated group) is never signalled: the reservation keeps counting until the group is empty or the boot changes, and an inbox item shows its members. PGID reuse by an unrelated group therefore only delays release, and the delay clears itself when that group ends. Nobody, including the owner, can release a non-empty group's reservation (G14).
-
-Recovery-needed reservations count as reserved for admission and as in use for their worktree. On Windows the runner's death closes the Job Object, whose kill-on-close stops the group, so recovery normally becomes `stale` at the next pass.
+A `recovery_needed` group is **verified** when the recorded child (PID and start time) is alive and still has the recorded PGID. The recovery pass signals only verified groups. An unverified group (the runner died at `starting`, the child exited while descendants remain, or the PGID was reused by an unrelated group) is never signalled: the reservation keeps counting until the group is empty or the boot changes, and an inbox item shows its members. PGID reuse by an unrelated group therefore only delays release, and the delay clears itself when that group ends. Nobody, including the owner, can release a non-empty group's reservation (G14). Recovery-needed reservations count as reserved for admission and as in use for their worktree.
 
 ### 4.6 Worktree in-use lock
 
 - The worktree of a job is found by walking up from the runner's cwd to the nearest `.git` entry (file or directory); the key is the FNV-1a of that directory's canonical path. A job outside any worktree takes no in-use lock.
-- The runner takes `worktrees/<key>.lock` **shared** at acceptance, before admission and before any wait, and holds it until the child has exited and the reservation is deleted (C15). Several jobs can share a worktree.
-- **Fail-open never skips the in-use lock.** If the lock is held exclusively past the wait cap (an `act` is reclaiming the worktree), the runner exits 125 without running the stage (section 5.6). After acquiring it, the runner checks that the worktree root still exists with the identity it had before the wait; if not, it also exits 125 without running. Only when the lock file cannot be opened at all (the state dir is broken) does the runner fail open without it: `act` needs the same file, so no reclamation can run in that state.
-- `act` takes the lock **exclusively** with `try_lock` (no waiting) and keeps it until the target has been moved to trash and inspected (section 9.5). A worktree is in use when that `try_lock` fails, or when a `live` or `recovery_needed` reservation names the worktree key (checked under the admission lock while holding the exclusive lock). The second check covers a crashed runner, whose shared lock the OS has already dropped.
+- The runner takes `worktrees/<key>.lock` **shared** at acceptance, before admission and before any wait, and holds it until the stage has exited, on every path that runs the stage: admitted, overflow, fail-open, and TTY passthrough (C15). Several jobs can share a worktree.
+- **The lock keeps running commands from losing files under them; it does not protect data,** which `act` protects by deleting only what it inspected (section 9.5). When the lock cannot be opened or taken within the wait cap (an `act` holds it, or the state dir is broken), the runner runs the stage anyway (G4) and records `in_use_unprotected`.
+- `act` takes the lock **exclusively** with `try_lock` (no waiting) and keeps it until its deletion ends. A worktree is in use when that `try_lock` fails, when a `live` or `recovery_needed` reservation names the worktree key (checked under the admission lock while holding the exclusive lock; this covers a crashed runner, whose shared lock the OS has already dropped), or when a process has its working directory inside the target.
 
 ### 4.7 Records
 
@@ -303,7 +301,7 @@ Recovery-needed reservations count as reserved for admission and as in use for t
 
 ### 4.9 Plans store
 
-`plans/<plan>/plan.json` is written once. `act` claims a plan by creating `plans/<plan>/claim` with `create_new`, including the trash path it will use, and fsyncs it before touching the target, so a plan runs at most once even across a crash or power loss. Each step (`renamed`, `inspected`, `restored`) is appended and fsynced. A claim without `result.json` means the run was interrupted; the next `plan` or `act` run finishes it: an entry still at the trash path is deleted if the claim records `inspected`, otherwise moved back to its original path. If that path is occupied, the entry stays in trash and an `interrupted_act` inbox item reports it. The plan itself is never retried. Plan directories older than 30 days are removed by `plan` runs.
+`plans/<plan>/plan.json` is written once. `act` claims a plan by creating `plans/<plan>/claim` with `create_new` and fsyncing it before touching the target, so a plan runs at most once even across a crash or power loss. A claim without `result.json` means the run was interrupted; the plan is never retried, and a new plan inspects the target from scratch. Plan directories older than 30 days are removed by `plan` runs.
 
 ### 4.10 Sessions
 
@@ -318,11 +316,11 @@ Recovery-needed reservations count as reserved for admission and as in use for t
 | inside the admission lock | Temp file in `tmp/`; lock dropped by the OS | Temp GC |
 | at `reserved` | Reservation; its group was the runner alone and is now empty | `stale` |
 | at `starting` | Reservation; a child may or may not exist in the group | Empty group: `stale`. Otherwise `recovery_needed`, unverified, until the group is empty |
-| at `running` | Reservation with the child's identity | Windows: job killed, `stale`. Unix: `recovery_needed`, verified; stopped, then `stale` |
+| at `running` | Reservation with the child's identity | `recovery_needed`, verified; stopped, then `stale` |
 | after the child exits, before release | Reservation; group empty | `stale`; records lack `job_finished` |
 | during release | Nothing or a free live lock | Recovery pass |
 
-`act` dying leaves its target in place or at the recorded trash path (section 4.9). Power loss: reservations, live locks, and in-use locks are reset by the reboot (`boot_s` check, OS locks). Plans and the inbox survive through fsync.
+`act` dying leaves a partially deleted target whose remaining entries were all inspected (section 9.5). Power loss: reservations, live locks, and in-use locks are reset by the reboot (`boot_s` check, OS locks). Plans and the inbox survive through fsync.
 
 ### 4.12 Disk reserve file
 
@@ -336,60 +334,63 @@ Phase 1 creates `<state>/reserve` with really allocated blocks (written zeros, n
 cardinal run [--spec-b64 SPEC] -- COMMAND [ARG]...
 ```
 
-- **The stage** arrives as argv after `--`: the stage's own words after the calling shell has expanded them (variables, including ones that are not exported, globs, `~`, quoting), with the stage's assignment prefixes and redirections already applied to the runner process by that shell (section 6.4). The runner executes the argv directly, without a shell, so expansion, cwd, environment, and redirections are exactly those of the calling shell.
-- **`--spec-b64`** is unpadded base64url of a `cardinal.run-spec.v1` JSON document (section 11.3): class, rule, resources, Bash timeout, background flag, session, agent, and tool-use IDs, stage index, and the stage's source text. Everything the runner needs from the hook travels here, so no configuration value is ever spliced into shell text, and base64url contains nothing that any shell or Git Bash's path conversion treats specially. Without a spec (people, tests), `admission.default_resources` applies.
+- **The stage** arrives as argv after `--`: the stage's own words after the calling shell has expanded them (variables, including ones that are not exported, globs, `~`, quoting), with the stage's redirections already applied to the runner process by that shell. Assignment prefixes arrive as a leading `env NAME=value …` (section 6.4). The runner executes the argv directly, without a shell, so expansion, cwd, environment, and redirections are exactly those of the calling shell.
+- **`--spec-b64`** is unpadded base64url of a `cardinal.run-spec.v1` JSON document (section 11.3): class, rule, resources, Bash timeout, background flag, session, agent, and tool-use IDs, stage index, and the stage's source text. Everything the runner needs from the hook travels here, so no configuration value is ever spliced into shell text, and base64url contains nothing a shell treats specially. Without a spec (people, tests), `admission.default_resources` applies.
 
 ### 5.2 Steps
 
-1. If stdin is a terminal: **TTY passthrough.** Append `tty_passthrough` (best effort) and run the stage as the fail-open path of step 9 does: no process group, no admission, no in-use lock.
-2. Decode the spec, resolve the state dir, load `host.toml`.
-3. Take the worktree in-use lock shared (section 4.6).
-4. Set up the group (section 5.5).
-5. Admission (section 4.4). If the budget is full, release the admission lock, sleep (250 ms doubling to 2 s), and retry until the wait cap (section 5.4).
-6. Write `starting` (the start boundary, section 5.3), spawn the stage, write `running` with the child's PID and start time, append `job_started`.
-7. Wait for the child, forwarding signals and watching the parent (section 5.5).
-8. Release: delete the reservation, drop the in-use lock, append `job_finished` (exit status, `measurements: [{kind: "wall_time", ms}]`), drop and delete the live lock, print the wait note if there was a wait, exit with the child's status (section 5.6).
-9. **Fail open** (section 5.3): append `job_fail_open` if records still work, release whatever was taken, restore the original process group (Unix) or clear kill-on-close (Windows), and run the stage without a reservation: `exec` on Unix, so the runner process becomes the stage; spawn and wait on Windows. Nothing is printed. If the stage itself cannot be executed, print `<command>: <OS error>` and exit 127 (not found) or 126, as shells do.
+1. Start watching the parent process (section 5.5).
+2. If stdin is a terminal (**TTY passthrough**): take the in-use lock as in step 4, record `tty_passthrough`, and run the stage as fail-open does.
+3. Decode the spec, resolve the state dir, load `host.toml`.
+4. Take the worktree in-use lock shared (section 4.6). If that is not possible within the wait cap, continue without it and record `in_use_unprotected`.
+5. Set up the process group (section 5.5).
+6. Admission (section 4.4). If the budget is full, release the admission lock, sleep (250 ms doubling to 2 s), and retry until the wait cap (section 5.4).
+7. Write `starting` (the start boundary, section 5.3), spawn the stage, write `running` with the child's PID and start time, append `job_started`.
+8. Wait for the child, forwarding signals.
+9. Release: delete the reservation, append `job_finished` (exit status, `waited_ms`, `measurements: [{kind: "wall_time", ms}]`), drop the live lock and the in-use lock, and exit with the child's status or re-raise its signal (section 5.6).
+
+**Fail open** (section 5.3): append `job_fail_open` if records still work, drop the reservation and live lock if taken, restore the original process group, spawn the stage in it, and finish as in step 9; the runner never `exec`s, so the in-use lock stays held until the stage exits. Nothing is printed, except `<command>: <OS error>` with exit 127 (not found) or 126 when the stage cannot be executed, as shells do.
 
 ### 5.3 Start boundary
 
-- **The stage has started once `spawn()` has returned a child.** Before that, the runner itself runs the stage on every failure it can observe: an error in steps 2–6 other than a busy in-use lock, a failed `spawn()` (the OS guarantees that no child ran), the admission-lock deadline, and a panic, which a top-level `catch_unwind` turns into fail-open. Every wait before the spawn has a deadline: the admission lock (`lock_timeout_ms`, then fail open), the budget (the wait cap, then the overflow start of section 5.4), and the in-use lock (the wait cap, then exit 125 without running, section 4.6).
+- **The stage has started once `spawn()` has returned a child.** Before that, the runner itself runs the stage on every failure it can observe: an error in steps 3–7, a failed `spawn()` (the OS guarantees that no child ran), and a panic, which a top-level `catch_unwind` turns into fail-open. Every wait before the spawn has a deadline: the admission lock (`lock_timeout_ms`, then fail open), the in-use lock (the wait cap, then unprotected), and the budget (the wait cap, then overflow, section 5.4).
 - **After `spawn()` has returned, the runner never runs the stage again.** A later error or panic ends in waiting for the child and returning its status when possible, and otherwise in exit 125.
 - **The `starting` record**, written immediately before `spawn()`, is the boundary as seen from the state dir: a reservation at `starting` whose runner died may or may not have a child, and recovery treats it as possibly running.
-- **Zero-run cases that remain:** the runner killed (for example by SIGKILL) between its start and the spawn, and a runner path that is executable but cannot be loaded (`[ -x R ]` passes, the exec fails with a loader error). Both end the Bash call with a visible non-zero status (137, or 126 with the shell's message), nothing runs twice, and nothing reports success. A shell-side fallback on the runner's exit status could not tell these cases from the stage's own failure and would run the stage twice.
+- **Zero-run cases that remain:** the runner killed (for example by SIGKILL) between its start and the spawn; a runner path that is executable but cannot be loaded (`[ -x R ]` passes, the exec fails with a loader error); and the parent exiting before the spawn, which is a cancellation (section 5.5). The first two end the Bash call with a visible non-zero status (137, or 126 with the shell's message), nothing runs twice, and nothing reports success (section 17, item 5).
 
 ### 5.4 Wait cap and phase 0 overflow
 
 - Wait cap: `max_wait_ms` if the spec says background; otherwise `min(max_wait_ms, timeout_ms × wait_fraction)`. Phase 2 subtracts the expected run time once measurements exist.
-- **When the wait reaches the cap, phase 0 starts the stage anyway, over budget** (admission result `overflow`), records it, and prints `[cardinal] Ran over budget after waiting 30 s (budget was full).` at the end. This is a phase 0 interim rule; phase 2 replaces it with an accepted job (C4). Alternatives rejected for phase 0: returning an error makes agents retry and adds load; waiting until the Bash timeout gets the command moved to the background by Claude Code with the wait still in front of it.
-- After a wait of at least 1 s that ended in normal admission, the runner prints `[cardinal] Ran after waiting 40 s` at the end. Both notes go to the runner's stderr, which is the stage's stderr including its redirections.
+- **When the wait reaches the cap, phase 0 starts the stage anyway, over budget** (admission result `overflow`). This is a phase 0 interim rule; phase 2 replaces it with an accepted job (C4). Alternatives rejected for phase 0: returning an error makes agents retry and adds load; waiting until the Bash timeout gets the command moved to the background by Claude Code with the wait still in front of it.
+- **Waits add no output,** because text from the runner would enter the stage's pipes (`2>&1 | jq .`); `job_finished` records `waited_ms` and the admission result for `explain job`. Phase 2's accepted-job reply is the only output cardinal adds to a successful command (design §6).
 
 ### 5.5 Child execution
 
 - **Execution:** argv is resolved through `PATH` as `env` does, with inherited stdio, cwd, and environment. The runner never proxies output, so terminal detection, buffering, and pipe behavior are unchanged, and the runner's death cannot break the child's output.
-- **Unix group:** in step 4 the runner calls `setpgid(0, 0)` and records `pgid` as its own PID. `EPERM` is accepted when `getpgid(0)` already equals the runner's PID (it already leads its group, for example as a session leader); any other result is a pre-start failure. The child inherits the group. The runner leads the group, not the child, so that the PGID is known before the reservation is written and a crash at any point leaves a group that can be checked (section 4.5).
-- **Unix signals:** the runner forwards SIGINT, SIGTERM, SIGHUP, and SIGQUIT to the rest of the group and keeps waiting. If its parent process exits while the child runs (the Bash call was killed with its shell's process group, which no longer contains the stage), the runner sends SIGTERM to the group and SIGKILL 5 s later. When the direct child exits, the runner releases; group members left behind are not killed (the same as running the stage without cardinal) and show up in `inventory`. Processes that leave the group (`setsid`) are not tracked.
-- **Windows group:** in step 4 the runner creates a Job Object named `Local\cardinal-<host-id>-<job>` with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` and assigns itself to it; the child inherits membership, so no grandchild escapes. On normal completion the runner clears the kill-on-close limit before exiting, so leftovers behave as on Unix; only the runner's abnormal death kills the group.
+- **Process group:** in step 5 the runner calls `setpgid(0, 0)` and records `pgid` as its own PID. `EPERM` is accepted when `getpgid(0)` already equals the runner's PID (it already leads its group, for example as a session leader); any other result is a pre-start failure. The child inherits the group, whose PGID is thus known before the reservation is written (section 4.5).
+- **Signals:** on the admitted path the runner forwards SIGINT, SIGTERM, SIGHUP, and SIGQUIT to the rest of the group. On the fail-open and TTY paths the child shares the caller's group and gets terminal signals itself; the runner ignores SIGINT and SIGQUIT while waiting, as `system()` does, and forwards SIGTERM and SIGHUP.
+- **Parent death:** the runner watches its parent from its start. If the parent exits before the spawn (the Bash call was cancelled), the runner releases what it holds and exits without starting the stage. After the spawn, it sends SIGTERM to the group (to the child on the fail-open and TTY paths) and SIGKILL 5 s later, and holds its reservation and in-use lock until the group is empty (the child has exited).
+- **Normal exit:** when the direct child exits, the runner releases. Group members left behind are not killed (the same as running the stage without cardinal) and show up in `inventory`. Processes that leave the group (`setsid`) are not tracked.
+- **Windows:** in phase 0 the hook does not rewrite (section 6.3) and `cardinal run` always takes the fail-open path; the argument contract and Job Objects are phase 3 (section 17, item 11).
 
 ### 5.6 Exit status and infrastructure failure
 
-| Situation | Exit status | stderr |
+| Situation | Exit | Added output |
 | --- | --- | --- |
-| Child exited with code N | N | the child's output only (plus a wait note) |
-| Child killed by signal N (Unix) | 128 + N | the child's output only |
-| Pre-start failure, TTY passthrough | whatever the stage returns | nothing added |
-| In-use lock held past the wait cap, or the worktree changed while waiting | 125 | `[cardinal] The worktree is being reclaimed; the command was not run.` |
-| Runner error after the child started, child status unknown | 125 | `[cardinal] Infrastructure failure after the command started: <reason>. The command was not rerun.` |
-| Runner killed after the child started | set by the killer (137 for SIGKILL) | nothing; the record has `job_started` without `job_finished`, and `explain job` reports `runner_died` |
-| Release or record failure after the child exited | the child's status | nothing |
+| Child exited with code N | N | none |
+| Child killed by signal N | signal N: after releasing, the runner restores N's default disposition and raises it | none |
+| Pre-start failure, TTY passthrough | the stage's status or signal | none |
+| Runner error after the child started, child status unknown | 125 | `[cardinal] Infrastructure failure after the command started: <reason>. The command was not rerun.` on stderr |
+| Runner killed after the child started | set by the killer (137 for SIGKILL) | none; the record has `job_started` without `job_finished`, and `explain job` reports `runner_died` |
+| Release or record failure after the child exited | the child's status | none |
 
-125 follows the convention of `env`, `nice`, and `timeout` for "the wrapper itself failed". It can collide with a child's own 125, so the stderr line and the records are the distinguishing signal, not the code alone.
+125 follows the convention of `env`, `nice`, and `timeout` for "the wrapper itself failed". It can collide with a child's own 125, so the stderr line and the records are the distinguishing signal. The line appears only when the stage's own status is unknown, so it never changes the output of a command whose result is known.
 
 ### 5.7 Executor contract (phase 2 seam)
 
 ```rust
 pub trait Executor {
-    /// Sets up the process group or Job Object; runs before the reservation is written.
+    /// Sets up the process group; runs before the reservation is written.
     fn prepare(&self) -> Result<GroupIdentity, NotStarted>;
     /// Starts the invocation. `Err` guarantees that nothing started, so the caller may run the stage itself.
     fn start(&self, inv: &Invocation) -> Result<Box<dyn Running>, NotStarted>;
@@ -415,14 +416,15 @@ Phase 0 has one implementation, the local executor. The start boundary is the sa
 | Bash timeout default and maximum | `BASH_DEFAULT_TIMEOUT_MS` default 120000; `BASH_MAX_TIMEOUT_MS` default 600000 (the ceiling is the larger of the two) | [Environment variables](https://code.claude.com/docs/en/env-vars) |
 | What happens at the Bash timeout? | A foreground command that reaches its timeout is moved to the background, not stopped, unless it starts with `sleep` or `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` | [Tools reference](https://code.claude.com/docs/en/tools-reference) |
 | `updatedInput` semantics | "Replaces the entire input object, so include unchanged fields alongside modified ones." Permission rules and auto-background eligibility are evaluated against the returned input. Combine with `allow` to auto-approve or `ask` to prompt; without `permissionDecision` the normal permission flow applies | Hooks reference |
-| How is `if … then … else … fi` matched against permission rules? | Each branch's commands are matched separately, in one-line and multi-line form and after a leading `cd … &&`. Every other fallback shape (`&&`, `\|\|`, or `;` chains, `{ …; } \|\| …`, `test -x … && exec …`) prompts even when every part is allowed. `"ask"` prompts even when every part is allowed; `"allow"` runs the command when the original's rules would not. In `auto` mode, a rewritten command whose original stage is not allowed by a rule was denied by the auto-mode classifier while the original alone was allowed | Checked against Claude Code 2.1.322 |
+| How is `if … then … else … fi` matched against permission rules? | Each branch separately, in one-line and multi-line form, after `cd … &&`, inside pipelines and lists, and with two wrapped stages: the outcome equals the original's. Other fallback shapes (`&&`/`\|\|`/`;` chains, `{ …; } \|\| …`, `test -x … && exec …`) prompt even when every part is allowed. `"ask"` always prompts; `"allow"` runs commands the original's rules would not. In `auto` mode the classifier denied a rewritten command whose original stage no rule allowed, while allowing the original | Checked against Claude Code 2.1.322 |
+| Do assignment prefixes before the runner match its rule? | No: `FOO=1 R run …` prompts under `Bash(R run:*)` (only known variables such as `LANG` are stripped); `R run … -- env FOO=1 cmd` matches | Checked against Claude Code 2.1.322 |
 | Several hooks returning `updatedInput` | Not documented; hooks run in parallel | Hooks reference |
 | Hook timeout | `timeout` in seconds; default 600 for command hooks; a timed-out `PreToolUse` hook is discarded and the call continues through the normal permission flow | Hooks reference |
 | Exit codes and output | Exit 2 blocks the tool call; other non-zero exits are non-blocking; exit 0 with empty stdout is success; exit 0 with invalid JSON is a non-blocking error | Hooks reference |
 | `SubagentStop` input | `agent_id`, `agent_type`, `agent_transcript_path`, `stop_hook_active`, `last_assistant_message`, plus common fields | Hooks reference |
 | `SessionEnd` input | `reason`: `clear`, `resume`, `logout`, `prompt_input_exit`, `other`; default hook timeout 1.5 s | Hooks reference |
 | Shell and cwd of Bash commands | The user's shell, with aliases, functions, and options captured from its rc file at session start; a `cd` carries over to later Bash calls while inside the project directory (never in subagents) | Tools reference |
-| Windows | The Bash tool runs in Git Bash; without Git Bash a separate PowerShell tool is used, whose input has the same fields | Tools reference; [Troubleshooting install](https://code.claude.com/docs/en/troubleshoot-install) |
+| Windows | The Bash tool runs in Git Bash; without Git Bash, a separate PowerShell tool runs commands | Tools reference; [Troubleshooting install](https://code.claude.com/docs/en/troubleshoot-install) |
 
 ### 6.2 Installation
 
@@ -439,11 +441,11 @@ The owner adds this to `~/.claude/settings.json` (never to a repository, G5); `e
 }
 ```
 
-The explicit `timeout` matters: the 600 s default would let a stuck hook stall every Bash call. Set `[hook] runner` to a path that survives upgrades; the hook's own executable may live in a versioned directory, and a vanished runner path silently turns every rewrite into the fallback. The allow rule names the runner path exactly as the hook writes it. cardinal must be the only hook that returns `updatedInput` for Bash, because the order in which several are applied is undefined.
+The explicit `timeout` keeps a stuck hook from stalling Bash calls for the 600 s default. Set `[hook] runner` to a path that survives upgrades (a vanished runner path silently turns every rewrite into the fallback) and name it exactly in the allow rule. cardinal must be the only hook returning `updatedInput` for Bash; the order of several is undefined.
 
 ### 6.3 `hook claude pre-tool-use`
 
-1. Read stdin (bounded at 1 MiB) as JSON. Exit 0 with empty stdout, rewriting nothing, if `tool_name` is not `Bash`, `tool_input.command` is not a string, `hook.enabled` is false, `permission_mode` is `auto` (section 6.5), or anything fails.
+1. Read stdin (bounded at 1 MiB) as JSON. Exit 0 with empty stdout, rewriting nothing, if the platform is Windows (section 5.5), `tool_name` is not `Bash`, `tool_input.command` is not a string, `hook.enabled` is false, `permission_mode` is `auto` (section 6.5), or anything fails.
 2. Find and classify stages (section 7) within `hook.deadline_ms`, measured from process start. Past the deadline: no rewrite.
 3. If at least one stage is classified, rewrite each classified stage (section 6.4) and print:
 
@@ -459,39 +461,35 @@ The hook writes nothing to the state dir and takes no reservation (C1). It never
 
 ### 6.4 Rewritten command
 
-The hook replaces only the span of each classified stage, in place, and leaves every other byte of the command alone. For a stage `S` whose command word is `W`, the replacement is
+The hook replaces only the span of each classified stage, in place, and leaves every other byte of the command alone. For a stage `S`, the replacement is
 
 ```sh
 if [ -x R ]; then S'; else S; fi
 ```
 
-where `R` is the runner path and `S'` is `S` with `R run --spec-b64 <spec> --` inserted immediately before `W`. Assignment prefixes and redirections stay where they were in both branches. Example:
+where `R` is the runner path, the `else` branch is the stage as written, and `S'` is `R run --spec-b64 <spec> --`, then `env` followed by the stage's assignment prefixes if it has any, then its command word and arguments, then its redirections in their original order. Example:
 
 ```sh
 # original
 cd packages/app && CI=1 pnpm test 2>&1 | tail -50 || echo failed
 # rewritten
-cd packages/app && if [ -x /usr/local/bin/cardinal ]; then CI=1 /usr/local/bin/cardinal run --spec-b64 eyJzY2hlbWEiOi… -- pnpm test 2>&1; else CI=1 pnpm test 2>&1; fi | tail -50 || echo failed
+cd packages/app && if [ -x /usr/local/bin/cardinal ]; then /usr/local/bin/cardinal run --spec-b64 eyJzY2hlbWEiOi… -- env CI=1 pnpm test 2>&1; else CI=1 pnpm test 2>&1; fi | tail -50 || echo failed
 ```
 
 - **Everything else stays in the calling shell:** pipes, `&&`/`||`/`;` lists and their short-circuiting, a leading `cd` and the cwd it leaves for later Bash calls, shell options such as `pipefail` and `errexit`, functions used by other stages, and the command's first word unless its first stage is classified. Claude Code's timeout handling depends only on a leading `sleep`, and a `sleep` stage is never wrapped (section 7.2).
 - **Both branches carry the stage's own words,** so variables, globs, `~`, and quoting are expanded by the calling shell either way, and exactly one branch runs. The `if` returns the status of the branch that ran, so pipeline and list semantics are unchanged.
+- **Assignments become `env` arguments,** because the runner's rule does not match `FOO=1 R run …` (section 6.1). Arguments are word-split, globbed, and tilde-expanded and assignment values are not, so some stages stay unwrapped (section 7.2).
 - **`[ -x R ]`** is the fallback test: if the runner path is missing or not executable (uninstalled, moved, upgraded to another path), the `else` branch runs the original stage.
 - **Several classified stages** in one command are each wrapped and reserved separately; the spec's stage index tells them apart. Scripts started inside a stage are not controlled separately; their weight is learned for the stage (design §6).
 - **One-line form:** a stage span never contains a newline or a comment, so the replacement stays on one line and the rest of the line follows `fi` unchanged.
-- On Windows the runner path is written with forward slashes (`C:/…/cardinal.exe`), which Git Bash accepts.
 
-Running `bash`, `zsh`, and `sh` on this form gives the same output and status as the original for short-circuit lists (`cd missing && false || printf fallback`), `pipefail` pipelines, non-exported variables, globs, assignment prefixes, and redirections, and runs the original once with its status when the runner path is missing. `tests/rewrite_equivalence.rs` keeps these cases (section 13.5).
-
-PowerShell tool (Windows without Git Bash), implemented in phase 3: the stage is wrapped as `if (Test-Path -LiteralPath 'R' -PathType Leaf) { & 'R' run --spec-b64 <spec> -- <stage words> } else { <stage> }`. Its permission matching has not been checked.
+In bash, zsh, and sh this form gives the original's stdout, stderr, and status for lists, `pipefail`, non-exported variables, globs, `env` assignments, and redirections, with the runner present and missing; `tests/rewrite_equivalence.rs` keeps these cases (section 13.5).
 
 ### 6.5 Permissions
 
-Claude Code evaluates permission rules against the rewritten command, and splits `if … then … else … fi` into its branches for matching (section 6.1). The rewrite therefore returns no `permissionDecision`: with the allow rule for the runner installed, the rewritten command needs approval exactly when the original stage does, and deny rules on the original still match its copy in the `else` branch. Returning `"allow"` would run commands the owner never allowed, and `"ask"` would prompt for every command.
+Claude Code evaluates permission rules against the rewritten command and splits `if … then … else … fi` into its branches for matching (section 6.1). The rewrite therefore returns no `permissionDecision`: with the allow rule for the runner installed, the rewritten command needs approval exactly when the original stage does, and deny rules on the original still match its copy in the `else` branch. Returning `"allow"` would run commands the owner never allowed, and `"ask"` would prompt for every command. The G4 real-host check repeats this for the Claude Code version in use.
 
-The check covered the `if` form as a whole command and after `cd … &&`. Stage wrapping also puts it inside pipelines and `&&`/`||` lists, and puts assignment prefixes in front of the runner. Each of these shapes is part of the G4 real-host check (section 15); the built-in classifier rewrites only shapes that check has confirmed, and leaves the others unrewritten.
-
-**`auto` mode is not rewritten in phase 0.** The auto-mode classifier may deny the rewritten form of a stage that it allows in its original form; a command whose parts are all allowed by rules runs without the classifier. Phase 0 accepts the coverage loss: commands in `auto` mode bypass admission. A later phase can lift it by rewriting in `auto` mode only stages that an explicit allow rule covers, which needs cardinal to evaluate the owner's permission rules, or Claude Code to report the original call's permission decision to hooks.
+**`auto` mode is not rewritten in phase 0,** because the auto-mode classifier may deny a stage's rewritten form while allowing the original; commands in `auto` mode bypass admission. Lifting this needs cardinal to evaluate the owner's permission rules (to rewrite only stages an allow rule covers), or Claude Code to report the original call's permission decision to hooks.
 
 ### 6.6 `subagent-stop` and `session-end`
 
@@ -521,7 +519,15 @@ The hand-written tokenizer accepts a conservative subset of POSIX shell syntax: 
 
 **The whole command is left unrewritten** when a stage span cannot be delimited with certainty or the outer shell could change what a stage means: a here-document, `$(`, backticks, `$((`, `<(`, `>(`, `(`, `)`, `{`, `}`, `[[`, `!`, a keyword in command position (`if then else elif fi for while until do done case esac function select`), a function definition, `eval` or `alias` anywhere in command position, or unbalanced quotes.
 
-**A single stage is left unwrapped** (other stages may still be wrapped) when its command word is a shell builtin, keyword, or precommand modifier (`time`, `command`, `builtin`, `exec`, `noglob`, `nocorrect`, and the rest of the shell's builtins), `sleep`, or in `[classify] skip`; when it runs asynchronously (followed by `&`), because its runner would outlive the calling shell; or when its pipeline contains another classified stage, because a stage waiting for admission could block a running one through the pipe. Not understanding a command can only cause a missed rewrite, never a changed one.
+**A single stage is left unwrapped** (other stages may still be wrapped) when:
+
+- its command word is a shell builtin, keyword, or precommand modifier (`time`, `command`, `builtin`, `exec`, `noglob`, `nocorrect`, and the rest of the shell's builtins), `sleep`, or in `[classify] skip`;
+- it expands shell state (`$?`, `${?}`, `$_`, `$!`, `$-`, `$$`, `PIPESTATUS`, `pipestatus`), some of which the fallback test changes;
+- an assignment value contains an unquoted `$`, backquote, `~`, or glob character, which `env` arguments would expand differently (section 6.4);
+- it runs asynchronously (followed by `&`), because its runner would outlive the calling shell;
+- its pipeline contains another classified stage, because a stage waiting for admission could block a running one through the pipe.
+
+Not understanding a command can only cause a missed rewrite, never a changed one.
 
 ### 7.3 Normalization
 
@@ -543,7 +549,7 @@ Normalization decides the class only; the rewrite always uses the stage's own wo
 
 ### 7.5 Shadowed tools
 
-An alias or function in the owner's rc that shadows a classified tool's name is not applied when the stage runs through the runner, which executes the tool from `PATH`. Rules name tools that the owner chose in their own profile, and both the profile and the rc are the owner's, so the owner can keep a shadowed tool out of rewriting with `[classify] skip` (per repository, or in a generic profile for all). This relies on the owner knowing what their rc defines; cardinal does not detect shadowing in phase 0. A later check could run the owner's shell once and report every rule command word that resolves to an alias or function.
+An alias or function in the owner's rc that shadows a classified tool's name is not applied when the stage runs through the runner, which executes the tool from `PATH`. The owner writes both the rules and the rc, and can keep a shadowed tool out of rewriting with `[classify] skip` (per repository, or in a generic profile for all). Phase 0 does not detect shadowing; a later check could run the owner's shell once and report every rule command word that resolves to an alias or function.
 
 ### 7.6 Classifier unit seam
 
@@ -623,10 +629,10 @@ A worktree is managed by another app when its path is under a `[observe] managed
 
 | Kind | Target | Effect |
 | --- | --- | --- |
-| `reclaim_worktree` | A linked worktree (never a main worktree) | `git -C <main> worktree move <path> <trash>`, inspect, then `git -C <main> worktree remove <trash>` without `--force` (git refuses dirty or locked worktrees itself, a second line of defense). The branch is kept |
-| `reclaim_dir` | A regenerable ignored entry inside an observed worktree | Rename to `<trash>`, inspect, then `std::fs::remove_dir_all` (does not follow symbolic links) or file removal |
+| `reclaim_worktree` | A linked worktree (never a main worktree) | Snapshot deletion of the worktree directory (section 9.5), its `.git` file last; once the directory is gone, `git -C <main> worktree remove <path>` removes that worktree's administrative entry. The branch is kept |
+| `reclaim_dir` | A regenerable ignored entry inside an observed worktree | Snapshot deletion of the entry |
 
-The trash path is `<parent of the target>/.cardinal-trash-<plan>`: on the same file system, so the move is an atomic rename. A trash directory in the state dir was rejected because it is often on another volume (always across drives on Windows), where a rename fails. The trash entry is the target itself under another name, exists only while `act` runs, and an interrupted `act` is finished by the next run (section 4.9). Caches outside worktrees (phase 1), process stops for outlived processes, and branch deletion are not phase 0 plan kinds. A recovery-needed reservation is never released by a plan; it is released only when its group is empty (section 4.5).
+`git worktree prune` is not used: it would also drop the entry, index included, of every other worktree whose directory is missing at that moment, such as one on an unmounted volume. Caches outside worktrees (phase 1), process stops for outlived processes, and branch deletion are not phase 0 plan kinds. A recovery-needed reservation is never released by a plan; it is released only when its group is empty (section 4.5).
 
 ### 9.2 Checks
 
@@ -635,21 +641,20 @@ Each plan carries a list of checks. An **invariant** failing or being `unknown` 
 | Check | Kinds | Role | Pass when |
 | --- | --- | --- | --- |
 | `observed` | both | invariant | Every git and gh fact the plan depends on is known |
-| `not_in_use` | both | invariant | Exclusive in-use lock acquired and no live or recovery-needed reservation names the worktree (section 4.6) |
+| `not_in_use` | both | invariant | Exclusive in-use lock acquired, no live or recovery-needed reservation names the worktree, and no process has its working directory inside the target (section 4.6) |
 | `not_managed` | both | invariant | The worktree is not under a managed root and not git-locked (design §4) |
 | `clean` | `reclaim_worktree` | invariant | `dirty` is `no` |
 | `no_unpushed` | `reclaim_worktree` | invariant | `unpushed` is `no` |
 | `no_open_pr` | `reclaim_worktree` | invariant | `open_pr` is `no` |
 | `has_upstream` | `reclaim_worktree` | invariant | The branch has an upstream (G6). This also keeps freshly created worktrees, which start clean at the base, from being reclaimed before their first push |
 | `regenerable` | `reclaim_dir` | invariant | The target is a `regenerable` ignored entry of a worktree that observation listed |
-| `not_symlink` | both | invariant | The target path itself is not a symbolic link |
-| `no_protected` | both | invariant | Nothing in the moved tree, descendants included, is protected |
-| `no_unclassifiable` | both | invariant | Nothing in the moved tree is unclassifiable ignored data |
-| `no_nested_repository` | both | invariant | No directory below the moved tree's root has its own `.git` entry (another worktree, a submodule, a nested clone) |
-| `no_process_inside` | both | invariant | No process has its working directory inside the moved tree |
+| `plain_target` | both | invariant | The target is not a symbolic link, not a mount point, and on the same device as its parent |
+| `no_protected` | both | invariant | Nothing in the target, descendants included, is protected |
+| `no_unclassifiable` | both | invariant | Nothing in the target is unclassifiable ignored data |
+| `no_nested_repository` | both | invariant | No directory below the target's root has its own `.git` entry (another worktree, a submodule, a nested clone) |
 | `merge_evidence` | `reclaim_worktree` | condition | `base_ancestor` or `merged_pr` is `yes` |
 
-`plan` evaluates every check on the target in place, and `act` evaluates the last four invariants again on the moved tree. Plans are created even when invariants fail, with `invariants_ok: false`, so the arbiter sees the reason and an `act` on them demonstrates the refusal (G10).
+`plan` evaluates every check on the target; `act` evaluates them again at run time, walking the whole target (section 9.5). Plans are created even when invariants fail, with `invariants_ok: false`, so the arbiter sees the reason and an `act` on them demonstrates the refusal (G10).
 
 ### 9.3 Approval scope
 
@@ -657,25 +662,26 @@ Approval is needed when a condition fails; otherwise none is needed. This is the
 
 ### 9.4 Identity binding
 
-A plan stores the target identity: `host_id`, repository common dir, worktree path, worktree root identity (`dev` and `ino` on Unix; creation time where the OS has one), HEAD object ID, and target path. `act` re-reads all of them; any difference makes the plan `expired` (C14). A new worktree created at the same path has a new root identity even if its HEAD and branch are the same.
+A plan stores the target identity: `host_id`, repository common dir, worktree path, worktree root identity (`dev` and `ino` on Unix; creation time where the OS has one), HEAD object ID, branch, and target path. `act` re-reads all of them; any difference makes the plan `expired` (C14). A new worktree created at the same path has a new root identity even if its HEAD and branch are the same.
 
 ### 9.5 act procedure
 
 1. Load the plan; a wrong `host_id` gives `expired`.
-2. Claim: create `plans/<id>/claim` with `create_new`, recording the trash path; fsync. If it exists: `already_executed`. (`--dry-run` skips claiming.)
-3. Take the worktree's in-use lock exclusively (`try_lock`), then check reservations under the admission lock.
-4. Re-observe the target from scratch (section 8) and compare identity; a difference gives `expired`.
-5. Evaluate the checks on the target in place. Any invariant not `pass`: `rejected`. If a condition fails and `--owner-approved` is absent: `rejected` with reason `owner_approval_required`.
-6. Move the target to the trash path (section 9.1); append `renamed` to the claim.
-7. Inspect the moved tree: walk it completely, descendants included, for `no_protected`, `no_unclassifiable`, and `no_nested_repository`; check `no_process_inside`; for a worktree, also run `git status` at the trash path for `clean`. Any failure: move it back, append `restored`, `rejected`. Otherwise append `inspected`.
-8. Drop the in-use lock, then delete the moved tree. Anything created at the original path after step 6 is outside the trash and survives. A partial deletion (for example a file held open on Windows) gives `partial`; everything in the moved tree was inspected, so nothing deleted can be owner data.
-9. Write `result.json` (fsync), append an `act` record.
+2. Claim: create `plans/<id>/claim` with `create_new`; fsync. If it exists: `already_executed`.
+3. Take the worktree's in-use lock exclusively (`try_lock`), check reservations under the admission lock, and hold the lock until step 8 ends.
+4. Re-observe the target (section 8); an identity difference gives `expired`.
+5. Evaluate the git and gh checks. An invariant not `pass`, or a failed condition without `--owner-approved` (`owner_approval_required`): `rejected`.
+6. **Snapshot:** walk the target without following symbolic links or crossing devices, record each entry's `(dev, ino, type, size, mtime)` (creation time for `dev, ino` on Windows), and evaluate `plain_target`, `no_protected`, `no_unclassifiable`, `no_nested_repository`, and the process part of `not_in_use` on what the walk saw. Any failure: `rejected`, nothing touched.
+7. Re-read root identity, HEAD, and branch; a difference gives `expired`.
+8. **Delete bottom-up:** unlink a file only if its metadata equals the snapshot, remove a directory only once empty, and list what is left in `skipped_changed`. A worktree's `.git` file goes last, only if HEAD and branch still match; otherwise `expired`.
+9. If a worktree's directory is gone: `git -C <main> worktree remove <path>`.
+10. Write `result.json` (`executed`, or `partial`; fsync), append an `act` record, drop the lock.
 
-Two `act` runs on the same plan race only at step 2, where `create_new` lets exactly one through. The residual window is a process that already holds an open handle inside the moved tree other than its working directory; it can still write there after the inspection.
+`act` writes nothing inside the repository. **Data safety rests on the snapshot, not on locks:** entries created, rewritten, or replaced after it do not match and survive with their directories, even beside a command that runs without the in-use lock (section 4.6). Still exposed are a rewrite that keeps size and mtime within one timestamp tick, a write between a check and its unlink, and a write through a handle open across the unlink, all to files inspected as regenerable or as tracked files of a clean, pushed worktree. After a crash every remaining entry was inspected; a partially deleted worktree shows its deleted tracked files as changes, so it is no longer a candidate and is left to the arbiter or owner.
 
 ### 9.6 Dry-run and unit gating
 
-- `act --dry-run` performs steps 1 and 3–5 and the walk of step 7 on the target in place, without claiming, moving, or deleting. It reports `dry_run` with the checks and the bytes that would be freed when the plan would execute, and otherwise the refusal (`rejected` or `expired`) it would get.
+- `act --dry-run` performs steps 1 and 3–7 without claiming or deleting. It reports `dry_run` with the checks and the bytes that would be freed when the plan would execute, and otherwise the refusal (`rejected` or `expired`) it would get.
 - `act --caller unit:<name>` marks the caller. When `host.toml` has `[unit.<name>] act = false` (the default for any unit), `act` behaves as `--dry-run` and appends a `planned` record (C16). Phase 0 has no units, but the gate is part of `act` now so units cannot bypass it later.
 
 ## 10. Inbox and explain
@@ -688,7 +694,6 @@ In phase 0 items are raised only by the refresh that `cardinal inbox` runs first
 | --- | --- | --- | --- |
 | `recovery_needed` | `recovery_needed:<job>` | A reservation is `recovery_needed` (evidence: group members, verified or not) | The reservation is gone |
 | `outlived_processes` | `outlived:<session>` | A session snapshot has live processes after its agent process ended | None of them is alive |
-| `interrupted_act` | `interrupted_act:<plan>` | An interrupted act could not move its target back (section 4.9) | The trash entry is gone |
 
 Statuses are `open`, `escalated` (waiting for the owner), `resolved`, and `dismissed`. Raising a key that exists updates `seen` and evidence of an open or escalated item and leaves resolved and dismissed items alone (C19).
 
@@ -738,8 +743,7 @@ type Tri = "yes" | "no" | "unknown";
 type Resources = { [name: string]: number };            // positive integers
 type Check = { name: string; role: "invariant" | "condition";
                result: "pass" | "fail" | "unknown"; detail: string };
-type GroupIdentity = { kind: "pgid"; pgid: number; leader_start_s: number }   // leader = the runner
-                   | { kind: "job_object"; name: string };
+type GroupIdentity = { kind: "pgid"; pgid: number; leader_start_s: number };  // leader = the runner; phase 3 adds a Job Object kind
 
 // cardinal.error.v1
 { schema; error: { code: "state_unavailable" | "config_invalid" | "not_found" | "ambiguous_id"
@@ -760,7 +764,7 @@ type GroupIdentity = { kind: "pgid"; pgid: number; leader_start_s: number }   //
   priority: "normal"; resources: Resources;
   admission: "within_budget" | "overflow";
   class: string | null; rule: string | null;
-  worktree: null | { key: string; path: string };
+  worktree: null | { key: string; path: string; protected: boolean };  // false: in_use_unprotected
   session: null | { id: string; agent_id: string | null; tool_use_id: string | null; stage_index: number };
   cwd: string; argv: string[] }                                      // argv truncated to 16 KiB in total
 
@@ -802,7 +806,7 @@ type Worktree = {
 // cardinal.plan.v1
 { schema; id: string; created_ms: number; host_id: string;
   kind: "reclaim_worktree" | "reclaim_dir";
-  target: { path: string; repo: string; worktree: string; head: string | null;
+  target: { path: string; repo: string; worktree: string; head: string | null; branch: string | null;
             root_id: null | { dev: number; ino: number }; root_created_ms: number | null };
   bytes: { allocated: number | null; exclusive: number | null };
   checks: Check[]; invariants_ok: boolean;
@@ -815,12 +819,14 @@ type Worktree = {
 { schema; plan_id: string; caller: string;
   status: "executed" | "partial" | "dry_run" | "rejected" | "expired" | "already_executed";
   reasons: string[];                                       // failing check names, "owner_approval_required", "identity_changed:<field>"
-  checks: Check[]; freed_bytes: number | null; error: string | null; finished_ms: number }
+  checks: Check[]; freed_bytes: number | null;
+  skipped_changed: string[];                               // entries changed or created since the snapshot
+  error: string | null; finished_ms: number }
 
 // cardinal.inbox-item.v1
-{ schema; key: string; kind: "recovery_needed" | "outlived_processes" | "interrupted_act";
+{ schema; key: string; kind: "recovery_needed" | "outlived_processes";
   status: "open" | "escalated" | "resolved" | "dismissed";
-  subject: { job_id?: string; session_id?: string; plan_id?: string; worktree?: string };
+  subject: { job_id?: string; session_id?: string; worktree?: string };
   evidence: object;                                        // the observation that raised it
   created_ms: number; updated_ms: number; seen: number;
   resolution: null | { outcome: "resolved" | "escalated" | "dismissed"; by: string; note: string; at_ms: number } }
@@ -841,10 +847,10 @@ type Worktree = {
 // cardinal.record.v1  (one line in records/*.jsonl)
 { schema; ts_ms: number; host_id: string;
   kind: "job_admitted" | "job_started" | "job_finished" | "job_fail_open" | "job_infra_failure"
-      | "job_recovered" | "tty_passthrough" | "session_ended" | "subagent_stopped" | "plan_created"
-      | "act" | "planned" | "inbox_raised" | "inbox_resolved" | "hook_error" | "config_error";
+      | "job_recovered" | "in_use_unprotected" | "tty_passthrough" | "session_ended" | "subagent_stopped"
+      | "plan_created" | "act" | "planned" | "inbox_raised" | "inbox_resolved" | "hook_error" | "config_error";
   job_id?: string; plan_id?: string; inbox_key?: string; session_id?: string;
-  data: object }                                           // kind-specific; job_finished.data has exit, signal, waited_ms, measurements
+  data: object }                                           // kind-specific; job_finished.data has exit, signal, waited_ms, admission, measurements
 
 // cardinal.session-snapshot.v1  (sessions/<session>.json)
 { schema; session_id: string; reason: string; ended_ms: number;
@@ -872,11 +878,11 @@ These names are reserved and not registered in phase 0 (an unregistered command 
 | `toml` | Use | Configuration (design §9) |
 | `sysinfo` (`system` feature only) | Use | Process table, start times, parents, working directories, boot time on all three OSes; memory sensors later come from the same crate |
 | `rustix` (`process` feature) | Use (Unix) | Safe `setpgid`, `getpgid`, `kill_process_group`, `test_kill_process_group`; avoids raw `libc` |
-| `signal-hook` | Use (Unix) | Forwarding signals to the group without hand-written handlers |
-| `windows-sys` | Use (Windows) | Job Object FFI. Chosen over `windows` (design candidate) because only a few raw calls are needed and it compiles much faster |
+| `signal-hook` | Use (Unix) | Forwarding and re-raising signals without hand-written handlers |
 | `base64` | Use | `--spec-b64` encoding |
 | `thiserror` | Use | Typed errors where callers branch (before or after the start boundary, config vs state) |
 | `dunce` | Use | Canonical Windows paths without `\\?\`, so they compare equal to paths from git |
+| `windows-sys` | Skip (phase 3) | Job Object FFI; preferred over `windows` (design candidate) for its smaller compile |
 | `fs4` | Skip | std has file locks since Rust 1.89 with the same `flock`/`LockFileEx` semantics; the reserve file is written with zeros |
 | `jobserver` | Skip (phase 2) | Only needed when cardinal shares a jobserver with Cargo |
 | `anyhow` | Skip | Typed errors are needed for JSON error codes anyway |
@@ -900,17 +906,19 @@ Tests do not rely on starting processes at the same time. The `testpoint` module
 - `CARDINAL_TEST_PAUSE=<point>[,<point>]`: at a point the process creates `<dir>/<point>.<pid>.reached` and polls for `<dir>/<point>.release`; after 30 s it aborts so a broken test fails instead of hanging.
 - `CARDINAL_TEST_FAIL=<point>`: the process returns an injected error at that point.
 
-Points: `admission.locked`, `admission.waiting` (budget full, about to sleep), `inuse.waiting`, `run.before_starting`, `run.after_spawn`, `act.claimed`, `act.renamed`, `act.inspected`, `hook.classified`. **Every contended test waits for the second actor's `.reached` file before releasing the first**, so it proves the second actor actually hit the contended point. Examples:
+Points: `admission.reserved` (reservation committed, admission lock released), `admission.waiting` (budget full, about to sleep), `inuse.waiting`, `run.before_starting`, `run.after_spawn`, `act.locked` (exclusive in-use lock taken), `act.inspected` (snapshot recorded, nothing deleted yet), `hook.classified`. **Every contended test waits for the second actor's `.reached` file before releasing the first**, so it proves the second actor actually hit the contended point. Examples:
 
-- Two runners and a budget of one job: pause the first at `admission.locked`; start the second and wait for its `admission.waiting`; release; assert exactly one `within_budget` start before the other.
-- Execution and deletion never overlap: pause `act` at `act.claimed` (exclusive in-use lock held); start a runner in the worktree and wait for its `inuse.waiting`; release `act`; assert the runner exits 125 and the stage never ran. Reverse order: a runner paused at `run.after_spawn`, then `act` is `rejected` with `not_in_use`.
-- Deletion is limited to what was inspected: after `plan`, create `target/deep/x/fuzz/corpus/seed`; `act` is `rejected` and `target/` is back in place. Pause `act` at `act.inspected` and create a file at the original `target/` path; it survives the deletion.
-- Two `act` runs on one plan: pause the first at `act.claimed`; the second returns `already_executed`.
-- Start boundary: a runner killed at `run.before_starting` runs the stage zero times and the Bash-level status is 137 (the accepted case of section 5.3); an injected failure at `run.before_starting` or a failed spawn runs it once; a runner killed at `run.after_spawn` never reruns it.
+- Two runners and a budget of one job: pause the first at `admission.reserved`; start the second and wait for its `admission.waiting`; release; assert the second starts only after the first's reservation is gone.
+- `act` and a runner: pause `act` at `act.locked`; start a runner in the worktree and wait for its `inuse.waiting`; release; the stage starts after `act` ends, or, with a shorter wait cap, runs and records `in_use_unprotected`. A runner paused at `run.after_spawn` makes `act` `rejected` with `not_in_use`.
+- Snapshot deletion: pause `act` at `act.inspected`; in the target, create a file, rewrite an inspected file, and create `fuzz/corpus/seed`; release; all three survive with their directories and are listed in `skipped_changed`. Protected data created before `act` gives `rejected` with nothing touched.
+- Two `act` runs on one plan: pause the first at `act.locked`; the second returns `already_executed`.
+- Start boundary: a runner killed at `run.before_starting` runs the stage zero times and the Bash-level status is 137; an injected failure at `run.before_starting` or a failed spawn runs it once; a runner killed at `run.after_spawn` never reruns it.
+- Parent death: killing the runner's parent at `admission.waiting` leaves the stage unstarted and no reservation behind; killing it after `run.after_spawn`, with a grandchild that ignores SIGTERM, keeps the reservation until SIGKILL has emptied the group.
+- Signals: a stage killed by SIGTERM gives `bash -c` the same status and message with and without cardinal.
 
 ### 13.2 Real process groups
 
-Recovery tests run real children: `cardinal run -- sh -c 'sleep 30 & sleep 30 & wait'`, pause at `run.after_spawn`, SIGKILL the runner by its PID, then assert: the reservation is `recovery_needed` and verified, `act` on the worktree is `rejected` with `not_in_use`, the next admission or `cardinal inbox` sends SIGTERM and keeps counting, the group is empty afterwards (`kill(-pgid, 0)` gives `ESRCH`), and the next job is admitted. A runner killed at `run.before_starting` leaves a `stale` reservation. The derived-state function is also tested against a fake process table for the cases a real system cannot produce on demand: a reused PGID with a new leader (released), a reused PGID whose leader has exited (kept, never signalled), and a child that left its descendants behind (kept, never signalled). On Windows the same real test asserts the children die with the runner. Every test kills what it started, by PID, in a drop guard.
+Recovery tests run real children: `cardinal run -- sh -c 'sleep 30 & sleep 30 & wait'`, pause at `run.after_spawn`, SIGKILL the runner by its PID, then assert: the reservation is `recovery_needed` and verified, `act` on the worktree is `rejected` with `not_in_use`, the next admission or `cardinal inbox` sends SIGTERM and keeps counting, the group is empty afterwards (`kill(-pgid, 0)` gives `ESRCH`), and the next job is admitted. A runner killed at `run.before_starting` leaves a `stale` reservation. The derived-state function is also tested against a fake process table for the cases a real system cannot produce on demand: a reused PGID with a new leader (released), a reused PGID whose leader has exited (kept, never signalled), and a child that left its descendants behind (kept, never signalled). Every test kills what it started, by PID, in a drop guard.
 
 ### 13.3 Git fixtures
 
@@ -931,10 +939,10 @@ Recovery tests run real children: `cardinal run -- sh -c 'sleep 30 & sleep 30 & 
 
 - Each integration test gets its own `CARDINAL_STATE_DIR` and `CARDINAL_CONFIG_DIR` in a temp dir.
 - G5 and C20 tests list the worktree recursively, including ignored files, before and after hook, run, and act, and use stages that write nothing.
-- C6 tests run each input through the real shells (`bash` and `zsh` where installed, `sh` always, Git Bash on Windows CI) once directly and once rewritten, and compare stdout, stderr, exit status, final `pwd` (printed by the outer shell after the command), and `env` output. Inputs include short-circuit lists (`cd missing && cargo test || printf fallback`), `pipefail` and `errexit`, non-exported variables and globs in a stage, assignment prefixes, redirections, several classified stages, and a missing runner path. Until the real runner exists, a fake runner that executes its argv after `--` stands in.
-- The admission path performs no network or arbiter call at run time: `cardinal run` executes with recording fakes for `git`, `gh`, and `claude` first in `PATH` and a recording listener in `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY`; the test asserts no fake was invoked, no connection arrived, and the inbox directory is unchanged. On Linux it also asserts that `/proc/<runner>/fd` holds no socket at `admission.locked` and `run.after_spawn`.
+- C6 tests run each input through the real shells (`bash` and `zsh` where installed, `sh` always) once directly and once rewritten, and compare stdout, stderr, exit status, final `pwd` (printed by the outer shell after the command), and `env` output. Inputs include short-circuit lists (`cd missing && cargo test || printf fallback`), `pipefail` and `errexit`, non-exported variables and globs in a stage, assignment prefixes, redirections, several classified stages, a missing runner path, and stages that must stay unwrapped (section 7.2). Until the real runner exists, a fake runner that executes its argv after `--` stands in.
+- The admission path performs no network or arbiter call at run time: `cardinal run` executes with recording fakes for `git`, `gh`, and `claude` first in `PATH` and a recording listener in `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY`; the test asserts no fake was invoked, no connection arrived, and the inbox directory is unchanged. On Linux it also asserts that `/proc/<runner>/fd` holds no socket at `admission.reserved` and `run.after_spawn`.
 - C13 fixtures put protected data deep inside a regenerable directory (`target/a/b/fuzz/corpus/seed`), so a check that stops at the top level fails. Refusal tests pair each refusal with a control that succeeds, including `reclaim_dir` of `node_modules` in a managed worktree (refused) next to the same in an unmanaged one (executed).
-- CI runs the whole suite on macOS, Linux, and Windows. Unix-only tests (process groups, signals, zsh) are `#[cfg(unix)]`; Job Object tests are `#[cfg(windows)]`; nothing is skipped silently through features.
+- CI runs the whole suite on macOS, Linux, and Windows. Unix-only tests (process groups, signals, zsh, rewriting) are `#[cfg(unix)]`; on Windows the hook's no-rewrite rule and the fail-open runner are tested; nothing is skipped silently through features.
 
 ## 14. Work split
 
@@ -953,7 +961,7 @@ flowchart LR
   O -. "integration gate" .-> P
 ```
 
-F declares every public function signature named below with bodies that return `cardinal.error.v1` code `not_implemented` (clippy denies `todo!` and `unimplemented!`), so each work unit only fills bodies in modules it owns plus one `match` arm in `cli`. Shared OS process helpers are implemented in F, not declared, because #4, #5, and #6 all need them.
+F declares every public function signature named below with bodies that return `cardinal.error.v1` code `not_implemented` (clippy denies `todo!` and `unimplemented!`), so each work unit only fills bodies in modules it owns plus one `match` arm in `cli`. Shared OS process helpers are implemented in F, not declared, because #4, #5, #6, and #7 all need them.
 
 | Work unit | Can start | Completes independently? | Integration gate |
 | --- | --- | --- | --- |
@@ -971,10 +979,10 @@ A work unit is done when its own completion tests pass; its integration gate is 
 | Work unit | Owns | Completion tests |
 | --- | --- | --- |
 | **F** (first PR of #4) | `src/lib.rs`, `src/main.rs`, `src/cli/mod.rs` (all commands and flags of section 11.2), `src/contract/`, `src/config/`, `src/state/`, `src/record.rs`, `src/sensor.rs`, `src/testpoint.rs`, `src/os/mod.rs` with the process table, start times, parent PID, process working directories, and boot time implemented; skeleton `mod.rs` of every other module with signatures: `admission::{list_reservations, in_use, recovery_pass}`, `observe::{inventory, observe_worktree}`, `classify::{find_stages, classify}`, `inbox::raise`, `plan::create`, `act::execute`; `tests/support/`, `scripts/repo-guard`, `scripts/test`, CI and `lefthook.yml` switched to `mise exec -- scripts/test`; `examples/config/` | `tests/records.rs` (torn tails, rotation), `tests/layering.rs` (passes, and fails when a forbidden import is added), `tests/repo_guard.rs`, `tests/fixture_guard.rs`, `tests/os_process.rs` |
-| **#4** runner, admission, reservations | `src/admission/`, `src/run/`, `src/exec/`, `src/os/unix.rs` and `src/os/windows.rs` (groups, signals, Job Objects) | `tests/admission_concurrency.rs`, `tests/run_start_boundary.rs`, `tests/run_infra_failure.rs`, `tests/run_wait.rs`, `tests/run_tty.rs`, `tests/recovery.rs`, `tests/in_use.rs`, `tests/admission_isolation.rs` |
+| **#4** runner, admission, reservations | `src/admission/`, `src/run/`, `src/exec/`, `src/os/unix.rs` (groups, signals) | `tests/admission_concurrency.rs`, `tests/run_start_boundary.rs`, `tests/run_infra_failure.rs`, `tests/run_wait.rs`, `tests/run_tty.rs`, `tests/run_parent_death.rs`, `tests/run_signals.rs`, `tests/recovery.rs`, `tests/in_use.rs`, `tests/admission_isolation.rs` |
 | **#5** Claude Code hook | `src/classify/`, `src/adapter/claude/`, `examples/claude/settings.json` | `tests/hook_claude.rs`, `tests/rewrite_equivalence.rs`, `tests/session_end.rs`, `tests/no_repo_writes.rs`, proptest suites in `classify` |
 | **#6** observation, inventory | `src/observe/`, the `inventory` handler | `tests/observe_worktrees.rs`, `tests/observe_env.rs`, `tests/observe_readonly.rs`, `tests/inventory.rs` |
-| **#7** plan, act, inbox, explain | `src/plan/`, `src/act/`, `src/inbox/`, `src/explain.rs`, their handlers | `tests/plan_act.rs`, `tests/act_single.rs`, `tests/act_trash.rs`, `tests/inbox.rs`, `tests/unit_dry_run.rs`, `tests/explain.rs` |
+| **#7** plan, act, inbox, explain | `src/plan/`, `src/act/`, `src/inbox/`, `src/explain.rs`, their handlers | `tests/plan_act.rs`, `tests/act_single.rs`, `tests/act_snapshot.rs`, `tests/inbox.rs`, `tests/unit_dry_run.rs`, `tests/explain.rs` |
 | **#8** arbiter subagent and skill | `integrations/claude-code/agents/cardinal-arbiter.md`, `integrations/claude-code/skills/cardinal-arbiter/SKILL.md`, install notes in `integrations/claude-code/README.md`, `tests/skill_commands.rs` | `tests/skill_commands.rs` parses every `cardinal …` line in the skill with the clap definitions |
 
 Every work unit's completion command is `mise exec -- scripts/test`.
@@ -985,7 +993,7 @@ The subagent runs headless, one at a time, and only through the CLI:
 
 1. `cardinal inbox` → for each `open` item, `cardinal explain inbox KEY` and `cardinal inventory`.
 2. Reclaim work: `cardinal plan` (or a targeted plan), then `cardinal act PLAN --caller arbiter` for plans with `invariants_ok: true` and `approval: "none"`. Never `--owner-approved`.
-3. A plan that needs approval or a decision outside the reclaim scope (including `recovery_needed` items whose group is unverified, and `interrupted_act` items): `cardinal inbox resolve KEY --outcome escalated --note "<what the owner must decide, with the plan ID or processes>"`.
+3. A plan that needs approval or a decision outside the reclaim scope (including `recovery_needed` items whose group is unverified, and partially deleted worktrees): `cardinal inbox resolve KEY --outcome escalated --note "<what the owner must decide, with the plan ID or processes>"`.
 4. Resolve items it handled with `--outcome resolved` and a note; report refused acts with their `reasons`.
 
 It never edits files in repositories, and never runs `git worktree remove`, `rm`, or `kill` directly. Starting it from an OS timer is phase 1; in phase 0 it is started by hand.
@@ -996,58 +1004,60 @@ Real-host checks run on macOS with Claude Code and the hook installed as in sect
 
 | ID | Condition (design §10) | Check on a real host |
 | --- | --- | --- |
-| G4 | Before the child starts, a missing, crashed, or unresponsive cardinal, or a runner that cannot start, leaves the command running exactly once with the same result; after start, no rerun and an infrastructure failure | A classified probe prints its args, `pwd`, sorted `env`, writes to stdout and stderr, appends one line to a counter file outside the repository, and exits 7. An agent runs it inside `cd sub && probe 2>&1 \| tail -5 \|\| echo fallback` (a) without the hook, (b) with the runner path not executable, (c) with the state dir unwritable, (d) with `admission.lock` held by another process past `lock_timeout_ms`, (e) with the hook's deadline forced to be missed, (f) with a failure injected before the start boundary. All outputs equal (a), and the counter grows by one each time. Permissions: in `default` mode, with allow rules for the probe and the runner, no shape of section 6.5 (whole command, after `cd … &&`, in a pipeline, in `&&`/`\|\|` lists, with an assignment prefix) prompts; without a rule for the probe, each prompts exactly as the original does; in `auto` mode nothing is rewritten. After start: SIGKILL the runner of a long probe; the counter shows one start, the exit status is 137, and `cardinal explain job` reports `runner_died`. The accepted zero-run case (runner killed before the spawn) ends with status 137 and no run |
+| G4 | Before the child starts, a missing, crashed, or unresponsive cardinal, or a runner that cannot start, leaves the command running exactly once with the same result; after start, no rerun and an infrastructure failure | A classified probe prints its args, `pwd`, sorted `env`, writes to stdout and stderr, appends one line to a counter file outside the repository, and exits 7. An agent runs it inside `cd sub && FOO=1 probe 2>&1 \| tail -5 \|\| echo fallback` (a) without the hook, (b) with the runner path not executable, (c) with the state dir unwritable, (d) with `admission.lock` held by another process past `lock_timeout_ms`, (e) with the hook's deadline forced to be missed, (f) with a failure injected before the start boundary. All outputs equal (a), and the counter grows by one each time. Permissions: in `default` mode, with allow rules for the probe and the runner, no rewritten shape of section 6.4 prompts; without a rule for the probe, each prompts exactly as the original does; in `auto` mode nothing is rewritten. After start: SIGKILL the runner of a long probe; the counter shows one start, the exit status is 137, and `cardinal explain job` reports `runner_died`. The accepted zero-run cases (runner killed before the spawn, Bash call cancelled before the spawn) end with no run |
 | G5 | No files or instructions are added to target repositories | Snapshot `git status --porcelain --ignored --untracked-files=all` and a recursive listing (ignored files included) of a real worktree; install, run classified commands that write nothing, run `inventory`, `plan`, `act` (reclaiming a sibling worktree and a regenerable directory of this worktree); compare. Also confirm no repository file mentions cardinal |
 | G10 | With valid plans, safe operations succeed and only G6/G7 operations are refused | Prepare: a merged clean worktree with `node_modules` (control), the `target/` of a dirty worktree (control), a worktree with `fuzz/corpus`, a `target/` with protected data deep inside, a dirty worktree, a worktree with an unpushed commit, a worktree without upstream, a worktree with a waiting job, and `node_modules` of an app-managed worktree. Ask the arbiter to reclaim all of them. The two controls are reclaimed; each other one is refused with the matching check; the protected worktree's clean `target/` is reclaimable separately |
 | G14 | After a runner crash, reservation and in-use state remain until the group stops, then are released | Budget of one job. Start a classified command whose script starts background children; SIGKILL the runner. Immediately: `inventory` shows `recovery_needed` and `in_use`; `act` on that worktree's plan is refused (`not_in_use`). Start another classified command: it waits while recovery stops the group, then runs. Afterwards `ps -g <pgid>` is empty and the reservation is gone |
 
 ## 16. Plan layer for phase 0
 
-Claims from design §11 that phase 0 implements, restated for phase 0, plus new claims A1–A11. EARS, one line each.
+Claims from design §11 that phase 0 implements, restated for phase 0, plus new claims A1–A13. EARS, one line each.
 
 | ID | Claim (EARS) | Source | Test |
 | --- | --- | --- | --- |
 | C1 | When a classified stage reaches the PreToolUse hook, the hook shall rewrite it to run through `cardinal run` and shall not create a reservation. | G14 | `hook_claude::rewrite_takes_no_reservation` |
 | C2 | When the runner decides admission, it shall decide inside the admission lock from the live and recovery-needed reservations and the new job's resources against the host budgets, and shall reserve all resources or none. (Sensors: phase 2.) | G1 | `admission_concurrency::*` |
-| C5 | If the runner path is not executable, the shell prefix shall run the original stage; if the runner fails in any observable way before `spawn()` returns a child, the runner shall run the stage once; after that, cardinal shall not rerun it and shall report an infrastructure failure; if the hook misses its deadline, the command shall not be rewritten. | G4 | `run_start_boundary::*`, `run_infra_failure::*`, `hook_claude::deadline_no_rewrite`, `rewrite_equivalence::runner_missing` |
-| C6 | When the hook rewrites a command, the other Bash input fields shall be unchanged, only classified stages shall be wrapped, and the command shall keep its meaning, including lists, pipelines, shell options, cwd, persisted cwd, and environment. (No injection in phase 0.) | G4 | `rewrite_equivalence::*`, `hook_claude::other_fields_preserved` |
-| C8 | When a runner dies, its reservation and in-use state shall count as reserved and in use until its process group is empty or the boot changes; on Windows the Job Object stops the group, on Unix the recovery pass stops a verified group. | G14 | `recovery::*` |
+| C5 | If the runner path is not executable, the shell fallback shall run the original stage; if the runner fails in any observable way before `spawn()` returns a child, the runner shall run the stage once; after that, cardinal shall not rerun it and shall report an infrastructure failure; if the hook misses its deadline, the command shall not be rewritten. | G4 | `run_start_boundary::*`, `run_infra_failure::*`, `hook_claude::deadline_no_rewrite`, `rewrite_equivalence::runner_missing` |
+| C6 | When the hook rewrites a command, the other Bash input fields shall be unchanged, only classified stages shall be wrapped, and the command shall keep its meaning, including lists, pipelines, shell options, cwd, persisted cwd, environment, and output. (No injection in phase 0.) | G4 | `rewrite_equivalence::*`, `hook_claude::other_fields_preserved`, `run_wait::no_output_added` |
+| C8 | When a runner dies, its reservation and in-use state shall count as reserved and in use until its process group is empty or the boot changes, and the recovery pass shall stop a verified group. | G14 | `recovery::*` |
 | C9 | On SubagentStop and SessionEnd, cardinal shall record the end and shall not stop processes; processes that outlive their session shall appear in the inbox. | G8 | `session_end::*`, `inbox::outlived_processes_raised` |
 | C12 | A whole worktree shall be a plan without approval only when it has merge evidence, is clean, has no unpushed commits, no open PR, an upstream, is not in use or managed, contains no protected, unclassifiable, or nested-repository data, and observation succeeded. | G3, G6, G7 | `plan_act::candidates::*` (commits after merged PR, reused branch name, no upstream, gh failure, control) |
-| C13 | When `act` runs, it shall inspect the whole moved target including descendants and shall refuse it if it contains protected or unclassifiable ignored data. | G7, G10 | `plan_act::protected_deep_in_target_refused`, `plan_act::protected_worktree_refused_target_dir_reclaimed` |
-| C14 | `act` shall require a plan ID, expire the plan when its identity changed, apply the same checks for every caller, and never run a plan twice. | G10 | `plan_act::identity::*`, `act_single::*` |
-| C15 | The runner shall hold the worktree's in-use lock from acceptance until completion, and reclamation shall proceed only with the lock taken exclusively. | G6 | `in_use::waiting_and_running_jobs_block_act` |
+| C13 | When `act` runs, it shall inspect the whole target including descendants and shall refuse it if it contains protected or unclassifiable ignored data. | G7, G10 | `plan_act::protected_deep_in_target_refused`, `plan_act::protected_worktree_refused_target_dir_reclaimed` |
+| C14 | `act` shall require a plan ID, expire the plan when its identity changed (checked again during deletion), apply the same checks for every caller, and never run a plan twice. | G10 | `plan_act::identity::*`, `act_snapshot::head_change_stops_deletion`, `act_single::*` |
+| C15 | The runner shall hold the worktree's in-use lock from acceptance until the stage exits on every path where it can take it, and reclamation shall proceed only with the lock taken exclusively. | G6 | `in_use::waiting_and_running_jobs_block_act`, `in_use::held_on_fail_open_and_tty` |
 | C16 | While a unit's `act` is false, `act` called as that unit shall leave the target unchanged and record the planned operation. | G3 | `unit_dry_run::*` |
 | C17 | The admission path shall not use the network. | G11 | `layering::admission_has_no_observe_dependency`, `admission_isolation::no_network` |
 | C18 | The admission path shall not call the arbiter or wait for it. | G1, G4 | `layering::admission_has_no_inbox_dependency`, `admission_isolation::no_arbiter` |
 | C19 | When an item is raised, the inbox shall not duplicate an existing key and shall not reopen resolved or dismissed items. | G8 | `inbox::*` |
-| C20 | cardinal shall create no files inside target repositories. | G5 | `no_repo_writes::*`, `act_trash::interrupted_act_finished` |
-| A1 | When the wait reaches the wait cap, the phase 0 runner shall start the stage once over budget, record `overflow`, and print the overflow note to stderr. | Phase 0 interim rule: G4, and the seam for C4 | `run_wait::overflow_runs_once` |
+| C20 | cardinal shall create no files inside target repositories. | G5 | `no_repo_writes::*`, `act_snapshot::nothing_written_in_repo` |
+| A1 | When the wait reaches the wait cap, the phase 0 runner shall start the stage once over budget and record `overflow`. | Phase 0 interim rule: G4, and the seam for C4 | `run_wait::overflow_runs_once` |
 | A2 | When cardinal runs git or gh, it shall pass a constructed environment from which repository-location variables inherited from the caller are absent. | G5 | `observe_env::inherited_git_vars_ignored` |
 | A3 | Observation shall not write inside any repository, including its `.git` directory. | G5, C20 | `observe_readonly::index_and_refs_unchanged` |
 | A4 | When a reservation's runner is dead, cardinal shall release it only when its process group is empty or the boot changed, and shall signal the group only when the recorded child is alive in it. | G14 | `recovery::unverified_group_not_signalled`, `recovery::reused_pgid_*`, `recovery::previous_boot_released` |
-| A5 | If the hook fails, reads malformed input, misses its deadline, or sees `permission_mode` `auto`, it shall exit 0 with empty stdout. | G4 | `hook_claude::never_blocks::*`, `hook_claude::auto_mode_not_rewritten` |
+| A5 | If the hook runs on Windows, fails, reads malformed input, misses its deadline, or sees `permission_mode` `auto`, it shall exit 0 with empty stdout. | G4 | `hook_claude::never_blocks::*`, `hook_claude::auto_mode_not_rewritten`, `hook_claude::windows_not_rewritten` |
 | A6 | When `act` runs, it shall compute the need for owner approval from the checks it evaluates, and shall not execute a plan that needs it without `--owner-approved`. | design §5 | `plan_act::approval_recomputed_when_merge_evidence_disappears` |
-| A7 | `act` shall refuse a target that contains another repository or worktree below its root. | G7 | `plan_act::nested_repository_refused` |
+| A7 | `act` shall refuse a target that is a symbolic link, a mount point, or on another device than its parent, or that contains another repository below its root. | G7 | `plan_act::nested_repository_refused`, `plan_act::mount_point_refused` |
 | A8 | `act` shall refuse both plan kinds for a worktree under a managed root or locked by git. | design §4 | `plan_act::managed_worktree_refused`, `plan_act::managed_reclaim_dir_refused` |
-| A9 | If the in-use lock is held exclusively past the wait cap, the runner shall exit 125 without running the stage. | G6, G10 | `admission_concurrency::execution_and_deletion_never_overlap` |
-| A10 | `act` shall delete only the tree it moved to trash and inspected. | G7 | `act_trash::created_after_plan_refused`, `act_trash::created_after_move_survives` |
-| A11 | When stdin is a terminal, the runner shall run the stage directly without a process group or admission and record `tty_passthrough`. | G4 | `run_tty::passthrough` |
+| A9 | If the in-use lock cannot be taken within the wait cap, the runner shall run the stage and record `in_use_unprotected`. | G4 | `in_use::unprotected_run_recorded` |
+| A10 | When `act` deletes, it shall unlink only entries whose metadata equals the snapshot taken at inspection and remove directories only when empty. | G7 | `act_snapshot::changed_and_new_entries_survive` |
+| A11 | When stdin is a terminal, the runner shall run the stage without a process group or admission, holding the in-use lock, and record `tty_passthrough`. | G4 | `run_tty::passthrough` |
+| A12 | If the runner's parent exits, the runner shall not start the stage, or, after the spawn, shall stop the group and hold the reservation until it is empty. | G14 | `run_parent_death::*` |
+| A13 | When the stage dies by a signal, the runner shall die by the same signal. | G4 | `run_signals::same_signal_death` |
 
 Out of scope for phase 0: C3 and C4 (phase 2, memory pressure and accepted jobs), C7 (phase 3, WSL), C10 and C11 (phase 1, disk thresholds and the reserve file), C21 (phase 2, measurement kinds).
 
 ## 17. Issues with the design
 
-1. **Permission rules see the rewritten command.** Claude Code evaluates permission rules against `updatedInput`, not the original command ([hooks reference](https://code.claude.com/docs/en/hooks)), which design §6 did not account for. Checked against Claude Code 2.1.322: the `if … then … else … fi` form is split per branch, so with an allow rule for the runner the rewritten command needs approval exactly when the original does; every other fallback form prompts. Remaining limits: `auto` mode is not rewritten (section 6.5), and the shapes inside pipelines and lists still need the G4 real-host check.
+1. **Permission rules see the rewritten command.** Claude Code evaluates permission rules against `updatedInput`, not the original command ([hooks reference](https://code.claude.com/docs/en/hooks)), which design §6 did not account for. In Claude Code 2.1.322 the `if … then … else … fi` form is split per branch, so with an allow rule for the runner the rewritten command needs approval exactly when the original does; other fallback forms and assignment prefixes before the runner prompt, and `auto` mode is not rewritten (sections 6.1, 6.5).
 2. **Running the whole command string in a child shell changed its meaning.** Claude Code keeps the Bash tool's working directory across calls and applies aliases, functions, and options captured from the user's rc file ([tools reference](https://code.claude.com/docs/en/tools-reference)). A child shell drops the persisted `cd`, rc options such as `pipefail`, and the short-circuit structure around the heavy command, and changes the command's first word, on which timeout handling depends. Resolution: only classified stages are wrapped, in place (section 6.4); design §6 "Command capture" and C6 now say so. Residual: an rc alias or function shadowing a classified tool (section 7.5).
 3. **The Bash timeout does not kill.** design §6 bounds the wait by the Bash tool timeout. Claude Code moves a foreground command that reaches its timeout to the background instead of stopping it ([tools reference](https://code.claude.com/docs/en/tools-reference)), so an overrun costs the agent a background task, not the command. The bound is kept (section 5.4); design §14's first question is answered by section 6.1.
 4. **Stopping "the recorded process group" needs an identity that survives a crash.** design §6 says admission or a reconciler stops a dead runner's group before releasing it. A child-led group's PGID is unknown until after the spawn, and a PGID can be reused once its group empties. Resolution: the runner leads the group, so the PGID is recorded before the reservation exists; the reservation is released only when the group is empty or the boot changed; only a group whose recorded child is still in it is signalled (section 4.5).
-5. **G4 has two zero-run cases.** A runner killed between its start and the spawn, and a runner path that is executable but cannot be loaded, run the stage zero times. They are accepted because they end with a visible non-zero status, never run the stage twice, and never report success; a shell-side fallback on the exit status would run the stage twice after a real failure (section 5.3).
-6. **A command in a worktree being reclaimed is refused, not failed open.** Running it would race the deletion; the runner exits 125 without running (section 4.6). This is cardinal working as intended, not one of G4's failure states.
+5. **G4 has zero-run cases.** A runner killed between its start and the spawn, and a runner path that is executable but cannot be loaded, run the stage zero times. They are accepted because they end with a visible non-zero status, never run the stage twice, and never report success; a shell-side fallback on the exit status would run the stage twice after a real failure (section 5.3).
+6. **Reclaim safety cannot depend on the in-use lock.** design §7 and C15 tie reclamation to the in-use lock, but G4 requires a stage to run even when its runner cannot take that lock. Resolution: `act` deletes only entries unchanged since its inspection (section 9.5); the lock only keeps running commands from losing files under them.
 7. **No accepted jobs in phase 0.** design §6's step for a wait that reaches the cap is an accepted job, which is phase 2. Phase 0 starts the stage over budget instead (A1). This weakens G1 until phase 2, which phase 0 does not claim.
 8. **`git status` writes.** Without `--no-optional-locks`, `git status` refreshes and rewrites the index of the worktree it observes. Observation always disables optional locks (A3) so that observing does not change repositories.
 9. **"No upstream" is an invariant.** G6 and G10 make a branch without upstream unreclaimable, so `act` refuses it even with owner approval. A worktree whose work was never pushed has to be pushed or removed by hand. This is intended: it also protects freshly created worktrees.
 10. **Hard links distort disk numbers.** Package managers that hard-link from a shared store make `node_modules` look larger than what deleting it frees. Inventory reports exclusive bytes next to allocated bytes (section 8.5).
-11. **PowerShell on Windows.** Claude Code on Windows without Git Bash runs commands through a separate PowerShell tool. design §9 names only the Bash tool. Section 6.4 fixes the PowerShell rewrite form for phase 3.
+11. **Windows needs its own contract.** Git Bash converts arguments for native programs, Rust does not resolve extensionless `.cmd` shims, and Claude Code on Windows without Git Bash runs a separate PowerShell tool, which design §9 does not name. Phase 0 does not rewrite on Windows; phase 3 defines the contract and adds Job Objects.
 12. **Hook defaults are unsafe for cardinal.** Command hooks default to a 600 s timeout, and several hooks returning `updatedInput` have no defined order. The installation sets explicit timeouts and requires cardinal to be the only Bash-rewriting hook (section 6.2).
-13. **Process groups do not track processes that leave them.** A tool that calls `setsid` or `setpgid` for its own children takes them out of the job's group on Unix; the reservation can be released while they run. Job Objects on Windows do not have this gap.
+13. **Process groups do not track processes that leave them.** A tool that calls `setsid` or `setpgid` for its own children takes them out of the job's group; the reservation can be released while they run.
