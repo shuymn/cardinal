@@ -3,22 +3,21 @@
 //! once as written and once as the hook rewrote it, and the two runs must agree on stdout,
 //! stderr, exit status, the final cwd, and the environment. Claims C5 and C6 (section 16).
 //!
-//! A fake runner that executes its argv after `--` stands in for `cardinal run`
-//! (`hook_support::fake_runner`); the hook's integration gate repeats these cases with the
-//! real runner.
+//! A wrapped stage runs through the real runner, `cardinal run` with a state and config dir of
+//! the test's own, and the records it appends count the jobs it started.
 
 #![cfg(unix)]
 
 mod hook_support;
 mod support;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use cardinal_test_support::Scope;
 use hook_support::{
-    PROFILE, configure, executable, fake_runner, host, input, probe, rewritten, run_hook,
-    runner_path,
+    PROFILE, configure, executable, host, input, probe, real_runner, rewritten, run_hook,
+    runner_path, started_jobs,
 };
 use proptest::prelude::{Just, Strategy, prop, prop_assert_eq, prop_oneof, proptest};
 use proptest::test_runner::Config as ProptestConfig;
@@ -89,13 +88,12 @@ struct Outcome {
     status: Option<i32>,
 }
 
-/// A test bench in a scope, whose constructed environment the shells get: tools in `bin/`, a
-/// fake runner, the shells, and two configurations whose runner path is the fake runner
-/// (`present`) or a path that does not exist (`missing`).
+/// A test bench in a scope, whose constructed environment the shells get: tools in `bin/`,
+/// the real runner as `bin/cardinal`, the shells, and two configurations whose runner path is
+/// that runner (`present`) or a path that does not exist (`missing`).
 struct Bench {
     scope: Scope,
     bin: PathBuf,
-    log: PathBuf,
     runner: String,
     shells: Vec<Shell>,
     present: Dirs,
@@ -108,13 +106,12 @@ impl Bench {
         let root = scope.root();
         let bin = root.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
-        let log = root.join("runner.log");
         probe(&bin);
         // Found by zsh's `PATH_DIRS` search for `tools/probe`.
         std::fs::create_dir_all(bin.join("tools")).unwrap();
         probe(&bin.join("tools"));
         executable(&bin.join("npx"), "#!/bin/sh\nexec \"$@\"\n");
-        let runner = runner_path(&fake_runner(&bin, &log));
+        let runner = runner_path(&real_runner(&bin));
         let present = Dirs::new();
         configure(&present, &host(&runner, ""), &[("generic", PROFILE)]);
         let missing = Dirs::new();
@@ -124,7 +121,6 @@ impl Bench {
         Self {
             scope,
             bin,
-            log,
             runner,
             shells,
             present,
@@ -149,9 +145,9 @@ impl Bench {
             .map_or_else(|| command.to_owned(), |doc| rewritten(&doc).to_owned())
     }
 
-    /// Runs `setup` and `command` in `shell` in a fresh work dir; returns what it printed and
-    /// how many times the fake runner ran.
-    fn run(&self, shell: &Shell, setup: &str, command: &str) -> (Outcome, usize) {
+    /// Runs `setup` and `command` in `shell` in a fresh work dir with `dirs`' state and config
+    /// dir exported; returns what it printed and how many jobs the runner started.
+    fn run(&self, shell: &Shell, dirs: &Dirs, setup: &str, command: &str) -> (Outcome, usize) {
         let play = self.play();
         if play.exists() {
             std::fs::remove_dir_all(&play).unwrap();
@@ -166,15 +162,23 @@ impl Bench {
         ] {
             std::fs::write(work.join(name), contents).unwrap();
         }
-        std::fs::write(&self.log, b"").unwrap();
+        let jobs_before = started_jobs(dirs.state()).len();
         let path = std::env::join_paths(
             std::iter::once(self.bin.clone())
                 .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
         )
         .unwrap();
-        let output = self
-            .scope
-            .command(&shell.path, &work)
+        let mut command_line = self.scope.command(&shell.path, &work);
+        if cfg!(target_os = "macos") {
+            // CoreFoundation, which `cardinal` links (through sysinfo), sets this variable to
+            // the user's text encoding before `main`, so every stage the runner starts carries
+            // it. The agent's shell inherits the same value from the agent, which links
+            // CoreFoundation as well, and so do these shells, from this process.
+            let encoding = std::env::var_os("__CF_USER_TEXT_ENCODING")
+                .expect("CoreFoundation sets __CF_USER_TEXT_ENCODING in this process too");
+            command_line.env("__CF_USER_TEXT_ENCODING", encoding);
+        }
+        let output = command_line
             .args(shell.options)
             .arg("-c")
             // `/etc/zshenv` may reset PATH; the script sets it again.
@@ -185,10 +189,12 @@ impl Bench {
             .env("PATH", &path)
             .env("PWD", &work)
             .env("EXPORTED", "visible")
+            .env("CARDINAL_STATE_DIR", dirs.state())
+            .env("CARDINAL_CONFIG_DIR", dirs.config())
             .stdin(Stdio::null())
             .output()
             .unwrap();
-        let calls = std::fs::read_to_string(&self.log).unwrap().lines().count();
+        let calls = started_jobs(dirs.state()).len() - jobs_before;
         let outcome = Outcome {
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
@@ -756,8 +762,8 @@ fn check_after(bench: &Bench, dirs: &Dirs, expect_calls: bool, change: impl FnOn
         for shell in shells.iter().filter(|s| {
             (case.only.is_empty() || case.only.contains(&s.name)) && (!case.pipefail || s.pipefail)
         }) {
-            let (original, original_calls) = bench.run(shell, case.setup, case.command);
-            let (outcome, calls) = bench.run(shell, case.setup, &rewritten);
+            let (original, original_calls) = bench.run(shell, dirs, case.setup, case.command);
+            let (outcome, calls) = bench.run(shell, dirs, case.setup, &rewritten);
             assert_eq!(original_calls, 0);
             assert_eq!(
                 outcome, original,
@@ -801,7 +807,11 @@ fn runner_missing() {
     );
     check(&bench, &bench.missing, false);
 
+    // A regular file without execute permission in place of the link; a script that would
+    // change every outcome if it ran.
     let bench = Bench::new();
+    std::fs::remove_file(&bench.runner).unwrap();
+    executable(Path::new(&bench.runner), "#!/bin/sh\nexit 99\n");
     std::fs::set_permissions(
         &bench.runner,
         <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o644),
@@ -810,7 +820,7 @@ fn runner_missing() {
     check(&bench, &bench.present, false);
 
     // A directory in its place passes `-x` but not `-f`; the hook, which refuses a directory
-    // runner, rewrote while the runner was a file.
+    // runner, rewrote while the runner was the binary.
     let bench = Bench::new();
     check_after(&bench, &bench.present, false, || {
         std::fs::remove_file(&bench.runner).unwrap();
@@ -906,8 +916,8 @@ proptest! {
         let bench = Bench::new();
         let rewritten = bench.rewrite(&bench.present, &command);
         for shell in bench.shells.iter().filter(|s| s.pipefail || !setup.contains("pipefail")) {
-            let (original, _) = bench.run(shell, setup, &command);
-            let (outcome, _) = bench.run(shell, setup, &rewritten);
+            let (original, _) = bench.run(shell, &bench.present, setup, &command);
+            let (outcome, _) = bench.run(shell, &bench.present, setup, &rewritten);
             prop_assert_eq!(outcome, original, "{} in {}:\n{}\n{}", command, shell.name, rewritten, setup);
         }
     }
@@ -933,8 +943,9 @@ fn piped_redirection_stays_unwrapped() {
         runner = bench.runner
     );
     for shell in &bench.shells {
-        let (as_written, _) = bench.run(shell, "", &original);
-        let (as_wrapped, _) = bench.run(shell, "", &wrapped);
+        let (as_written, _) = bench.run(shell, &bench.present, "", &original);
+        let (as_wrapped, calls) = bench.run(shell, &bench.present, "", &wrapped);
+        assert_eq!(calls, 1, "{}: the runner ran the stage", shell.name);
         if shell.name == "zsh" {
             assert_ne!(
                 as_wrapped, as_written,

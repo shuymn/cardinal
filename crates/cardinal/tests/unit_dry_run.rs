@@ -2,12 +2,13 @@
 //! default for every unit), `act` called as that unit leaves the target unchanged, claims
 //! nothing, and records the planned operation.
 
-mod fakes;
+mod observe_common;
+mod plan_support;
 mod support;
 
 use cardinal::act::ActOptions;
-use cardinal::contract::{ActStatus, Caller, IgnoredClass, PlanKind, RecordKind};
-use fakes::{Setup, write};
+use cardinal::contract::{ActStatus, Caller, PlanKind, RecordKind};
+use plan_support::{Setup, write};
 
 fn unit(name: &str) -> ActOptions {
     ActOptions {
@@ -26,18 +27,22 @@ fn records_of(s: &Setup, plan: &str, kind: RecordKind) -> Vec<cardinal::contract
 }
 
 fn assert_only_planned(host_toml: Option<&str>) {
-    let s = Setup::with_host(host_toml);
-    let wt = s.worktree("unit", &[("target", IgnoredClass::Regenerable)]);
+    let s = Setup::with_host(host_toml.unwrap_or_default());
+    let wt = s.worktree("unit");
     write(&wt, "target/debug/app", "bin");
     let plan = s.plan(PlanKind::ReclaimDir, &wt.join("target"));
-    let before = fakes::listing(&wt);
+    let before = plan_support::listing(&wt);
     for _ in 0..2 {
         let result = s.act(&plan.id, &unit("disk-reclaim")).unwrap();
         assert_eq!(result.status, ActStatus::DryRun, "{result:#?}");
         assert_eq!(result.caller, "unit:disk-reclaim");
         assert!(result.freed_bytes.unwrap() > 0);
     }
-    assert_eq!(fakes::listing(&wt), before, "the target is unchanged");
+    assert_eq!(
+        plan_support::listing(&wt),
+        before,
+        "the target is unchanged"
+    );
     assert!(!s.state.plan_claim(&plan.id).exists(), "nothing claimed");
     let planned = records_of(&s, &plan.id, RecordKind::Planned);
     assert_eq!(planned.len(), 2, "each run records the planned operation");
@@ -71,8 +76,8 @@ fn enabling_one_unit_leaves_the_others_gated() {
 /// Phase 0 still only reports, so the target stays.
 #[test]
 fn unit_with_act_true_is_recorded_as_act() {
-    let s = Setup::with_host(Some("[unit.disk-reclaim]\nact = true\n"));
-    let wt = s.worktree("enabled", &[("target", IgnoredClass::Regenerable)]);
+    let s = Setup::with_host("[unit.disk-reclaim]\nact = true\n");
+    let wt = s.worktree("enabled");
     write(&wt, "target/debug/app", "bin");
     let plan = s.plan(PlanKind::ReclaimDir, &wt.join("target"));
     let result = s.act(&plan.id, &unit("disk-reclaim")).unwrap();
@@ -88,12 +93,13 @@ fn unit_with_act_true_is_recorded_as_act() {
 #[test]
 fn gated_unit_reports_refusals() {
     let s = Setup::new();
-    let wt = s.worktree("protected", &[("target", IgnoredClass::Regenerable)]);
+    let wt = s.worktree("protected");
     write(&wt, "target/proptest-regressions/x.txt", "keep");
     let plan = s.plan(PlanKind::ReclaimDir, &wt.join("target"));
     let result = s.act(&plan.id, &unit("disk-reclaim")).unwrap();
     assert_eq!(result.status, ActStatus::Rejected);
-    assert_eq!(result.reasons, ["no_protected"]);
+    // Observation classifies `target`, which holds protected data, as protected.
+    assert_eq!(result.reasons, ["regenerable", "no_protected"]);
     assert!(!s.state.plan_claim(&plan.id).exists());
     assert_eq!(records_of(&s, &plan.id, RecordKind::Planned).len(), 1);
 }

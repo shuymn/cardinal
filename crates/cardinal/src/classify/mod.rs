@@ -1,11 +1,12 @@
 //! Classification: the shell tokenizer, stage finder, normalizer, rule matcher, stage
 //! rewriting, and the `Classifier` seam (`docs/architecture.md` sections 6.4 and 7).
 //!
-//! [`find_stages`] splits a command into stages or refuses it; [`decide`] classifies each
-//! stage and applies the rules of section 7.2 that keep a stage unwrapped; [`rewrite`] wraps
-//! the stages that remain (section 6.4); [`trace`] reports, from the same outcomes, how each
-//! stage was classified. Not understanding a command only ever leads to a missed rewrite,
-//! never a changed one.
+//! [`find_stages`] splits a command into stages or refuses it; [`select`] picks the profiles
+//! of the command's repository; [`decide`] classifies each stage and applies the rules of
+//! section 7.2 that keep a stage unwrapped; [`rewrite`] wraps the stages that remain
+//! (section 6.4); [`trace`] reports, from the same outcomes, how each stage was classified.
+//! The hook and `explain command` both go through these, so they cannot disagree. Not
+//! understanding a command only ever leads to a missed rewrite, never a changed one.
 
 mod normalize;
 mod rewrite;
@@ -15,9 +16,10 @@ mod words;
 
 use std::collections::BTreeMap;
 use std::ops::Range;
+use std::path::Path;
 use std::time::Instant;
 
-use crate::config::{Pattern, Profile, Rule, Selection};
+use crate::config::{Config, Pattern, Profile, Rule, Selection, normalize_remote};
 use crate::contract::{
     ClassifyDecision, ClassifyRepo, ClassifyRequest, ClassifyRequestSchema, ClassifyResponse,
     ClassifyResponseSchema, ClassifyTool, Error, ErrorCode, Resources,
@@ -389,6 +391,88 @@ pub fn decide(
         }
     }
     outcomes
+}
+
+/// What a caller read of a repository's `origin` remote for profile matching.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Origin {
+    Url(String),
+    /// No origin, git failed or could not start, or its output was unusable.
+    Unknown,
+    /// The caller's deadline passed before git answered.
+    TimedOut,
+}
+
+impl Origin {
+    /// What `git remote get-url origin` said: one non-empty line from a git that exited 0,
+    /// else nothing usable.
+    #[must_use]
+    pub fn from_output(code: Option<i32>, stdout: &[u8]) -> Self {
+        let url = String::from_utf8_lossy(stdout).trim().to_owned();
+        if code == Some(0) && !url.is_empty() && !url.contains('\n') {
+            Self::Url(url)
+        } else {
+            Self::Unknown
+        }
+    }
+}
+
+/// The profiles that apply to `stages` run in the repository whose canonical git common dir
+/// is `common_dir` (section 3.3): profiles matched by path, then by the origin remote, then
+/// the generic ones. `origin` reads the remote, and is called only inside a repository, when
+/// some profile could match by remote but not by path, and when a rule could match a stage
+/// at all. Returns the selection with the origin URL it read, or `None` when reading the
+/// origin missed the caller's deadline. The hook and `explain command` both select through
+/// this function, so they classify a command the same way.
+pub fn select<'c>(
+    config: &'c Config,
+    stages: &[Stage],
+    common_dir: Option<&Path>,
+    origin: impl FnOnce() -> Origin,
+) -> Option<(Selection<'c>, Option<String>)> {
+    let path_matched =
+        |profile: &Profile| common_dir.is_some_and(|dir| profile.matches_common_dir(dir));
+    let remote_needed = common_dir.is_some()
+        && config.profiles.iter().any(|profile| {
+            profile
+                .matcher
+                .as_ref()
+                .is_some_and(|m| !m.remotes.is_empty())
+                && !path_matched(profile)
+        })
+        && rules_could_match(stages, &config.profiles);
+    let remote = if remote_needed {
+        match origin() {
+            Origin::Url(url) => Some(url),
+            Origin::Unknown => None,
+            Origin::TimedOut => return None,
+        }
+    } else {
+        None
+    };
+    let selection = config.select(|profile| {
+        path_matched(profile)
+            || remote
+                .as_deref()
+                .is_some_and(|url| profile.matches_remote(url))
+    });
+    Some((selection, remote))
+}
+
+/// The repository of a classification request: its common dir, its main worktree (the
+/// parent of a `.git` common dir, else the common dir itself, a bare repository), and its
+/// normalized origin.
+#[must_use]
+pub fn request_repo(common_dir: &Path, remote: Option<&str>) -> ClassifyRepo {
+    let main_worktree = match (common_dir.file_name(), common_dir.parent()) {
+        (Some(name), Some(parent)) if name == ".git" => parent,
+        _ => common_dir,
+    };
+    ClassifyRepo {
+        common_dir: common_dir.to_string_lossy().into_owned(),
+        main_worktree: main_worktree.to_string_lossy().into_owned(),
+        remote: remote.and_then(normalize_remote),
+    }
 }
 
 /// Whether any rule of `profiles` could match a stage, under any profile's wrappers. The hook

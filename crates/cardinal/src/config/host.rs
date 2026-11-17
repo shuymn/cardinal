@@ -104,7 +104,9 @@ impl HostConfig {
 
 impl Hook {
     /// The runner path written into rewrites: `[hook] runner`, else this executable. It must be
-    /// absolute and consist only of `A–Z a–z 0–9 / . _ + -`, so it never needs shell quoting.
+    /// absolute and consist only of `A–Z a–z 0–9 / . _ + -`, so it never needs shell quoting,
+    /// and must not be a directory, which passes the shell's `-x` test (the rewrite's `-f`
+    /// test would only ever take the fallback).
     pub fn runner_path(&self) -> Result<String, ConfigError> {
         let path = if let Some(path) = &self.runner {
             path.clone()
@@ -117,6 +119,12 @@ impl Hook {
                 .to_owned()
         };
         validate_runner(&path)?;
+        if Path::new(&path).is_dir() {
+            return Err(ConfigError::invalid(
+                "host.toml",
+                format!("the runner path {path} is a directory, not the cardinal binary"),
+            ));
+        }
         Ok(path)
     }
 }

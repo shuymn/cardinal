@@ -1,29 +1,33 @@
 //! Snapshot inspection (A7, C13, C14; `docs/architecture.md` sections 9.2 and 9.5): `act`
 //! inspects the target before its checks, observes the worktree again after the snapshot, and
 //! on Linux does not enter a bind mount below the target or accept a target that is one;
-//! `plan`'s walk lists only the directories it recorded. A race pauses `act` or the walk in a
-//! helper process at its test point, makes the change once the point is reached, and releases
-//! it. On Linux the bind mounts are made in a mount namespace of the helper's own
-//! (`Scope::mount_namespace` and `Scope::bind_mount`).
-//!
-//! Observation comes from the fake in `tests/fakes` until the integration gate; it reads
-//! HEAD and branch from the worktree's git files, as git would.
+//! `plan`'s walk lists only the directories it recorded. A race pauses `act` (the `cardinal`
+//! binary, observing the fixture through git and the fake `gh` of `tests/plan_support`) or
+//! the walk (a helper process) at its test point, makes the change once the point is
+//! reached, and releases it. On Linux the bind mounts are made in a mount namespace of the
+//! process's own (`Scope::mount_namespace` and `Scope::bind_mount`).
 
-mod fakes;
+mod observe_common;
+mod plan_support;
 mod support;
 
 use std::path::Path;
+#[cfg(target_os = "linux")]
+use std::process::Stdio;
 use std::time::Duration;
 
-use cardinal::contract::{ActResult, ActStatus, IgnoredClass, PlanKind};
+#[cfg(target_os = "linux")]
+use cardinal::contract::ActResult;
+use cardinal::contract::{ActStatus, PlanKind};
 use cardinal_test_support::{Command, Scope};
-use fakes::{Setup, arbiter, write};
+#[cfg(target_os = "linux")]
+use plan_support::act_result;
+use plan_support::{Setup, arbiter, write};
 use support::helper::Mode;
 use support::testpoints::TestPoints;
 
 #[test]
 fn helper() {
-    fakes::run_act_if_requested();
     walk_if_requested();
 }
 
@@ -39,7 +43,7 @@ fn walk_if_requested() {
     let request: serde_json::Value = serde_json::from_str(&request).expect("a walk request");
     let path = |key: &str| std::path::PathBuf::from(request[key].as_str().expect(key));
     for key in ["worktree", "target", "out"] {
-        fakes::assert_inside(&path("root"), &path(key), key);
+        plan_support::assert_inside(&path("root"), &path(key), key);
     }
     let walk = cardinal::plan::walk(&path("worktree"), &path("target")).expect("walk");
     let doc = serde_json::json!({
@@ -52,37 +56,20 @@ fn walk_if_requested() {
 
 const WAIT: Duration = Duration::from_secs(20);
 
-/// Runs `act` of `plan` in a helper paused at `point`, calls `change` once the helper has
-/// reached it, releases it, and returns its result.
-fn act_with_change_at(s: &Setup, plan: &str, point: &str, change: impl FnOnce()) -> ActResult {
-    // A test-point directory of its own, so no release file of an earlier race is left.
-    let scope = Scope::new();
-    let points = TestPoints::new(&scope);
-    let out = points.dir().join("result.json");
-    let mut command = s.act_command(plan, &arbiter(), &out);
-    points.apply(&mut command, &[point], None);
-    let mut child = command.spawn().unwrap();
-    points.wait_reached(point, child.id(), WAIT);
-    change();
-    points.release(point);
-    assert!(child.wait().unwrap().success());
-    fakes::read_result(&out)
-}
-
-/// A tracked file edited after the snapshot, before the checks: the checks see the worktree
-/// dirty and nothing is touched.
+/// A tracked file edited after the snapshot, before the checks: the checks, which observe
+/// the worktree through git again, see it dirty, and nothing is touched.
 #[test]
 fn edit_before_checks_is_rejected() {
     let s = Setup::new();
-    let wt = s.worktree("edited", &[("node_modules", IgnoredClass::Regenerable)]);
+    let wt = s.worktree("edited");
     write(&wt, "node_modules/pkg/index.js", "x");
     let plan = s.plan(PlanKind::ReclaimWorktree, &wt);
-    let result = act_with_change_at(&s, &plan.id, cardinal::testpoint::ACT_SNAPSHOTTED, || {
-        write(&wt, "src/lib.rs", "// edited after the snapshot\n");
-        // What `git status` now reports.
-        s.fake
-            .update(&wt, |w| w.facts.dirty = cardinal::contract::Tri::Yes);
-    });
+    let result = s.act_at(
+        &plan.id,
+        &arbiter(),
+        cardinal::testpoint::ACT_SNAPSHOTTED,
+        || write(&wt, "src/lib.rs", "// edited after the snapshot\n"),
+    );
     assert_eq!(result.status, ActStatus::Rejected, "{result:#?}");
     assert_eq!(result.reasons, ["clean"]);
     assert!(
@@ -101,7 +88,7 @@ fn branch_switch_expires_the_plan() {
         .enumerate()
     {
         let s = Setup::new();
-        let wt = s.worktree("switched", &[("node_modules", IgnoredClass::Regenerable)]);
+        let wt = s.worktree("switched");
         write(&wt, "node_modules/pkg/index.js", "x");
         let target = match kind {
             PlanKind::ReclaimWorktree => wt.clone(),
@@ -157,20 +144,44 @@ fn ran_in_namespace(test: &str) {
 }
 
 /// Runs `inner` in a mount namespace of its own where each `(source, target)` of `binds` is
-/// bind-mounted first. The mounts end with the namespace.
+/// bind-mounted first, and returns its output. The mounts end with the namespace.
 #[cfg(target_os = "linux")]
-fn with_binds(s: &Setup, binds: &[(&Path, &Path)], mut inner: Command) {
+fn with_binds(s: &Setup, binds: &[(&Path, &Path)], mut inner: Command) -> std::process::Output {
     s.fx.scope().mount_namespace(&mut inner, binds);
-    let status = inner.status().unwrap();
-    assert!(status.success(), "the helper in the namespace: {status}");
+    inner.output().unwrap()
 }
 
-/// Runs `act` of `plan` in a helper under `binds` (see [`with_binds`]).
+/// Runs `act` of `plan` under `binds` (see [`with_binds`]).
 #[cfg(target_os = "linux")]
 fn act_with_binds(s: &Setup, plan: &str, binds: &[(&Path, &Path)]) -> ActResult {
-    let out = s.fx.path(&format!("result-{plan}.json"));
-    with_binds(s, binds, s.act_command(plan, &arbiter(), &out));
-    fakes::read_result(&out)
+    let output = with_binds(s, binds, s.act_command(plan, &arbiter()));
+    act_result(&output).expect("an act result")
+}
+
+/// Runs `act` of `plan` under `binds` paused at `point`, calls `at` once it has reached it,
+/// releases it, and returns its result.
+#[cfg(target_os = "linux")]
+fn act_with_binds_at(
+    s: &Setup,
+    plan: &str,
+    binds: &[(&Path, &Path)],
+    point: &str,
+    at: impl FnOnce(),
+) -> ActResult {
+    let scope = Scope::new();
+    let points = TestPoints::new(&scope);
+    let mut command = s.act_command(plan, &arbiter());
+    points.apply(&mut command, &[point], None);
+    s.fx.scope().mount_namespace(&mut command, binds);
+    let child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    points.wait_reached(point, child.id(), WAIT);
+    at();
+    points.release(point);
+    act_result(&child.wait_with_output().unwrap()).expect("an act result")
 }
 
 /// A helper process (this test binary, see [`walk_if_requested`]) that runs `plan::walk` of
@@ -213,7 +224,11 @@ fn walk_with_binds(
     binds: &[(&Path, &Path)],
 ) -> (String, Vec<String>) {
     let out = s.fx.path("walk.json");
-    with_binds(s, binds, walk_command(s, worktree, target, &out));
+    let output = with_binds(s, binds, walk_command(s, worktree, target, &out));
+    assert!(
+        output.status.success(),
+        "the walk in the namespace: {output:?}"
+    );
     read_walk(&out)
 }
 
@@ -277,18 +292,12 @@ fn bind_mounts_are_not_entered() {
     let owner = s.fx.path("owner");
     let big = "x".repeat(1 << 20);
     write(&owner, "data/keep", &big);
-    let wt = s.worktree(
-        "bound",
-        &[
-            ("target", IgnoredClass::Regenerable),
-            ("node_modules", IgnoredClass::Regenerable),
-        ],
-    );
+    let wt = s.worktree("bound");
     write(&wt, "target/debug/app", "bin");
     write(&wt, "node_modules/pkg/index.js", "x");
     std::fs::create_dir_all(wt.join("node_modules/cache")).unwrap();
     let data = owner.join("data");
-    let before = fakes::listing(&wt);
+    let before = plan_support::listing(&wt);
 
     let target = wt.join("target");
     let plan = s.plan(PlanKind::ReclaimDir, &target);
@@ -306,7 +315,7 @@ fn bind_mounts_are_not_entered() {
     );
 
     assert_eq!(std::fs::read_to_string(data.join("keep")).unwrap(), big);
-    assert_eq!(fakes::listing(&wt), before, "nothing touched");
+    assert_eq!(plan_support::listing(&wt), before, "nothing touched");
 
     let (mount, entries) = walk_with_binds(&s, &wt, &target, &[(&data, &target)]);
     assert_eq!(mount, "Boundary");
@@ -362,7 +371,8 @@ impl Watch {
 
 /// A7 on Linux: a bind mount below the target is told by its mount before it is read. `plan`'s
 /// walk neither opens nor lists it; `act`'s snapshot opens it to read its mount and does not
-/// list it.
+/// list it. The observation `act` runs after its snapshot walks the ignored entry, bind mount
+/// included (section 8.3), so the events are read where the snapshot has just been recorded.
 #[cfg(target_os = "linux")]
 #[test]
 fn bind_mounts_are_not_listed() {
@@ -372,7 +382,7 @@ fn bind_mounts_are_not_listed() {
     }
     let data = s.fx.path("owner/data");
     write(&data, "keep", "x");
-    let wt = s.worktree("bound", &[("node_modules", IgnoredClass::Regenerable)]);
+    let wt = s.worktree("bound");
     write(&wt, "node_modules/pkg/index.js", "x");
     let cache = wt.join("node_modules").join("cache");
     std::fs::create_dir_all(&cache).unwrap();
@@ -392,9 +402,20 @@ fn bind_mounts_are_not_listed() {
         "the walk neither opens nor lists the bind mount"
     );
 
-    let result = act_with_binds(&s, &plan.id, &[(&data, &cache)]);
+    let listed = std::cell::Cell::new(None);
+    let result = act_with_binds_at(
+        &s,
+        &plan.id,
+        &[(&data, &cache)],
+        cardinal::testpoint::ACT_SNAPSHOTTED,
+        || listed.set(Some(watch.seen().1)),
+    );
     assert_eq!(result.status, ActStatus::DryRun, "{result:#?}");
-    assert!(!watch.seen().1, "the snapshot does not list the bind mount");
+    assert_eq!(
+        listed.get(),
+        Some(false),
+        "the snapshot does not list the bind mount"
+    );
     ran_in_namespace("bind_mounts_are_not_listed");
 }
 

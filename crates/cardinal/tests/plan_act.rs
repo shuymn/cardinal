@@ -3,10 +3,12 @@
 //! binding (C14), recomputed approval (A6), plain targets (A7), and managed worktrees (A8).
 //! Every refusal is paired with a control that passes every check and reports `dry_run`.
 //!
-//! Observation and admission come from the fake in `tests/fakes` until the integration gate
-//! runs these against the real modules. The tests that inspect targets run on Unix, where
-//! `act` reads its snapshot through directory descriptors; `act_report_only` runs the
-//! report-only contract on every platform.
+//! `plan` and `act` run as the `cardinal` binary on fixture repositories, observed by the real
+//! `observe` and `admission` modules with GitHub answered by the fake `gh`
+//! (`tests/plan_support`); a fact changes through the fixture, gh's answers, or a real
+//! reservation. The tests that inspect targets run on Unix, where `act` reads its snapshot
+//! through directory descriptors; `act_report_only` runs the report-only contract on every
+//! platform.
 
 #![cfg_attr(
     not(unix),
@@ -17,15 +19,14 @@
     )
 )]
 
-mod fakes;
+mod observe_common;
+mod plan_support;
 mod support;
 
 use std::path::Path;
 
-use cardinal::contract::{
-    ActStatus, Approval, CheckResult, IgnoredClass, InUse, MergeEvidence, Plan, PlanKind, Tri,
-};
-use fakes::{Setup, arbiter, write};
+use cardinal::contract::{ActStatus, Approval, CheckResult, InUse, Plan, PlanKind};
+use plan_support::{Setup, arbiter, write};
 
 #[test]
 fn helper() {
@@ -61,7 +62,7 @@ mod candidates {
     #[test]
     fn control_passes_without_approval() {
         let s = Setup::new();
-        let wt = s.worktree("done", &[("node_modules", IgnoredClass::Regenerable)]);
+        let wt = s.worktree("done");
         write(&wt, "node_modules/pkg/index.js", "x");
         let plan = s.plan(PlanKind::ReclaimWorktree, &wt);
         assert_no_approval(&plan);
@@ -76,15 +77,11 @@ mod candidates {
     #[test]
     fn commits_after_merged_pr_need_approval() {
         let s = Setup::new();
-        let wt = s.worktree("merged-then-more", &[]);
+        let wt = s.worktree("merged-then-more");
         s.fx.commit_file(&wt, "src/more.rs", "// more\n", "more work");
-        s.fx.push(&wt, &s.origin, "merged-then-more");
-        s.fake.update(&wt, |w| {
-            w.facts.merge_evidence = MergeEvidence::None;
-            w.facts.merged_pr = None;
-        });
+        s.publish(&wt, "merged-then-more");
         let plan = s.plan(PlanKind::ReclaimWorktree, &wt);
-        assert!(plan.invariants_ok);
+        assert!(plan.invariants_ok, "{:#?}", plan.checks);
         assert_eq!(plan.approval, Approval::Owner);
         assert_eq!(check(&plan.checks, "merge_evidence"), CheckResult::Fail);
         let result = s.act(&plan.id, &arbiter()).unwrap();
@@ -93,29 +90,33 @@ mod candidates {
         assert!(wt.join("src/more.rs").exists());
     }
 
-    /// A branch name reused for new work after its PR merged gives no evidence either.
+    /// A branch name reused for new work after its PR merged gives no evidence either: gh
+    /// finds the merged PR, whose head is the branch's old HEAD.
     #[test]
     fn reused_branch_name_needs_approval() {
         let s = Setup::new();
-        let wt = s.worktree("reused", &[]);
-        s.fake
-            .update(&wt, |w| w.facts.merge_evidence = MergeEvidence::None);
+        let wt = s.worktree("reused");
+        let old = s.head(&wt);
+        s.fx.commit_file(&wt, "src/new.rs", "// new work\n", "new work");
+        s.publish(&wt, "reused");
+        s.set_merged(&s.head(&wt), &observe_common::merged_json(99, &old));
         let plan = s.plan(PlanKind::ReclaimWorktree, &wt);
-        assert_eq!(plan.approval, Approval::Owner);
+        assert_eq!(plan.approval, Approval::Owner, "{:#?}", plan.checks);
         let result = s.act(&plan.id, &arbiter()).unwrap();
         assert_eq!(result.status, ActStatus::Rejected);
+        assert_eq!(result.reasons, ["owner_approval_required"]);
         assert!(wt.join("src/lib.rs").exists());
     }
 
-    /// No upstream is an invariant: not even the owner's approval reclaims it (G6).
+    /// No upstream is an invariant: not even the owner's approval reclaims it (G6). The
+    /// branch's commits are on the remote, so nothing else fails.
     #[test]
     fn no_upstream_is_refused_even_with_approval() {
         let s = Setup::new();
-        let wt = s.worktree("local-only", &[]);
-        s.fake.update(&wt, |w| {
-            w.facts.has_upstream = Tri::No;
-            w.upstream = None;
-        });
+        let wt = s.fx.worktree_add(&s.main, "local-only", "local-only");
+        s.fx.commit_file(&wt, "src/lib.rs", "// local\n", "work");
+        s.fx.update_ref(&wt, "refs/remotes/origin/local-only", &s.head(&wt));
+        s.merge(&wt);
         let plan = s.plan(PlanKind::ReclaimWorktree, &wt);
         assert!(!plan.invariants_ok);
         assert_eq!(check(&plan.checks, "has_upstream"), CheckResult::Fail);
@@ -129,18 +130,9 @@ mod candidates {
     #[test]
     fn gh_failure_is_refused_even_with_approval() {
         let s = Setup::new();
-        let wt = s.worktree("gh-down", &[]);
-        let mut world = s.fake.read();
-        let observed = world
-            .worktrees
-            .iter_mut()
-            .find(|o| Path::new(&o.worktree.path) == wt)
-            .unwrap();
-        observed.repo.gh = cardinal::contract::GhStatus::Unknown;
-        observed.repo.gh_error = Some("gh exited with 1".into());
-        observed.worktree.facts.open_pr = Tri::Unknown;
-        observed.worktree.facts.merge_evidence = MergeEvidence::Unknown;
-        s.fake.write(&world);
+        let wt = s.worktree("gh-down");
+        s.gh_fails("open", 1);
+        s.gh_fails("merged", 1);
         let plan = s.plan(PlanKind::ReclaimWorktree, &wt);
         assert!(!plan.invariants_ok);
         assert_eq!(check(&plan.checks, "observed"), CheckResult::Fail);
@@ -155,18 +147,28 @@ mod candidates {
         assert!(wt.join("src/lib.rs").exists());
     }
 
+    /// A worktree that is dirty, has a commit nobody pushed, or has an open PR is refused, also
+    /// with the owner's approval. The unpushed commit is not merged either, which only the
+    /// approval covers.
     #[test]
     fn dirty_unpushed_or_open_pr_is_refused() {
-        type Change = fn(&mut cardinal::contract::Worktree);
+        type Change = fn(&Setup, &Path, &str);
         let s = Setup::new();
         let cases: [(&str, &str, Change); 3] = [
-            ("dirty", "clean", |w| w.facts.dirty = Tri::Yes),
-            ("unpushed", "no_unpushed", |w| w.facts.unpushed = Tri::Yes),
-            ("open-pr", "no_open_pr", |w| w.facts.open_pr = Tri::Yes),
+            ("dirty", "clean", |_, wt, _| {
+                write(wt, "src/lib.rs", "// edited\n");
+            }),
+            ("unpushed", "no_unpushed", |s, wt, _| {
+                s.fx.commit_file(wt, "src/more.rs", "// more\n", "more work");
+            }),
+            ("open-pr", "no_open_pr", |s, wt, name| {
+                let entry = observe_common::open_entry(7, name, &s.head(wt), false);
+                s.set_open(&format!("[{entry}]"));
+            }),
         ];
         for (name, failing, change) in cases {
-            let wt = s.worktree(name, &[]);
-            s.fake.update(&wt, change);
+            let wt = s.worktree(name);
+            change(&s, &wt, name);
             let plan = s.plan(PlanKind::ReclaimWorktree, &wt);
             let result = s.act(&plan.id, &owner_approved()).unwrap();
             assert_eq!(result.status, ActStatus::Rejected, "{name}");
@@ -175,29 +177,22 @@ mod candidates {
         }
     }
 
-    /// In use: a reservation (a waiting or crashed job), the in-use lock (a running job), or
-    /// a process with its working directory inside.
+    /// In use: a reservation (a job whose runner crashed with its group running), the in-use
+    /// lock (a running job), or a process with its working directory inside. The budget
+    /// admits the one job.
     #[test]
     fn worktree_in_use_is_refused() {
-        let s = Setup::new();
-        let reserved = s.worktree("reserved", &[]);
-        let key = cardinal::state::worktree_key(&reserved);
-        let mut world = s.fake.read();
-        world.in_use.insert(
-            key,
-            InUse {
-                value: true,
-                jobs: vec!["0123456789abcdef".into()],
-            },
-        );
-        s.fake.write(&world);
-        let locked = s.worktree("locked", &[]);
-        let busy = s.worktree("busy", &[]);
+        let s = Setup::with_host("[budget]\ncpu = 1");
+        let reserved = s.worktree("reserved");
+        let locked = s.worktree("locked");
+        let busy = s.worktree("busy");
         let plans: Vec<Plan> = [&reserved, &locked, &busy]
             .iter()
             .map(|wt| s.plan(PlanKind::ReclaimWorktree, wt))
             .collect();
 
+        let jobs = support::jobs::Jobs::new(s.fx.scope(), &s.state_dir, &s.config_dir);
+        let crashed = jobs.crashed(&reserved, 1);
         let lock_path = s
             .state
             .worktree_lock(&cardinal::state::worktree_key(&locked));
@@ -221,7 +216,30 @@ mod candidates {
             assert_eq!(result.reasons, ["not_in_use"], "{}", wt.display());
             assert!(wt.join("src/lib.rs").exists());
         }
+        let facts = &result_facts(&s, &plans[0], "not_in_use");
+        assert!(
+            facts.contains(&crashed.job),
+            "the reservation names the worktree: {facts}"
+        );
         sleeper.kill();
+    }
+
+    /// The facts the latest `act` record of `plan` holds for check `name`, as JSON text.
+    fn result_facts(s: &Setup, plan: &Plan, name: &str) -> String {
+        let records = cardinal::record::read_all(&s.state).unwrap();
+        let act = records
+            .iter()
+            .rev()
+            .find(|r| {
+                r.kind == cardinal::contract::RecordKind::Act
+                    && r.plan_id.as_deref() == Some(&plan.id)
+            })
+            .expect("an act record");
+        let check = act.data["checks"]
+            .as_array()
+            .and_then(|checks| checks.iter().find(|c| c["name"] == name))
+            .expect("the check");
+        check["facts"].to_string()
     }
 }
 
@@ -233,7 +251,7 @@ mod identity {
     #[test]
     fn new_worktree_at_the_same_path_expires() {
         let s = Setup::new();
-        let wt = s.worktree("again", &[]);
+        let wt = s.worktree("again");
         let plan = s.plan(PlanKind::ReclaimWorktree, &wt);
         // Hold the old root open so the new directory cannot reuse its inode.
         let _old_root = std::fs::File::open(&wt).unwrap();
@@ -248,7 +266,7 @@ mod identity {
     #[test]
     fn head_advanced_while_clean_expires() {
         let s = Setup::new();
-        let wt = s.worktree("advanced", &[]);
+        let wt = s.worktree("advanced");
         let plan = s.plan(PlanKind::ReclaimWorktree, &wt);
         s.fx.commit_file(&wt, "src/new.rs", "// new\n", "advance");
         let result = s.act(&plan.id, &arbiter()).unwrap();
@@ -260,7 +278,7 @@ mod identity {
     #[test]
     fn plan_of_another_host_expires() {
         let s = Setup::new();
-        let wt = s.worktree("elsewhere", &[("target", IgnoredClass::Regenerable)]);
+        let wt = s.worktree("elsewhere");
         write(&wt, "target/x", "x");
         let plan = s.plan(PlanKind::ReclaimDir, &wt.join("target"));
         let file = s.state.plan_file(&plan.id);
@@ -279,24 +297,45 @@ mod identity {
     }
 }
 
+/// The detail of check `name` in `result`.
+#[cfg(unix)]
+fn detail<'a>(result: &'a cardinal::contract::ActResult, name: &str) -> &'a str {
+    &result
+        .checks
+        .iter()
+        .find(|c| c.name == name)
+        .unwrap_or_else(|| panic!("no check {name}"))
+        .detail
+}
+
 /// C13: `act` inspects the whole target at run time, descendants included. The protected
-/// data appears after the plan was made, so only `act`'s own inspection can find it.
+/// data appears after the plan was made, so only `act`'s own inspection can find it, and is
+/// removed once `act` has recorded its snapshot, so the observation `act` runs after the
+/// snapshot no longer classifies it: the snapshot alone refuses the plan.
 #[cfg(unix)]
 #[test]
 fn protected_deep_in_target_refused() {
     let s = Setup::new();
-    let wt = s.worktree("deep", &[("target", IgnoredClass::Regenerable)]);
+    let wt = s.worktree("deep");
     write(&wt, "target/a/b/c.o", "obj");
     let plan = s.plan(PlanKind::ReclaimDir, &wt.join("target"));
     assert!(plan.invariants_ok, "{:#?}", plan.checks);
     write(&wt, "target/a/b/fuzz/corpus/seed", "precious");
-    let result = s.act(&plan.id, &arbiter()).unwrap();
-    assert_eq!(result.status, ActStatus::Rejected);
-    assert_eq!(result.reasons, ["no_protected"]);
-    assert!(wt.join("target/a/b/fuzz/corpus/seed").exists());
+    let result = s.act_at(
+        &plan.id,
+        &arbiter(),
+        cardinal::testpoint::ACT_SNAPSHOTTED,
+        || std::fs::remove_dir_all(wt.join("target/a/b/fuzz")).unwrap(),
+    );
+    assert_eq!(result.status, ActStatus::Rejected, "{result:#?}");
+    assert_eq!(result.reasons, ["no_protected"], "{result:#?}");
+    assert_eq!(
+        detail(&result, "no_protected"),
+        "protected data: target/a/b/fuzz/corpus"
+    );
     assert!(wt.join("target/a/b/c.o").exists(), "nothing touched");
 
-    let control = s.worktree("shallow", &[("target", IgnoredClass::Regenerable)]);
+    let control = s.worktree("shallow");
     write(&control, "target/a/b/c.o", "obj");
     let plan = s.plan(PlanKind::ReclaimDir, &control.join("target"));
     let result = s.act(&plan.id, &arbiter()).unwrap();
@@ -310,13 +349,7 @@ fn protected_deep_in_target_refused() {
 #[test]
 fn protected_worktree_refused_target_dir_passes() {
     let s = Setup::new();
-    let wt = s.worktree(
-        "fuzzing",
-        &[
-            ("fuzz/corpus", IgnoredClass::Protected),
-            ("target", IgnoredClass::Regenerable),
-        ],
-    );
+    let wt = s.worktree("fuzzing");
     write(&wt, "fuzz/corpus/seed", "precious");
     write(&wt, "target/debug/app", "bin");
     let whole = s.plan(PlanKind::ReclaimWorktree, &wt);
@@ -335,16 +368,15 @@ fn protected_worktree_refused_target_dir_passes() {
 }
 
 /// A6: `act` recomputes approval from the checks it evaluates; the plan's stored approval
-/// never widens what it may do.
+/// never widens what it may do. gh stops reporting the merged PR after the plan was made.
 #[cfg(unix)]
 #[test]
 fn approval_recomputed_when_merge_evidence_disappears() {
     let s = Setup::new();
-    let wt = s.worktree("was-merged", &[]);
+    let wt = s.worktree("was-merged");
     let plan = s.plan(PlanKind::ReclaimWorktree, &wt);
     assert_no_approval(&plan);
-    s.fake
-        .update(&wt, |w| w.facts.merge_evidence = MergeEvidence::None);
+    s.unset_merged(&s.head(&wt));
     let result = s.act(&plan.id, &arbiter()).unwrap();
     assert_eq!(result.status, ActStatus::Rejected);
     assert_eq!(result.reasons, ["owner_approval_required"]);
@@ -357,26 +389,36 @@ fn approval_recomputed_when_merge_evidence_disappears() {
     assert!(wt.join("src/lib.rs").exists());
 }
 
-/// A7: another repository below the target's root is refused.
+/// A7: another repository below the target's root is refused. Its `.git` appears after the
+/// plans were made and is removed once `act` has recorded its snapshot, so the observation
+/// `act` runs after the snapshot no longer classifies it: the snapshot alone refuses each plan.
 #[cfg(unix)]
 #[test]
 fn nested_repository_refused() {
     let s = Setup::new();
-    let wt = s.worktree("vendored", &[("node_modules", IgnoredClass::Regenerable)]);
+    let wt = s.worktree("vendored");
     write(&wt, "node_modules/pkg/index.js", "x");
     let dir = s.plan(PlanKind::ReclaimDir, &wt.join("node_modules"));
     let whole = s.plan(PlanKind::ReclaimWorktree, &wt);
     assert!(dir.invariants_ok && whole.invariants_ok);
-    write(&wt, "node_modules/pkg/.git/HEAD", "ref: refs/heads/main\n");
     for plan in [&dir, &whole] {
-        let result = s.act(&plan.id, &owner_approved()).unwrap();
+        write(&wt, "node_modules/pkg/.git/HEAD", "ref: refs/heads/main\n");
+        let result = s.act_at(
+            &plan.id,
+            &owner_approved(),
+            cardinal::testpoint::ACT_SNAPSHOTTED,
+            || std::fs::remove_dir_all(wt.join("node_modules/pkg/.git")).unwrap(),
+        );
         assert_eq!(result.status, ActStatus::Rejected, "{result:#?}");
         assert_eq!(result.reasons, ["no_nested_repository"], "{result:#?}");
+        assert_eq!(
+            detail(&result, "no_nested_repository"),
+            "repositories inside: node_modules/pkg"
+        );
     }
-    assert!(wt.join("node_modules/pkg/.git/HEAD").exists());
     assert!(wt.join("node_modules/pkg/index.js").exists());
 
-    let control = s.worktree("plain", &[("node_modules", IgnoredClass::Regenerable)]);
+    let control = s.worktree("plain");
     write(&control, "node_modules/pkg/index.js", "x");
     let plan = s.plan(PlanKind::ReclaimDir, &control.join("node_modules"));
     assert_eq!(
@@ -391,7 +433,7 @@ fn nested_repository_refused() {
 #[test]
 fn symlink_target_refused() {
     let s = Setup::new();
-    let wt = s.worktree("linked", &[("node_modules", IgnoredClass::Regenerable)]);
+    let wt = s.worktree("linked");
     write(&wt, "node_modules/pkg/index.js", "x");
     let plan = s.plan(PlanKind::ReclaimDir, &wt.join("node_modules"));
     assert!(plan.invariants_ok);
@@ -401,7 +443,9 @@ fn symlink_target_refused() {
     std::os::unix::fs::symlink(&outside, wt.join("node_modules")).unwrap();
     let result = s.act(&plan.id, &owner_approved()).unwrap();
     assert_eq!(result.status, ActStatus::Rejected);
-    assert_eq!(result.reasons, ["plain_target"]);
+    // git does not ignore a link with the name of an ignored directory: the target is no
+    // longer a regenerable entry either.
+    assert_eq!(result.reasons, ["regenerable", "plain_target"]);
     assert!(outside.join("pkg/index.js").exists());
 
     let link_plan = s.plan(PlanKind::ReclaimDir, &wt.join("node_modules"));
@@ -416,7 +460,7 @@ fn symlink_target_refused() {
     );
 
     // A directory on the way to the target replaced by a link: nothing below it is reached.
-    let deep = s.worktree("deep", &[("web/node_modules", IgnoredClass::Regenerable)]);
+    let deep = s.worktree("deep");
     write(&deep, "web/node_modules/pkg/index.js", "x");
     let nested = s.plan(PlanKind::ReclaimDir, &deep.join("web/node_modules"));
     assert!(nested.invariants_ok, "{:#?}", nested.checks);
@@ -425,7 +469,7 @@ fn symlink_target_refused() {
     std::os::unix::fs::symlink(&outside, deep.join("web")).unwrap();
     let result = s.act(&nested.id, &owner_approved()).unwrap();
     assert_eq!(result.status, ActStatus::Rejected);
-    assert_eq!(result.reasons, ["plain_target"]);
+    assert_eq!(result.reasons, ["regenerable", "plain_target"]);
     assert!(outside.join("node_modules/pkg/index.js").exists());
 }
 
@@ -498,7 +542,7 @@ fn mount_point_refused() {
         }
     }
     let s = Setup::new();
-    let wt = s.worktree("mounted", &[("node_modules", IgnoredClass::Regenerable)]);
+    let wt = s.worktree("mounted");
     std::fs::create_dir(wt.join("node_modules")).unwrap();
     let contents = s.fx.path("image");
     write(&contents, "pkg/index.js", "on the image");
@@ -543,14 +587,14 @@ fn mount_point_refused() {
     assert!(attached.detach().success(), "hdiutil detach");
 }
 
-/// A8: both plan kinds are refused for a worktree managed by another app, whether
-/// observation reports it or it lies under a configured managed root.
+/// A8: both plan kinds are refused for a worktree managed by another app: one git has
+/// locked, and one under a configured managed root.
 #[cfg(unix)]
 #[test]
 fn managed_worktree_refused() {
     let s = Setup::new();
-    let wt = s.worktree("by-app", &[]);
-    s.fake.update(&wt, |w| w.managed_by = Some("t3code".into()));
+    let wt = s.worktree("by-app");
+    s.fx.worktree_lock(&s.main, &wt);
     let plan = s.plan(PlanKind::ReclaimWorktree, &wt);
     assert_eq!(check(&plan.checks, "not_managed"), CheckResult::Fail);
     let result = s.act(&plan.id, &owner_approved()).unwrap();
@@ -558,7 +602,7 @@ fn managed_worktree_refused() {
     assert_eq!(result.reasons, ["not_managed"]);
     assert!(wt.join("src/lib.rs").exists());
 
-    let control = s.worktree("by-hand", &[]);
+    let control = s.worktree("by-hand");
     let plan = s.plan(PlanKind::ReclaimWorktree, &control);
     assert_eq!(
         s.act(&plan.id, &arbiter()).unwrap().status,
@@ -571,13 +615,12 @@ fn managed_worktree_refused() {
 #[test]
 fn managed_reclaim_dir_refused() {
     let mut s = Setup::new();
-    let host = format!(
-        "[observe]\nmanaged = [{{ app = \"t3code\", root = \"{}\" }}]\n",
-        s.fx.path("apps").display()
-    );
-    s.config = fakes::config(s.dirs.config(), Some(&host));
-    // Observation does not report it; the configured root alone makes it managed.
-    let wt = s.worktree("apps/wt", &[("node_modules", IgnoredClass::Regenerable)]);
+    let apps = s.fx.path("apps");
+    s.scene.observe_config(&format!(
+        "managed = [{{ app = \"t3code\", root = \"{}\" }}]",
+        apps.display()
+    ));
+    let wt = s.worktree("apps/wt");
     write(&wt, "node_modules/pkg/index.js", "x");
     let plan = s.plan(PlanKind::ReclaimDir, &wt.join("node_modules"));
     let result = s.act(&plan.id, &owner_approved()).unwrap();
@@ -585,7 +628,7 @@ fn managed_reclaim_dir_refused() {
     assert_eq!(result.reasons, ["not_managed"]);
     assert!(wt.join("node_modules/pkg/index.js").exists());
 
-    let control = s.worktree("unmanaged", &[("node_modules", IgnoredClass::Regenerable)]);
+    let control = s.worktree("unmanaged");
     write(&control, "node_modules/pkg/index.js", "x");
     let plan = s.plan(PlanKind::ReclaimDir, &control.join("node_modules"));
     assert_eq!(
@@ -601,45 +644,44 @@ fn managed_reclaim_dir_refused() {
 #[test]
 fn plan_all_covers_candidates_and_regenerable_entries() {
     let s = Setup::new();
-    let done = s.worktree("done", &[("node_modules", IgnoredClass::Regenerable)]);
-    let busy = s.worktree("busy", &[("target", IgnoredClass::Regenerable)]);
+    let done = s.worktree("done");
+    let busy = s.worktree("busy");
     write(&busy, "target/x", "x");
-    s.fake.update(&busy, |w| {
-        w.facts.dirty = Tri::Yes;
-        w.reclaim.candidate = false;
-    });
-    let list = cardinal::plan::create_all_with(&s.config, &s.state, &s.fake, &[]).unwrap();
-    let targets: Vec<(PlanKind, String)> = list
+    write(&busy, "notes.txt", "not committed\n");
+    let list = s.plan_all();
+    let mut targets: Vec<(String, PlanKind)> = list
         .plans
         .iter()
-        .map(|p| (p.kind, p.target.path.clone()))
+        .map(|p| (p.target.path.clone(), p.kind))
         .collect();
+    targets.sort_by(|a, b| a.0.cmp(&b.0));
     assert_eq!(
         targets,
         [
-            (PlanKind::ReclaimWorktree, done.display().to_string()),
             (
-                PlanKind::ReclaimDir,
-                busy.join("target").display().to_string()
+                busy.join("target").display().to_string(),
+                PlanKind::ReclaimDir
             ),
+            (done.display().to_string(), PlanKind::ReclaimWorktree),
         ]
     );
     assert!(list.errors.is_empty(), "{:?}", list.errors);
 }
 
-/// Plans are bound and stored; the CLI resolves unique prefixes.
+/// Plans are bound and stored; the CLI resolves unique prefixes; a main worktree is never
+/// planned.
 #[test]
 fn plan_is_stored_and_recorded() {
     let s = Setup::new();
-    let wt = s.worktree("stored", &[("target", IgnoredClass::Regenerable)]);
+    let wt = s.worktree("stored");
     write(&wt, "target/x", "x");
     let plan = s.plan(PlanKind::ReclaimDir, &wt.join("target"));
     assert_eq!(plan.host_id, s.state.host_id());
     assert_eq!(plan.target.worktree, wt.display().to_string());
     assert_eq!(plan.target.branch.as_deref(), Some("stored"));
     assert_eq!(
-        plan.target.head,
-        fakes::read_head(&wt).head,
+        plan.target.head.as_deref(),
+        Some(s.head(&wt).as_str()),
         "bound to the observed HEAD"
     );
     let stored = cardinal::plan::load(&s.state, &plan.id[..6]).unwrap();
@@ -649,23 +691,11 @@ fn plan_is_stored_and_recorded() {
         r.kind == cardinal::contract::RecordKind::PlanCreated
             && r.plan_id.as_deref() == Some(&plan.id)
     }));
-    let mut world = s.fake.read();
-    world
-        .worktrees
-        .push(fakes::reclaimable(&s.main, &s.main, &[]));
-    s.fake.write(&world);
-    let err = cardinal::plan::create_with(
-        &s.config,
-        &s.state,
-        &s.fake,
-        PlanKind::ReclaimWorktree,
-        &s.main,
-    )
-    .unwrap_err();
+    let err = s.try_plan(PlanKind::ReclaimWorktree, &s.main).unwrap_err();
     assert_eq!(
         err.code,
         cardinal::contract::ErrorCode::InvalidArgument,
-        "a main worktree is never reclaimed: {err}"
+        "a main worktree is never reclaimed: {err:?}"
     );
 }
 

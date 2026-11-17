@@ -10,7 +10,6 @@ mod session;
 
 use std::ffi::OsString;
 use std::io::{Read, Write};
-use std::path::Path;
 use std::time::Instant;
 
 use serde_json::{Map, Value};
@@ -22,6 +21,9 @@ use crate::record::Recorder;
 use crate::state::{Durability, StateDir, now_ms};
 
 use hook::{Pass, Settings};
+
+pub(crate) use hook::timeout_ms;
+pub(crate) use repo::{Repo, origin};
 
 /// The most hook input read from stdin.
 const MAX_INPUT: u64 = 1024 * 1024;
@@ -140,18 +142,10 @@ fn run_pre_tool_use(
     if !config.host.hook.enabled {
         return Ok(());
     }
-    // A directory passes the shell's `-x` test; the rewrite's `-f` test would only ever take
-    // the fallback.
     let runner = match config.host.hook.runner_path() {
-        Ok(runner) if Path::new(&runner).is_dir() => Err(format!(
-            "the runner path {runner} is a directory, not the cardinal binary"
-        )),
-        Ok(runner) => Ok(runner),
-        Err(err) => Err(err.to_string()),
-    };
-    let runner = match runner {
         Ok(runner) => runner,
-        Err(message) => {
+        Err(err) => {
+            let message = err.to_string();
             record(Some(&config.host), &Pass::Config(message.clone()));
             return Err(Error::new(ErrorCode::ConfigInvalid, message));
         }

@@ -123,7 +123,7 @@ fn hooks_write_nothing_in_the_repository() {
 }
 
 /// A rewritten command whose stages write nothing runs in the repository and leaves it
-/// unchanged; the runner ran (the fake runner of section 13.5).
+/// unchanged; the real runner started both wrapped stages there.
 #[cfg(unix)]
 #[test]
 fn rewritten_command_writes_nothing_in_the_repository() {
@@ -131,9 +131,8 @@ fn rewritten_command_writes_nothing_in_the_repository() {
     let repo = repository(&fixture);
     let bin = fixture.path("bin");
     std::fs::create_dir_all(&bin).unwrap();
-    let log = bin.join("runner.log");
     hook_support::probe(&bin);
-    let runner = hook_support::runner_path(&hook_support::fake_runner(&bin, &log));
+    let runner = hook_support::runner_path(&hook_support::real_runner(&bin));
     let dirs = Dirs::new();
     configure(
         &dirs,
@@ -157,12 +156,15 @@ fn rewritten_command_writes_nothing_in_the_repository() {
     let output = fixture
         .command("sh", &repo)
         .env("PATH", path)
+        .env("CARDINAL_STATE_DIR", dirs.state())
+        .env("CARDINAL_CONFIG_DIR", dirs.config())
         .args(["-c", rewritten])
         .output()
         .unwrap();
     assert!(output.status.success(), "{output:?}");
     assert!(String::from_utf8_lossy(&output.stdout).contains("probe argv: <--err> <x>"));
-    assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 2);
+    let jobs = hook_support::started_jobs(dirs.state());
+    assert_eq!(jobs.len(), 2, "{jobs:#?}");
 
     assert_eq!(listing(&repo), before);
 }

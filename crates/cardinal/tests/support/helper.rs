@@ -66,13 +66,16 @@ pub enum Mode {
     /// and write its PID to `dir/background.pid`; run `cardinal hook claude <event>` as this
     /// process's child, or with `via_shell` as the child of `sh -c` as Claude Code runs it,
     /// with `dir/input.json` on stdin and the state and config dirs `state` and `config`;
-    /// write its exit status to `dir/hook.done`, then sleep.
+    /// write its exit status to `dir/hook.done`, then sleep. With `stray` (Unix), first start
+    /// a sleep in the helper's group that is not this process's descendant (a shell in that
+    /// group starts it and exits) and write its PID to `dir/stray.pid`.
     Agent {
         dir: PathBuf,
         event: String,
         state: PathBuf,
         config: PathBuf,
         via_shell: bool,
+        stray: bool,
     },
     /// Run `cmd /D /C exit 0` through `cardinal::os::child`, start a sleeping helper through a
     /// scope of this process, write its PID to `out`, then sleep: the sleeper is a process
@@ -162,6 +165,7 @@ pub fn run_if_requested() {
             Path::new(&args[2]),
             Path::new(&args[3]),
             args[4] == "via-shell",
+            args[5] == "stray",
         ),
         #[cfg(windows)]
         "outside" => {
@@ -189,10 +193,27 @@ pub fn run_if_requested() {
 }
 
 /// The `agent` mode: see [`Mode::Agent`].
-fn agent(dir: &Path, event: &str, state: &Path, config: &Path, via_shell: bool) {
+fn agent(dir: &Path, event: &str, state: &Path, config: &Path, via_shell: bool, stray: bool) {
     let scope = Scope::new();
     let background = spawn(&scope, &Mode::Sleep, scope.root());
     std::fs::write(dir.join("background.pid"), background.id().to_string()).expect("write the pid");
+    #[cfg(unix)]
+    if stray {
+        let status = scope
+            .shell(
+                &format!(
+                    "sleep 600 </dev/null >/dev/null 2>&1 & echo $! > '{}'",
+                    dir.join("stray.pid").display()
+                ),
+                scope.root(),
+            )
+            .join_group(&background)
+            .status()
+            .expect("start the stray process");
+        assert!(status.success(), "the stray process's shell failed");
+    }
+    #[cfg(not(unix))]
+    let _ = stray;
     let input = dir.join("input.json");
     let cardinal = env!("CARGO_BIN_EXE_cardinal");
     let mut hook = if via_shell {
@@ -350,6 +371,7 @@ pub fn args(mode: &Mode) -> Vec<String> {
             state,
             config,
             via_shell,
+            stray,
         } => (
             "agent",
             vec![
@@ -358,6 +380,7 @@ pub fn args(mode: &Mode) -> Vec<String> {
                 state.to_string_lossy().into_owned(),
                 config.to_string_lossy().into_owned(),
                 if *via_shell { "via-shell" } else { "" }.to_owned(),
+                if *stray { "stray" } else { "" }.to_owned(),
             ],
         ),
         #[cfg(windows)]

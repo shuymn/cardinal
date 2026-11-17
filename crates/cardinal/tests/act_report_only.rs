@@ -3,23 +3,18 @@
 //! leaves the target's contents, the worktree's `.git`, Git's administrative data for the
 //! worktree, and the plan unclaimed and unchanged.
 //!
-//! Each `act` runs in its own process: the helper, which observes through the fake, and the
-//! `cardinal` binary itself, which observes the fixture through git.
+//! Each `act` is the `cardinal` binary, which observes the fixture through git and the fake
+//! `gh` of `tests/plan_support`.
 
-mod fakes;
+mod observe_common;
+mod plan_support;
 mod support;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use cardinal::act::ActOptions;
-use cardinal::contract::{ActStatus, Caller, IgnoredClass, MergeEvidence, PlanKind};
-use fakes::{Setup, write};
-
-#[test]
-fn helper() {
-    fakes::run_act_if_requested();
-}
+use cardinal::contract::{ActResult, ActStatus, PlanKind};
+use plan_support::{Setup, act_result, write};
 
 /// Everything `act` must leave as it was.
 struct Untouched {
@@ -36,14 +31,14 @@ struct Untouched {
 
 impl Untouched {
     fn read(s: &Setup, wt: &Path, plan: &str) -> Self {
-        let main = fakes::listing(&s.main);
+        let main = plan_support::listing(&s.main);
         let name = wt.file_name().unwrap();
         assert!(
             main.contains_key(&Path::new(".git/worktrees").join(name).join("gitdir")),
             "the worktree's administrative data is part of the comparison"
         );
         Self {
-            worktree: fakes::listing(wt),
+            worktree: plan_support::listing(wt),
             main,
             registered: s.fx.worktree_list(&s.main),
             plan: std::fs::read(s.state.plan_file(plan)).unwrap(),
@@ -80,19 +75,33 @@ impl Untouched {
     }
 }
 
-/// Runs `act` in a helper process and returns its status and reasons.
-fn act_in_helper(s: &Setup, plan: &str, options: &ActOptions) -> (ActStatus, Vec<String>) {
-    let out = s.fx.path(&format!("result-{plan}.json"));
-    let status = s.act_command(plan, options, &out).status().unwrap();
-    assert!(status.success(), "the act helper: {status}");
-    let result = fakes::read_result(&out);
-    assert_eq!(result.caller, options.caller.to_string());
-    (result.status, result.reasons)
+/// `cardinal act PLAN ARGS…`, after checking that the plan targets the fixture.
+fn act(s: &Setup, plan: &str, args: &[&str]) -> ActResult {
+    plan_support::assert_plans_inside(s.fx.root(), &s.state, plan);
+    let output = s
+        .cardinal()
+        .args(["act", plan])
+        .args(args)
+        .output()
+        .unwrap();
+    act_result(&output).expect("an act result")
 }
 
+/// The callers, as `act` arguments and as the result names them: the default caller, the
+/// arbiter by name, the owner, and a unit whose `act` is true.
+const CALLERS: [(&[&str], &str); 4] = [
+    (&[], "arbiter"),
+    (&["--caller", "arbiter"], "arbiter"),
+    (&["--caller", "owner"], "owner"),
+    (&["--caller", "unit:disk-reclaim"], "unit:disk-reclaim"),
+];
+
+/// A plan of each kind, one that needs approval (gh stops reporting the merged PR before it is
+/// made) and ones that do not, acted on twice by every caller with and without
+/// `--owner-approved`: each run reports, and nothing changes.
 #[test]
 fn repeated_act_changes_nothing() {
-    let s = Setup::with_host(Some("[unit.disk-reclaim]\nact = true\n"));
+    let s = Setup::with_host("[unit.disk-reclaim]\nact = true\n");
     let cases = [
         (PlanKind::ReclaimDir, false),
         (PlanKind::ReclaimWorktree, false),
@@ -101,11 +110,10 @@ fn repeated_act_changes_nothing() {
     for (n, (kind, needs_approval)) in cases.into_iter().enumerate() {
         for owner_approved in [false, true] {
             let name = format!("case-{n}-{owner_approved}");
-            let wt = s.worktree(&name, &[("node_modules", IgnoredClass::Regenerable)]);
+            let wt = s.worktree(&name);
             write(&wt, "node_modules/pkg/index.js", "x");
             if needs_approval {
-                s.fake
-                    .update(&wt, |w| w.facts.merge_evidence = MergeEvidence::None);
+                s.unset_merged(&s.head(&wt));
             }
             let target = match kind {
                 PlanKind::ReclaimWorktree => wt.clone(),
@@ -126,53 +134,54 @@ fn repeated_act_changes_nothing() {
             } else {
                 (ActStatus::DryRun, Vec::new())
             };
-            let callers = [
-                Caller::Arbiter,
-                Caller::Arbiter,
-                Caller::Owner,
-                Caller::Unit("disk-reclaim".into()),
-            ];
-            for caller in callers {
-                let options = ActOptions {
-                    dry_run: false,
-                    owner_approved,
-                    caller,
-                };
-                assert_eq!(act_in_helper(&s, &plan.id, &options), expected, "{case}");
-                before.assert_unchanged(&s, &wt, &plan.id, &case);
-            }
-
-            // The binary observes the fixture itself, through git. The branch was pushed to a
-            // path, not to a remote, so the worktree has no upstream and counts as unpushed:
-            // a worktree plan is refused for both, whatever the approval, and a directory plan
-            // reports as it does through the fake.
-            let (code, status) = match kind {
-                PlanKind::ReclaimDir => (0, "dry_run"),
-                PlanKind::ReclaimWorktree => (3, "rejected"),
-            };
-            fakes::assert_plans_inside(s.fx.root(), &s.state, &plan.id);
-            for _ in 0..2 {
-                let mut cardinal = s.cardinal();
-                cardinal.args(["act", &plan.id]);
-                if owner_approved {
-                    cardinal.arg("--owner-approved");
-                }
-                let assert = cardinal.assert().code(code);
-                let doc: serde_json::Value =
-                    serde_json::from_slice(&assert.get_output().stdout).unwrap();
-                assert_eq!(doc["status"], status, "{case}: {doc:#}");
-                if kind == PlanKind::ReclaimWorktree {
-                    for check in ["no_unpushed", "has_upstream"] {
-                        assert!(
-                            doc["reasons"]
-                                .as_array()
-                                .is_some_and(|reasons| reasons.iter().any(|r| r == check)),
-                            "{case}: refused for {check}: {doc:#}"
-                        );
+            for (caller, named) in CALLERS {
+                for _ in 0..2 {
+                    let mut args = caller.to_vec();
+                    if owner_approved {
+                        args.push("--owner-approved");
                     }
+                    let result = act(&s, &plan.id, &args);
+                    assert_eq!(result.caller, named, "{case}");
+                    assert_eq!(
+                        (result.status, result.reasons),
+                        expected,
+                        "{case}, {caller:?}"
+                    );
+                    before.assert_unchanged(&s, &wt, &plan.id, &case);
                 }
-                before.assert_unchanged(&s, &wt, &plan.id, &case);
             }
         }
+    }
+}
+
+/// A10 through the binary: a worktree that passes every check (an upstream, merged per gh,
+/// clean, nothing unpushed) reports `dry_run` for the default caller, the owner with
+/// approval, and a unit whose `act` is true, and its contents, its Git linkage, and Git's
+/// administrative data for it are as they were before.
+#[test]
+fn worktree_passing_every_check_is_only_reported() {
+    let s = Setup::with_host("[unit.disk-reclaim]\nact = true\n");
+    let wt = s.worktree("passes");
+    write(&wt, "node_modules/pkg/index.js", "x");
+    let plan = s.plan(PlanKind::ReclaimWorktree, &wt);
+    assert!(
+        plan.checks
+            .iter()
+            .all(|c| c.result == cardinal::contract::CheckResult::Pass),
+        "{:#?}",
+        plan.checks
+    );
+    let before = Untouched::read(&s, &wt, &plan.id);
+    for (args, named) in [
+        (&[][..], "arbiter"),
+        (&["--caller", "owner", "--owner-approved"][..], "owner"),
+        (&["--caller", "unit:disk-reclaim"][..], "unit:disk-reclaim"),
+    ] {
+        let result = act(&s, &plan.id, args);
+        assert_eq!(result.caller, named);
+        assert_eq!(result.status, ActStatus::DryRun, "{named}: {result:#?}");
+        assert!(result.reasons.is_empty(), "{named}: {result:#?}");
+        assert!(result.freed_bytes.unwrap() > 0, "{named}: {result:#?}");
+        before.assert_unchanged(&s, &wt, &plan.id, named);
     }
 }

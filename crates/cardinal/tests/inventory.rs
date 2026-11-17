@@ -1,22 +1,20 @@
 //! `cardinal inventory` (`docs/architecture.md` sections 8 and 11): host facts, budgets and
-//! reservations, in-use state, ignored data, sizes, and outlived processes. Reservations
-//! come from a fake until the runner work unit provides `admission::list_reservations`.
+//! reservations, in-use state, ignored data, sizes, and outlived processes. Reservations and
+//! the in-use locks they come with are made by jobs of the real runner (`support::jobs`).
 
 mod observe_common;
 mod support;
 
-use std::num::NonZeroU64;
 use std::path::Path;
 use std::time::Duration;
 
 use cardinal::contract::{
-    DerivedState, Error, ErrorCode, IgnoredClass, Reservation, ReservationView,
-    ReservationWorktree, SessionProcess, SessionSnapshot, SessionSnapshotSchema, SnapshotAgent,
+    IgnoredClass, SessionProcess, SessionSnapshot, SessionSnapshotSchema, SnapshotAgent,
 };
 use cardinal::state::{LockMode, try_lock, worktree_key};
 use cardinal_test_support::Child;
 use cardinal_test_support::process::wait_for;
-use observe_common::{FakeReservations, Scene, worktree};
+use observe_common::{Scene, worktree};
 use support::helper::{self, Mode};
 
 /// A sleeping helper in `cwd`, inside the fixture.
@@ -27,41 +25,6 @@ fn spawn_helper(scene: &Scene, cwd: &Path) -> Child {
 #[test]
 fn helper() {
     helper::run_if_requested();
-}
-
-fn reservation(
-    job: &str,
-    derived: DerivedState,
-    worktree: Option<&Path>,
-    cpu: u64,
-) -> ReservationView {
-    let reservation: Reservation = serde_json::from_value(serde_json::json!({
-        "schema": "cardinal.reservation.v1",
-        "job_id": job,
-        "state": "running",
-        "boot_s": 1, "created_ms": 2, "updated_ms": 3,
-        "runner": {"pid": 1, "start_s": 1},
-        "group": {"kind": "pgid", "pgid": 1, "leader_start_s": 1},
-        "child": null, "stop_signal_ms": null, "priority": "normal",
-        "resources": {"cpu": cpu},
-        "admission": "within_budget",
-        "class": null, "rule": null, "worktree": null, "session": null,
-        "cwd": "/", "argv": ["cargo", "test"]
-    }))
-    .unwrap();
-    ReservationView {
-        reservation: Reservation {
-            worktree: worktree.map(|path| ReservationWorktree {
-                key: worktree_key(&dunce::canonicalize(path).unwrap()),
-                path: path.to_string_lossy().into_owned(),
-                protected: true,
-            }),
-            ..reservation
-        },
-        derived,
-        members: vec![],
-        verified: false,
-    }
 }
 
 #[test]
@@ -91,58 +54,86 @@ fn the_binary_prints_one_inventory_document() {
     assert_eq!(parsed.repos.len(), 1);
 }
 
+/// The configured budget, and the reservations of a live job, a job whose runner was killed
+/// while its group runs, and a job whose runner was killed before it started: only the first
+/// two count as reserved. The stale job comes last, since the admission pass of any later
+/// runner would delete its reservation. The budget admits all three jobs at once.
+#[cfg(unix)]
 #[test]
 fn budget_reserved_and_reservations() {
-    let scene = Scene::new();
-    std::fs::write(
-        scene.config_dir.join("host.toml"),
-        format!(
-            "[budget]\ncpu = 8\ngpu = 1\n\n[observe]\ngh = '{}'\n",
-            scene.gh_program().display()
-        ),
-    )
-    .unwrap();
-    let config = cardinal::config::Config::load(&scene.config_dir).unwrap();
-    let fake = FakeReservations(Ok(vec![
-        reservation("aaaaaaaaaaaaaaaa", DerivedState::Live, None, 2),
-        reservation("bbbbbbbbbbbbbbbb", DerivedState::RecoveryNeeded, None, 3),
-        reservation("cccccccccccccccc", DerivedState::Stale, None, 4),
-    ]));
-    let inv = cardinal::observe::Observer::new(&config)
-        .with_env(scene.env())
-        .with_reservations(&fake)
-        .inventory(
-            &scene.state(),
-            &cardinal::observe::InventoryOptions {
-                repos: vec![scene.repo.clone()],
-                sizes: false,
-            },
-        )
-        .unwrap();
-    assert_eq!(inv.budget["cpu"], NonZeroU64::new(8).unwrap());
+    use std::num::NonZeroU64;
+
+    use cardinal::contract::DerivedState;
+
+    let mut scene = Scene::new();
+    scene.observe_config("[budget]\ncpu = 16\ngpu = 1");
+    scene.config();
+    let jobs = support::jobs::Jobs::new(scene.fx.scope(), &scene.state_dir, &scene.config_dir);
+    let live = jobs.running(&scene.repo, 2);
+    let crashed = jobs.crashed(&scene.repo, 3);
+    let stale = jobs.stale(&scene.repo, 4);
+
+    let inv = scene.inventory();
+    assert_eq!(inv.budget["cpu"], NonZeroU64::new(16).unwrap());
     assert_eq!(inv.budget["gpu"], NonZeroU64::new(1).unwrap());
     assert_eq!(inv.reserved["cpu"].get(), 5, "live plus recovery-needed");
-    assert_eq!(inv.reservations.len(), 3);
+    let mut found: Vec<(&str, DerivedState)> = inv
+        .reservations
+        .iter()
+        .map(|v| (v.reservation.job_id.as_str(), v.derived))
+        .collect();
+    found.sort_unstable_by_key(|(job, _)| *job);
+    let mut expected = vec![
+        (live.job.as_str(), DerivedState::Live),
+        (crashed.job.as_str(), DerivedState::RecoveryNeeded),
+        (stale.as_str(), DerivedState::Stale),
+    ];
+    expected.sort_unstable_by_key(|(job, _)| *job);
+    assert_eq!(found, expected, "{:#?}", inv.reservations);
     assert_eq!(inv.repos.len(), 1);
 }
 
+/// A worktree is in use while a live job runs in it (its reservation and the in-use lock its
+/// runner holds) and while the reservation of a job whose runner was killed counts; the
+/// reservation of a job that never started counts for nothing. The budget admits the three
+/// one-CPU jobs at once, whatever the host's CPU count.
+#[cfg(unix)]
 #[test]
-fn reservations_lock_and_processes_make_a_worktree_in_use() {
-    let scene = Scene::new();
-    let by_job = scene.worktree("by-job", "by-job");
+fn jobs_make_a_worktree_in_use() {
+    let mut scene = Scene::new();
+    let by_live = scene.worktree("by-live", "by-live");
+    let by_crashed = scene.worktree("by-crashed", "by-crashed");
     let stale = scene.worktree("stale", "stale");
+    let free = scene.worktree("free", "free");
+    scene.observe_config("[budget]\ncpu = 3");
+    scene.config();
+    let jobs = support::jobs::Jobs::new(scene.fx.scope(), &scene.state_dir, &scene.config_dir);
+    let live = jobs.running(&by_live, 1);
+    let crashed = jobs.crashed(&by_crashed, 1);
+    let stale_job = jobs.stale(&stale, 1);
+
+    let inv = scene.inventory();
+    for (wt, job) in [(&by_live, &live.job), (&by_crashed, &crashed.job)] {
+        let w = worktree(&inv, wt);
+        assert!(w.facts.in_use.value, "{w:#?}");
+        assert_eq!(w.facts.in_use.jobs, [job.as_str()], "{w:#?}");
+        assert!(w.reclaim.failed.contains(&"not_in_use".to_owned()));
+    }
+    let w = worktree(&inv, &stale);
+    assert!(
+        !w.facts.in_use.value && w.facts.in_use.jobs.is_empty(),
+        "a stale reservation ({stale_job}) counts for nothing: {w:#?}"
+    );
+    assert!(!worktree(&inv, &free).facts.in_use.value);
+}
+
+/// A worktree is in use while someone holds its in-use lock or a process works inside it.
+#[test]
+fn locks_and_processes_make_a_worktree_in_use() {
+    let scene = Scene::new();
     let by_lock = scene.worktree("by-lock", "by-lock");
     let by_process = scene.worktree("by-process", "by-process");
     let free = scene.worktree("free", "free");
-    let fake = FakeReservations(Ok(vec![
-        reservation(
-            "aaaaaaaaaaaaaaaa",
-            DerivedState::RecoveryNeeded,
-            Some(&by_job),
-            1,
-        ),
-        reservation("bbbbbbbbbbbbbbbb", DerivedState::Stale, Some(&stale), 1),
-    ]));
     let state_dir = scene.state();
     let lock = try_lock(
         &state_dir.worktree_lock(&worktree_key(&by_lock)),
@@ -160,15 +151,7 @@ fn reservations_lock_and_processes_make_a_worktree_in_use() {
         });
     }
 
-    let inv = scene.inventory_with(&fake, false);
-    let w = worktree(&inv, &by_job);
-    assert!(w.facts.in_use.value);
-    assert_eq!(w.facts.in_use.jobs, ["aaaaaaaaaaaaaaaa"]);
-    assert!(w.reclaim.failed.contains(&"not_in_use".to_owned()));
-    assert!(
-        !worktree(&inv, &stale).facts.in_use.value,
-        "a stale reservation counts for nothing"
-    );
+    let inv = scene.inventory();
     assert!(worktree(&inv, &by_lock).facts.in_use.value);
     assert_eq!(
         worktree(&inv, &by_process).facts.in_use.value,
@@ -181,16 +164,32 @@ fn reservations_lock_and_processes_make_a_worktree_in_use() {
     }
 }
 
+/// Reservations that cannot be read are an error of the inventory, and leave every
+/// worktree's in-use state unknown.
 #[test]
 fn unreadable_reservations_leave_in_use_unknown() {
     let scene = Scene::new();
     let wt = scene.worktree("feat", "feat");
-    let fake = FakeReservations(Err(Error::new(ErrorCode::StateUnavailable, "broken")));
-    let inv = scene.inventory_with(&fake, false);
+    let config = scene.config();
+    // Opened first: opening the state dir creates `reservations/` and fails on a file there.
+    let state = scene.state();
+    let reservations = state.reservations_dir();
+    std::fs::remove_dir(&reservations).unwrap();
+    std::fs::write(&reservations, "not a directory").unwrap();
+    let inv = cardinal::observe::Observer::new(&config)
+        .with_env(scene.env())
+        .inventory(
+            &state,
+            &cardinal::observe::InventoryOptions {
+                repos: vec![scene.repo.clone()],
+                sizes: false,
+            },
+        )
+        .unwrap();
     assert!(
+        inv.errors.iter().any(|e| e.scope == "reservations"),
+        "{:#?}",
         inv.errors
-            .iter()
-            .any(|e| e.scope == "reservations" && e.message == "broken")
     );
     let w = worktree(&inv, &wt);
     assert!(w.reclaim.unknown.contains(&"not_in_use".to_owned()));
@@ -202,8 +201,7 @@ fn inventory_is_read_only_for_the_state_dir() {
     let scene = Scene::new();
     scene.worktree("feat", "feat");
     let state = scene.state();
-    let fake = FakeReservations::none();
-    scene.inventory_with(&fake, true);
+    scene.inventory_with(true);
     assert_eq!(
         std::fs::read_dir(state.worktrees_dir()).unwrap().count(),
         0,
@@ -258,7 +256,7 @@ fn ignored_entries_are_classified_and_sized() {
         assert!(w.reclaim.failed.contains(&check.to_owned()), "{check}");
     }
 
-    let inv = scene.inventory_with(&FakeReservations::none(), true);
+    let inv = scene.inventory_with(true);
     let sized = class_of(&inv, "node_modules").allocated_bytes.unwrap();
     assert!(sized >= 5000, "{sized}");
     assert_eq!(
@@ -295,7 +293,6 @@ fn repositories_are_deduplicated_by_common_dir() {
     let config = scene.config();
     let inv = cardinal::observe::Observer::new(&config)
         .with_env(scene.env())
-        .with_reservations(&FakeReservations::none())
         .inventory(
             &scene.state(),
             &cardinal::observe::InventoryOptions {

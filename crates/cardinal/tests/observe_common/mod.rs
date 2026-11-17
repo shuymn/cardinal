@@ -1,7 +1,8 @@
 //! A repository scene for the observation tests: a main worktree whose `origin` is a
 //! GitHub URL, remote-tracking refs written directly (observation never fetches, and the
 //! fixture disables every transport), a fake `gh` answering from files, and a cardinal
-//! configuration that points at it.
+//! configuration that points at it. Reservations are the real ones of the scene's state
+//! dir, read through `admission`.
 
 #![allow(
     dead_code,
@@ -13,29 +14,14 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use cardinal::config::Config;
-use cardinal::contract::{Error, Inventory, ReservationView, Worktree};
-use cardinal::observe::{InventoryOptions, Observer, Reservations, WorktreeObservation};
+use cardinal::contract::{Error, Inventory, Worktree};
+use cardinal::observe::{InventoryOptions, Observer, WorktreeObservation};
 use cardinal::state::StateDir;
 
 use cardinal_test_support::Command;
 use cardinal_test_support::fixture::Fixture;
 
 pub const GITHUB: &str = "acme/app";
-
-/// Reservations for tests of observation alone: a fixed list, or a read failure.
-pub struct FakeReservations(pub Result<Vec<ReservationView>, Error>);
-
-impl FakeReservations {
-    pub fn none() -> Self {
-        Self(Ok(Vec::new()))
-    }
-}
-
-impl Reservations for FakeReservations {
-    fn list(&self, _state: &StateDir) -> Result<Vec<ReservationView>, Error> {
-        self.0.clone()
-    }
-}
 
 pub struct Scene {
     pub fx: Fixture,
@@ -47,6 +33,8 @@ pub struct Scene {
     observe_extra: String,
     /// `[observe] gh_timeout_ms`: long enough for a loaded machine by default.
     pub gh_timeout_ms: u64,
+    /// `[observe] git_timeout_ms`: long enough for a loaded machine by default.
+    pub git_timeout_ms: u64,
 }
 
 impl Scene {
@@ -71,6 +59,7 @@ impl Scene {
             state_dir,
             observe_extra: String::new(),
             gh_timeout_ms: 15_000,
+            git_timeout_ms: 15_000,
         };
         scene.push(&scene.repo, "main");
         scene.fx.symbolic_ref(
@@ -135,6 +124,16 @@ impl Scene {
         std::fs::write(self.gh_dir.join(format!("{kind}.code")), code.to_string()).unwrap();
     }
 
+    /// Makes the `kind` query write `line` to stderr.
+    pub fn gh_stderr(&self, kind: &str, line: &str) {
+        std::fs::write(self.gh_dir.join(format!("{kind}.err")), format!("{line}\n")).unwrap();
+    }
+
+    /// Makes the merged pull request search for `oid` fall back to the default answer.
+    pub fn unset_merged(&self, oid: &str) {
+        std::fs::remove_file(self.gh_dir.join(format!("merged-{oid}.out"))).unwrap();
+    }
+
     /// Makes the `kind` query hang past any deadline.
     pub fn gh_hangs(&self, kind: &str) {
         std::fs::write(self.gh_dir.join(format!("{kind}.sleep")), "").unwrap();
@@ -176,6 +175,7 @@ done
 [ -f "$dir/$kind.sleep" ] && exec sleep 30
 f="$dir/$kind-$search.out"; [ -f "$f" ] || f="$dir/$kind.out"
 [ -f "$f" ] && cat "$f"
+[ -f "$dir/$kind.err" ] && cat "$dir/$kind.err" >&2
 code=0; [ -f "$dir/$kind.code" ] && code=$(cat "$dir/$kind.code")
 exit "$code"
 "#
@@ -202,6 +202,7 @@ exit "$code"
              set f={dir}\\!kind!-!search!.out\r\n\
              if not exist \"!f!\" set f={dir}\\!kind!.out\r\n\
              if exist \"!f!\" type \"!f!\"\r\n\
+             if exist \"{dir}\\!kind!.err\" type \"{dir}\\!kind!.err\" 1>&2\r\n\
              set code=0\r\n\
              if exist \"{dir}\\!kind!.code\" set /p code=<\"{dir}\\!kind!.code\"\r\n\
              exit /b !code!\r\n"
@@ -227,9 +228,10 @@ exit "$code"
     /// Writes `host.toml` and loads the configuration.
     pub fn config(&self) -> Config {
         let host = format!(
-            "[observe]\ngh = '{}'\ngh_timeout_ms = {}\ngit_timeout_ms = 15000\n{}",
+            "[observe]\ngh = '{}'\ngh_timeout_ms = {}\ngit_timeout_ms = {}\n{}",
             self.gh_program().display(),
             self.gh_timeout_ms,
+            self.git_timeout_ms,
             self.observe_extra
         );
         std::fs::write(self.config_dir.join("host.toml"), host).unwrap();
@@ -272,12 +274,11 @@ exit "$code"
         env
     }
 
-    /// `inventory --repo <repo>` through the library, with `reservations`.
-    pub fn inventory_with(&self, reservations: &FakeReservations, sizes: bool) -> Inventory {
+    /// `inventory --repo <repo>` through the library, with `--sizes` if `sizes`.
+    pub fn inventory_with(&self, sizes: bool) -> Inventory {
         let config = self.config();
         Observer::new(&config)
             .with_env(self.env())
-            .with_reservations(reservations)
             .inventory(
                 &self.state(),
                 &InventoryOptions {
@@ -288,18 +289,16 @@ exit "$code"
             .unwrap()
     }
 
-    /// `inventory --repo <repo>` with no reservations.
+    /// `inventory --repo <repo>`.
     pub fn inventory(&self) -> Inventory {
-        self.inventory_with(&FakeReservations::none(), false)
+        self.inventory_with(false)
     }
 
-    /// `observe_worktree` of `path` with no reservations.
+    /// `observe_worktree` of `path`.
     pub fn observe(&self, path: &Path) -> Result<WorktreeObservation, Error> {
         let config = self.config();
-        let reservations = FakeReservations::none();
         Observer::new(&config)
             .with_env(self.env())
-            .with_reservations(&reservations)
             .observe_worktree(&self.state(), path)
     }
 

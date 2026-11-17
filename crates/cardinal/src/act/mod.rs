@@ -19,7 +19,7 @@ use crate::contract::{
     ConfigKey, Error, InUse, Plan, PlanKind, Provenance, RecordKind, RootId,
 };
 use crate::observe::WorktreeObservation;
-use crate::plan::{self, DataLists, InUseFacts, Inspection, Real, Sources, Walk};
+use crate::plan::{self, DataLists, InUseFacts, Inspection, Real, Walk};
 use crate::state::{self, LockMode, Probe, StateDir};
 use crate::testpoint;
 
@@ -39,22 +39,11 @@ pub fn execute(
     plan_id: &str,
     options: &ActOptions,
 ) -> Result<ActResult, Error> {
-    execute_with(config, state, &Real { config, state }, plan_id, options)
-}
-
-/// [`execute`] with the given sources.
-pub fn execute_with(
-    config: &Config,
-    state: &StateDir,
-    sources: &dyn Sources,
-    plan_id: &str,
-    options: &ActOptions,
-) -> Result<ActResult, Error> {
     let plan = plan::load(state, plan_id)?;
     let run = Run {
         config,
         state,
-        sources,
+        sources: Real { config, state },
         plan: &plan,
         options,
     };
@@ -104,7 +93,7 @@ impl Outcome {
 struct Run<'a> {
     config: &'a Config,
     state: &'a StateDir,
-    sources: &'a dyn Sources,
+    sources: Real<'a>,
     plan: &'a Plan,
     options: &'a ActOptions,
 }
