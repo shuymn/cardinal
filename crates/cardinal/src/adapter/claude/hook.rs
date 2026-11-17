@@ -82,8 +82,9 @@ fn positive(value: Option<String>) -> Option<u64> {
 
 /// The timeout written into each spec (section 6.3, step 4): `tool_input.timeout` if it is a
 /// positive number, else `BASH_DEFAULT_TIMEOUT_MS`, else 120000; capped at the larger of
-/// `BASH_MAX_TIMEOUT_MS` (else 600000) and the default.
-pub(super) fn timeout_ms(
+/// `BASH_MAX_TIMEOUT_MS` (else 600000) and the default. `explain command` resolves its
+/// timeout here too.
+pub(crate) fn timeout_ms(
     tool_input: &Map<String, Value>,
     var: &dyn Fn(&str) -> Option<String>,
 ) -> u64 {

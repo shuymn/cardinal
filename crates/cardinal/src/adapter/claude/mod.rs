@@ -22,6 +22,9 @@ use crate::state::{Durability, StateDir, now_ms};
 
 use hook::{Pass, Settings};
 
+pub(crate) use hook::timeout_ms;
+pub(crate) use repo::{Repo, origin};
+
 /// The most hook input read from stdin.
 const MAX_INPUT: u64 = 1024 * 1024;
 

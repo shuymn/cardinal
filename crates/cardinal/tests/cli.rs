@@ -1,5 +1,5 @@
-//! The `cardinal` binary: help, versions, usage errors, and the `not_implemented` answer of
-//! every command whose body belongs to a later work unit.
+//! The `cardinal` binary: help, versions, usage errors, and the errors every command answers
+//! with: a `cardinal.error.v1` document on stdout, a line on stderr, and exit 1.
 
 mod support;
 
@@ -62,26 +62,6 @@ fn version_is_text() {
 }
 
 #[test]
-fn unimplemented_commands_answer_not_implemented_with_exit_1() {
-    let dirs = Dirs::new();
-    // Commands with written bodies are tested with their modules (`tests/act_single.rs`,
-    // `tests/inbox.rs`, `tests/explain.rs`, and `tests/plan_act.rs`, which runs `plan` only
-    // on a fixture repository); this one still waits for the classifier it calls.
-    let commands: &[&[&str]] = &[&["explain", "command", "--cwd", "/w", "--", "pnpm test"]];
-    for args in commands {
-        let assert = dirs.cmd().args(*args).assert().code(1);
-        let output = assert.get_output();
-        let doc = json(&output.stdout);
-        assert_eq!(doc["schema"], "cardinal.error.v1", "{args:?}");
-        assert_eq!(doc["error"]["code"], "not_implemented", "{args:?}");
-        assert!(
-            String::from_utf8_lossy(&output.stderr).starts_with("cardinal: "),
-            "{args:?}: a human-readable line on stderr"
-        );
-    }
-}
-
-#[test]
 fn hooks_always_exit_0() {
     let dirs = Dirs::new();
     for event in ["pre-tool-use", "subagent-stop", "session-end"] {
@@ -128,8 +108,14 @@ fn invalid_config_is_config_invalid() {
     let dirs = Dirs::new();
     std::fs::write(dirs.config().join("host.toml"), "typo = 1\n").unwrap();
     let assert = dirs.cmd().arg("inventory").assert().code(1);
-    let doc = json(&assert.get_output().stdout);
+    let output = assert.get_output();
+    let doc = json(&output.stdout);
+    assert_eq!(doc["schema"], "cardinal.error.v1");
     assert_eq!(doc["error"]["code"], "config_invalid");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).starts_with("cardinal: "),
+        "a human-readable line on stderr"
+    );
     assert!(
         doc["error"]["message"]
             .as_str()

@@ -74,7 +74,15 @@ const TABLE: &[(&str, &[&str])] = &[
     ),
     (
         "explain",
-        &["classify", "record", "plan", "inbox", "state", "contract"],
+        &[
+            "adapter::claude",
+            "classify",
+            "record",
+            "plan",
+            "inbox",
+            "state",
+            "contract",
+        ],
     ),
 ];
 

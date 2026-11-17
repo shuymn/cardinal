@@ -3,12 +3,13 @@
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
-use crate::classify;
-use crate::config::{self, Config, Selection};
+use crate::adapter::claude::{self, Repo};
+use crate::classify::{self, BuiltIn, CallIds, Context, Origin, Rewritten};
+use crate::config::Config;
 use crate::contract::{
-    CheckResult, ClassifyDecision, ClassifyRepo, ClassifyRequest, ClassifyRequestSchema,
-    ClassifyResponse, ClassifyTool, Error, ErrorCode, Explain, ExplainKind, ExplainSchema,
+    CheckResult, ClassifyTool, Error, ErrorCode, Explain, ExplainKind, ExplainSchema,
     ExplainSource, ExplainSubject, Plan, Record, RecordKind, Reservation, ToolName,
 };
 use crate::inbox;
@@ -29,93 +30,13 @@ pub enum Subject {
     },
 }
 
-/// One stage's classification as the hook would see it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StageTrace {
-    pub response: ClassifyResponse,
-    /// The argv the rules were matched against (section 7.3).
-    pub normalized_argv: Vec<String>,
-    /// The `commands` entry of the rule that matched, as written.
-    pub pattern: Option<String>,
-    /// Where that rule is configured.
-    pub profile: Option<ProfileKey>,
-}
-
-/// A profile file and the key in it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ProfileKey {
-    pub file: PathBuf,
-    pub key: String,
-}
-
-/// The classification `explain command` traces: the stages of a command, each stage's
-/// classification with what it matched, and the rewrite the hook would produce.
-pub trait Tracer {
-    /// The stages of `command`, or the refusal of the whole command (section 7.2).
-    fn stages(&self, command: &str) -> Result<Vec<classify::Stage>, Error>;
-    /// One stage's classification against the rules of `selection`.
-    fn trace(
-        &self,
-        request: &ClassifyRequest,
-        selection: &Selection<'_>,
-    ) -> Result<StageTrace, Error>;
-    /// The rewritten command for the classified stages and runner path, or the reasons the
-    /// command or its stages stay unwrapped.
-    fn rewrite(
-        &self,
-        command: &str,
-        classified: &[(&classify::Stage, StageTrace)],
-        runner: &Path,
-    ) -> Result<String, Vec<String>>;
-}
-
-/// The classification module. Stages come from `classify::find_stages`; the trace and the
-/// rewrite are the classification module's pure trace and rewrite functions, which the hook
-/// shares, and answer `not_implemented` and `rewrite_unavailable` until they are wired in.
-pub struct Classifier;
-
-impl Tracer for Classifier {
-    fn stages(&self, command: &str) -> Result<Vec<classify::Stage>, Error> {
-        classify::find_stages(command)
-    }
-
-    fn trace(
-        &self,
-        request: &ClassifyRequest,
-        selection: &Selection<'_>,
-    ) -> Result<StageTrace, Error> {
-        let _ = (request, selection);
-        Err(Error::not_implemented("classify::trace"))
-    }
-
-    fn rewrite(
-        &self,
-        command: &str,
-        classified: &[(&classify::Stage, StageTrace)],
-        runner: &Path,
-    ) -> Result<String, Vec<String>> {
-        let _ = (command, classified, runner);
-        Err(vec!["rewrite_unavailable".to_owned()])
-    }
-}
-
 /// `cardinal explain`.
 pub fn explain(config: &Config, state: &StateDir, subject: &Subject) -> Result<Explain, Error> {
-    explain_with(config, state, subject, &Classifier)
-}
-
-/// [`explain`] tracing commands through `tracer`.
-pub fn explain_with(
-    config: &Config,
-    state: &StateDir,
-    subject: &Subject,
-    tracer: &dyn Tracer,
-) -> Result<Explain, Error> {
     match subject {
         Subject::Job(id) => job(state, id),
         Subject::Plan(id) => plan(config, state, id),
         Subject::Inbox(key) => inbox_item(state, key),
-        Subject::Command { cwd, command } => command_trace(config, tracer, cwd.as_deref(), command),
+        Subject::Command { cwd, command } => command_trace(config, cwd.as_deref(), command),
     }
 }
 
@@ -420,80 +341,23 @@ fn inbox_item(state: &StateDir, key: &str) -> Result<Explain, Error> {
     ))
 }
 
-/// `explain command [--cwd DIR] -- STRING`: the stages and their classification, without
-/// running anything: for each wrapped stage, the rule, the pattern it matched, the normalized
-/// argv, and the profile key. Profiles are selected by path; matching by remote needs git and
-/// is left to the hook.
-fn command_trace(
-    config: &Config,
-    tracer: &dyn Tracer,
-    cwd: Option<&Path>,
-    command: &str,
-) -> Result<Explain, Error> {
+/// `explain command [--cwd DIR] -- STRING`: each stage's classification and the rewrite the
+/// hook would produce for a foreground Bash call of `command` in `cwd` that names no timeout,
+/// session, or tool use, or null with the reasons in the summary. The trace and the rewrite
+/// come from the functions the hook classifies and rewrites with (`classify::select`,
+/// `decide`, `trace`, and `rewrite`), and the repository, its origin, and the timeout from
+/// the hook's own lookups under the hook's deadline, so the two cannot drift apart.
+fn command_trace(config: &Config, cwd: Option<&Path>, command: &str) -> Result<Explain, Error> {
+    let deadline = Instant::now() + Duration::from_millis(config.host.hook.deadline_ms);
     let cwd = match cwd {
         Some(cwd) => cwd.to_path_buf(),
         None => std::env::current_dir()
             .map_err(|err| Error::new(ErrorCode::InvalidArgument, err.to_string()))?,
     };
-    let root = state::find_worktree_root(&cwd);
-    let common = root.as_deref().and_then(config::git_common_dir);
-    let selection: Selection<'_> =
-        config.select(|p| common.as_deref().is_some_and(|c| p.matches_common_dir(c)));
-    let stages = tracer.stages(command)?;
-    let mut sources = Vec::new();
-    let mut classified = Vec::new();
-    for stage in &stages {
-        let request = ClassifyRequest {
-            schema: ClassifyRequestSchema,
-            command: command.to_owned(),
-            stage: command
-                .get(stage.span.clone())
-                .unwrap_or_default()
-                .to_owned(),
-            argv: stage.words.clone(),
-            cwd: cwd.display().to_string(),
-            repo: common
-                .as_ref()
-                .zip(root.as_ref())
-                .map(|(c, r)| ClassifyRepo {
-                    common_dir: c.display().to_string(),
-                    main_worktree: r.display().to_string(),
-                    remote: None,
-                }),
-            tool: ClassifyTool {
-                name: ToolName::Bash,
-                timeout_ms: 120_000,
-                background: false,
-            },
-        };
-        let trace = tracer.trace(&request, &selection)?;
-        if trace.response.decision == ClassifyDecision::Wrap {
-            sources.push(ExplainSource::Rule {
-                rule: trace.response.rule.clone().unwrap_or_default(),
-                pattern: trace.pattern.clone().unwrap_or_default(),
-                normalized_argv: trace.normalized_argv.clone(),
-            });
-            if let Some(profile) = &trace.profile {
-                sources.push(ExplainSource::Config {
-                    file: profile.file.display().to_string(),
-                    key: profile.key.clone(),
-                    value: trace.pattern.clone().into(),
-                });
-            }
-            classified.push((stage, trace));
-        }
-    }
-    let mut summary = format!("{} stages, {} classified", stages.len(), classified.len());
-    let mut rewritten = None;
-    if !classified.is_empty() {
-        let runner = std::env::current_exe().unwrap_or_default();
-        match tracer.rewrite(command, &classified, &runner) {
-            Ok(text) => rewritten = Some(text),
-            Err(skips) => {
-                let _ = write!(summary, "; not rewritten: {}", skips.join(", "));
-            }
-        }
-    }
+    let (sources, summary, rewritten) = match classify::tokenize(command) {
+        Ok(stages) => classify_command(config, &cwd, command, stages, deadline),
+        Err(refusal) => (Vec::new(), format!("not rewritten: {refusal}"), None),
+    };
     let mut doc = document(
         ExplainKind::Command,
         command.to_owned(),
@@ -503,4 +367,127 @@ fn command_trace(
     );
     doc.rewritten = rewritten;
     Ok(doc)
+}
+
+/// Classifies the stages of `command` as the hook does (sections 6.3 and 7): the rule,
+/// pattern, normalized argv, and profile key of each wrapped stage as sources, a summary
+/// with why each other stage stays unwrapped, and the rewritten command.
+fn classify_command(
+    config: &Config,
+    cwd: &Path,
+    command: &str,
+    stages: Vec<classify::Stage>,
+    deadline: Instant,
+) -> (Vec<ExplainSource>, String, Option<String>) {
+    let repo = Repo::locate(cwd);
+    let origin = || match &repo {
+        Some(repo) => claude::origin(&config.host.observe.git, &repo.root, deadline),
+        None => Origin::Unknown,
+    };
+    let common_dir = repo.as_ref().map(|repo| repo.common_dir.as_path());
+    let Some((selection, remote)) = classify::select(config, &stages, common_dir, origin) else {
+        return (Vec::new(), "not rewritten: deadline_missed".into(), None);
+    };
+    let var = |name: &str| std::env::var(name).ok();
+    let tool = ClassifyTool {
+        name: ToolName::Bash,
+        timeout_ms: claude::timeout_ms(&serde_json::Map::new(), &var),
+        background: false,
+    };
+    let classify_repo = common_dir.map(|dir| classify::request_repo(dir, remote.as_deref()));
+    let cwd_text = cwd.to_string_lossy();
+    let ctx = Context {
+        command,
+        cwd: &cwd_text,
+        repo: classify_repo.as_ref(),
+        tool: &tool,
+    };
+    let outcomes = classify::decide(
+        stages,
+        &ctx,
+        &selection,
+        &BuiltIn {
+            selection: &selection,
+        },
+        deadline,
+    );
+
+    let traces = classify::trace(command, &outcomes, &selection);
+    let mut sources = Vec::new();
+    let mut summary = format!(
+        "{} stages, {} wrapped",
+        traces.len(),
+        traces.iter().filter(|t| t.skip.is_none()).count()
+    );
+    for trace in &traces {
+        if let Some(skip) = trace.skip {
+            let _ = write!(
+                summary,
+                "; stage {} unwrapped: {}",
+                trace.index,
+                skip.as_str()
+            );
+            continue;
+        }
+        let Some(matched) = &trace.matched else {
+            continue;
+        };
+        sources.push(ExplainSource::Rule {
+            rule: matched.rule.clone(),
+            pattern: matched.pattern.clone(),
+            normalized_argv: trace.argv.clone().unwrap_or_default(),
+        });
+        let id = matched
+            .rule
+            .strip_prefix(&format!("{}/", matched.profile))
+            .unwrap_or(&matched.rule);
+        sources.push(ExplainSource::Config {
+            file: matched.file.display().to_string(),
+            key: format!("rule.{id}.commands"),
+            value: matched.pattern.clone().into(),
+        });
+    }
+    let rewritten = match hook_rewrite(config, &ctx, &outcomes, deadline) {
+        Ok(text) => Some(text),
+        Err(reason) => {
+            let _ = write!(summary, "; not rewritten: {reason}");
+            None
+        }
+    };
+    (sources, summary, rewritten)
+}
+
+/// The rewrite the hook would print for `outcomes`, or why it prints nothing: on Windows, with
+/// the hook disabled, with an unusable runner path, past the hook's deadline, or with no
+/// stage wrapped.
+fn hook_rewrite(
+    config: &Config,
+    ctx: &Context<'_>,
+    outcomes: &[classify::StageOutcome],
+    deadline: Instant,
+) -> Result<String, String> {
+    if cfg!(windows) {
+        return Err("the hook does not rewrite on Windows".into());
+    }
+    if !config.host.hook.enabled {
+        return Err("hook.enabled is false".into());
+    }
+    let runner = config
+        .host
+        .hook
+        .runner_path()
+        .map_err(|err| format!("config_invalid: {err}"))?;
+    if Instant::now() > deadline {
+        return Err("deadline_missed".into());
+    }
+    match classify::rewrite(
+        ctx,
+        outcomes,
+        &runner,
+        &config.host.admission.default_resources,
+        &CallIds::default(),
+    ) {
+        Rewritten::Command(text) => Ok(text),
+        Rewritten::Unchanged(_) => Err("no stage is wrapped".into()),
+    }
 }

@@ -74,7 +74,7 @@ Everything lives in the single crate `crates/cardinal` (library plus the `cardin
 | `plan` | Plan generation, identity binding | `observe`, `admission`, `state`, `record`, `contract` |
 | `act` | Plan evaluation: snapshot inspection, identity recheck, checks; report-only in phase 0 | `plan`, `observe`, `admission`, `state`, `record`, `contract`, `testpoint`, rustix |
 | `inbox` | Inbox store, dedup, refresh (recovery pass and built-in raisers) | `admission`, `observe`, `state`, `record`, `contract` |
-| `explain` | Explanation documents | `classify`, `record`, `plan`, `inbox`, `state`, `contract` |
+| `explain` | Explanation documents | `adapter::claude` (the hook's repository, origin, and timeout lookups for `explain command`), `classify`, `record`, `plan`, `inbox`, `state`, `contract` |
 | `cli` | clap definitions and thin handlers that print JSON | everything |
 
 "May use" is read transitively: a module may also use whatever the modules it may use may use, so `run` may use `contract` through `admission`. `testpoint` is open to every module above the foundation. `tests/layering.rs` checks every `crate::` and `super::` path in `src/` against this reading; a glob import of the crate root or an alias of `crate` counts as using every module, and `clippy::wildcard_imports` is denied, so no module comes into scope without a path the test sees.
@@ -88,6 +88,7 @@ flowchart TD
   cli --> inbox
   cli --> explain
   cli --> observe
+  explain --> adapter_claude
   adapter_claude --> classify
   run --> admission
   run --> exec

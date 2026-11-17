@@ -22,7 +22,7 @@ const MAX_OUTPUT: u64 = 64 * 1024;
 
 /// The worktree a cwd is in and its repository identity.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct Repo {
+pub(crate) struct Repo {
     /// The worktree root: the nearest directory with a `.git` entry.
     pub root: PathBuf,
     /// The canonical git common dir.
@@ -40,8 +40,8 @@ impl Repo {
 
 /// `git remote get-url origin` in `root`, run as section 8.1 requires and ended at
 /// `deadline`. Past the deadline git is not started, or its process group is killed and git
-/// reaped.
-pub(super) fn origin(git: &str, root: &Path, deadline: Instant) -> Origin {
+/// reaped. `explain command` reads the origin here too.
+pub(crate) fn origin(git: &str, root: &Path, deadline: Instant) -> Origin {
     // A child the deadline would end at once is not started.
     if Instant::now() >= deadline {
         return Origin::TimedOut;
