@@ -154,6 +154,20 @@ scan() {
   esac
 }
 
+# Process <pid> for a message: its group and command line, and its parent's PID and command
+# line, which lead to the test that started it (a parent that is init or a subreaper means
+# the process was orphaned).
+describe() {
+  local line pid ppid pgid args parent
+  if ! line=$(ps -o pid= -o ppid= -o pgid= -o args= -p "$1" 2>/dev/null); then
+    printf '%s (exited)' "$1"
+    return
+  fi
+  read -r pid ppid pgid args <<<"$line"
+  parent=$(ps -o args= -p "$ppid" 2>/dev/null) || parent='(exited)'
+  printf '%s in group %s: %s; parent %s: %s' "$pid" "$pgid" "$args" "$ppid" "$parent"
+}
+
 # The PIDs that belong to the run.
 marked_pids() {
   local found
@@ -181,12 +195,12 @@ sweep() {
   pids=$(printf '%s\n' "$found" | grep -v '^?' || true)
   hidden=$(printf '%s\n' "$found" | sed -n 's/^?//p' | sort)
   for pid in $(printf '%s\n' "$hidden" | comm -13 "$R/hidden" - 2>/dev/null); do
-    say "cannot tell whether process $(ps -o pid= -o command= -p "$pid" 2>/dev/null || echo "$pid") belongs to the run; it started during the run"
+    say "cannot tell whether process $(describe "$pid") belongs to the run; it started during the run"
     failed=1
   done
   [ -n "$pids" ] || return "$failed"
   for pid in $pids; do
-    say "leftover test process: $(ps -o pid= -o pgid= -o command= -p "$pid" 2>/dev/null || echo "$pid")"
+    say "leftover test process $(describe "$pid")"
     kill -KILL "$pid" 2>/dev/null || true
     swept=$((swept + 1))
   done
@@ -198,7 +212,13 @@ sweep() {
 }
 
 # Starts a process the way a test process starts, confined and with the marker, and checks
-# that the sweep sees it, so a sweep that finds nothing means nothing was left.
+# that the sweep sees it, so a sweep that finds nothing means nothing was left; then checks
+# that nothing of it outlives its kill, so a leftover found later is a test's.
+#
+# The probe reports its PID from inside the runner, and the check waits for that process,
+# not the runner: bubblewrap forks the command and sets it to die with bubblewrap only right
+# before the exec, so killing bubblewrap during its setup would orphan the command. The
+# command is killed first, and bubblewrap exits with it.
 check_sweep() {
   started=1
   [ "$os" != Windows ] || {
@@ -212,30 +232,53 @@ check_sweep() {
   fi
   # Processes whose membership is already hidden are not this run's.
   printf '%s\n' "$found" | sed -n 's/^?//p' | sort >"$R/hidden"
-  # shellcheck disable=SC2086 # the runner is a command line without spaces
-  env -i PATH="$PATH" "$marker" $runner sleep 30 &
-  local probe=$! pids tries=0
-  # The fork shows the marker or the sandbox only once env has run.
+  local ready=$R/probe.pid
+  # shellcheck disable=SC2016,SC2086 # $$ and $1 are the probe's; the runner has no spaces
+  env -i PATH="$PATH" "$marker" $runner \
+    sh -c 'echo "$$" >"$1.tmp" && mv "$1.tmp" "$1" && exec sleep 30' sh "$ready" </dev/null &
+  local probe=$! pid='' pids='' seen=0 unreadable=0 tries=0
+  while [ "$tries" -lt 50 ]; do
+    [ -n "$pid" ] || pid=$(cat "$ready" 2>/dev/null) || pid=''
+    if [ -n "$pid" ]; then
+      pids=$(marked_pids) || {
+        unreadable=1
+        break
+      }
+      case " $(printf '%s ' $pids)" in
+        *" $pid "*)
+          seen=1
+          break
+          ;;
+      esac
+    fi
+    tries=$((tries + 1))
+    sleep 0.1
+  done
+  [ -z "$pid" ] || kill -KILL "$pid" 2>/dev/null || true
+  kill -KILL "$probe" 2>/dev/null || true
+  wait "$probe" 2>/dev/null || true
+  if [ "$unreadable" -eq 1 ]; then
+    say "cannot read the process table"
+    return 1
+  elif [ "$seen" -eq 0 ]; then
+    say "the process sweep cannot see its probe process ${pid:-(it did not start)}"
+    return 1
+  fi
+  tries=0
   while :; do
     pids=$(marked_pids) || {
-      kill "$probe"
       say "cannot read the process table"
       return 1
     }
-    case " $(printf '%s ' $pids)" in *" $probe "*) break ;; esac
+    [ -n "$pids" ] || return 0
     tries=$((tries + 1))
-    [ "$tries" -lt 50 ] || break
+    [ "$tries" -lt 20 ] || break
     sleep 0.1
   done
-  kill "$probe"
-  wait "$probe" 2>/dev/null || true
-  case " $(printf '%s ' $pids)" in
-    *" $probe "*) ;;
-    *)
-      say "the process sweep cannot see process $probe"
-      return 1
-      ;;
-  esac
+  for pid in $pids; do
+    say "the process sweep's probe left process $(describe "$pid")"
+  done
+  return 1
 }
 
 # --- Confinement -------------------------------------------------------------------------
