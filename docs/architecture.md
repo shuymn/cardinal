@@ -685,7 +685,7 @@ Each plan carries a list of checks. An **invariant** failing or being `unknown` 
 | `no_open_pr` | `reclaim_worktree` | invariant | `open_pr` is `no` |
 | `has_upstream` | `reclaim_worktree` | invariant | The branch has an upstream (G6). This also keeps freshly created worktrees, which start clean at the base, from being reclaimed before their first push |
 | `regenerable` | `reclaim_dir` | invariant | The target is a `regenerable` ignored entry of a worktree that observation listed |
-| `plain_target` | both | invariant | The target is not a symbolic link, not a mount point, and on the same device as its parent |
+| `plain_target` | both | invariant | The target is not a symbolic link, not a mount point, and on the same device and mount as its parent. A bind mount on the same device counts as a mount point: the mount is told by its mount ID (`statx`) on Linux and by the path it is mounted on (`statfs`) on macOS; a mount that cannot be read is `unknown`. `plan` reads mount points from `/proc/self/mountinfo` on Linux and compares devices elsewhere; `act` checks mounts on every platform |
 | `no_protected` | both | invariant | Nothing in the target, descendants included, is protected |
 | `no_unclassifiable` | both | invariant | Nothing in the target is unclassifiable ignored data |
 | `no_nested_repository` | both | invariant | No directory below the target's root has its own `.git` entry (another worktree, a submodule, a nested clone) |
@@ -706,11 +706,11 @@ A plan stores the target identity: `host_id`, repository common dir, worktree pa
 1. Load the plan; a wrong `host_id` gives `expired`.
 2. Claim: create `plans/<id>/claim` with `create_new`; fsync. If it exists: `already_executed`.
 3. Take the worktree's in-use lock exclusively (`try_lock`), check reservations under the admission lock, and hold the lock until step 7 ends.
-4. **Snapshot:** walk the target without following symbolic links or crossing devices and record each entry's `(dev, ino, type, size, mtime)`.
+4. **Snapshot:** walk the target without following symbolic links or crossing devices or mounts and record each entry's `(dev, ino, type, size, mtime)`. A directory on another device or mount is recorded but not entered.
 5. **Checks, after the snapshot:** re-observe the target from scratch (section 8), comparing identity (`expired` on a difference), and evaluate every check of section 9.2: the git and gh facts (`clean`, HEAD, branch, `no_unpushed`, …) and, on the snapshot's entries, `plain_target`, `no_protected`, `no_unclassifiable`, `no_nested_repository`, and the process part of `not_in_use`. An invariant not `pass`, or a failed condition without `--owner-approved` (`owner_approval_required`): `rejected`, nothing touched.
-6. **Delete bottom-up** after re-reading the identity of section 9.4 (root identity, HEAD, branch) once more; any difference gives `expired` with nothing touched, for every plan kind. Use directory descriptors: open the target root relative to its parent and each directory relative to its own parent, never following links (`openat` with `O_DIRECTORY | O_NOFOLLOW`), and compare each directory's `(dev, ino)` with the snapshot as it is opened; a mismatch skips that subtree, and a symbolic link on the way to the target skips the whole target. Unlink (`unlinkat`) an entry only if its metadata equals the snapshot, remove a directory only once empty, and list everything left in `skipped_changed`. A worktree's `.git` file is left for step 7.
+6. **Delete bottom-up** after re-reading the identity of section 9.4 (root identity, HEAD, branch) once more; any difference gives `expired` with nothing touched, for every plan kind. Use directory descriptors: open the target root relative to its parent and each directory relative to its own parent, never following links (`openat` with `O_DIRECTORY | O_NOFOLLOW`), and compare each directory's `(dev, ino)` with the snapshot, and its mount with the target's, as it is opened; a mismatch skips that subtree, and a symbolic link on the way to the target, or a target that became a mount point, skips the whole target. Unlink (`unlinkat`) an entry only if its metadata equals the snapshot, remove a directory only once empty, and list everything left in `skipped_changed`. A worktree's `.git` file is left for step 7.
 7. For a worktree, only if nothing was skipped or failed and only `.git` remains: re-read HEAD and branch, and if they equal the plan, unlink `.git`, remove the directory, and run `git -C <main> worktree remove <path>`. Otherwise `.git` stays and the worktree stays connected to git (`partial`, or `expired` on a HEAD or branch change).
-8. Write `result.json` with the result, whatever its status once the plan is claimed (fsync), so a claim without it always means an interrupted run; append an `act` record, drop the lock. Every `act` run appends that record, refusals and dry runs included.
+8. Write `result.json` with the result, whatever its status once the plan is claimed (fsync), so a claim without it always means an interrupted run; append an `act` record, drop the lock. Every `act` run appends that record, refusals and dry runs included, except a gated unit's run, which appends a `planned` record instead (section 9.6). Both carry the checks with their facts and the provenance of section 10.2.
 
 On Windows, phase 0 `act` always takes the dry-run path of section 9.6 (no claim, nothing deleted), so repeating it keeps reporting `dry_run`; handle-relative deletion is phase 3.
 
@@ -725,7 +725,7 @@ On Windows, phase 0 `act` always takes the dry-run path of section 9.6 (no claim
 
 ### 10.1 Inbox
 
-In phase 0 items are raised only by the refresh that `cardinal inbox` runs first (skipped with `--no-refresh`); from phase 1, units raise them through the same `inbox::raise` function. The refresh first runs the recovery pass of section 4.4 under the admission lock, so recovery does not depend on another job being admitted. It then raises and clears:
+In phase 0 items are raised only by the refresh that `cardinal inbox` runs first (skipped with `--no-refresh`); from phase 1, units raise them through the same `inbox::raise` function. The refresh first runs the recovery pass of section 4.4 under the admission lock, so recovery does not depend on another job being admitted. It then raises and clears. It clears only items it read before it started observing, and only while they are unchanged (checked under `inbox/.lock`), so a refresh never closes an item that another refresh raised or updated from a newer observation:
 
 | Kind | Key | Raised when | Cleared (resolved by `cardinal`) when |
 | --- | --- | --- | --- |
@@ -736,14 +736,14 @@ Statuses are `open`, `escalated` (waiting for the owner), `resolved`, and `dismi
 
 ### 10.2 explain
 
-`explain` shows where a decision came from: configuration files and keys, the rule, observations (the exact command and its result), and records. Subjects: `job <id>`, `plan <id>`, `inbox <key>`, and `command [--cwd DIR] -- <string>` (a classification and rewrite trace without running anything). Job and plan IDs resolve by unique prefix.
+`explain` shows where a decision came from: configuration files and keys, the rule, observations, and records. Observations are the facts the checks read, each with its value and the tool or read that produced it (`git`, `gh`, `lstat`, the process table, …), and what could not be observed with its error; the observation module returns facts, not command transcripts, so exit codes and raw output are not kept. A plan stores them with its checks (`facts`) and in `provenance` (errors and the configuration keys used: the repository's `[data]` lists and `[observe] managed`), and every `act` record repeats them for its own evaluation. Subjects: `job <id>`, `plan <id>`, `inbox <key>`, and `command [--cwd DIR] -- <string>` (a classification and rewrite trace without running anything). Job and plan IDs resolve by unique prefix.
 
 | Subject | `outcome` |
 | --- | --- |
 | `job` | `exited:<code>` or `signaled:<signal>` (from `job_finished`), `infra_failure:<reason>`, `running`, `waiting` (reserved, not started), `runner_died` (started or reserved, live lock free), or `fail_open:<reason>` |
-| `plan` | The `act` result's status; `interrupted` for a claim without `result.json`; null before any `act`. A unit's dry run also lists `unit.<name>.act` as a configuration source |
+| `plan` | The `act` result's status; `interrupted` for a claim without `result.json`; without a claim, the status of the latest `act` or `planned` record (`dry_run`, also every run on Windows, or a refusal before the claim); null before any `act`. A unit's dry run also lists `unit.<name>.act` as a configuration source |
 | `inbox` | `<status> by <by>: <note>` (without `: <note>` when empty) once resolved, escalated, or dismissed; null while open |
-| `command` | null. `rewritten` is the command the hook would produce, or null with the reasons it stays unrewritten in `summary` |
+| `command` | null. Each wrapped stage lists its rule, the pattern that matched, the normalized argv, and the profile key, from the classification module's trace; `rewritten` is the command the hook would produce, or null with the reasons it stays unrewritten in `summary` |
 
 ## 11. CLI and JSON contracts
 
@@ -786,7 +786,10 @@ Types are written in TypeScript notation; `?` marks fields that may be absent, `
 type Tri = "yes" | "no" | "unknown";
 type Resources = { [name: string]: number };            // positive integers
 type Check = { name: string; role: "invariant" | "condition";
-               result: "pass" | "fail" | "unknown"; detail: string };
+               result: "pass" | "fail" | "unknown"; detail: string;
+               facts?: { name: string; value: unknown; source: string }[] };  // what the check read
+type Provenance = { errors: { source: string; message: string }[];
+                    config: { file: string; key: string; value: unknown }[] };
 type GroupIdentity = { kind: "pgid"; pgid: number; leader_start_s: number };  // leader = the runner; phase 3 adds a Job Object kind
 
 // cardinal.error.v1
@@ -854,7 +857,8 @@ type Worktree = {
             root_id: null | { dev: number; ino: number }; root_created_ms: number | null };
   allocated_bytes: number | null;
   checks: Check[]; invariants_ok: boolean;
-  approval: "none" | "owner" }                             // informational; act recomputes it
+  approval: "none" | "owner";                              // informational; act recomputes it
+  provenance: Provenance }
 
 // cardinal.plan-list.v1
 { schema; plans: Plan[]; errors: { scope: string; message: string }[] }
@@ -957,7 +961,7 @@ Tests do not rely on starting processes at the same time. The `testpoint` module
 - `CARDINAL_TEST_FAIL=<point>`: the process returns an injected error at that point.
 - `CARDINAL_TEST_PANIC=<point>[,<point>]`: the process panics at a listed point.
 
-Points: `admission.reserved` (reservation committed, admission lock released), `admission.waiting` (budget full, about to sleep), `inuse.waiting`, `run.watching` (the runner's signal handlers about to be set up), `run.before_starting`, `run.spawning` (admitted path, last cancellation check done, about to spawn), `run.spawned` (the spawn returned, nothing about the child read), `run.after_spawn`, `run.reaped` (the stage's child reaped, its status not read), `act.locked` (exclusive in-use lock taken), `act.snapshotted` (snapshot recorded, checks not run), `act.checked` (checks passed, nothing deleted), `hook.classified`, `record.opened` (shared records lock held, current file open, line not written). **Every contended test waits for the second actor's `.reached` file before releasing the first**, so it proves the second actor actually hit the contended point. Examples:
+Points: `admission.reserved` (reservation committed, admission lock released), `admission.waiting` (budget full, about to sleep), `inuse.waiting`, `run.watching` (the runner's signal handlers about to be set up), `run.before_starting`, `run.spawning` (admitted path, last cancellation check done, about to spawn), `run.spawned` (the spawn returned, nothing about the child read), `run.after_spawn`, `run.reaped` (the stage's child reaped, its status not read), `act.locked` (exclusive in-use lock taken), `act.snapshotted` (snapshot recorded, checks not run), `act.checked` (checks passed, nothing deleted), `hook.classified`, `record.opened` (shared records lock held, current file open, line not written), `inbox.observed` (the refresh observed reservations, processes, and sessions; nothing raised or cleared). **Every contended test waits for the second actor's `.reached` file before releasing the first**, so it proves the second actor actually hit the contended point. Examples:
 
 - Two runners and a budget of one job: pause the first at `admission.reserved`; start the second and wait for its `admission.waiting`; release; assert the second starts only after the first's reservation is gone.
 - `act` and a runner: pause `act` at `act.locked`; start a runner in the worktree and wait for its `inuse.waiting`; release; the stage starts after `act` ends, or, with a shorter wait cap, runs and records `in_use_unprotected`. A runner paused at `run.after_spawn` makes `act` `rejected` with `not_in_use`.
@@ -1116,7 +1120,7 @@ Claims from design §11 that phase 0 implements, restated for phase 0, plus new 
 | A4 | When a reservation's runner is dead, cardinal shall release it only when its process group is empty or the boot changed, and recovery shall never signal the group. | G14 | `recovery::crashed_runner_group_is_kept_until_empty`, `recovery::unverified_group_not_signalled`, `recovery::reused_pgid_*`, `recovery::previous_boot_released` |
 | A5 | If the hook runs on Windows, fails, reads malformed input, misses its deadline, or sees `permission_mode` `auto`, it shall exit 0 with empty stdout. | G4 | `hook_claude::never_blocks::*`, `hook_claude::auto_mode_not_rewritten`, `hook_claude::windows_not_rewritten` |
 | A6 | When `act` runs, it shall compute the need for owner approval from the checks it evaluates, and shall not execute a plan that needs it without `--owner-approved`. | design §5 | `plan_act::approval_recomputed_when_merge_evidence_disappears` |
-| A7 | `act` shall refuse a target that is a symbolic link, a mount point, or on another device than its parent, or that contains another repository below its root. | G7 | `plan_act::nested_repository_refused`, `plan_act::mount_point_refused` |
+| A7 | `act` shall refuse a target that is a symbolic link, a mount point, or on another device than its parent, or that contains another repository below its root. | G7 | `plan_act::nested_repository_refused`, `plan_act::mount_point_refused`, `act_snapshot::bind_mounts_are_not_entered` |
 | A8 | `act` shall refuse both plan kinds for a worktree under a managed root or locked by git. | design §4 | `plan_act::managed_worktree_refused`, `plan_act::managed_reclaim_dir_refused` |
 | A9 | If the in-use lock cannot be taken within the wait cap, the runner shall run the stage and record `in_use_unprotected`. | G4 | `in_use::unprotected_run_recorded` |
 | A10 | When `act` deletes, it shall unlink only entries whose metadata equals the snapshot taken before its checks, descend only into directories whose identity equals the snapshot, remove directories only when empty, and keep a worktree's `.git` unless nothing else remains. | G7 | `act_snapshot::*` |
