@@ -3,7 +3,8 @@
 //! (C9), and `recovery_needed` items raised and cleared by the refresh.
 //!
 //! The recovery pass is a fake until the integration gate runs these against the real
-//! `admission` module; sessions and processes are real.
+//! `admission` module; sessions and processes are real. A refresh that must pause runs in a
+//! helper process (this test binary re-run) with the same fake.
 
 mod fakes;
 mod support;
@@ -25,7 +26,48 @@ use support::helper::{self, Mode};
 
 #[test]
 fn helper() {
+    run_refresh_if_requested();
     helper::run_if_requested();
+}
+
+const REFRESH_ENV: &str = "CARDINAL_TEST_REFRESH";
+
+/// What a helper process needs to refresh with a fake recovery pass that reports
+/// `recovery_needed` reservations of these jobs.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RefreshRequest {
+    config: std::path::PathBuf,
+    state: std::path::PathBuf,
+    recovery_needed: Vec<String>,
+}
+
+/// A fake recovery pass reporting `jobs` as recovery-needed reservations.
+fn recovery_needed(
+    jobs: &[String],
+) -> impl Fn(&StateDir, &cardinal::config::HostConfig) -> Result<RecoveryReport, Error> {
+    let jobs = jobs.to_vec();
+    move |_, _| {
+        Ok(RecoveryReport {
+            reservations: jobs
+                .iter()
+                .map(|job| reservation_view(job, DerivedState::RecoveryNeeded))
+                .collect(),
+            ..RecoveryReport::default()
+        })
+    }
+}
+
+/// Runs the refresh a helper process was started for, then exits; returns at once otherwise.
+fn run_refresh_if_requested() {
+    let Ok(request) = std::env::var(REFRESH_ENV) else {
+        return;
+    };
+    let request: RefreshRequest = serde_json::from_str(&request).expect("a refresh request");
+    let config = Config::load(&request.config).expect("load the config");
+    let state = StateDir::open(&request.state).expect("open the state dir");
+    let refreshed =
+        inbox::refresh_with(&config, &state, &recovery_needed(&request.recovery_needed));
+    std::process::exit(i32::from(refreshed.is_err()));
 }
 
 struct Env {
@@ -51,6 +93,23 @@ impl Env {
     /// The `cardinal` binary on this state and config, confined to the fixture.
     fn cardinal(&self) -> assert_cmd::Command {
         fakes::cardinal(&self.fx, &self.dirs)
+    }
+
+    /// A helper process that refreshes with a recovery pass reporting `jobs`, confined to the
+    /// fixture.
+    fn refresh_command(&self, jobs: &[&str]) -> std::process::Command {
+        let request = RefreshRequest {
+            config: self.dirs.config().to_path_buf(),
+            state: self.state.root().to_path_buf(),
+            recovery_needed: jobs.iter().map(|&job| job.to_owned()).collect(),
+        };
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["helper", "--exact", "--nocapture", "--test-threads=1"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .env(REFRESH_ENV, serde_json::to_string(&request).unwrap());
+        fakes::confined(&self.fx, command, self.fx.root())
     }
 
     /// A sleeping helper process, confined to the fixture.
@@ -422,4 +481,41 @@ fn cli_lists_and_resolves() {
     assert_eq!(json(&assert.get_output().stdout)["items"][0]["key"], "k");
     let records = cardinal::record::read_all(&e.state).unwrap();
     assert!(records.iter().any(|r| r.kind == RecordKind::InboxResolved));
+}
+
+/// A refresh clears only the items it saw before it observed, and only while they are
+/// unchanged. Refresh A observes no reservations and pauses; refresh B, from a newer
+/// observation, updates the item A saw and raises a new one; A then closes neither. The next
+/// refresh that observes no reservations clears both.
+#[test]
+fn concurrent_refresh_keeps_newer_items() {
+    let e = env();
+    let (old, new) = ("aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb");
+    refresh(&e, &recovery_needed(&[old.to_owned()]));
+    let points = support::testpoints::TestPoints::new();
+    let mut command = e.refresh_command(&[]);
+    points.apply(&mut command, &[cardinal::testpoint::INBOX_OBSERVED], None);
+    let mut first = helper::ChildGuard::new(command.spawn().unwrap());
+    points.wait_reached(
+        cardinal::testpoint::INBOX_OBSERVED,
+        first.id(),
+        Duration::from_secs(20),
+    );
+    refresh(&e, &recovery_needed(&[old.to_owned(), new.to_owned()]));
+    points.release(cardinal::testpoint::INBOX_OBSERVED);
+    assert!(first.child().wait().unwrap().success());
+
+    let items = list(&e, Some(StatusFilter::All));
+    let status = |job: &str| {
+        let key = format!("recovery_needed:{job}");
+        items.iter().find(|i| i.key == key).map(|i| i.status)
+    };
+    assert_eq!(status(old), Some(InboxStatus::Open), "{items:#?}");
+    assert_eq!(status(new), Some(InboxStatus::Open), "{items:#?}");
+
+    let items = refresh(&e, &no_recovery);
+    assert!(
+        items.iter().all(|i| i.status == InboxStatus::Resolved),
+        "{items:#?}"
+    );
 }

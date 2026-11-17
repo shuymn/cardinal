@@ -4,9 +4,11 @@
 //! a key that exists updates the item while it is open or escalated and never reopens it once
 //! resolved or dismissed (C19). The refresh that `cardinal inbox` runs first is the only
 //! raiser in phase 0: it runs the recovery pass, then raises and clears `recovery_needed` and
-//! `outlived_processes` items.
+//! `outlived_processes` items. A refresh clears only items it saw before it started observing,
+//! and only while they are unchanged, so it never closes an item another refresh raised or
+//! updated from a newer observation.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -19,6 +21,7 @@ use crate::contract::{
 use crate::os::{Detail, ProcessTable};
 use crate::record::Recorder;
 use crate::state::{self, Durability, LockMode, StateDir};
+use crate::testpoint;
 
 /// How long an upsert waits for `inbox/.lock`.
 const LOCK_WAIT: Duration = Duration::from_secs(5);
@@ -156,7 +159,7 @@ pub fn resolve(
     outcome: ResolutionOutcome,
     note: Option<&str>,
 ) -> Result<InboxItem, Error> {
-    let item = close(state, key, outcome, BY_CLI, note.unwrap_or_default())?;
+    let item = close(state, key, outcome, BY_CLI, note.unwrap_or_default(), None)?;
     record_resolution(config, state, &item);
     Ok(item)
 }
@@ -167,6 +170,11 @@ pub fn refresh_with(
     state: &StateDir,
     recovery: &RecoveryPass<'_>,
 ) -> Result<(), Error> {
+    // The items as they were before anything was observed: only these may be cleared.
+    let before: BTreeMap<String, InboxItem> = read_all(state)?
+        .into_iter()
+        .map(|(_, item)| (item.key.clone(), item))
+        .collect();
     let report = recovery(state, &config.host)?;
     let reserved: BTreeSet<&str> = report
         .reservations
@@ -197,8 +205,11 @@ pub fn refresh_with(
 
     let table = ProcessTable::snapshot(Detail::default())
         .map_err(|err| Error::new(ErrorCode::Internal, err.to_string()))?;
+    let snapshots = read_sessions(state)?;
+    testpoint::hit(testpoint::INBOX_OBSERVED)
+        .map_err(|err| Error::new(ErrorCode::Internal, err.to_string()))?;
     let mut sessions = BTreeSet::new();
-    for (path, snapshot) in read_sessions(state)? {
+    for (path, snapshot) in snapshots {
         sessions.insert(snapshot.session_id.clone());
         let key = outlived_key(&snapshot.session_id);
         // `clear` and `resume` keep the agent running: nothing has outlived it yet.
@@ -215,6 +226,7 @@ pub fn refresh_with(
             clear(
                 config,
                 state,
+                &before,
                 &key,
                 "none of the session's processes is alive",
             )?;
@@ -239,7 +251,19 @@ pub fn refresh_with(
         raise_recorded(config, state, &item)?;
     }
 
-    for (_, item) in read_all(state)? {
+    clear_gone(config, state, &before, &reserved, &sessions)
+}
+
+/// Clears the open and escalated items of `before` whose reservation or session snapshot the
+/// refresh no longer saw.
+fn clear_gone(
+    config: &Config,
+    state: &StateDir,
+    before: &BTreeMap<String, InboxItem>,
+    reserved: &BTreeSet<&str>,
+    sessions: &BTreeSet<String>,
+) -> Result<(), Error> {
+    for item in before.values() {
         if !matches!(item.status, InboxStatus::Open | InboxStatus::Escalated) {
             continue;
         }
@@ -251,7 +275,7 @@ pub fn refresh_with(
                     .as_deref()
                     .is_some_and(|job| !reserved.contains(job)) =>
             {
-                clear(config, state, &item.key, "the reservation is gone")?;
+                clear(config, state, before, &item.key, "the reservation is gone")?;
             }
             InboxKind::OutlivedProcesses
                 if item
@@ -260,7 +284,13 @@ pub fn refresh_with(
                     .as_ref()
                     .is_some_and(|session| !sessions.contains(session)) =>
             {
-                clear(config, state, &item.key, "the session snapshot is gone")?;
+                clear(
+                    config,
+                    state,
+                    before,
+                    &item.key,
+                    "the session snapshot is gone",
+                )?;
             }
             _ => {}
         }
@@ -290,9 +320,27 @@ fn raise_recorded(config: &Config, state: &StateDir, item: &NewItem) -> Result<(
     Ok(())
 }
 
-/// Resolves an open or escalated item as cardinal; anything else is left alone.
-fn clear(config: &Config, state: &StateDir, key: &str, note: &str) -> Result<(), Error> {
-    match close(state, key, ResolutionOutcome::Resolved, BY_CARDINAL, note) {
+/// Resolves an open or escalated item as cardinal if it is still as `before` holds it, the
+/// store before the refresh observed anything; anything else is left alone.
+fn clear(
+    config: &Config,
+    state: &StateDir,
+    before: &BTreeMap<String, InboxItem>,
+    key: &str,
+    note: &str,
+) -> Result<(), Error> {
+    // Raised after the observation started: the observation may predate what raised it.
+    let Some(seen) = before.get(key) else {
+        return Ok(());
+    };
+    match close(
+        state,
+        key,
+        ResolutionOutcome::Resolved,
+        BY_CARDINAL,
+        note,
+        Some(seen),
+    ) {
         Ok(item) => {
             record_resolution(config, state, &item);
             Ok(())
@@ -302,13 +350,15 @@ fn clear(config: &Config, state: &StateDir, key: &str, note: &str) -> Result<(),
     }
 }
 
-/// Sets the outcome of an open or escalated item.
+/// Sets the outcome of an open or escalated item; with `expected`, only while the item still
+/// equals it (checked under the inbox lock).
 fn close(
     state: &StateDir,
     key: &str,
     outcome: ResolutionOutcome,
     by: &str,
     note: &str,
+    expected: Option<&InboxItem>,
 ) -> Result<InboxItem, Error> {
     let _lock = lock(state)?;
     let (path, existing) = find(state, key)?;
@@ -322,6 +372,12 @@ fn close(
         return Err(Error::new(
             ErrorCode::InvalidArgument,
             format!("the inbox item `{key}` is already closed"),
+        ));
+    }
+    if expected.is_some_and(|expected| *expected != item) {
+        return Err(Error::new(
+            ErrorCode::InvalidArgument,
+            format!("the inbox item `{key}` changed since it was observed"),
         ));
     }
     let now = state::now_ms();

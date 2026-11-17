@@ -44,6 +44,9 @@ pub const HOOK_CLASSIFIED: &str = "hook.classified";
 /// A record appender holds the shared records lock and the open current file, and has not
 /// written its line.
 pub const RECORD_OPENED: &str = "record.opened";
+/// The inbox refresh observed reservations, processes, and sessions, and has not raised or
+/// cleared anything.
+pub const INBOX_OBSERVED: &str = "inbox.observed";
 
 /// Every pause point.
 pub const POINTS: &[&str] = &[
@@ -61,6 +64,7 @@ pub const POINTS: &[&str] = &[
     ACT_CHECKED,
     HOOK_CLASSIFIED,
     RECORD_OPENED,
+    INBOX_OBSERVED,
 ];
 
 /// How long a paused process waits for its release file before aborting.
