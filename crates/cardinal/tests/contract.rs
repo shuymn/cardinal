@@ -70,14 +70,20 @@ fn check(name: &str, role: &str, result: &str) -> Value {
 }
 
 fn plan() -> Value {
+    let mut clean = check("clean", "invariant", "pass");
+    clean["facts"] = json!([{"name": "worktree.facts.dirty", "value": "no", "source": "git"}]);
     json!({
         "schema": "cardinal.plan.v1", "id": "fedcba9876543210", "created_ms": 5,
         "host_id": "00000000000000aa", "kind": "reclaim_worktree",
         "target": {"path": "/w", "repo": "/r/.git", "worktree": "/w", "head": "abc",
                    "branch": "feature", "root_id": {"dev": 1, "ino": 2}, "root_created_ms": null},
         "allocated_bytes": 4096,
-        "checks": [check("clean", "invariant", "pass"), check("merge_evidence", "condition", "fail")],
-        "invariants_ok": true, "approval": "owner"
+        "checks": [clean, check("merge_evidence", "condition", "fail")],
+        "invariants_ok": true, "approval": "owner",
+        "provenance": {
+            "errors": [{"source": "gh", "message": "HTTP 502"}],
+            "config": [{"file": "/c/repos/app.toml", "key": "data.protected", "value": ["fuzz/corpus"]}]
+        }
     })
 }
 
