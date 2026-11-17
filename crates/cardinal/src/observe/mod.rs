@@ -1175,36 +1175,23 @@ mod tests {
 
     #[test]
     fn plain_target_passes_a_plain_directory_and_fails_a_link_to_one() {
-        let tmp = tempfile::tempdir().unwrap();
-        let real = tmp.path().join("real");
-        let link = tmp.path().join("link");
+        let scope = cardinal_test_support::Scope::new();
+        let real = scope.path("real");
+        let link = scope.path("link");
         std::fs::create_dir(&real).unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(&real, &link).unwrap();
         // A junction needs no privilege, unlike a directory symbolic link.
         #[cfg(windows)]
-        assert!(
-            std::process::Command::new("cmd")
-                .env_clear()
-                .envs(std::env::vars_os().filter(|(k, _)| {
-                    ["PATH", "SystemRoot", "ComSpec", "PATHEXT"]
-                        .iter()
-                        .any(|keep| k.eq_ignore_ascii_case(keep))
-                }))
-                .current_dir(tmp.path())
-                .args(["/C", "mklink", "/J"])
-                .arg(&link)
-                .arg(&real)
+        {
+            let output = scope
+                .shell("mklink /J link real", scope.root())
                 .output()
-                .unwrap()
-                .status
-                .success()
-        );
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+        }
         assert_eq!(plain_target(&real), CheckResult::Pass);
         assert_eq!(plain_target(&link), CheckResult::Fail);
-        assert_eq!(
-            plain_target(&tmp.path().join("missing")),
-            CheckResult::Unknown
-        );
+        assert_eq!(plain_target(&scope.path("missing")), CheckResult::Unknown);
     }
 }

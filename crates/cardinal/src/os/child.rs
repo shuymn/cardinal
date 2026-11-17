@@ -539,6 +539,8 @@ mod tests {
     use std::ffi::OsString;
     use std::time::{Duration, Instant};
 
+    use cardinal_test_support::Scope;
+
     use super::{ChildError, Limits, git_env, lookup, run, run_guarded};
 
     fn pairs(items: &[(&str, &str)]) -> Vec<(OsString, OsString)> {
@@ -611,12 +613,12 @@ mod tests {
 
     #[test]
     fn a_missing_program_is_a_spawn_error() {
-        let dir = tempfile::tempdir().unwrap();
+        let scope = Scope::new();
         let err = run(
             "cardinal-no-such-program",
             &[],
             &[],
-            dir.path(),
+            scope.root(),
             limits(Duration::from_secs(5), 1024),
         )
         .unwrap_err();
@@ -627,13 +629,13 @@ mod tests {
     /// even looked up.
     #[test]
     fn a_failed_guard_starts_no_child() {
-        let dir = tempfile::tempdir().unwrap();
+        let scope = Scope::new();
         let err = run_guarded(
             || Err(std::io::Error::other("no reader thread")),
             "cardinal-no-such-program".as_ref(),
             &[],
             &[],
-            dir.path(),
+            scope.root(),
             limits(Duration::from_secs(5), 1024),
         )
         .unwrap_err();
@@ -648,42 +650,29 @@ mod tests {
         }
     }
 
-    /// `sh -c script` in `dir`, with only `PATH` from this process and `HOME` in `dir`.
+    /// `sh -c script` in the root of `scope`, with the scope's environment.
     #[cfg(unix)]
-    fn sh(
-        dir: &std::path::Path,
-        script: &str,
-        limits: Limits,
-    ) -> Result<super::Output, ChildError> {
-        sh_guarded(super::guard_termination, dir, script, limits)
-    }
-
-    /// [`sh`], with `guard` run before the child is started.
-    #[cfg(unix)]
-    fn sh_guarded(
-        guard: impl FnOnce() -> std::io::Result<()>,
-        dir: &std::path::Path,
-        script: &str,
-        limits: Limits,
-    ) -> Result<super::Output, ChildError> {
-        let mut inherited: Vec<(OsString, OsString)> =
-            std::env::vars_os().filter(|(k, _)| k == "PATH").collect();
-        inherited.push(("HOME".into(), dir.into()));
-        let env = git_env(inherited);
+    fn sh(scope: &Scope, script: &str, limits: Limits) -> Result<super::Output, ChildError> {
         let args = ["-c".into(), script.into()];
-        run_guarded(guard, "sh".as_ref(), &args, &env, dir, limits)
+        run("sh", &args, &scope.env(), scope.root(), limits)
     }
 
-    /// The directory a helper test, run through the test binary, reports to.
-    #[cfg(windows)]
-    const HELPER_DIR: &str = "CARDINAL_TEST_HELPER_DIR";
+    /// The process ID a child wrote to `file`.
+    #[cfg(unix)]
+    fn written_pid(file: &std::path::Path) -> u32 {
+        std::fs::read_to_string(file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    }
 
     #[cfg(unix)]
     #[test]
     fn output_and_status_are_returned() {
-        let dir = tempfile::tempdir().unwrap();
+        let scope = Scope::new();
         let out = sh(
-            dir.path(),
+            &scope,
             "printf out; printf err >&2; exit 3",
             limits(Duration::from_secs(10), 1024),
         )
@@ -696,23 +685,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_deadline_kills_and_reaps_the_child() {
-        let dir = tempfile::tempdir().unwrap();
-        let pid_file = dir.path().join("pid");
+        let scope = Scope::new();
+        let pid_file = scope.path("pid");
         let script = format!("echo $$ > '{}'; exec sleep 30", pid_file.display());
         let start = Instant::now();
-        let err = sh(
-            dir.path(),
-            &script,
-            limits(Duration::from_millis(300), 1024),
-        )
-        .unwrap_err();
+        let err = sh(&scope, &script, limits(Duration::from_millis(300), 1024)).unwrap_err();
         assert!(matches!(err, ChildError::Timeout { .. }), "{err}");
         assert!(start.elapsed() < Duration::from_secs(5));
-        let pid: u32 = std::fs::read_to_string(&pid_file)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
+        let pid = written_pid(&pid_file);
         assert!(
             crate::os::start_time_s(pid).is_none(),
             "the child was killed and reaped"
@@ -722,30 +702,21 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_descendant_holding_the_output_open_ends_in_a_timeout_and_is_killed() {
-        let dir = tempfile::tempdir().unwrap();
-        let pid_file = dir.path().join("pid");
+        let scope = Scope::new();
+        let pid_file = scope.path("pid");
         let script = format!(
             "sleep 30 & echo $! > '{}'; printf partial; exit 0",
             pid_file.display()
         );
         let start = Instant::now();
-        let err = sh(
-            dir.path(),
-            &script,
-            limits(Duration::from_millis(300), 1024),
-        )
-        .unwrap_err();
+        let err = sh(&scope, &script, limits(Duration::from_millis(300), 1024)).unwrap_err();
         assert!(matches!(err, ChildError::Timeout { .. }), "{err}");
         assert!(
             start.elapsed() < Duration::from_secs(5),
             "{:?}",
             start.elapsed()
         );
-        let pid: u32 = std::fs::read_to_string(&pid_file)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
+        let pid = written_pid(&pid_file);
         let gone = (0..250).any(|_| {
             std::thread::sleep(Duration::from_millis(20));
             crate::os::start_time_s(pid).is_none()
@@ -757,16 +728,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn output_at_the_limit_passes_and_one_byte_more_fails() {
-        let dir = tempfile::tempdir().unwrap();
-        let out = sh(
-            dir.path(),
-            "printf abcd",
-            limits(Duration::from_secs(10), 4),
-        )
-        .unwrap();
+        let scope = Scope::new();
+        let out = sh(&scope, "printf abcd", limits(Duration::from_secs(10), 4)).unwrap();
         assert_eq!(out.stdout, b"abcd");
         for script in ["printf abcd", "printf abcd >&2"] {
-            let err = sh(dir.path(), script, limits(Duration::from_secs(10), 3)).unwrap_err();
+            let err = sh(&scope, script, limits(Duration::from_secs(10), 3)).unwrap_err();
             assert!(
                 matches!(err, ChildError::OutputTooLarge { limit: 3, .. }),
                 "{script}: {err}"
@@ -779,30 +745,21 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn output_past_the_limit_ends_the_run_at_once_and_kills_the_child() {
-        let dir = tempfile::tempdir().unwrap();
-        let pid_file = dir.path().join("pid");
+        let scope = Scope::new();
+        let pid_file = scope.path("pid");
         let script = format!(
             "echo $$ > '{}'; head -c 4000000 /dev/zero; exec sleep 30",
             pid_file.display()
         );
         let start = Instant::now();
-        let err = sh(
-            dir.path(),
-            &script,
-            limits(Duration::from_secs(20), 64 * 1024),
-        )
-        .unwrap_err();
+        let err = sh(&scope, &script, limits(Duration::from_secs(20), 64 * 1024)).unwrap_err();
         assert!(matches!(err, ChildError::OutputTooLarge { .. }), "{err}");
         assert!(
             start.elapsed() < Duration::from_secs(10),
             "{:?}",
             start.elapsed()
         );
-        let pid: u32 = std::fs::read_to_string(&pid_file)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
+        let pid = written_pid(&pid_file);
         assert!(
             crate::os::start_time_s(pid).is_none(),
             "the child was killed and reaped"
@@ -814,19 +771,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_descendant_left_after_a_normal_exit_is_killed() {
-        let dir = tempfile::tempdir().unwrap();
-        let pid_file = dir.path().join("pid");
+        let scope = Scope::new();
+        let pid_file = scope.path("pid");
         let script = format!(
             "sleep 30 >/dev/null 2>&1 & echo $! > '{}'; exit 0",
             pid_file.display()
         );
-        let out = sh(dir.path(), &script, limits(Duration::from_secs(10), 1024)).unwrap();
+        let out = sh(&scope, &script, limits(Duration::from_secs(10), 1024)).unwrap();
         assert_eq!(out.code, Some(0));
-        let pid: u32 = std::fs::read_to_string(&pid_file)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
+        let pid = written_pid(&pid_file);
         let gone = (0..250).any(|_| {
             std::thread::sleep(Duration::from_millis(20));
             crate::os::start_time_s(pid).is_none()
@@ -891,7 +844,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn the_deadline_kills_the_whole_tree_on_windows() {
-        let dir = tempfile::tempdir().unwrap();
+        let scope = Scope::new();
         let target = ping_target(37);
         let watcher = watch_ping(&target);
         let err = run(
@@ -905,233 +858,11 @@ mod tests {
                 target.clone().into(),
             ],
             &windows_env(),
-            dir.path(),
+            scope.root(),
             limits(Duration::from_secs(5), 1024 * 1024),
         )
         .unwrap_err();
         assert!(matches!(err, ChildError::Timeout { .. }), "{err}");
         assert_gone(watcher.join().unwrap());
-    }
-
-    /// Writes `pid`'s ID and start time to `dir/name`, atomically.
-    #[cfg(windows)]
-    fn report(dir: &std::path::Path, name: &str, pid: u32) {
-        let start_s = crate::os::start_time_s(pid).expect("the process is listed");
-        let written = dir.join(format!("{name}.tmp"));
-        std::fs::write(&written, format!("{pid} {start_s}")).unwrap();
-        std::fs::rename(&written, dir.join(name)).unwrap();
-    }
-
-    /// The process ID and start time in `dir/name`, once [`report`] wrote it.
-    #[cfg(windows)]
-    fn reported(dir: &std::path::Path, name: &str) -> Option<(u32, u64)> {
-        let text = std::fs::read_to_string(dir.join(name)).ok()?;
-        let (pid, start_s) = text.split_once(' ')?;
-        Some((pid.parse().ok()?, start_s.parse().ok()?))
-    }
-
-    /// Set for `leave_a_process_helper` by
-    /// `a_process_left_holding_the_output_ends_in_a_timeout_on_windows`: the `ping` it leaves
-    /// gets its stdout and stderr, the run's pipes.
-    #[cfg(windows)]
-    const HELPER_KEEPS_OUTPUT: &str = "CARDINAL_TEST_HELPER_KEEPS_OUTPUT";
-
-    /// The arguments that make the test binary run `leave_a_process_helper`.
-    #[cfg(windows)]
-    fn helper_args() -> [OsString; 3] {
-        [
-            "os::child::tests::leave_a_process_helper",
-            "--exact",
-            "--ignored",
-        ]
-        .map(OsString::from)
-    }
-
-    /// Run through [`run`] by the Windows tests of a process left behind: reports itself,
-    /// starts a `ping`, reports it, and exits. The `ping` holds none of the run's pipes:
-    /// stdout and stderr, the run's pipes, stop being inheritable first, because a child
-    /// started to inherit handles gets every inheritable one, not only its own stdio. With
-    /// [`HELPER_KEEPS_OUTPUT`] set, the `ping` gets stdout and stderr instead.
-    #[cfg(windows)]
-    #[test]
-    #[ignore = "run by the Windows tests of a process left behind"]
-    fn leave_a_process_helper() {
-        use std::os::windows::io::AsRawHandle as _;
-        use std::process::Stdio;
-
-        use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
-
-        let Some(dir) = std::env::var_os(HELPER_DIR).map(std::path::PathBuf::from) else {
-            return;
-        };
-        report(&dir, "helper", std::process::id());
-        let keeps_output = std::env::var_os(HELPER_KEEPS_OUTPUT).is_some();
-        if !keeps_output {
-            for handle in [
-                std::io::stdout().as_raw_handle(),
-                std::io::stderr().as_raw_handle(),
-            ] {
-                // SAFETY: the handle is this process's stdout or stderr, open while it runs.
-                let set = unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) };
-                assert_ne!(set, 0, "{}", std::io::Error::last_os_error());
-            }
-        }
-        let output = || {
-            if keeps_output {
-                Stdio::inherit()
-            } else {
-                Stdio::null()
-            }
-        };
-        #[expect(
-            clippy::zombie_processes,
-            reason = "left running on purpose; Windows keeps no zombies, and the job ends it"
-        )]
-        let ping = std::process::Command::new("ping")
-            .args(["-n", "31", "127.0.0.1"])
-            .stdin(Stdio::null())
-            .stdout(output())
-            .stderr(output())
-            .spawn()
-            .unwrap();
-        report(&dir, "ping", ping.id());
-    }
-
-    /// What `watch_helper` saw of a process `leave_a_process_helper` reports: its ID and
-    /// start time once reported, and when it was last seen alive.
-    #[cfg(windows)]
-    #[derive(Clone, Copy, Debug)]
-    struct Seen {
-        name: &'static str,
-        process: Option<(u32, u64)>,
-        alive_at: Option<Duration>,
-    }
-
-    #[cfg(windows)]
-    impl std::fmt::Display for Seen {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            let name = self.name;
-            match (self.process, self.alive_at) {
-                (None, _) => write!(f, "{name} not started"),
-                (Some((pid, _)), None) => write!(f, "{name} {pid} never seen alive"),
-                (Some((pid, _)), Some(at)) => write!(f, "{name} {pid} last seen alive at {at:?}"),
-            }
-        }
-    }
-
-    /// Until `done` is set, notes when the helper and its `ping` were last seen alive, from
-    /// `start`.
-    #[cfg(windows)]
-    fn watch_helper(
-        dir: std::path::PathBuf,
-        start: Instant,
-        done: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    ) -> std::thread::JoinHandle<[Seen; 2]> {
-        std::thread::spawn(move || {
-            let mut seen = ["helper", "ping"].map(|name| Seen {
-                name,
-                process: None,
-                alive_at: None,
-            });
-            while !done.load(std::sync::atomic::Ordering::SeqCst) {
-                for seen in &mut seen {
-                    if seen.process.is_none() {
-                        seen.process = reported(&dir, seen.name);
-                    }
-                    if let Some((pid, start_s)) = seen.process
-                        && crate::os::is_alive(pid, start_s)
-                    {
-                        seen.alive_at = Some(start.elapsed());
-                    }
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            seen
-        })
-    }
-
-    /// Runs `leave_a_process_helper` through [`run`] in `dir` with `env` added, within
-    /// `timeout`, and returns the result, how long [`run`] took, and what `watch_helper` saw,
-    /// with every process the helper reported.
-    #[cfg(windows)]
-    fn run_helper(
-        dir: &std::path::Path,
-        env: &[(&str, &str)],
-        timeout: Duration,
-    ) -> (Result<super::Output, ChildError>, Duration, [Seen; 2]) {
-        let mut full = windows_env();
-        full.push((HELPER_DIR.into(), dir.into()));
-        full.extend(env.iter().map(|(k, v)| ((*k).into(), (*v).into())));
-        let done = std::sync::Arc::default();
-        let start = Instant::now();
-        let watcher = watch_helper(dir.to_owned(), start, std::sync::Arc::clone(&done));
-        let result = run(
-            std::env::current_exe().unwrap(),
-            &helper_args(),
-            &full,
-            dir,
-            limits(timeout, 1024 * 1024),
-        );
-        let returned = start.elapsed();
-        done.store(true, std::sync::atomic::Ordering::SeqCst);
-        let mut seen = watcher.join().unwrap();
-        for seen in &mut seen {
-            seen.process = seen.process.or_else(|| reported(dir, seen.name));
-        }
-        (result, returned, seen)
-    }
-
-    /// After a normal exit the rest of the job goes on Windows: the helper leaves a `ping`
-    /// that holds none of the run's pipes, so the run completes while the `ping` runs, well
-    /// before the deadline and the 30 s the `ping` takes, and the job takes it along.
-    ///
-    /// A failed run names the stage it stopped at: a helper that never started was not
-    /// resumed or never reached its body; one still alive at the deadline did not exit; one
-    /// gone long before the deadline exited while a process kept its output open.
-    #[cfg(windows)]
-    #[test]
-    fn a_process_left_after_a_normal_exit_is_killed_on_windows() {
-        let dir = tempfile::tempdir().unwrap();
-        let (result, returned, seen) = run_helper(dir.path(), &[], Duration::from_secs(20));
-        let seen_text = seen.map(|s| s.to_string()).join(", ");
-        let out = result.unwrap_or_else(|err| panic!("{err} after {returned:?}: {seen_text}"));
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        assert_eq!(out.code, Some(0), "{stdout}{}", out.stderr_line());
-        let ping = seen[1].process;
-        assert!(
-            ping.is_some(),
-            "the helper left no ping: {seen_text}\n{stdout}"
-        );
-        assert_gone(ping);
-    }
-
-    /// A process the child leaves holding its output keeps the run from completing on
-    /// Windows too: the helper exits at once and leaves a `ping` with its stdout and stderr,
-    /// so the run ends in a timeout at its deadline, not in success, and the job takes the
-    /// `ping` along.
-    #[cfg(windows)]
-    #[test]
-    fn a_process_left_holding_the_output_ends_in_a_timeout_on_windows() {
-        let timeout = Duration::from_secs(10);
-        let dir = tempfile::tempdir().unwrap();
-        let (result, returned, [helper, ping]) =
-            run_helper(dir.path(), &[(HELPER_KEEPS_OUTPUT, "1")], timeout);
-        let seen_text = format!("{helper}, {ping}");
-        assert!(
-            matches!(result, Err(ChildError::Timeout { .. })),
-            "{result:?} after {returned:?}: {seen_text}"
-        );
-        assert!(
-            returned < timeout + Duration::from_secs(5),
-            "{returned:?}: {seen_text}"
-        );
-        assert!(
-            helper.process.is_some()
-                && helper
-                    .alive_at
-                    .is_none_or(|at| at + Duration::from_secs(1) < timeout),
-            "the helper exited well before the deadline: {seen_text}"
-        );
-        assert_gone(ping.process);
     }
 }

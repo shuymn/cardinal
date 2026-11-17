@@ -108,8 +108,9 @@ fn spawn_with(
 #[cfg(test)]
 mod tests {
     use std::io;
-    use std::process::{Command, Stdio};
     use std::time::Duration;
+
+    use cardinal_test_support::Scope;
 
     use super::{enter, spawn_with};
 
@@ -117,13 +118,11 @@ mod tests {
     /// not stay behind suspended, and after it does not run on. `ping` would run for 30 s.
     #[test]
     fn a_child_that_cannot_enter_its_job_is_killed() {
+        let scope = Scope::new();
+        let env = super::super::git_env(std::env::vars_os());
+        let args: [std::ffi::OsString; 3] = ["-n", "31", "127.0.0.1"].map(Into::into);
         for assigned in [false, true] {
-            let mut command = Command::new("ping");
-            command
-                .args(["-n", "31", "127.0.0.1"])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null());
+            let command = super::super::command("ping".as_ref(), &args, &env, scope.root());
             let mut started = None;
             let err = spawn_with(command, |job, child| {
                 started = crate::os::start_time_s(child.id()).map(|s| (child.id(), s));
