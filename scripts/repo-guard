@@ -29,18 +29,14 @@
 
 # POSIX prelude: re-run under bash in a constructed environment. `sh` reads no startup file
 # when it runs a script; `bash --noprofile --norc` with BASH_ENV unset reads none either.
-# PATH finds git; CI selects the mode; TMPDIR keeps temporary files where the caller wants them.
+# PATH finds git; CI selects the mode; TMPDIR (and on Windows TEMP and TMP) keeps temporary
+# files where the caller wants them; on Windows, what programs need to start
+# (scripts/clean-env.sh).
 if [ "${1-}" != --clean-env ]; then
-  case $(uname -s) in
-    MINGW* | MSYS* | CYGWIN*)
-      exec env -i PATH="$PATH" CI="${CI-}" TMPDIR="${TMPDIR:-/tmp}" SYSTEMROOT="${SYSTEMROOT-}" WINDIR="${WINDIR-}" \
-        COMSPEC="${COMSPEC-}" PATHEXT="${PATHEXT-}" TEMP="${TEMP-}" TMP="${TMP-}" \
-        bash --noprofile --norc "$0" --clean-env "$@"
-      ;;
-    *)
-      exec env -i PATH="$PATH" CI="${CI-}" TMPDIR="${TMPDIR:-/tmp}" bash --noprofile --norc "$0" --clean-env "$@"
-      ;;
-  esac
+  TMPDIR=${TMPDIR:-/tmp}
+  export TMPDIR
+  . "$(dirname "$0")/clean-env.sh"
+  clean_exec 'PATH CI TMPDIR TEMP TMP' bash --noprofile --norc "$0" --clean-env "$@"
 fi
 shift
 
