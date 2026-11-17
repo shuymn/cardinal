@@ -9,8 +9,8 @@ use crate::classify;
 use crate::config::{self, Config, Selection};
 use crate::contract::{
     ActResult, CheckResult, ClassifyDecision, ClassifyRepo, ClassifyRequest, ClassifyRequestSchema,
-    ClassifyTool, Error, ErrorCode, Explain, ExplainKind, ExplainSchema, ExplainSource,
-    ExplainSubject, Plan, Record, RecordKind, Reservation, ToolName,
+    ClassifyResponse, ClassifyTool, Error, ErrorCode, Explain, ExplainKind, ExplainSchema,
+    ExplainSource, ExplainSubject, Plan, Record, RecordKind, Reservation, ToolName,
 };
 use crate::inbox;
 use crate::plan;
@@ -326,7 +326,7 @@ fn command_trace(config: &Config, cwd: Option<&Path>, command: &str) -> Result<E
         config.select(|p| common.as_deref().is_some_and(|c| p.matches_common_dir(c)));
     let stages = classify::find_stages(command)?;
     let mut sources = Vec::new();
-    let mut classified = 0;
+    let mut classified = Vec::new();
     for stage in &stages {
         let request = ClassifyRequest {
             schema: ClassifyRequestSchema,
@@ -354,7 +354,6 @@ fn command_trace(config: &Config, cwd: Option<&Path>, command: &str) -> Result<E
         let response =
             classify::classify(&request, &selection, Instant::now() + CLASSIFY_DEADLINE)?;
         if response.decision == ClassifyDecision::Wrap {
-            classified += 1;
             let rule = response.rule.clone().unwrap_or_default();
             let pattern = selection
                 .rules()
@@ -366,13 +365,40 @@ fn command_trace(config: &Config, cwd: Option<&Path>, command: &str) -> Result<E
                 pattern,
                 normalized_argv: request.argv.clone(),
             });
+            classified.push((stage, response));
         }
     }
-    Ok(document(
+    let mut summary = format!("{} stages, {} classified", stages.len(), classified.len());
+    let mut rewritten = None;
+    if !classified.is_empty() {
+        let runner = std::env::current_exe().unwrap_or_default();
+        match rewrite(command, &classified, &runner) {
+            Ok(text) => rewritten = Some(text),
+            Err(skips) => {
+                let _ = write!(summary, "; not rewritten: {}", skips.join(", "));
+            }
+        }
+    }
+    let mut doc = document(
         ExplainKind::Command,
         command.to_owned(),
-        format!("{} stages, {classified} classified", stages.len()),
+        summary,
         sources,
         None,
-    ))
+    );
+    doc.rewritten = rewritten;
+    Ok(doc)
+}
+
+/// The hook's rewrite (sections 6.4 and 7.2): the command text, its classified stages, and the
+/// runner path in; the rewritten command, or the reasons it or its stages stay unwrapped, out.
+/// A stand-in until the classification module provides the function, which the hook and
+/// `explain` then share; until then every classified command reports `rewrite_unavailable`.
+fn rewrite(
+    command: &str,
+    classified: &[(&classify::Stage, ClassifyResponse)],
+    runner: &Path,
+) -> Result<String, Vec<String>> {
+    let _ = (command, classified, runner);
+    Err(vec!["rewrite_unavailable".to_owned()])
 }
