@@ -96,11 +96,23 @@ pub fn run(spec_b64: Option<&str>, command: &[OsString]) -> ExitCode {
     let watch = Watch::start();
     let tty = std::io::stdin().is_terminal();
     let mut runner = Runner::new(started, command, watch);
-    match catch_unwind(AssertUnwindSafe(|| runner.drive(spec_b64, tty))) {
-        Ok(code) => code,
-        Err(_) => runner.after_panic(&panic_message()),
+    let mut result = catch_unwind(AssertUnwindSafe(|| runner.drive(spec_b64, tty)));
+    // A panic in recovery re-enters it, and recovery goes on from what the runner holds: a
+    // stage that has started is waited for, never run again. A runner that still cannot get
+    // past its panics ends without unwinding, like one that crashed, and leaves its job to the
+    // recovery pass.
+    for _ in 0..RECOVERY_ROUNDS {
+        if let Ok(code) = result {
+            return code;
+        }
+        let message = panic_message();
+        result = catch_unwind(AssertUnwindSafe(|| runner.after_panic(&message)));
     }
+    result.unwrap_or_else(|_| std::process::abort())
 }
+
+/// How many times a panic in recovery re-enters recovery.
+const RECOVERY_ROUNDS: usize = 3;
 
 /// The last panic message; panics print nothing, because the runner's stderr is the stage's.
 static PANIC: Mutex<Option<String>> = Mutex::new(None);
@@ -228,9 +240,9 @@ impl Runner {
         }
     }
 
-    /// After a panic anywhere in [`Runner::drive`]: before the spawn the runner fails open and
-    /// runs the stage once; after it, the runner waits for the child (again) and exits with
-    /// its status, or with 125 when the status is unknown.
+    /// After a panic anywhere in [`Runner::drive`] or in an earlier recovery: before the spawn
+    /// the runner fails open and runs the stage once; after it, the runner waits for the child
+    /// (again) and exits with its status, or with 125 when the status is unknown.
     fn after_panic(&mut self, message: &str) -> ExitCode {
         if let Some(cancel) = self.cancelled {
             return cancel_exit(cancel);
@@ -742,16 +754,19 @@ impl Runner {
             .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
     }
 
-    /// Appends a record for this job; a record failure is never surfaced.
+    /// Appends a record for this job. Records are best-effort (section 4.7): a failure, a
+    /// panic included, loses the record and is never surfaced.
     fn record(&self, kind: RecordKind, data: Value) {
         let Some(ctx) = &self.ctx else { return };
-        let mut record = ctx.recorder.record(kind);
-        record.job_id = Some(self.job_id.clone());
-        record.session_id = self.spec.as_ref().and_then(|s| s.session_id.clone());
-        if let Value::Object(map) = data {
-            record.data = map;
-        }
-        let _ = ctx.recorder.append(&record);
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            let mut record = ctx.recorder.record(kind);
+            record.job_id = Some(self.job_id.clone());
+            record.session_id = self.spec.as_ref().and_then(|s| s.session_id.clone());
+            if let Value::Object(map) = data {
+                record.data = map;
+            }
+            ctx.recorder.append(&record)
+        }));
     }
 }
 

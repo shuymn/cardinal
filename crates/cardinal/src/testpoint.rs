@@ -7,7 +7,7 @@
 //!   `<dir>/<point>.<pid>.reached` and polls for `<dir>/<point>.release`. After 30 s it aborts,
 //!   so a broken test fails instead of hanging.
 //! - `CARDINAL_TEST_FAIL=<point>`: the process returns an injected error at that point.
-//! - `CARDINAL_TEST_PANIC=<point>`: the process panics at that point.
+//! - `CARDINAL_TEST_PANIC=<point>[,<point>]`: the process panics at a listed point.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -70,7 +70,7 @@ struct Settings {
     dir: PathBuf,
     pause: Vec<String>,
     fail: Option<String>,
-    panic: Option<String>,
+    panic: Vec<String>,
 }
 
 fn settings() -> Option<&'static Settings> {
@@ -78,16 +78,19 @@ fn settings() -> Option<&'static Settings> {
     SETTINGS
         .get_or_init(|| {
             let dir = std::env::var_os("CARDINAL_TEST_DIR").filter(|d| !d.is_empty())?;
-            let list = |name| std::env::var(name).unwrap_or_default();
-            Some(Settings {
-                dir: PathBuf::from(dir),
-                pause: list("CARDINAL_TEST_PAUSE")
+            let var = |name| std::env::var(name).unwrap_or_default();
+            let list = |name| {
+                var(name)
                     .split(',')
                     .filter(|p| !p.is_empty())
                     .map(str::to_owned)
-                    .collect(),
-                fail: Some(list("CARDINAL_TEST_FAIL")).filter(|p| !p.is_empty()),
-                panic: Some(list("CARDINAL_TEST_PANIC")).filter(|p| !p.is_empty()),
+                    .collect()
+            };
+            Some(Settings {
+                dir: PathBuf::from(dir),
+                pause: list("CARDINAL_TEST_PAUSE"),
+                fail: Some(var("CARDINAL_TEST_FAIL")).filter(|p| !p.is_empty()),
+                panic: list("CARDINAL_TEST_PANIC"),
             })
         })
         .as_ref()
@@ -103,7 +106,7 @@ pub fn hit(point: &'static str) -> Result<(), Injected> {
         pause(&settings.dir, point);
     }
     assert!(
-        settings.panic.as_deref() != Some(point),
+        !settings.panic.iter().any(|p| p == point),
         "injected panic at {point}"
     );
     if settings.fail.as_deref() == Some(point) {

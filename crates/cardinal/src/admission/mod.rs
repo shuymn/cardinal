@@ -389,9 +389,11 @@ impl Drop for Admitter {
     }
 }
 
-/// An admitted job: its reservation file and its live lock. Dropping it releases both, so a
-/// runner that fails open or unwinds before the spawn never leaves a reservation behind;
-/// after the spawn the runner keeps the job until the stage has ended.
+/// An admitted job: its reservation file and its live lock. Dropped while still `reserved`, it
+/// releases both, so a runner that fails open or unwinds before the start boundary never
+/// leaves a reservation behind. Once [`Job::starting`] has been called, the stage may be
+/// running: dropped then, it is abandoned as by [`Job::abandon`], so no path that drops the
+/// job (an unwinding panic included) deletes the reservation of a stage that may still run.
 pub struct Job {
     state: StateDir,
     reservation: Reservation,
@@ -411,7 +413,7 @@ impl Job {
     }
 
     /// Writes `starting`: the start boundary as seen from the state directory. Written
-    /// immediately before the spawn.
+    /// immediately before the spawn. From here on, dropping the job abandons it.
     pub fn starting(&mut self) -> Result<(), AdmissionError> {
         self.reservation.state = ReservationState::Starting;
         self.reservation.updated_ms = now_ms();
@@ -448,11 +450,16 @@ impl Job {
 
 impl Drop for Job {
     fn drop(&mut self) {
-        if !self.done {
+        if self.done {
+            return;
+        }
+        if self.reservation.state == ReservationState::Reserved {
             let _ = remove_if_exists(&self.state.reservation(&self.reservation.job_id));
             if let Some(live) = self.live.take() {
                 let _ = std::fs::remove_file(live.path());
             }
+        } else {
+            drop(self.live.take());
         }
     }
 }

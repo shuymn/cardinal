@@ -222,3 +222,44 @@ fn dropping_a_job_or_an_unadmitted_admitter_leaves_nothing() {
     assert!(read(&state, "eeee000000000001").is_none());
     assert!(!state.live_lock("eeee000000000001").exists());
 }
+
+/// Once `starting` is written the stage may be running: a job dropped then (an unwinding
+/// panic) keeps its reservation and live lock file for recovery and only lets go of the lock.
+#[test]
+fn a_job_dropped_after_the_start_boundary_is_abandoned() {
+    let (_dir, state) = state();
+    let host = HostConfig::defaults();
+    for running in [false, true] {
+        let job_id = if running {
+            "ffff000000000002"
+        } else {
+            "ffff000000000001"
+        };
+        let mut admitter = Admitter::new(&state, &host, job_id.into(), None);
+        let Pass::Admitted(mut job) = admitter
+            .pass(&reservation(job_id, 701, None, 1), true)
+            .unwrap()
+        else {
+            panic!("overflow always admits");
+        };
+        drop(admitter);
+        job.starting().unwrap();
+        if running {
+            job.running(ProcessIdentity {
+                pid: 702,
+                start_s: 11,
+            })
+            .unwrap();
+        }
+        drop(job);
+        let kept = read(&state, job_id).expect("the reservation stays");
+        assert_ne!(kept.state, ReservationState::Reserved, "{running}");
+        assert!(state.live_lock(job_id).exists(), "{running}");
+        assert!(
+            state::try_lock(&state.live_lock(job_id), LockMode::Exclusive)
+                .unwrap()
+                .is_some(),
+            "{running}: the live lock is no longer held"
+        );
+    }
+}
