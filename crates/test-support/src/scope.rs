@@ -281,6 +281,30 @@ impl Command {
         self
     }
 
+    /// The program, as given to [`Scope::command`].
+    #[must_use]
+    pub fn get_program(&self) -> &OsStr {
+        self.inner.get_program()
+    }
+
+    /// The arguments, without the program.
+    pub fn get_args(&self) -> std::process::CommandArgs<'_> {
+        self.inner.get_args()
+    }
+
+    /// The whole environment the child gets: the scope's constructed environment with the
+    /// changes made through [`Command::env`] and [`Command::env_remove`] (a removed variable
+    /// has `None` as its value).
+    pub fn get_envs(&self) -> std::process::CommandEnvs<'_> {
+        self.inner.get_envs()
+    }
+
+    /// The working directory inside the scope root.
+    #[must_use]
+    pub fn get_current_dir(&self) -> Option<&Path> {
+        self.inner.get_current_dir()
+    }
+
     /// Starts the child. Its cleanup slot exists before it starts.
     pub fn spawn(&mut self) -> io::Result<Child> {
         self.check_shell();
