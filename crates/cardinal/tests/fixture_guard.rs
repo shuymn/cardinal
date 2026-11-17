@@ -43,8 +43,127 @@ fn named_operations_work_inside_the_fixture() {
     assert!(wt.join("dir/a.txt").exists());
     let bare = fixture.init_bare("remote.git");
     fixture.git(&repo, &["remote", "add", "origin", &bare.to_string_lossy()]);
-    fixture.git(&repo, &["push", "-q", "origin", "main"]);
+    fixture.push(&repo, "origin", "main");
     assert_eq!(fixture.git(&bare, &["rev-parse", "main"]).trim(), head);
+}
+
+/// `url` as a `file://` URL with forward slashes.
+fn file_url(path: &Path) -> String {
+    let path = path.to_string_lossy().replace('\\', "/");
+    if path.starts_with('/') {
+        format!("file://{path}")
+    } else {
+        format!("file:///{path}")
+    }
+}
+
+#[test]
+fn pushes_cannot_leave_the_root() {
+    let fixture = Fixture::new();
+    let repo = fixture.init("repo");
+    fixture.commit_file(&repo, "a.txt", "a\n", "first");
+    let other = Fixture::new();
+    let outside = other.init_bare("other.git");
+    let url = file_url(&outside);
+    fixture.git(&repo, &["remote", "add", "evil", &url]);
+
+    // Plain git has no transport at all.
+    let output = fixture.git_output(&repo, &["push", "-q", "evil", "main"]);
+    assert!(!output.status.success(), "a push to {url} went through");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("not allowed"), "{stderr}");
+    refuses("re-enabling the file transport", || {
+        fixture.git(
+            &repo,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "push",
+                "-q",
+                "evil",
+                "main",
+            ],
+        );
+    });
+    refuses("re-enabling transports in config", || {
+        fixture.git(&repo, &["config", "protocol.allow", "always"]);
+    });
+    // The named push checks where the remote leads.
+    refuses("a push to a remote outside", || {
+        fixture.push(&repo, "evil", "main");
+    });
+    refuses("a push to a URL outside", || {
+        fixture.push(&repo, &url, "main");
+    });
+    fixture.git(
+        &repo,
+        &["remote", "set-url", "evil", "ssh://fixture.invalid/x.git"],
+    );
+    refuses("a push to a network remote", || {
+        fixture.push(&repo, "evil", "main");
+    });
+    assert_eq!(
+        other.git(&outside, &["for-each-ref"]),
+        "",
+        "the outside repository is untouched"
+    );
+}
+
+#[cfg(unix)]
+fn symlink(target: &Path, link: &Path, _dir: bool) {
+    std::os::unix::fs::symlink(target, link).unwrap();
+}
+
+#[cfg(windows)]
+fn symlink(target: &Path, link: &Path, dir: bool) {
+    if dir {
+        std::os::windows::fs::symlink_dir(target, link).unwrap();
+    } else {
+        std::os::windows::fs::symlink_file(target, link).unwrap();
+    }
+}
+
+#[test]
+fn symbolic_links_out_of_the_root_are_refused() {
+    let fixture = Fixture::new();
+    let repo = fixture.init("repo");
+    let other = Fixture::new();
+    let target = other.path("config");
+    std::fs::write(&target, "").unwrap();
+    let outside_dir = other.path("dir");
+    std::fs::create_dir(&outside_dir).unwrap();
+    symlink(&target, &repo.join("link-to-outside"), false);
+    symlink(&other.path("missing"), &repo.join("dangling"), false);
+    symlink(&outside_dir, &repo.join("dir-link"), true);
+    let cases: &[(&str, &[&str])] = &[
+        (
+            "config --file",
+            &["config", "--file", "link-to-outside", "a.b", "c"],
+        ),
+        (
+            "config --file=",
+            &["config", "--file=link-to-outside", "a.b", "c"],
+        ),
+        (
+            "a dangling link",
+            &["config", "--file", "dangling", "a.b", "c"],
+        ),
+        ("a path below a link", &["init", "-q", "dir-link/new"]),
+        (
+            "a climb after a link",
+            &["init", "-q", "dir-link/../escape"],
+        ),
+        ("-C through a link", &["-C", "dir-link", "init", "-q"]),
+    ];
+    for (what, args) in cases {
+        refuses(what, || {
+            fixture.git(&repo, args);
+        });
+    }
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "");
+    for name in ["missing", "escape", "dir/new", "dir/.git"] {
+        assert!(!other.path(name).exists(), "{name} was created outside");
+    }
 }
 
 #[test]

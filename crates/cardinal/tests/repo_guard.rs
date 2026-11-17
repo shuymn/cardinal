@@ -104,7 +104,7 @@ fn pushes_and_upstreams_of_other_worktrees_are_ignored() {
     fixture.git(&repo, &["remote", "add", "origin", &bare]);
     assert!(guard(&fixture, "snapshot", &repo, &file).status.success());
     let wt = fixture.path("wt");
-    fixture.git(&wt, &["push", "-q", "-u", "origin", "feature"]);
+    fixture.push(&wt, "origin", "feature");
     fixture.git(&wt, &["config", "branch.feature.note", "x"]);
     let output = guard(&fixture, "verify", &repo, &file);
     assert!(
@@ -114,7 +114,7 @@ fn pushes_and_upstreams_of_other_worktrees_are_ignored() {
     );
 
     // The same for this worktree's own branch is a change.
-    fixture.git(&repo, &["push", "-q", "-u", "origin", "main"]);
+    fixture.push(&repo, "origin", "main");
     assert!(!guard(&fixture, "verify", &repo, &file).status.success());
 }
 

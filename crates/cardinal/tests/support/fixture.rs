@@ -1,11 +1,13 @@
 //! Git fixtures (`docs/architecture.md` section 13.3).
 //!
 //! Fixtures live in the OS temp dir, outside any repository. Git runs only through
-//! [`Fixture::git`], which panics unless the directory, every path-like argument, and the git
-//! dir and common dir git resolves for the call are inside the fixture root. The environment
-//! is constructed, not inherited: `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, and every
-//! other inherited `GIT_*` never reach git, so a test run from a git hook cannot touch the
-//! repository the tests run in.
+//! [`Fixture::git`] and the named operations, which panic unless the directory, every
+//! argument read as a path (symbolic links followed), and the git dir and common dir git
+//! resolves for the call are inside the fixture root. The isolated config disables every
+//! transport, so only [`Fixture::push`], which checks the remote's URL, moves objects
+//! between repositories. The environment is constructed, not inherited: `GIT_DIR`,
+//! `GIT_WORK_TREE`, `GIT_INDEX_FILE`, and every other inherited `GIT_*` never reach git, so a
+//! test run from a git hook cannot touch the repository the tests run in.
 
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
@@ -43,7 +45,8 @@ pub struct Fixture {
 
 impl Fixture {
     /// A new fixture root in the OS temp dir, with an isolated git configuration that
-    /// disables signing and hooks.
+    /// disables signing, hooks, and every transport (`file` too, so a local path or
+    /// `file://` remote cannot write elsewhere; ssh would use the real user's keys).
     pub fn new() -> Self {
         let dir = tempfile::Builder::new()
             .prefix("cardinal-fixture-")
@@ -70,7 +73,8 @@ impl Fixture {
             format!(
                 "[core]\n\thooksPath = \"{hooks}\"\n\tautocrlf = false\n\
                  [commit]\n\tgpgsign = false\n[tag]\n\tgpgsign = false\n\
-                 [init]\n\tdefaultBranch = main\n[gc]\n\tauto = 0\n[maintenance]\n\tauto = false\n"
+                 [init]\n\tdefaultBranch = main\n[gc]\n\tauto = 0\n[maintenance]\n\tauto = false\n\
+                 [protocol]\n\tallow = never\n"
             ),
         )
         .expect("write the fixture git config");
@@ -147,15 +151,47 @@ impl Fixture {
 
     /// Runs git in `dir` after the guard checks, without checking its status.
     pub fn git_output(&self, dir: &Path, args: &[&str]) -> Output {
-        self.assert_inside(dir, "directory");
-        for arg in args {
-            self.check_arg(dir, arg);
-        }
+        self.run_git(dir, &[], args)
+    }
+
+    fn run_git(&self, dir: &Path, config: &[&str], args: &[&str]) -> Output {
+        self.check_args(dir, args);
         self.check_resolved_git_dirs(dir, args);
         self.command("git", dir)
+            .args(config)
             .args(args)
             .output()
             .expect("run git")
+    }
+
+    /// `git push -q -u remote branch` from `repo`, where `remote` is a remote name or a
+    /// URL. Every push URL must be a local path or `file://` URL inside the root; only this
+    /// call enables the file transport.
+    pub fn push(&self, repo: &Path, remote: &str, branch: &str) {
+        let configured = self.git_output(repo, &["remote", "get-url", "--push", "--all", remote]);
+        let urls = if configured.status.success() {
+            String::from_utf8(configured.stdout).expect("git output is UTF-8")
+        } else {
+            remote.to_owned()
+        };
+        for url in urls.lines() {
+            let path = url.strip_prefix("file://").unwrap_or(url);
+            assert!(
+                !path.contains("://"),
+                "refusing git: push URL {url} is not a local path"
+            );
+            self.assert_inside(&repo.join(path), "push URL");
+        }
+        let output = self.run_git(
+            repo,
+            &["-c", "protocol.file.allow=always"],
+            &["push", "-q", "-u", remote, branch],
+        );
+        assert!(
+            output.status.success(),
+            "git push {remote} {branch} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     /// `git init` of a new repository `root/name` on branch `main`.
@@ -206,29 +242,53 @@ impl Fixture {
         );
     }
 
-    /// Absolute paths, `name=/abs` values, attached short-option values (`-C/abs`), `~`, and
-    /// relative paths with `..` must stay inside the root.
-    fn check_arg(&self, dir: &Path, arg: &str) {
+    /// Each `-C` directory, then every argument read as a path relative to the directory
+    /// git ends up in, must resolve inside the root. Arguments that are not paths resolve
+    /// inside it trivially.
+    fn check_args(&self, dir: &Path, args: &[&str]) {
+        self.assert_inside(dir, "directory");
+        let mut cwd = dir.to_path_buf();
+        let mut rest = args.iter();
+        while let Some(arg) = rest.next() {
+            if !arg.starts_with('-') {
+                break;
+            }
+            if *arg == "-C" {
+                if let Some(value) = rest.next() {
+                    cwd = cwd.join(value);
+                    self.assert_inside(&cwd, "directory");
+                }
+            } else if GLOBAL_WITH_VALUE.contains(arg) {
+                rest.next();
+            }
+        }
+        for arg in args {
+            self.check_arg(&cwd, arg);
+        }
+    }
+
+    /// The argument itself, its `name=value` value, and an attached short-option value
+    /// (`-C/abs`) must not name a home directory and must resolve inside the root. Settings
+    /// that re-enable a transport are refused outright.
+    fn check_arg(&self, cwd: &Path, arg: &str) {
+        let lower = arg.to_ascii_lowercase();
+        assert!(
+            !(lower.contains("protocol.") && lower.contains("allow")),
+            "refusing git: argument {arg} changes which transports git may use"
+        );
         let mut candidates = vec![arg];
         if let Some((_, value)) = arg.split_once('=') {
             candidates.push(value);
         }
-        if arg.len() > 2 && arg.starts_with('-') && !arg.starts_with("--") {
-            candidates.push(&arg[2..]);
+        if arg.starts_with('-') && !arg.starts_with("--") {
+            candidates.extend(arg.get(2..).filter(|value| !value.is_empty()));
         }
         for candidate in candidates {
             assert!(
                 !candidate.starts_with('~'),
                 "refusing git: argument {arg} names a home directory"
             );
-            let path = Path::new(candidate);
-            let absolute = path.is_absolute() || candidate.starts_with(['/', '\\']);
-            let climbs = candidate.split(['/', '\\']).any(|segment| segment == "..");
-            if absolute {
-                self.assert_inside(path, "argument");
-            } else if climbs {
-                self.assert_inside(&dir.join(path), "argument");
-            }
+            self.assert_inside(&cwd.join(candidate), "argument");
         }
     }
 
@@ -267,6 +327,9 @@ impl Fixture {
     }
 }
 
+/// Symbolic link chains longer than this are not followed further.
+const MAX_LINKS: u32 = 40;
+
 /// Removes `.` and `..` lexically.
 fn normalize(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
@@ -282,11 +345,39 @@ fn normalize(path: &Path) -> PathBuf {
     out
 }
 
-/// The canonical form of `path`: its longest existing ancestor canonicalized (resolving
-/// symbolic links), followed by the rest.
+/// Where `path` leads on disk. Each symbolic link along it is followed, dangling ones too,
+/// before a later `..` applies, as the OS would; then the longest existing ancestor is
+/// canonicalized.
 fn resolve(path: &Path) -> PathBuf {
-    let path = normalize(path);
-    let mut existing = path.as_path();
+    canonical_prefix(&follow_links(path, 0))
+}
+
+fn follow_links(path: &Path, depth: u32) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::Normal(name) => {
+                out.push(name);
+                if depth < MAX_LINKS
+                    && let Ok(target) = std::fs::read_link(&out)
+                {
+                    let base = out.parent().map(Path::to_path_buf).unwrap_or_default();
+                    out = follow_links(&base.join(target), depth + 1);
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// `path` with its longest existing ancestor canonicalized, followed by the rest.
+fn canonical_prefix(path: &Path) -> PathBuf {
+    let mut existing = path;
     let mut rest = Vec::new();
     loop {
         if let Ok(canonical) = dunce::canonicalize(existing) {
@@ -299,7 +390,7 @@ fn resolve(path: &Path) -> PathBuf {
                 rest.push(name.to_os_string());
                 existing = parent;
             }
-            _ => return path,
+            _ => return path.to_path_buf(),
         }
     }
 }
