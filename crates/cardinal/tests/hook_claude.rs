@@ -1,19 +1,31 @@
 //! `cardinal hook claude pre-tool-use` (`docs/architecture.md` section 6.3): the rewrite and
 //! its spec, the fields it keeps, the deadline, the cases that print nothing, and profile
 //! matching through the repository. Claims C1, C5, C6, and A5 (section 16).
+//!
+//! Rewriting, and the records the hook appends on the way, are Unix-only in phase 0: on
+//! Windows the hook stops before it reads its input (section 6.3), which
+//! `windows_not_rewritten` checks.
 
 mod hook_support;
 mod support;
 
 use std::path::Path;
+#[cfg(unix)]
 use std::time::Duration;
 
+#[cfg(unix)]
 use cardinal::contract::{Record, RecordKind};
+#[cfg(unix)]
 use cardinal::state::StateDir;
-use hook_support::{PROFILE, RUNNER, cmd, configure, host, input, rewritten, run_hook, specs};
-use serde_json::{Value, json};
+use hook_support::{PROFILE, RUNNER, cmd, configure, host, input, run_hook};
+#[cfg(unix)]
+use hook_support::{rewritten, specs};
+use serde_json::Value;
+#[cfg(unix)]
+use serde_json::json;
 use support::cardinal::Dirs;
 
+#[cfg(unix)]
 fn records(dirs: &Dirs) -> Vec<Record> {
     let state = StateDir::open(dirs.state()).expect("open the state dir");
     cardinal::record::read_all(&state).expect("read records")
@@ -27,6 +39,7 @@ fn configured(extra_host: &str) -> Dirs {
 
 /// C1: a classified stage is rewritten to run through `cardinal run`, and the hook leaves
 /// the state dir untouched: no reservation, nothing at all.
+#[cfg(unix)]
 #[test]
 fn rewrite_takes_no_reservation() {
     let dirs = configured("");
@@ -53,6 +66,7 @@ fn rewrite_takes_no_reservation() {
 
 /// The spec carries the class, rule, resources, timeout, background flag, stage, and the
 /// call's IDs; resources come from the rule or `default_resources`.
+#[cfg(unix)]
 #[test]
 fn spec_carries_the_call() {
     let dirs = configured("[admission]\ndefault_resources = { cpu = 2, memory_mb = 100 }\n");
@@ -91,6 +105,7 @@ fn spec_carries_the_call() {
 
 /// The timeout falls back to `BASH_DEFAULT_TIMEOUT_MS` and is capped by
 /// `BASH_MAX_TIMEOUT_MS`, both from the hook's environment.
+#[cfg(unix)]
 #[test]
 fn timeout_comes_from_the_environment() {
     let dirs = configured("");
@@ -113,6 +128,7 @@ fn timeout_comes_from_the_environment() {
 
 /// C6: `updatedInput` is the original `tool_input` with only `command` replaced, unknown
 /// fields included; no permission decision is returned.
+#[cfg(unix)]
 #[test]
 fn other_fields_preserved() {
     let dirs = configured("");
@@ -134,6 +150,7 @@ fn other_fields_preserved() {
     assert_eq!(doc.as_object().unwrap().len(), 1);
 }
 
+#[cfg(unix)]
 fn hook_process(dirs: &Dirs) -> std::process::Command {
     let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_cardinal"));
     command
@@ -148,6 +165,7 @@ fn hook_process(dirs: &Dirs) -> std::process::Command {
 
 /// C5: a hook that is still classifying when its deadline passes rewrites nothing and
 /// records why; the same input within the deadline is rewritten.
+#[cfg(unix)]
 #[test]
 fn deadline_no_rewrite() {
     use std::io::{Read, Write};
@@ -206,6 +224,7 @@ fn deadline_no_rewrite() {
 }
 
 /// A5: `auto` mode is not rewritten.
+#[cfg(unix)]
 #[test]
 fn auto_mode_not_rewritten() {
     let dirs = configured("");
@@ -235,12 +254,17 @@ fn windows_not_rewritten() {
 mod never_blocks {
     use std::path::Path;
 
+    #[cfg(unix)]
     use cardinal::contract::RecordKind;
     use serde_json::json;
 
-    use super::hook_support::{PROFILE, RUNNER, cmd, configure, host, input, run_hook};
+    use super::configured;
+    #[cfg(unix)]
+    use super::hook_support::host;
+    use super::hook_support::{PROFILE, RUNNER, cmd, configure, input, run_hook};
+    #[cfg(unix)]
+    use super::records;
     use super::support::cardinal::Dirs;
-    use super::{configured, records};
 
     fn raw(dirs: &Dirs, stdin: Vec<u8>) {
         let output = dirs
@@ -314,6 +338,7 @@ mod never_blocks {
         assert_eq!(run_hook(cmd(&dirs), &input("make", Path::new("/w"))), None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn invalid_config_is_recorded() {
         let dirs = Dirs::new();
@@ -330,6 +355,7 @@ mod never_blocks {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn invalid_runner_path_is_recorded() {
         for runner in [
@@ -378,6 +404,7 @@ mod never_blocks {
         assert_eq!(run_hook(command, &input("make", Path::new("/w"))), None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn injected_failure() {
         let dirs = configured("");
