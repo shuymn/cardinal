@@ -5,6 +5,10 @@
 //! it is opened is detected by its `(dev, ino)`. A directory on another mount than the target
 //! (a bind mount on the same device included) is recorded but not entered, and a target that
 //! is a mount point is reported as one. Nothing here writes.
+//!
+//! The snapshot keeps a descriptor open for every directory from the target down to the one
+//! it is reading, so directories nested deeper than the open-file limit allows fail it with
+//! `EMFILE`; the walk checks are then `unknown` and `act` rejects the plan.
 
 use std::ffi::{OsStr, OsString};
 use std::io;
