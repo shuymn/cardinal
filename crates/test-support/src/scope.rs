@@ -15,8 +15,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use tempfile::TempDir;
 
-/// The variable the test harness sets to a unique value for each test executable it runs. A
-/// scope passes it to every child, so the harness can find what a test left running.
+/// The variable the test harness sets to a value unique to each harness run. A scope passes
+/// it to every child, so the harness can find what a test left running.
 pub const RUN_MARKER: &str = "CARDINAL_TEST_RUN";
 
 /// Fixed identity and dates for every commit made inside a scope.
