@@ -463,18 +463,6 @@ fn file_references(rel: &Path, src: &str) -> Vec<Reference> {
         .collect()
 }
 
-/// [`file_references`] of every file in `src/`.
-fn module_references() -> Vec<Reference> {
-    let src = src_dir();
-    source_files()
-        .iter()
-        .flat_map(|file| {
-            let text = std::fs::read_to_string(file).unwrap();
-            file_references(file.strip_prefix(&src).unwrap(), &text)
-        })
-        .collect()
-}
-
 /// Whether `toks[i]` is the external crate `name` at the start of a path: `name` or
 /// `::name`, but not `crate::name` or `os::name`.
 fn is_crate(toks: &[Tok], i: usize, name: &str) -> bool {
@@ -562,19 +550,11 @@ fn sources_follow_the_layering() {
     );
 }
 
+// The sources follow the table (`sources_follow_the_layering`); these check that the table
+// itself keeps the rules of section 2.2.
+
 #[test]
 fn admission_has_no_observe_dependency() {
-    let violations: Vec<String> = module_references()
-        .into_iter()
-        .filter(|r| ADMISSION_PATH.contains(&r.from.as_str()))
-        .filter(|r| ["observe", "plan", "act"].contains(&r.to.as_str()))
-        .map(|r| r.to_string())
-        .collect();
-    assert!(
-        violations.is_empty(),
-        "the admission path reaches observation:\n{}",
-        violations.join("\n")
-    );
     for module in ADMISSION_PATH {
         for banned in ["observe", "plan", "act"] {
             assert!(
@@ -587,16 +567,6 @@ fn admission_has_no_observe_dependency() {
 
 #[test]
 fn admission_has_no_inbox_dependency() {
-    let violations: Vec<String> = module_references()
-        .into_iter()
-        .filter(|r| ADMISSION_PATH.contains(&r.from.as_str()) && r.to == "inbox")
-        .map(|r| r.to_string())
-        .collect();
-    assert!(
-        violations.is_empty(),
-        "the admission path reaches the inbox:\n{}",
-        violations.join("\n")
-    );
     for module in ADMISSION_PATH {
         assert!(
             !allowed()[module].contains("inbox"),
@@ -607,12 +577,14 @@ fn admission_has_no_inbox_dependency() {
 
 #[test]
 fn foundation_modules_import_nothing_above_them() {
-    let violations: Vec<String> = module_references()
-        .into_iter()
-        .filter(|r| FOUNDATION.contains(&r.from.as_str()) && r.to != "contract")
-        .map(|r| r.to_string())
-        .collect();
-    assert!(violations.is_empty(), "{}", violations.join("\n"));
+    let allowed = allowed();
+    for module in FOUNDATION {
+        assert!(
+            allowed[module].iter().all(|dep| *dep == "contract"),
+            "the table lets {module} use {:?}",
+            allowed[module]
+        );
+    }
 }
 
 #[test]

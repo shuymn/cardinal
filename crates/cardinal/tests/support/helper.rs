@@ -154,36 +154,29 @@ pub fn spawn(mode: &Mode, cwd: Option<&Path>) -> ChildGuard {
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
-    ChildGuard(Some(command.spawn().expect("start a helper process")))
+    ChildGuard(command.spawn().expect("start a helper process"))
 }
 
 /// Kills and reaps its child when dropped.
-pub struct ChildGuard(Option<Child>);
+pub struct ChildGuard(Child);
 
 impl ChildGuard {
     pub fn new(child: Child) -> Self {
-        Self(Some(child))
+        Self(child)
     }
 
     pub fn id(&self) -> u32 {
-        self.0.as_ref().expect("child").id()
+        self.0.id()
     }
 
     pub fn child(&mut self) -> &mut Child {
-        self.0.as_mut().expect("child")
-    }
-
-    /// Hands the child over without killing it.
-    pub fn into_child(mut self) -> Child {
-        self.0.take().expect("child")
+        &mut self.0
     }
 
     /// Kills the child (SIGKILL on Unix, `TerminateProcess` on Windows) and reaps it.
     pub fn kill(&mut self) {
-        if let Some(child) = self.0.as_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        let _ = self.0.kill();
+        let _ = self.0.wait();
     }
 }
 
