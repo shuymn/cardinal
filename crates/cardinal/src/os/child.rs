@@ -7,13 +7,13 @@
 //!
 //! No process cardinal starts here outlives what started it: the child's process group
 //! (Unix) or Job Object (Windows) is killed before the child is reaped, after a normal exit
-//! too. A terminated process takes its live children along. On Unix the first [`run`] in a
-//! process installs handlers for SIGTERM, SIGINT, and SIGHUP that end the process by the
-//! same signal (see `guard_termination`), so a process that handles those signals itself
-//! must not use [`run`]; when that fails, no child starts, and this and every later [`run`]
-//! in the process return [`ChildError::Setup`]. On Windows each child's job is killed when
-//! its only handle, held by this process, closes; other processes this process starts are
-//! not affected.
+//! too. A terminated process takes its live children along. On Unix [`prepare`], or else the
+//! first [`run`] in a process, installs handlers for SIGTERM, SIGINT, and SIGHUP that end the
+//! process by the same signal (see `guard_termination`), so a process that handles those
+//! signals itself must not use [`run`]; when that fails, no child starts, and this and every
+//! later [`run`] in the process return [`ChildError::Setup`]. On Windows each child's job is
+//! killed when its only handle, held by this process, closes; other processes this process
+//! starts are not affected.
 //!
 //! For short-lived callers only (a CLI command, a hook): a descendant that left the child's
 //! process group (`setsid`) is not killed, and a reader thread blocked on a pipe it holds
@@ -271,6 +271,16 @@ fn live() -> MutexGuard<'static, Vec<u32>> {
     LIVE.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Sets up, now, what [`run`] needs before this process's first child. On Unix that is the
+/// termination handling of `guard_termination`, set up best before the process starts any
+/// thread other than the one calling this: a termination signal sent to the process while
+/// the handlers go in is lost if it reaches a thread that does not block it. A command that
+/// runs children calls this first. A failure is not lost: every [`run`] returns it.
+pub fn prepare() {
+    #[cfg(unix)]
+    let _ = guard_termination();
+}
+
 /// Makes this process take its children along when it is terminated, once per process.
 /// SIGCHLD goes to its default action first, so every child stays unreaped, and the process
 /// group it leads pinned, until [`Reaper::finish`] reaps it, also when the caller ignored
@@ -278,26 +288,37 @@ fn live() -> MutexGuard<'static, Vec<u32>> {
 /// group and end the process by the same signal with its default action. A failure installs
 /// no handler and is returned by this and every later call: signal-hook keeps a slot for a
 /// signal it once took, so a second attempt would not install its handler again.
+///
+/// Both change process-wide signal state, which cardinal owns: it is a command line program,
+/// and this library serves only its binary and tests.
 #[cfg(unix)]
 fn guard_termination() -> std::io::Result<()> {
-    use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
-
     static GUARD: OnceLock<Result<(), String>> = OnceLock::new();
     GUARD
-        .get_or_init(|| {
-            unix::reset_child_signal();
-            unix::watch_signals(&[SIGTERM, SIGINT, SIGHUP], |sig| {
-                // Held until the process ends: no child starts or is reaped after this.
-                let live = live();
-                for &pgid in live.iter() {
-                    crate::os::kill_process_group(pgid);
-                }
-                unix::die_by_signal(sig)
-            })
-            .map_err(|err| err.to_string())
-        })
+        .get_or_init(|| guard_with(unix::watch_signals).map_err(|err| err.to_string()))
         .clone()
         .map_err(std::io::Error::other)
+}
+
+/// The setup of [`guard_termination`], with `watch` installing handlers that call the
+/// function it is given.
+#[cfg(unix)]
+fn guard_with(watch: impl FnOnce(&[i32], fn(i32)) -> std::io::Result<()>) -> std::io::Result<()> {
+    use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
+
+    unix::reset_child_signal();
+    watch(&[SIGTERM, SIGINT, SIGHUP], end_with_children)
+}
+
+/// Kills every live child's process group, then ends this process by `sig`.
+#[cfg(unix)]
+fn end_with_children(sig: i32) {
+    // Held until the process ends: no child starts or is reaped after this.
+    let live = live();
+    for &pgid in live.iter() {
+        crate::os::kill_process_group(pgid);
+    }
+    unix::die_by_signal(sig)
 }
 
 /// Owns the child until it is reaped. On every exit from [`run`], complete or early
@@ -626,11 +647,144 @@ mod tests {
         script: &str,
         limits: Limits,
     ) -> Result<super::Output, ChildError> {
+        sh_guarded(super::guard_termination, dir, script, limits)
+    }
+
+    /// [`sh`], with `guard` run before the child is started.
+    #[cfg(unix)]
+    fn sh_guarded(
+        guard: impl FnOnce() -> std::io::Result<()>,
+        dir: &std::path::Path,
+        script: &str,
+        limits: Limits,
+    ) -> Result<super::Output, ChildError> {
         let mut inherited: Vec<(OsString, OsString)> =
             std::env::vars_os().filter(|(k, _)| k == "PATH").collect();
         inherited.push(("HOME".into(), dir.into()));
         let env = git_env(inherited);
-        run("sh", &["-c".into(), script.into()], &env, dir, limits)
+        let args = ["-c".into(), script.into()];
+        run_guarded(guard, "sh".as_ref(), &args, &env, dir, limits)
+    }
+
+    /// The directory a helper test, run through the test binary, reports to.
+    const HELPER_DIR: &str = "CARDINAL_TEST_HELPER_DIR";
+
+    /// The process ID a test helper wrote to `dir/name`.
+    #[cfg(unix)]
+    fn written_pid(dir: &std::path::Path, name: &str) -> Option<u32> {
+        std::fs::read_to_string(dir.join(name))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    }
+
+    /// Does nothing with the signal it is called for.
+    #[cfg(unix)]
+    extern "C" fn inert(_: libc::c_int) {}
+
+    /// Run by `a_signal_while_the_handlers_go_in_ends_the_run`. Raises SIGTERM on the thread
+    /// that installs the handlers, where the one for SIGTERM is installed but does nothing
+    /// with it yet, as signal-hook's does until it has published the action it runs; then
+    /// runs a child that writes its PID to `child` and sleeps. Writes `returned` if the run
+    /// returned, which it does only if the signal was lost.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "run by a_signal_while_the_handlers_go_in_ends_the_run"]
+    fn signal_while_the_handlers_go_in_helper() {
+        let Some(dir) = std::env::var_os(HELPER_DIR).map(std::path::PathBuf::from) else {
+            return;
+        };
+        let guard = || {
+            super::guard_with(|signals, on_signal| {
+                super::unix::watch_signals_with(
+                    signals,
+                    on_signal,
+                    super::unix::start_thread,
+                    |sig, writer| {
+                        if sig == libc::SIGTERM {
+                            let mut action = std::mem::MaybeUninit::<libc::sigaction>::zeroed();
+                            // SAFETY: `action` is a zeroed `sigaction` with an empty mask and
+                            // `inert` as its handler, which touches nothing; `raise` sends
+                            // SIGTERM to this thread.
+                            unsafe {
+                                let action = action.as_mut_ptr();
+                                (*action).sa_sigaction = inert as *const () as libc::sighandler_t;
+                                libc::sigemptyset(&raw mut (*action).sa_mask);
+                                libc::sigaction(sig, action, std::ptr::null_mut());
+                                libc::raise(sig);
+                            }
+                        }
+                        signal_hook::low_level::pipe::register(sig, writer)
+                    },
+                )
+            })
+        };
+        let script = format!("echo $$ > '{}'; exec sleep 30", dir.join("child").display());
+        let result = sh_guarded(guard, &dir, &script, limits(Duration::from_secs(3), 1024));
+        std::fs::write(dir.join("returned"), format!("{result:?}")).unwrap();
+    }
+
+    /// A termination signal that arrives while the handlers go in is not lost: it waits
+    /// until they are in place, then ends the run and the process by that signal, and kills
+    /// the child if one started.
+    #[cfg(unix)]
+    #[test]
+    fn a_signal_while_the_handlers_go_in_ends_the_run() {
+        use std::os::unix::process::ExitStatusExt as _;
+        use std::process::{Command, Stdio};
+
+        /// Kills the helper's child, if it is still there, on every way out of the test.
+        struct KillChild<'a>(&'a std::path::Path);
+        impl Drop for KillChild<'_> {
+            fn drop(&mut self) {
+                if let Some(pid) = written_pid(self.0, "child")
+                    && crate::os::start_time_s(pid).is_some()
+                {
+                    crate::os::kill_process_group(pid);
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let _kill = KillChild(dir.path());
+        let mut helper = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "os::child::tests::signal_while_the_handlers_go_in_helper",
+                "--exact",
+                "--ignored",
+            ])
+            .env(HELPER_DIR, dir.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let status = loop {
+            if let Some(status) = helper.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = helper.kill();
+                let _ = helper.wait();
+                panic!("the helper did not end within 20 s");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let returned = std::fs::read_to_string(dir.path().join("returned")).ok();
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGTERM),
+            "{status}; the run returned {returned:?}"
+        );
+        if let Some(pid) = written_pid(dir.path(), "child") {
+            let gone = (0..250).any(|_| {
+                std::thread::sleep(Duration::from_millis(20));
+                crate::os::start_time_s(pid).is_none()
+            });
+            assert!(gone, "the child {pid} was killed with the helper");
+        }
     }
 
     #[cfg(unix)]
@@ -867,10 +1021,6 @@ mod tests {
         assert!(matches!(err, ChildError::Timeout { .. }), "{err}");
         assert_gone(watcher.join().unwrap());
     }
-
-    /// The directory `leave_a_process_helper` reports to.
-    #[cfg(windows)]
-    const HELPER_DIR: &str = "CARDINAL_TEST_HELPER_DIR";
 
     /// Writes `pid`'s ID and start time to `dir/name`, atomically.
     #[cfg(windows)]

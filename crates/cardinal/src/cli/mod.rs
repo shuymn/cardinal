@@ -21,6 +21,7 @@ use crate::contract::{Caller, Error, ErrorCode, InboxStatus, PlanKind, Resolutio
 use crate::explain::{self, Subject};
 use crate::inbox::{self, StatusFilter};
 use crate::observe::{self, InventoryOptions};
+use crate::os::child;
 use crate::plan;
 use crate::run;
 use crate::state::StateDir;
@@ -238,13 +239,17 @@ fn dispatch(command: Command) -> ExitCode {
         // The runner prints nothing of its own: its stdout and stderr are the stage's.
         Command::Run(args) => run::run(args.spec_b64.as_deref(), &args.command),
         Command::Hook(args) => hook(&args),
-        Command::Inventory(args) => respond(context().and_then(|ctx| {
-            let options = InventoryOptions {
-                repos: args.repos,
-                sizes: args.sizes,
-            };
-            observe::inventory(&ctx.config, &ctx.state, &options)
-        })),
+        Command::Inventory(args) => {
+            // Runs git and gh, so it sets their cleanup up while this is the only thread.
+            child::prepare();
+            respond(context().and_then(|ctx| {
+                let options = InventoryOptions {
+                    repos: args.repos,
+                    sizes: args.sizes,
+                };
+                observe::inventory(&ctx.config, &ctx.state, &options)
+            }))
+        }
         Command::Inbox(args) => match args.command {
             None => respond(context().and_then(|ctx| {
                 let status = args.status.map(|status| match status {
