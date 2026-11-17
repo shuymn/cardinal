@@ -997,10 +997,11 @@ The subagent runs headless, one at a time, and only through the CLI:
 
 1. `cardinal inbox` → for each `open` item, `cardinal explain inbox KEY` and `cardinal inventory`.
 2. Reclaim work: `cardinal plan` (or a targeted plan), then `cardinal act PLAN --caller arbiter` for plans with `invariants_ok: true` and `approval: "none"`. Never `--owner-approved`.
-3. A plan that needs approval or a decision outside the reclaim scope (including `recovery_needed` items whose group is unverified, and partially deleted worktrees): `cardinal inbox resolve KEY --outcome escalated --note "<what the owner must decide, with the plan ID or processes>"`.
-4. Resolve items it handled with `--outcome resolved` and a note; report refused acts with their `reasons`.
+3. An inbox item that needs a decision outside the reclaim scope (including `recovery_needed` items whose group is unverified): `cardinal inbox resolve KEY --outcome escalated --note "<what the owner must decide, with the job ID or processes>"`.
+4. Plans that need approval, partially deleted worktrees, and leftovers of an interrupted `act` have no inbox item in phase 0, and `inbox resolve` works only on existing keys. They go into the arbiter's final report, each with its plan ID or path and what the owner must decide. An inbox kind for owner approval comes with the web UI (phases 1 and 3).
+5. Resolve items it handled with `--outcome resolved` and a note; report refused acts with their `reasons`.
 
-It never edits files in repositories, and never runs `git worktree remove`, `rm`, or `kill` directly. Starting it from an OS timer is phase 1; in phase 0 it is started by hand.
+It never edits files in repositories, and never runs `git worktree remove`, `rm`, or `kill` directly. Starting it from an OS timer is phase 1; in phase 0 the owner starts it by hand and reads its report.
 
 ## 15. Purpose layer for phase 0
 
