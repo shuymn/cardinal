@@ -232,6 +232,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("w");
         touch(&root, "outside/proptest-regressions/x");
+        // What a walk that followed the link would count: more than the link and the
+        // directory holding it take on any file system, whatever its block size and however
+        // it stores a long link target.
+        let big = 1 << 20;
+        std::fs::write(root.join("outside/big"), vec![1u8; big]).unwrap();
         std::fs::create_dir_all(root.join("target")).unwrap();
         std::os::unix::fs::symlink(root.join("outside"), root.join("target/link")).unwrap();
         let class = classify(
@@ -242,7 +247,8 @@ mod tests {
         assert_eq!(class, IgnoredClass::Regenerable);
         let linked = allocated_bytes(&root.join("target")).unwrap();
         let outside = allocated_bytes(&root.join("outside")).unwrap();
-        assert!(linked < outside, "{linked} < {outside}");
+        assert!(outside >= big as u64, "{outside} >= {big}");
+        assert!(linked < big as u64, "{linked} < {big}");
     }
 
     #[test]
