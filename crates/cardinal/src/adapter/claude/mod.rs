@@ -8,13 +8,14 @@ mod hook;
 mod repo;
 mod session;
 
+use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::time::Instant;
 
 use serde_json::{Map, Value};
 
-use crate::config::{self, Config, HostConfig};
+use crate::config::{self, Base, Config, HostConfig};
 use crate::contract::{Error, ErrorCode, RecordKind};
 use crate::os::{self, Detail, ProcessTable};
 use crate::record::Recorder;
@@ -24,6 +25,13 @@ use hook::{Pass, Settings};
 
 /// The most hook input read from stdin.
 const MAX_INPUT: u64 = 1024 * 1024;
+
+/// The environment the hook resolves its directories and settings from.
+type Env<'a> = &'a dyn Fn(&str) -> Option<OsString>;
+
+fn process_env(name: &str) -> Option<OsString> {
+    std::env::var_os(name)
+}
 
 fn invalid(message: impl Into<String>) -> Error {
     Error::new(ErrorCode::InvalidArgument, message)
@@ -50,15 +58,16 @@ fn string(doc: &Map<String, Value>, key: &str) -> Option<String> {
     doc.get(key).and_then(Value::as_str).map(str::to_owned)
 }
 
-/// Appends one record to the state dir from the environment, with the record limits of
-/// `host` (else the defaults). Failures are returned for the caller to ignore.
+/// Appends one record to the state dir from `env`, with the record limits of `host` (else
+/// the defaults). Failures are returned for the caller to ignore.
 fn append(
+    env: Env<'_>,
     host: Option<&HostConfig>,
     kind: RecordKind,
     session_id: Option<String>,
     data: Map<String, Value>,
 ) -> Result<(), Error> {
-    let state = open_state()?;
+    let state = open_state(env)?;
     let defaults;
     let host = if let Some(host) = host {
         host
@@ -75,8 +84,8 @@ fn append(
         .map_err(|err| Error::new(ErrorCode::StateUnavailable, err.to_string()))
 }
 
-fn open_state() -> Result<StateDir, Error> {
-    let dir = config::state_dir()
+fn open_state(env: Env<'_>) -> Result<StateDir, Error> {
+    let dir = config::resolve(Base::State, cfg!(windows), env)
         .map_err(|err| Error::new(ErrorCode::StateUnavailable, err.to_string()))?;
     Ok(StateDir::open(&dir)?)
 }
@@ -84,33 +93,50 @@ fn open_state() -> Result<StateDir, Error> {
 /// `cardinal hook claude pre-tool-use`: reads the hook input from `input` and writes the hook
 /// output (or nothing) to `output`.
 pub fn pre_tool_use(input: &mut dyn Read, output: &mut dyn Write) -> Result<(), Error> {
-    let start = Instant::now();
-    let var = |name: &str| std::env::var(name).ok();
-    run_pre_tool_use(input, output, cfg!(windows), &var, start)
+    run_pre_tool_use(input, output, cfg!(windows), &process_env, Instant::now())
 }
 
 fn run_pre_tool_use(
     input: &mut dyn Read,
     output: &mut dyn Write,
     windows: bool,
-    var: &dyn Fn(&str) -> Option<String>,
+    env: Env<'_>,
     start: Instant,
 ) -> Result<(), Error> {
     // Section 5.5: phase 0 does not rewrite on Windows.
     if windows {
         return Ok(());
     }
-    let doc = read_input(input)?;
-    let input = hook::parse(&doc).map_err(|pass| invalid(format!("{pass:?}")))?;
-
-    let config = match config::config_dir().and_then(|dir| Config::load(&dir)) {
-        Ok(config) => config,
+    let doc = match read_input(input) {
+        Ok(doc) => doc,
         Err(err) => {
-            let message = err.to_string();
-            record_pass(None, &input, &Pass::Config(message.clone()));
-            return Err(Error::new(ErrorCode::ConfigInvalid, message));
+            record_pass(env, None, &Pass::Invalid(err.message.clone()), None, None);
+            return Err(err);
         }
     };
+    let input = match hook::parse(&doc) {
+        Ok(input) => input,
+        Err(pass) => {
+            let (session_id, tool_use_id) =
+                (string(&doc, "session_id"), string(&doc, "tool_use_id"));
+            record_pass(env, None, &pass, session_id, tool_use_id);
+            return Err(invalid(format!("{pass:?}")));
+        }
+    };
+    let record = |host: Option<&HostConfig>, pass: &Pass| {
+        let ids = (input.session_id.clone(), input.tool_use_id.clone());
+        record_pass(env, host, pass, ids.0, ids.1);
+    };
+
+    let config =
+        match config::resolve(Base::Config, windows, env).and_then(|dir| Config::load(&dir)) {
+            Ok(config) => config,
+            Err(err) => {
+                let message = err.to_string();
+                record(None, &Pass::Config(message.clone()));
+                return Err(Error::new(ErrorCode::ConfigInvalid, message));
+            }
+        };
     if !config.host.hook.enabled {
         return Ok(());
     }
@@ -126,14 +152,15 @@ fn run_pre_tool_use(
     let runner = match runner {
         Ok(runner) => runner,
         Err(message) => {
-            record_pass(Some(&config.host), &input, &Pass::Config(message.clone()));
+            record(Some(&config.host), &Pass::Config(message.clone()));
             return Err(Error::new(ErrorCode::ConfigInvalid, message));
         }
     };
+    let var = |name: &str| env(name).and_then(|value| value.into_string().ok());
     let settings = Settings {
         config: &config,
         runner: &runner,
-        var,
+        var: &var,
         deadline: hook::deadline(&config, start),
         start,
         fallback_cwd: std::env::current_dir().ok(),
@@ -145,7 +172,7 @@ fn run_pre_tool_use(
             line.push(b'\n');
             // Rewriting and serializing a large command takes time too.
             if Instant::now() > settings.deadline {
-                record_pass(Some(&config.host), &input, &hook::missed(start));
+                record(Some(&config.host), &hook::missed(start));
                 return Ok(());
             }
             output
@@ -153,16 +180,28 @@ fn run_pre_tool_use(
                 .map_err(|err| Error::new(ErrorCode::Internal, err.to_string()))
         }
         Err(pass) => {
-            record_pass(Some(&config.host), &input, &pass);
+            record(Some(&config.host), &pass);
             Ok(())
         }
     }
 }
 
-/// Records a configuration error or a hook failure; other reasons to print nothing are
-/// normal and leave no record.
-fn record_pass(host: Option<&HostConfig>, input: &hook::Call, pass: &Pass) {
+/// Records input the hook cannot use, a configuration error, or a hook failure; other
+/// reasons to print nothing are normal and leave no record.
+fn record_pass(
+    env: Env<'_>,
+    host: Option<&HostConfig>,
+    pass: &Pass,
+    session_id: Option<String>,
+    tool_use_id: Option<String>,
+) {
     let (kind, reason, detail) = match pass {
+        Pass::Invalid(message) => (RecordKind::HookError, "invalid_input", message.clone()),
+        Pass::NoCommand => (
+            RecordKind::HookError,
+            "invalid_input",
+            "the Bash call has no string command".to_owned(),
+        ),
         Pass::Config(message) => (RecordKind::ConfigError, "config_invalid", message.clone()),
         Pass::DeadlineMissed { elapsed_ms } => (
             RecordKind::HookError,
@@ -176,8 +215,8 @@ fn record_pass(host: Option<&HostConfig>, input: &hook::Call, pass: &Pass) {
     data.insert("event".into(), "pre_tool_use".into());
     data.insert("reason".into(), reason.into());
     data.insert("detail".into(), detail.into());
-    data.insert("tool_use_id".into(), input.tool_use_id.clone().into());
-    let _ = append(host, kind, input.session_id.clone(), data);
+    data.insert("tool_use_id".into(), tool_use_id.into());
+    let _ = append(env, host, kind, session_id, data);
 }
 
 /// The data of a `subagent_stopped` or `session_ended` record.
@@ -200,6 +239,7 @@ pub fn subagent_stop(input: &mut dyn Read) -> Result<(), Error> {
     let doc = read_input(input)?;
     let host = load_host();
     append(
+        &process_env,
         host.as_ref(),
         RecordKind::SubagentStopped,
         string(&doc, "session_id"),
@@ -226,7 +266,7 @@ pub fn session_end(input: &mut dyn Read) -> Result<(), Error> {
         else {
             return Ok(());
         };
-        let state = open_state()?;
+        let state = open_state(&process_env)?;
         let bytes = serde_json::to_vec(&snapshot)
             .map_err(|err| Error::new(ErrorCode::Internal, err.to_string()))?;
         state
@@ -234,6 +274,7 @@ pub fn session_end(input: &mut dyn Read) -> Result<(), Error> {
             .map_err(Error::from)
     });
     let recorded = append(
+        &process_env,
         host.as_ref(),
         RecordKind::SessionEnded,
         session_id,

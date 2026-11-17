@@ -24,7 +24,10 @@ const MAX_TIMEOUT_MS: u64 = 600_000;
 /// Why the hook printed nothing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Pass {
+    /// Unreadable, not a JSON object, or over 1 MiB; recorded as `hook_error`.
+    Invalid(String),
     NotBash,
+    /// A Bash call without a string command; recorded as `hook_error`.
     NoCommand,
     AutoMode,
     /// `config_invalid`, or a runner path the rewrite cannot use; recorded as `config_error`.

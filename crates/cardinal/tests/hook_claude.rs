@@ -298,6 +298,16 @@ mod never_blocks {
         ] {
             assert_eq!(run_hook(cmd(&dirs), &call), None, "{call}");
         }
+        // Each input the hook cannot use leaves a record; another tool's call does not.
+        #[cfg(unix)]
+        {
+            let found = records(&dirs);
+            assert_eq!(found.len(), 9, "{found:?}");
+            for record in &found {
+                assert_eq!(record.kind, RecordKind::HookError);
+                assert_eq!(record.data["reason"], "invalid_input");
+            }
+        }
     }
 
     #[test]
