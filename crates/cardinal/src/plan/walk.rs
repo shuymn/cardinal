@@ -2,7 +2,6 @@
 //! and 9.5). `plan` walks by path; `act` takes its snapshot with directory descriptors and
 //! produces the same [`Entry`] values, so both evaluate the same checks.
 
-use std::collections::HashSet;
 use std::fs::Metadata;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -157,9 +156,8 @@ impl Walk {
 
 /// Walks `target`, which is `worktree` or a path inside it, by path without following
 /// symbolic links or entering another device or mount. Plans use it; `act` uses its own
-/// descriptor-based snapshot on Unix and this walk on Windows, where it only dry-runs.
-/// Mounts are read from `/proc/self/mountinfo` on Linux; elsewhere a mount point is told by
-/// its device, which is what `plan` reports and `act` checks again with `statfs`.
+/// descriptor-based snapshot on Unix and this walk on Windows. Mounts are told by
+/// [`mount_id`], as `act` tells them.
 pub fn walk(worktree: &Path, target: &Path) -> io::Result<Walk> {
     let rel = target
         .strip_prefix(worktree)
@@ -179,19 +177,14 @@ pub fn walk(worktree: &Path, target: &Path) -> io::Result<Walk> {
     let parent = target.parent().unwrap_or(target);
     let parent_dev = Entry::from_metadata(PathBuf::new(), &std::fs::symlink_metadata(parent)?).dev;
     let root = Entry::from_metadata(rel, &std::fs::symlink_metadata(target)?);
-    let mount_points = mount_points();
-    let mount = match &mount_points {
-        _ if root.dev != parent_dev => Mount::Boundary,
-        Ok(points) if points.contains(target) => Mount::Boundary,
-        Ok(_) => Mount::Same,
-        Err(err) => Mount::Unknown(err.clone()),
-    };
+    let root_mount = mount_id(target);
+    let mount = Mount::between(parent_dev, root.dev, &mount_id(parent), &root_mount);
     let mut entries = Vec::new();
     // A target that is not on its parent's mount is refused, so nothing below it is read.
-    if let (EntryKind::Dir, None, Mount::Same, Ok(points)) =
-        (root.kind, &link_in_path, &mount, &mount_points)
+    if let (EntryKind::Dir, None, Mount::Same, Ok(on_mount)) =
+        (root.kind, &link_in_path, &mount, &root_mount)
     {
-        walk_dir(target, &root.rel, root.dev, points, &mut entries)?;
+        walk_dir(target, &root.rel, root.dev, on_mount, &mut entries)?;
     }
     Ok(Walk {
         root,
@@ -201,62 +194,40 @@ pub fn walk(worktree: &Path, target: &Path) -> io::Result<Walk> {
     })
 }
 
-/// The mount points of this process, as absolute paths: from `/proc/self/mountinfo` on
-/// Linux, none elsewhere.
-#[cfg_attr(
-    not(target_os = "linux"),
-    expect(
-        clippy::unnecessary_wraps,
-        reason = "only Linux can fail to read its mounts"
-    )
-)]
-fn mount_points() -> Result<HashSet<PathBuf>, String> {
-    #[cfg(target_os = "linux")]
-    {
-        let path = "/proc/self/mountinfo";
-        std::fs::read_to_string(path)
-            .map(|text| parse_mountinfo(&text))
-            .map_err(|err| format!("{path}: {err}"))
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        Ok(HashSet::new())
-    }
+/// What identifies a mount.
+#[cfg(unix)]
+type MountKey = crate::os::mount::MountId;
+/// Windows reads no mount identity (see [`mount_id`]): every directory the walk reaches is on
+/// its parent's volume.
+#[cfg(not(unix))]
+#[derive(Debug, PartialEq, Eq)]
+struct MountKey;
+
+/// The mount of the entry at `path` (`os::mount`), not following a final symbolic link.
+#[cfg(unix)]
+fn mount_id(path: &Path) -> Result<MountKey, String> {
+    crate::os::mount::of_path(path)
 }
 
-/// The mount points listed in `mountinfo` text (the fifth field, octal escapes decoded).
-#[cfg_attr(
-    not(any(target_os = "linux", test)),
-    expect(dead_code, reason = "only Linux reads mountinfo")
+/// Windows has no mount to tell apart on one volume: a folder a volume is mounted on is a
+/// reparse point, which `symlink_metadata` reports as a link, so the walk neither follows nor
+/// enters it, and a target that is one fails `plain_target` as a link.
+#[cfg(not(unix))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the same signature as the Unix version"
 )]
-fn parse_mountinfo(text: &str) -> HashSet<PathBuf> {
-    text.lines()
-        .filter_map(|line| line.split(' ').nth(4))
-        .map(|field| {
-            let bytes = field.as_bytes();
-            let mut out = Vec::with_capacity(bytes.len());
-            let mut i = 0;
-            while i < bytes.len() {
-                let escape = bytes.get(i + 1..i + 4).filter(|_| bytes[i] == b'\\');
-                let octal = |d: &[u8]| u8::from_str_radix(std::str::from_utf8(d).ok()?, 8).ok();
-                if let Some(byte) = escape.and_then(octal) {
-                    out.push(byte);
-                    i += 4;
-                } else {
-                    out.push(bytes[i]);
-                    i += 1;
-                }
-            }
-            PathBuf::from(String::from_utf8_lossy(&out).into_owned())
-        })
-        .collect()
+fn mount_id(_path: &Path) -> Result<MountKey, String> {
+    Ok(MountKey)
 }
 
+/// Records the entries below `dir`. A directory on another device or mount than `dev` and
+/// `on_mount` is recorded but not entered; a mount that cannot be read fails the walk.
 fn walk_dir(
     dir: &Path,
     rel: &Path,
     dev: u64,
-    mount_points: &HashSet<PathBuf>,
+    on_mount: &MountKey,
     out: &mut Vec<Entry>,
 ) -> io::Result<()> {
     let mut names: Vec<_> = std::fs::read_dir(dir)?
@@ -272,12 +243,13 @@ fn walk_dir(
             Err(err) => return Err(err),
         };
         let entry = Entry::from_metadata(rel.join(&name), &meta);
-        let descend =
-            entry.kind == EntryKind::Dir && entry.dev == dev && !mount_points.contains(&path);
+        let descend = entry.kind == EntryKind::Dir
+            && entry.dev == dev
+            && mount_id(&path).map_err(io::Error::other)? == *on_mount;
         let child_rel = entry.rel.clone();
         out.push(entry);
         if descend {
-            walk_dir(&path, &child_rel, dev, mount_points, out)?;
+            walk_dir(&path, &child_rel, dev, on_mount, out)?;
         }
     }
     Ok(())
@@ -327,19 +299,6 @@ mod tests {
             Mount::between(1, 1, &unknown, &same),
             Mount::Unknown("statx: no mount ID".into())
         );
-    }
-
-    #[test]
-    fn mountinfo_lists_mount_points() {
-        let text = "22 1 0:21 / /proc rw,nosuid - proc proc rw\n\
-                    95 29 8:1 /home/u/data /work/a\\040b/target rw - ext4 /dev/sda1 rw\n";
-        let points = super::parse_mountinfo(text);
-        assert!(points.contains(std::path::Path::new("/proc")));
-        assert!(
-            points.contains(std::path::Path::new("/work/a b/target")),
-            "{points:?}"
-        );
-        assert_eq!(points.len(), 2);
     }
 
     #[test]

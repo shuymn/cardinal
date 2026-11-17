@@ -16,6 +16,7 @@ use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, Stat};
 use rustix::io::Errno;
 
 use crate::contract::RootId;
+use crate::os::mount::{self, MountId};
 use crate::plan::{Entry, EntryKind, Mount, Walk};
 
 const DIR_FLAGS: OFlags = OFlags::RDONLY
@@ -57,60 +58,6 @@ fn open_dir_at(dir: impl AsFd, name: &OsStr) -> io::Result<OwnedFd> {
     Ok(rustix::fs::openat(dir, name, DIR_FLAGS, Mode::empty())?)
 }
 
-/// What identifies the mount an open directory is on: the mount ID (`statx`, Linux 5.8 and
-/// later) on Linux, the path the filesystem is mounted on (`statfs`) on macOS. An error means
-/// the mount cannot be told, and the callers fail closed.
-#[cfg(target_os = "linux")]
-fn mount_of(fd: impl AsFd) -> Result<Vec<u8>, String> {
-    statx_mount(fd, c"", AtFlags::EMPTY_PATH)
-}
-
-#[cfg(target_os = "linux")]
-fn statx_mount<P: rustix::path::Arg>(
-    dir: impl AsFd,
-    path: P,
-    flags: AtFlags,
-) -> Result<Vec<u8>, String> {
-    use rustix::fs::StatxFlags;
-    let st = rustix::fs::statx(dir, path, flags | AtFlags::NO_AUTOMOUNT, StatxFlags::MNT_ID)
-        .map_err(|err| format!("statx: {err}"))?;
-    if StatxFlags::from_bits_retain(st.stx_mask).contains(StatxFlags::MNT_ID) {
-        Ok(st.stx_mnt_id.to_ne_bytes().to_vec())
-    } else {
-        Err("statx reports no mount ID (Linux before 5.8)".to_owned())
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn mount_of(fd: impl AsFd) -> Result<Vec<u8>, String> {
-    let st = rustix::fs::fstatfs(fd).map_err(|err| format!("fstatfs: {err}"))?;
-    Ok(st
-        .f_mntonname
-        .iter()
-        .map(|c| u8::from_ne_bytes(c.to_ne_bytes()))
-        .take_while(|&b| b != 0)
-        .collect())
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn mount_of(_fd: impl AsFd) -> Result<Vec<u8>, String> {
-    Err("mount identity is not available on this platform".to_owned())
-}
-
-/// The mount of the entry `name` in `dir` that is not a directory. Only Linux mounts on
-/// files; elsewhere such an entry is on its directory's mount.
-fn file_mount_at(dir: &OwnedFd, name: &OsStr) -> Result<Vec<u8>, String> {
-    #[cfg(target_os = "linux")]
-    {
-        statx_mount(dir, name, AtFlags::SYMLINK_NOFOLLOW)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = name;
-        mount_of(dir)
-    }
-}
-
 /// Names in an open directory, sorted, without `.` and `..`.
 fn names(dir: impl AsFd) -> io::Result<Vec<OsString>> {
     let mut names = Vec::new();
@@ -131,7 +78,7 @@ pub struct Target {
     parent: OwnedFd,
     parent_dev: u64,
     /// The mount of `parent`.
-    parent_mount: Result<Vec<u8>, String>,
+    parent_mount: Result<MountId, String>,
     /// The target's name in `parent`.
     name: OsString,
     /// The target's path relative to the worktree (empty for the worktree itself).
@@ -173,7 +120,7 @@ impl Target {
             .collect();
         let Some((last, dirs)) = names.split_last() else {
             let parent_dev = entry(PathBuf::new(), &rustix::fs::fstat(&top)?).dev;
-            let parent_mount = mount_of(&top);
+            let parent_mount = mount::of_dir(&top);
             return Ok(Self {
                 parent: top,
                 parent_dev,
@@ -208,7 +155,7 @@ impl Target {
             }
         }
         let parent_dev = entry(PathBuf::new(), &rustix::fs::fstat(&current)?).dev;
-        let parent_mount = mount_of(&current);
+        let parent_mount = mount::of_dir(&current);
         Ok(Self {
             parent: current,
             parent_dev,
@@ -271,10 +218,10 @@ impl Target {
 
     /// Whether the target, on device `dev`, is on its parent's mount, and its own mount:
     /// read from `dir` when the target is that open directory, by name otherwise.
-    fn target_mount(&self, dev: u64, dir: Option<&OwnedFd>) -> (Mount, Result<Vec<u8>, String>) {
+    fn target_mount(&self, dev: u64, dir: Option<&OwnedFd>) -> (Mount, Result<MountId, String>) {
         let own = match dir {
-            Some(fd) => mount_of(fd),
-            None => file_mount_at(&self.parent, &self.name),
+            Some(fd) => mount::of_dir(fd),
+            None => mount::of_entry_at(&self.parent, &self.name),
         };
         (
             Mount::between(self.parent_dev, dev, &self.parent_mount, &own),
@@ -284,12 +231,12 @@ impl Target {
 }
 
 /// Records the entries below `fd`. A directory on another device or mount than `dev` and
-/// `mount` is recorded but not entered; a mount that cannot be read fails the snapshot.
+/// `on_mount` is recorded but not entered; a mount that cannot be read fails the snapshot.
 fn snapshot_dir(
     fd: &OwnedFd,
     rel: &Path,
     dev: u64,
-    mount: &[u8],
+    on_mount: &[u8],
     out: &mut Vec<Entry>,
 ) -> io::Result<()> {
     for name in names(fd)? {
@@ -311,9 +258,9 @@ fn snapshot_dir(
                     // Replaced between the stat and the open: the entry stays as the stat
                     // saw it, and nothing below the replacement is recorded.
                     if snapshot.same_identity(&opened)
-                        && mount_of(&child_fd).map_err(io::Error::other)? == mount
+                        && mount::of_dir(&child_fd).map_err(io::Error::other)? == on_mount
                     {
-                        snapshot_dir(&child_fd, &child_rel, dev, mount, out)?;
+                        snapshot_dir(&child_fd, &child_rel, dev, on_mount, out)?;
                     }
                 }
                 Err(err)

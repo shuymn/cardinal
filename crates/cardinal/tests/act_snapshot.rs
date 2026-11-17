@@ -24,6 +24,29 @@ use support::testpoints::TestPoints;
 #[test]
 fn helper() {
     fakes::run_act_if_requested();
+    walk_if_requested();
+}
+
+const WALK_ENV: &str = "CARDINAL_TEST_WALK";
+
+/// Runs the `plan::walk` a helper process was started for, writes the mount and the entries
+/// it found, and exits; returns at once otherwise.
+fn walk_if_requested() {
+    let Ok(request) = std::env::var(WALK_ENV) else {
+        return;
+    };
+    let request: serde_json::Value = serde_json::from_str(&request).expect("a walk request");
+    let path = |key: &str| std::path::PathBuf::from(request[key].as_str().expect(key));
+    for key in ["worktree", "target", "out"] {
+        fakes::assert_inside(&path("root"), &path(key), key);
+    }
+    let walk = cardinal::plan::walk(&path("worktree"), &path("target")).expect("walk");
+    let doc = serde_json::json!({
+        "mount": format!("{:?}", walk.mount),
+        "entries": walk.entries.iter().map(|e| e.rel.display().to_string()).collect::<Vec<_>>(),
+    });
+    std::fs::write(path("out"), doc.to_string()).expect("write the walk");
+    std::process::exit(0);
 }
 
 const WAIT: Duration = Duration::from_secs(20);
@@ -116,11 +139,11 @@ fn mount_namespace(s: &Setup) -> Option<&'static [&'static str]> {
     None
 }
 
-/// Runs `act` of `plan` in a helper inside a private mount namespace where each `(source,
-/// target)` of `binds` is bind-mounted first. The mounts are undone after the helper, and end
-/// with the namespace on every other path (a failed mount, a panic, a kill).
+/// Runs `inner` inside a private mount namespace where each `(source, target)` of `binds` is
+/// bind-mounted first. The mounts are undone after `inner`, and end with the namespace on
+/// every other path (a failed mount, a panic, a kill).
 #[cfg(target_os = "linux")]
-fn act_with_binds(s: &Setup, flags: &[&str], plan: &str, binds: &[(&Path, &Path)]) -> ActResult {
+fn with_binds(s: &Setup, flags: &[&str], binds: &[(&Path, &Path)], inner: &std::process::Command) {
     let quote = |path: &Path| format!("'{}'", path.display().to_string().replace('\'', "'\\''"));
     let mut mounts = String::new();
     let mut unmounts = String::new();
@@ -134,15 +157,13 @@ fn act_with_binds(s: &Setup, flags: &[&str], plan: &str, binds: &[(&Path, &Path)
         unmounts.insert_str(0, &format!("umount {}\n", quote(target)));
     }
     let script = format!("{mounts}\"$@\"\nstatus=$?\n{unmounts}exit $status\n");
-    let out = s.fx.path(&format!("result-{plan}.json"));
-    let act = s.act_command(plan, &arbiter(), &out);
     let mut command = std::process::Command::new("unshare");
     command
         .args(flags)
         .args(["sh", "-c", &script, "sh"])
-        .arg(act.get_program())
-        .args(act.get_args());
-    for (key, value) in act.get_envs() {
+        .arg(inner.get_program())
+        .args(inner.get_args());
+    for (key, value) in inner.get_envs() {
         if let Some(value) = value {
             command.env(key, value);
         }
@@ -152,16 +173,49 @@ fn act_with_binds(s: &Setup, flags: &[&str], plan: &str, binds: &[(&Path, &Path)
         .stdout(std::process::Stdio::null())
         .status()
         .unwrap();
-    assert!(
-        status.success(),
-        "the act helper in the namespace: {status}"
-    );
+    assert!(status.success(), "the helper in the namespace: {status}");
+}
+
+/// Runs `act` of `plan` in a helper under `binds` (see [`with_binds`]).
+#[cfg(target_os = "linux")]
+fn act_with_binds(s: &Setup, flags: &[&str], plan: &str, binds: &[(&Path, &Path)]) -> ActResult {
+    let out = s.fx.path(&format!("result-{plan}.json"));
+    with_binds(s, flags, binds, &s.act_command(plan, &arbiter(), &out));
     fakes::read_result(&out)
+}
+
+/// Runs `plan::walk` of `target` in a helper under `binds`, and returns the mount and the
+/// entries it found.
+#[cfg(target_os = "linux")]
+fn walk_with_binds(
+    s: &Setup,
+    flags: &[&str],
+    worktree: &Path,
+    target: &Path,
+    binds: &[(&Path, &Path)],
+) -> (String, Vec<String>) {
+    let out = s.fx.path("walk.json");
+    let request = serde_json::json!({
+        "root": s.fx.root(), "worktree": worktree, "target": target, "out": out,
+    });
+    let mut walk = std::process::Command::new(std::env::current_exe().unwrap());
+    walk.args(["helper", "--exact", "--nocapture", "--test-threads=1"])
+        .env(WALK_ENV, request.to_string());
+    with_binds(s, flags, binds, &walk);
+    let doc: serde_json::Value = serde_json::from_slice(&std::fs::read(&out).unwrap()).unwrap();
+    let entries = doc["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e.as_str().unwrap().to_owned())
+        .collect();
+    (doc["mount"].as_str().unwrap().to_owned(), entries)
 }
 
 /// A7 on Linux: a bind mount on the same filesystem is a mount point. `act` rejects a target
 /// that is one, and the snapshot does not enter one below its target: what it would free
-/// leaves out the bound data. The bound data survives both.
+/// leaves out the bound data. The bound data survives both. `plan`'s walk by path tells the
+/// same mounts.
 #[cfg(target_os = "linux")]
 #[test]
 fn bind_mounts_are_not_entered() {
@@ -202,4 +256,17 @@ fn bind_mounts_are_not_entered() {
 
     assert_eq!(std::fs::read_to_string(data.join("keep")).unwrap(), big);
     assert_eq!(fakes::listing(&wt), before, "nothing touched");
+
+    let (mount, entries) = walk_with_binds(&s, flags, &wt, &target, &[(&data, &target)]);
+    assert_eq!(mount, "Boundary");
+    assert!(entries.is_empty(), "{entries:?}");
+    let (mount, entries) =
+        walk_with_binds(&s, flags, &wt, &wt.join("node_modules"), &[(&data, &cache)]);
+    assert_eq!(mount, "Same");
+    assert!(
+        entries.contains(&"node_modules/cache".to_owned())
+            && entries.contains(&"node_modules/pkg/index.js".to_owned())
+            && !entries.iter().any(|e| e.starts_with("node_modules/cache/")),
+        "the bind mount is listed, not entered: {entries:?}"
+    );
 }
