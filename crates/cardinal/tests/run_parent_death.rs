@@ -7,13 +7,14 @@
 mod runner_support;
 mod support;
 
+use std::os::unix::process::CommandExt as _;
 use std::time::{Duration, Instant};
 
 use cardinal::admission::{list_reservations, recovery_pass};
 use cardinal::config::HostConfig;
 use cardinal::contract::{DerivedState, RecordKind};
-use cardinal::testpoint::{ADMISSION_WAITING, RUN_AFTER_SPAWN, RUN_BEFORE_STARTING};
-use runner_support::{Env, GroupGuard, WAIT, wait_gone};
+use cardinal::testpoint::{ADMISSION_WAITING, RUN_AFTER_SPAWN, RUN_BEFORE_STARTING, RUN_STOPPING};
+use runner_support::{Env, GroupGuard, Pty, WAIT, output, wait_gone};
 use support::helper::{ChildGuard, wait_for, wait_for_file};
 
 #[test]
@@ -187,4 +188,99 @@ fn parent_exit_after_the_child_exited_stops_its_descendants() {
     assert!(env.worktree_lock_free());
     let finished = env.records_of(RecordKind::JobFinished);
     assert_eq!(finished[0].data["exit"], 0);
+}
+
+/// On the fail-open and TTY paths a stage that stops stops the runner too (job control). When
+/// the parent exits meanwhile, the stopped runner cannot notice; its watchdog, outside the
+/// stopped process, continues the group, and the runner stops the stage as for any parent
+/// exit: the stage, the runner, and the watchdog are gone within the 5 s bound, and the in-use
+/// lock is free.
+#[test]
+fn parent_exit_while_the_stage_is_stopped_stops_it() {
+    for path in ["fail_open", "tty"] {
+        parent_exit_with_a_stopped_stage(path, false);
+    }
+}
+
+/// The same when the parent exits after the runner found it alive and before the runner
+/// stopped itself.
+#[test]
+fn parent_exit_as_the_runner_stops_stops_the_stage() {
+    for path in ["fail_open", "tty"] {
+        parent_exit_with_a_stopped_stage(path, true);
+    }
+}
+
+/// Runs a stage that stops itself on `path` under a parent shell that leads a group of its
+/// own, kills the parent once the runner has stopped (or, with `at_stop`, while the runner is
+/// paused at `run.stopping`), and checks that the stage is stopped within the bound.
+fn parent_exit_with_a_stopped_stage(path: &str, at_stop: bool) {
+    let env = Env::with_budget(1);
+    let pid_file = env.file("pid");
+    let script = format!(
+        "echo $$ > '{}'; kill -STOP $$; exec sleep 30",
+        pid_file.display()
+    );
+    let fail = (path == "fail_open").then_some(RUN_BEFORE_STARTING);
+    let pause: &[&str] = if at_stop { &[RUN_STOPPING] } else { &[] };
+    let runner = env.run_at(None, &["sh", "-c", &script], pause, fail);
+    let mut parent = env.in_shell(&runner, "; exit $?");
+    // The caller's group is the parent's own, as a job-control shell gives a job.
+    parent.process_group(0);
+    let pty = Pty::open();
+    if path == "tty" {
+        parent.stdin(pty.stdin());
+    }
+    let mut parent = ChildGuard::new(parent.spawn().unwrap());
+    let parent_pid = parent.id();
+    let _group = GroupGuard(parent_pid);
+    // A member whose parent is outside the group keeps the group from becoming orphaned when
+    // the parent exits, so the kernel does not continue it (SIGHUP and SIGCONT).
+    let mut anchor = env.isolated("sleep");
+    anchor.arg("30").process_group(parent_pid.cast_signed());
+    let _anchor = ChildGuard::new(anchor.spawn().unwrap());
+    let stage: u32 = wait_for("the stage PID", WAIT, || {
+        std::fs::read_to_string(&pid_file).ok()?.trim().parse().ok()
+    });
+    let stage_start = cardinal::os::start_time_s(stage).unwrap();
+    let runner_pid = cardinal::os::parent_pid(stage).unwrap();
+    let runner_start = cardinal::os::start_time_s(runner_pid).unwrap();
+    let stopped = |pid: u32| {
+        let mut ps = env.isolated("ps");
+        ps.args(["-o", "stat=", "-p", &pid.to_string()]);
+        output(&mut ps).stdout.starts_with(b"T")
+    };
+    if at_stop {
+        env.wait_any_reached(RUN_STOPPING);
+    } else {
+        wait_for("the runner to stop", WAIT, || {
+            stopped(runner_pid).then_some(())
+        });
+    }
+    let others: Vec<(u32, u64)> =
+        cardinal::os::ProcessTable::snapshot(cardinal::os::Detail::default())
+            .unwrap()
+            .iter()
+            .filter(|p| p.parent == Some(runner_pid) && p.pid != stage)
+            .map(|p| (p.pid, p.start_s))
+            .collect();
+
+    parent.kill();
+    if at_stop {
+        wait_orphaned(runner_pid, parent_pid);
+        env.points.release(RUN_STOPPING);
+    }
+    wait_for(
+        &format!("{path}: the stopped stage to end"),
+        Duration::from_secs(6),
+        || (!cardinal::os::is_alive(stage, stage_start)).then_some(()),
+    );
+    wait_gone(runner_pid, runner_start);
+    assert_eq!(others.len(), 1, "{path}: the watchdog");
+    for (pid, start_s) in others {
+        wait_gone(pid, start_s);
+    }
+    assert!(env.worktree_lock_free(), "{path}");
+    let finished = env.records_of(RecordKind::JobFinished);
+    assert_eq!(finished[0].data["signal"], 15, "{path}: SIGTERM");
 }
