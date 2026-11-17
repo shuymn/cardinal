@@ -47,7 +47,8 @@ pub trait Sources {
     fn inventory(&self, repos: &[PathBuf]) -> Result<Inventory, Error>;
     /// Live and recovery-needed reservations naming the worktree with key `worktree_key`.
     fn in_use(&self, worktree_key: &str) -> Result<InUse, Error>;
-    /// HEAD and branch of the worktree rooted at `worktree`, read right before deletion.
+    /// HEAD and branch of the worktree rooted at `worktree`, read right before deletion: a
+    /// local read of the two, not a new observation.
     fn head(&self, worktree: &Path) -> Result<Head, Error>;
     /// `git -C <main> worktree remove <worktree>`: drops the administrative entry of a
     /// worktree whose directory `act` has removed.
@@ -78,12 +79,11 @@ impl Sources for Real<'_> {
         admission::in_use(self.state, worktree_key)
     }
 
+    /// `git rev-parse HEAD` and `git symbolic-ref -q HEAD` in `worktree` through `observe::git`
+    /// (constructed environment, deadline), once that runner is wired in.
     fn head(&self, worktree: &Path) -> Result<Head, Error> {
-        let observation = observe::observe_worktree(self.config, self.state, worktree)?;
-        Ok(Head {
-            head: observation.worktree.head,
-            branch: observation.worktree.branch,
-        })
+        let _ = worktree;
+        Err(Error::not_implemented("observe::git"))
     }
 
     fn remove_worktree(&self, main: &Path, worktree: &Path) -> Result<(), Error> {
