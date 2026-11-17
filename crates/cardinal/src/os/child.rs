@@ -8,7 +8,9 @@
 use std::ffi::{OsStr, OsString};
 use std::io::Read;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+#[cfg(unix)]
+use std::process::Child;
+use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -198,13 +200,62 @@ enum Stream {
     Failed(std::io::Error),
 }
 
+/// A started child: on Unix the leader of its own process group, on Windows the first
+/// process of its own Job Object, which every process it starts joins.
+#[cfg(unix)]
+type Handle = Child;
+#[cfg(windows)]
+type Handle = Box<dyn process_wrap::std::ChildWrapper>;
+
+#[cfg(unix)]
+fn spawn(mut command: Command) -> std::io::Result<Handle> {
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    command.spawn()
+}
+
+/// Starts the child suspended, assigns it to a new Job Object, then resumes it, so it starts
+/// nothing outside the job.
+#[cfg(windows)]
+fn spawn(command: Command) -> std::io::Result<Handle> {
+    process_wrap::std::CommandWrap::from(command)
+        .wrap(process_wrap::std::JobObject)
+        .spawn()
+}
+
+#[cfg(unix)]
+fn take_output(child: &mut Handle) -> [Option<Box<dyn Read + Send>>; 2] {
+    [
+        child
+            .stdout
+            .take()
+            .map(|s| Box::new(s) as Box<dyn Read + Send>),
+        child
+            .stderr
+            .take()
+            .map(|s| Box::new(s) as Box<dyn Read + Send>),
+    ]
+}
+
+#[cfg(windows)]
+fn take_output(child: &mut Handle) -> [Option<Box<dyn Read + Send>>; 2] {
+    [
+        child
+            .stdout()
+            .take()
+            .map(|s| Box::new(s) as Box<dyn Read + Send>),
+        child
+            .stderr()
+            .take()
+            .map(|s| Box::new(s) as Box<dyn Read + Send>),
+    ]
+}
+
 /// Owns the child until its output is complete. Dropped before that (deadline, output over
-/// the limit, read error, a reader thread that could not start), it kills the child's
-/// process group on Unix, so descendants holding the output open go too, then kills and
-/// reaps the child. On Windows only the child is killed; a descendant can outlive it until
-/// it closes the pipe.
+/// the limit, read error, a reader thread that could not start), it kills the child and
+/// every descendant still in its process group (Unix) or Job Object (Windows), so none holds
+/// the output open, and reaps the child.
 struct Reaper {
-    child: Child,
+    child: Handle,
     complete: bool,
 }
 
@@ -213,15 +264,25 @@ impl Drop for Reaper {
         if self.complete {
             return;
         }
-        // The group is the child's own (`process_group(0)`); while the child is unreaped or a
-        // member still holds the output open, its ID cannot belong to another group.
         #[cfg(unix)]
-        crate::os::kill_process_group(self.child.id());
-        if matches!(self.child.try_wait(), Ok(Some(_))) {
-            return;
+        {
+            // The group is the child's own (`process_group(0)`); while the child is unreaped
+            // or a member still holds the output open, its ID cannot belong to another group.
+            crate::os::kill_process_group(self.child.id());
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            let _ = self.child.kill();
+            let _ = self.child.wait();
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        #[cfg(windows)]
+        {
+            // Terminates every process in the job, then reaps the child alone: the wrapper's
+            // own `wait` also waits for a job notification, which may already have been
+            // consumed.
+            let _ = self.child.start_kill();
+            let _ = self.child.inner_mut().wait();
+        }
     }
 }
 
@@ -256,11 +317,12 @@ fn read_streams(
 /// Runs `program` with `args` and exactly `env` in `cwd`, stdin closed, within `limits`.
 ///
 /// Output is read on two threads, each stopping one byte past `limits.max_output`. On Unix
-/// the child leads its own process group. On the deadline the group is killed and the child
-/// reaped, and the result is [`ChildError::Timeout`]; that includes a child that exited
-/// while a descendant still holds its output open. A stream over the limit ends the same
-/// way at once, with [`ChildError::OutputTooLarge`]. Once the group is gone the reader
-/// threads see end of file and end; nothing waits for them.
+/// the child leads its own process group; on Windows it runs in its own Job Object. On the
+/// deadline the group or job is killed and the child reaped, and the result is
+/// [`ChildError::Timeout`]; that includes a child that exited while a descendant still
+/// holds its output open. A stream over the limit ends the same way at once, with
+/// [`ChildError::OutputTooLarge`]. Once the group or job is gone the reader threads see end
+/// of file and end; nothing waits for them.
 pub fn run(
     program: impl AsRef<OsStr>,
     args: &[OsString],
@@ -279,28 +341,16 @@ pub fn run(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .current_dir(cwd);
-    #[cfg(unix)]
-    std::os::unix::process::CommandExt::process_group(&mut command, 0);
     let mut child = Reaper {
-        child: command.spawn().map_err(|source| ChildError::Spawn {
+        child: spawn(command).map_err(|source| ChildError::Spawn {
             program: name(),
             source,
         })?,
         complete: false,
     };
 
-    let stdout = child
-        .child
-        .stdout
-        .take()
-        .map(|s| Box::new(s) as Box<dyn Read + Send>);
-    let stderr = child
-        .child
-        .stderr
-        .take()
-        .map(|s| Box::new(s) as Box<dyn Read + Send>);
-    let (receiver, mut pending) =
-        read_streams([stdout, stderr], limits.max_output).map_err(|source| ChildError::Io {
+    let (receiver, mut pending) = read_streams(take_output(&mut child.child), limits.max_output)
+        .map_err(|source| ChildError::Io {
             program: name(),
             source,
         })?;
@@ -598,5 +648,68 @@ mod tests {
             crate::os::start_time_s(pid).is_none(),
             "the child was killed and reaped"
         );
+    }
+
+    /// On the deadline the whole job goes on Windows: `cmd` waits for `ping`, which holds
+    /// the output open; killing `cmd` alone would leave `ping` running.
+    #[cfg(windows)]
+    #[test]
+    fn the_deadline_kills_the_whole_tree_on_windows() {
+        use crate::os::{Detail, ProcessTable};
+
+        let dir = tempfile::tempdir().unwrap();
+        let id = std::process::id();
+        let target = format!("127.{}.{}.37", (id >> 8) & 0xff, id & 0xff);
+        let inherited = std::env::vars_os().filter(|(k, _)| {
+            ["PATH", "SystemRoot", "ComSpec", "PATHEXT"]
+                .iter()
+                .any(|keep| k.eq_ignore_ascii_case(keep))
+        });
+        let env = git_env(inherited);
+
+        // Finds the `ping` while it runs, so the check below cannot pass for a `ping` that
+        // never started.
+        let wanted = target.clone();
+        let watcher = std::thread::spawn(move || {
+            let detail = Detail {
+                cmd: true,
+                cwd: false,
+            };
+            for _ in 0..200 {
+                if let Ok(table) = ProcessTable::snapshot(detail) {
+                    let found = table.iter().find(|p| {
+                        p.name.to_ascii_lowercase().starts_with("ping")
+                            && p.cmd.iter().any(|arg| arg == &wanted)
+                    });
+                    if let Some(p) = found {
+                        return Some((p.pid, p.start_s));
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            None
+        });
+        let err = run(
+            "cmd",
+            &[
+                "/D".into(),
+                "/C".into(),
+                "ping".into(),
+                "-n".into(),
+                "31".into(),
+                target.clone().into(),
+            ],
+            &env,
+            dir.path(),
+            limits(Duration::from_secs(5), 1024 * 1024),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChildError::Timeout { .. }), "{err}");
+        let (pid, start_s) = watcher.join().unwrap().expect("ping started");
+        let gone = (0..250).any(|_| {
+            std::thread::sleep(Duration::from_millis(20));
+            !crate::os::is_alive(pid, start_s)
+        });
+        assert!(gone, "ping {pid} was killed with the job");
     }
 }
