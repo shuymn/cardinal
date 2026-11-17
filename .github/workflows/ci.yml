@@ -67,14 +67,18 @@ jobs:
             target/
           key: ${{ steps.cache-key.outputs.key }}
 
-      - name: Check formatting
-        run: mise exec -- cargo fmt --all --check
+      - name: Run checks
+        run: mise exec -- scripts/test
 
-      - name: Run clippy
-        run: mise exec -- cargo clippy --all-targets --locked -- -D warnings
-
-      - name: Run tests
-        run: mise exec -- cargo test --locked
+      # A second run with the variables git exports to hooks, so a test that lets them
+      # reach git would write to this checkout and fail the repository guard.
+      - name: Run checks as a git hook would
+        run: |
+          GIT_DIR=$(git rev-parse --absolute-git-dir)
+          GIT_WORK_TREE=$(git rev-parse --show-toplevel)
+          GIT_INDEX_FILE=$(git rev-parse --path-format=absolute --git-path index)
+          export GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+          mise exec -- scripts/test
 
   test-linux:
     name: Test (ubuntu-latest)
@@ -125,14 +129,18 @@ jobs:
             target/
           key: ${{ steps.cache-key.outputs.key }}
 
-      - name: Check formatting
-        run: mise exec -- cargo fmt --all --check
+      - name: Run checks
+        run: mise exec -- scripts/test
 
-      - name: Run clippy
-        run: mise exec -- cargo clippy --all-targets --locked -- -D warnings
-
-      - name: Run tests
-        run: mise exec -- cargo test --locked
+      # A second run with the variables git exports to hooks, so a test that lets them
+      # reach git would write to this checkout and fail the repository guard.
+      - name: Run checks as a git hook would
+        run: |
+          GIT_DIR=$(git rev-parse --absolute-git-dir)
+          GIT_WORK_TREE=$(git rev-parse --show-toplevel)
+          GIT_INDEX_FILE=$(git rev-parse --path-format=absolute --git-path index)
+          export GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+          mise exec -- scripts/test
 
   test-windows:
     name: Test (windows-latest)
@@ -183,14 +191,19 @@ jobs:
             target/
           key: ${{ steps.cache-key.outputs.key }}
 
-      - name: Check formatting
-        run: mise exec -- cargo fmt --all --check
+      # Windows cannot start an extensionless script directly, so bash runs it.
+      - name: Run checks
+        run: mise exec -- bash scripts/test
 
-      - name: Run clippy
-        run: mise exec -- cargo clippy --all-targets --locked -- -D warnings
-
-      - name: Run tests
-        run: mise exec -- cargo test --locked
+      # A second run with the variables git exports to hooks, so a test that lets them
+      # reach git would write to this checkout and fail the repository guard.
+      - name: Run checks as a git hook would
+        run: |
+          GIT_DIR=$(git rev-parse --absolute-git-dir)
+          GIT_WORK_TREE=$(git rev-parse --show-toplevel)
+          GIT_INDEX_FILE=$(git rev-parse --path-format=absolute --git-path index)
+          export GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+          mise exec -- bash scripts/test
 
   # The required status check: passes only when every test job succeeded; a
   # failed, cancelled or skipped job, or a missing result, fails it.

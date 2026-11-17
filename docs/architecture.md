@@ -63,7 +63,7 @@ Everything lives in the single crate `crates/cardinal` (library plus the `cardin
 | `state` | State paths, atomic writes, lock helpers with deadlines, IDs and keys, JSONL append and read | `contract` |
 | `record` | Record appending, rotation, reading | `state`, `contract` |
 | `testpoint` | Pause points and failure injection for tests ([section 13.1](#131-deterministic-concurrency)) | std |
-| `os` | Platform backends behind one API: process table, start times, parent PID, process working directories, boot time; process-group setup and signals (Unix) | std, rustix, signal-hook, sysinfo |
+| `os` | Platform backends behind one API: process table, start times, parent PID, process working directories, boot time; process-group setup and signals (Unix) | std, rustix, signal-hook, sysinfo, windows-sys |
 | `sensor` | Phase 2 seam: `Sensors` trait, `Unavailable` implementation | `contract` |
 | `exec` | `Invocation` (argv; cwd and env by inheritance), `Placement::Local`, `Executor` trait, local executor | `os`, `contract` |
 | `admission` | Budget math (pure), reservation store, liveness and the recovery pass, worktree in-use query | `state`, `config`, `os`, `sensor`, `record`, `contract` |
@@ -76,6 +76,8 @@ Everything lives in the single crate `crates/cardinal` (library plus the `cardin
 | `inbox` | Inbox store, dedup, refresh (recovery pass and built-in raisers) | `admission`, `observe`, `state`, `record`, `contract` |
 | `explain` | Explanation documents | `classify`, `record`, `plan`, `inbox`, `state`, `contract` |
 | `cli` | clap definitions and thin handlers that print JSON | everything |
+
+"May use" is read transitively: a module may also use whatever the modules it may use may use, so `run` may use `contract` through `admission`. `testpoint` is open to every module above the foundation. `tests/layering.rs` checks every `crate::` and `super::` path in `src/` against this reading; a glob import of the crate root or an alias of `crate` counts as using every module, and `clippy::wildcard_imports` is denied, so no module comes into scope without a path the test sees.
 
 ```mermaid
 flowchart TD
@@ -103,7 +105,7 @@ flowchart TD
 
 Two rules matter most and are part of the layering test:
 
-- `admission`, `run`, and `exec` never import `observe`, `inbox`, `plan`, or `act`. gh lives only in `observe`, and nothing on the admission path raises inbox items (C17, C18). Section 13.5 checks the same at run time.
+- `admission`, `run`, and `exec` never import `observe`, `inbox`, `plan`, or `act`, and `admission` uses neither `std::net` nor `std::process`. gh lives only in `observe`, and nothing on the admission path raises inbox items (C17, C18). Section 13.5 checks the same at run time.
 - `contract`, `state`, `config`, `testpoint`, and `os` import nothing above them, so every work unit can depend on them from day one.
 
 ## 3. Configuration
@@ -215,7 +217,7 @@ protected = ["fuzz/corpus", "fuzz/artifacts", "proptest-regressions"]
   plans/<plan>/result.json    # act result
   records/records.jsonl       # current record file
   records/records.<n>.jsonl   # rotated files, n = 1..keep-1
-  records/.rotate.lock        # empty; serializes rotation
+  records/.lock               # empty; appenders shared, rotation exclusive
   tmp/                        # temporary files for atomic writes (same file system)
   jobs/                       # reserved for phase 2 accepted jobs
   tickets/                    # reserved for phase 2 queue tickets
@@ -249,8 +251,8 @@ Locks use `std::fs::File::{lock, lock_shared, try_lock, try_lock_shared}` (stabl
 - Lock files are always empty and separate from data files, because Windows locks are mandatory: a locked byte range cannot be read by other processes.
 - std opens files close-on-exec and non-inheritable, so a child never inherits the runner's locks. A surviving child therefore cannot keep a dead runner looking alive.
 - Waiting with a deadline is a `try_lock` loop with backoff (5 ms doubling to 50 ms). Every acquisition has a deadline; there is no unbounded `lock()`.
-- Lock order is always: worktree in-use lock, then admission lock, then inbox or rotate lock. Nothing takes them in another order.
-- `admission.lock`, `worktrees/*.lock`, `inbox/.lock`, and `records/.rotate.lock` are never deleted, so no process can lock a file another process has already unlinked. `worktrees/*.lock` grows by one empty file per worktree ever used; phase 1 may prune them under the admission lock.
+- Lock order is always: worktree in-use lock, then admission lock, then inbox or records lock. Nothing takes them in another order.
+- `admission.lock`, `worktrees/*.lock`, `inbox/.lock`, and `records/.lock` are never deleted, so no process can lock a file another process has already unlinked. `worktrees/*.lock` grows by one empty file per worktree ever used; phase 1 may prune them under the admission lock.
 
 ### 4.4 Admission protocol
 
@@ -291,7 +293,8 @@ A `recovery_needed` group is **verified** when the recorded child (PID and start
 ### 4.7 Records
 
 - One JSON object per line, appended with a single `write` on a file opened in append mode (`O_APPEND`; `FILE_APPEND_DATA` on Windows), so concurrent appenders do not interleave.
-- When `records.jsonl` exceeds `max_bytes`, the appender that notices takes `.rotate.lock` with `try_lock` (skips rotation if busy), renames `records.<keep-2>` → `records.<keep-1>` … `records.jsonl` → `records.1.jsonl`. An appender that still holds the old file writes into the rotated file; nothing is lost.
+- An appender holds `records/.lock` **shared** from opening `records.jsonl` until its write is done (waiting at most 1 s for a rotation to finish, else the record is dropped). Rotation and removal take it **exclusively**, so no file is renamed or removed while an appender has it open, and a delayed appender never writes into a file a later rotation has replaced.
+- When `records.jsonl` exceeds `max_bytes`, the appender that notices takes the lock exclusively with a 100 ms deadline (on timeout the next append rotates), checks the size again, and renames `records.<keep-2>` → `records.<keep-1>` … `records.jsonl` → `records.1.jsonl`; with `keep = 1` it removes `records.jsonl`.
 - Readers skip lines that do not parse. A crash mid-write costs at most the torn line and the line appended after it.
 - A record failure is never surfaced to a command and never causes a rerun (C5, C11).
 
@@ -881,7 +884,7 @@ These names are reserved and not registered in phase 0 (an unregistered command 
 | `base64` | Use | `--spec-b64` encoding |
 | `thiserror` | Use | Typed errors where callers branch (before or after the start boundary, config vs state) |
 | `dunce` | Use | Canonical Windows paths without `\\?\`, so they compare equal to paths from git |
-| `windows-sys` | Skip (phase 3) | Job Object FFI; preferred over `windows` (design candidate) for its smaller compile |
+| `windows-sys` (`Win32_Foundation`, `Win32_System_Threading`) | Use (Windows) | Telling an exited process from a running one: Windows lists an exited process until its last handle closes, and sysinfo reports every Windows process as running. Job Object FFI follows in phase 3. Preferred over `windows` (design candidate) for its smaller compile |
 | `fs4` | Skip | std has file locks since Rust 1.89 with the same `flock`/`LockFileEx` semantics; the reserve file is written with zeros |
 | `jobserver` | Skip (phase 2) | Only needed when cardinal shares a jobserver with Cargo |
 | `anyhow` | Skip | Typed errors are needed for JSON error codes anyway |
@@ -905,12 +908,13 @@ Tests do not rely on starting processes at the same time. The `testpoint` module
 - `CARDINAL_TEST_PAUSE=<point>[,<point>]`: at a point the process creates `<dir>/<point>.<pid>.reached` and polls for `<dir>/<point>.release`; after 30 s it aborts so a broken test fails instead of hanging.
 - `CARDINAL_TEST_FAIL=<point>`: the process returns an injected error at that point.
 
-Points: `admission.reserved` (reservation committed, admission lock released), `admission.waiting` (budget full, about to sleep), `inuse.waiting`, `run.before_starting`, `run.after_spawn`, `act.locked` (exclusive in-use lock taken), `act.snapshotted` (snapshot recorded, checks not run), `act.checked` (checks passed, nothing deleted), `hook.classified`. **Every contended test waits for the second actor's `.reached` file before releasing the first**, so it proves the second actor actually hit the contended point. Examples:
+Points: `admission.reserved` (reservation committed, admission lock released), `admission.waiting` (budget full, about to sleep), `inuse.waiting`, `run.before_starting`, `run.after_spawn`, `act.locked` (exclusive in-use lock taken), `act.snapshotted` (snapshot recorded, checks not run), `act.checked` (checks passed, nothing deleted), `hook.classified`, `record.opened` (shared records lock held, current file open, line not written). **Every contended test waits for the second actor's `.reached` file before releasing the first**, so it proves the second actor actually hit the contended point. Examples:
 
 - Two runners and a budget of one job: pause the first at `admission.reserved`; start the second and wait for its `admission.waiting`; release; assert the second starts only after the first's reservation is gone.
 - `act` and a runner: pause `act` at `act.locked`; start a runner in the worktree and wait for its `inuse.waiting`; release; the stage starts after `act` ends, or, with a shorter wait cap, runs and records `in_use_unprotected`. A runner paused at `run.after_spawn` makes `act` `rejected` with `not_in_use`.
 - Snapshot deletion of a worktree: editing a tracked file at `act.snapshotted` gives `rejected` (`clean`) with nothing touched. At `act.checked`, edit a tracked file, create a file, and create `fuzz/corpus/seed`: all survive with their directories, are listed in `skipped_changed`, and the worktree keeps its `.git` (`git status` in it still works). At `act.checked`, replace an inspected subdirectory with a symbolic link to protected data: the protected data is intact and the subtree is listed as skipped. At `act.checked`, switch the worktree to another branch with the same tree: `expired` with nothing deleted, both for a worktree plan and for a `reclaim_dir` plan inside it (`act_snapshot::head_change_stops_deletion`). On Windows, `act` twice on the same plan reports `dry_run` both times.
 - Two `act` runs on one plan: pause the first at `act.locked`; the second returns `already_executed`.
+- Records: pause an appender at `record.opened`; two appends that would each rotate leave `records.jsonl` in place, and after the release the paused record is read back with the others.
 - Start boundary: a runner killed at `run.before_starting` runs the stage zero times and the Bash-level status is 137; an injected failure at `run.before_starting` or a failed spawn runs it once; a runner killed at `run.after_spawn` never reruns it.
 - Parent death: killing the runner's parent at `admission.waiting` leaves the stage unstarted and no reservation behind; killing it after `run.after_spawn`, with a grandchild that ignores SIGTERM, keeps the reservation until SIGKILL has emptied the group.
 - Signals: a stage killed by SIGTERM gives `bash -c` the same status and message with and without cardinal.
@@ -924,7 +928,8 @@ Recovery tests run real children: `cardinal run -- sh -c 'sleep 30 & sleep 30 & 
 `tests/support` provides the only way tests run git:
 
 - Fixtures live under `tempfile::TempDir` in the OS temp dir, outside any repository.
-- `Fixture::git(dir, args)` panics unless `dir`, every path-like argument (`-C`, `--git-dir`, `--work-tree`, absolute paths), and the resolved `git rev-parse --absolute-git-dir --git-common-dir` are inside the fixture root. A test builds a decoy fixture whose `.git` file points outside and asserts the helper refuses it.
+- `Fixture::git(dir, args)` panics unless `dir`, every `-C` directory, every argument read as a path relative to the directory git runs in (with its `name=value` value and attached short-option value), and the resolved `git rev-parse --absolute-git-dir --git-common-dir` are inside the fixture root. Paths resolve as the OS would: symbolic links are followed, dangling ones too, before a later `..` applies. A test builds a decoy fixture whose `.git` file points outside and asserts the helper refuses it; others refuse a symbolic link to outside passed as `config --file`.
+- The isolated config sets `protocol.allow=never`, so no transport works, `file` included: a local-path or `file://` remote cannot write elsewhere, and ssh cannot use the real user's keys. `Fixture::push` is the one way to move objects: its target is a `BareRepo`, which only `Fixture::init_bare` creates, so a push cannot name a URL or path of its own; it checks that the target's git dir is inside the root and enables only the `file` transport for that call. Arguments that set `protocol.*allow` are refused.
 - The environment is constructed, not inherited: `HOME`, `XDG_CONFIG_HOME`, and `GIT_CONFIG_GLOBAL` point inside the fixture, `GIT_CONFIG_NOSYSTEM=1`, `GIT_CEILING_DIRECTORIES` is the fixture's parent, `PATH` is the test process's; no other `GIT_*` passes.
 - Author and committer identity come only from `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_NAME`, `GIT_COMMITTER_EMAIL` (and fixed dates). Tests never run `git config user.*` or `--global`. The isolated config disables signing and hooks.
 - "Remote" repositories are bare fixtures; GitHub is a fake `gh` (a shell script on Unix, a `.cmd` on Windows) selected with `[observe] gh`, returning canned JSON or failing (exit 1, timeout, invalid JSON).
@@ -932,7 +937,7 @@ Recovery tests run real children: `cardinal run -- sh -c 'sleep 30 & sleep 30 & 
 
 ### 13.4 Repository guard
 
-`scripts/repo-guard snapshot|verify <repo> <file>` records, for the repository the tests run in: `git show-ref --head`, `git worktree list --porcelain`, `git config --local --list`, `git stash list`, and `git hash-object` of the index. `scripts/test` runs `cargo fmt --all --check` and `cargo clippy --all-targets --locked -- -D warnings`, takes a snapshot, runs `cargo test --locked`, and verifies. CI, the git hooks, and every work unit run it as `mise exec -- scripts/test`; CI runs it a second time with `GIT_DIR`, `GIT_WORK_TREE`, and `GIT_INDEX_FILE` exported as a git hook would. `tests/repo_guard.rs` proves the guard works: it snapshots a fixture, mutates it, and asserts `verify` fails.
+`scripts/repo-guard snapshot|verify <repo> <file>` records, for the repository the tests run in: `git show-ref --head`, `git worktree list --porcelain`, `git config --local --list`, `git stash list`, and `git hash-object` of the index. It leaves out work in other worktrees of the same repository (the branches they have checked out, with their remote-tracking refs and `branch.<name>.*` config, and their HEAD lines) and refs outside git's own namespaces, so parallel work in sibling worktrees does not fail a run; adding or removing a worktree, a stash, or any other new ref or config entry still does. `scripts/test` runs `cargo fmt --all --check` and `cargo clippy --all-targets --locked -- -D warnings`, takes a snapshot, runs `cargo test --locked`, and verifies. CI, the git hooks, and every work unit run it as `mise exec -- scripts/test`; CI runs it a second time with `GIT_DIR`, `GIT_WORK_TREE`, and `GIT_INDEX_FILE` exported as a git hook would. `tests/repo_guard.rs` proves the guard works: it snapshots a fixture, mutates it, and asserts `verify` fails.
 
 ### 13.5 Other rules
 

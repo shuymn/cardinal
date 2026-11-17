@@ -24,9 +24,6 @@ commit-msg:
       run: mise exec -- pommitlint lint --edit {1}
 
 pre-push:
-  piped: true
   commands:
-    clippy:
-      run: mise exec -- cargo clippy --all-targets -- -D warnings
     test:
-      run: mise exec -- cargo test
+      run: mise exec -- scripts/test

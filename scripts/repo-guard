@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# Records or checks the state of a git repository, so a test run that writes to the
+# repository it runs in fails (docs/architecture.md section 13.4).
+#
+#   scripts/repo-guard snapshot <repo> <file>   write the state of <repo> to <file>
+#   scripts/repo-guard verify <repo> <file>     fail if <repo> no longer matches <file>
+#
+# The state is: refs with HEAD, the worktree list, the local config, the stash list, and
+# the hash of the index. Work in other worktrees of the same repository is left out: the
+# branches those worktrees have checked out (their refs, remote-tracking refs, and
+# `branch.<name>.*` config) and their HEAD lines. Refs outside git's own namespaces (heads,
+# tags, remotes, notes, stash), which other tools keep for themselves, are left out too.
+# Adding or removing a worktree, any other new ref or config entry, or a stash still counts
+# as a change.
+set -euo pipefail
+shopt -s inherit_errexit 2>/dev/null || true
+
+usage() {
+  echo "usage: $0 snapshot|verify <repo> <file>" >&2
+  exit 2
+}
+
+[ "$#" -eq 3 ] || usage
+mode=$1
+repo=$2
+file=$3
+
+state() {
+  local own worktrees other_branches other_names refs index nl=$'\n'
+  # awk prelude: drop[] holds the full refs in $SKIP, names[] their branch names.
+  local branch_names='BEGIN {
+    n = split(ENVIRON["SKIP"], skip, "\n")
+    for (i = 1; i <= n; i++) {
+      if (skip[i] == "") continue
+      drop[skip[i]] = 1
+      name = skip[i]
+      sub(/^refs\/heads\//, "", name)
+      names[name] = 1
+    }
+  }'
+  # Empty for a bare repository, whose worktrees all count as other worktrees.
+  own=$(git -C "$repo" rev-parse --show-toplevel 2>/dev/null || true)
+  worktrees=$(git -C "$repo" worktree list --porcelain)
+  other_branches=$(printf '%s\n' "$worktrees" | OWN="$own" awk '
+    /^worktree / { other = (substr($0, 10) != ENVIRON["OWN"]) }
+    other && /^branch / { print substr($0, 8) }')
+  other_names=$(printf '%s\n' "$other_branches" | sed -n 's|^refs/heads/||p')
+
+  echo "## show-ref --head"
+  # Exit 1 means no refs at all, which is a state too.
+  refs=$(git -C "$repo" show-ref --head) || [ "$?" -eq 1 ]
+  printf '%s\n' "$refs" | SKIP="$other_branches" awk "$branch_names"'
+    {
+      keep = ($2 == "HEAD" || $2 ~ /^refs\/(heads|tags|remotes|notes)\// || $2 == "refs/stash") && !($2 in drop)
+      if (keep && $2 ~ /^refs\/remotes\//) {
+        name = $2
+        sub(/^refs\/remotes\/[^\/]+\//, "", name)
+        keep = !(name in names)
+      }
+    }
+    keep'
+  echo "## worktree list --porcelain"
+  printf '%s\n' "$worktrees" | OWN="$own" awk '
+    /^worktree / { other = (substr($0, 10) != ENVIRON["OWN"]) }
+    !(other && /^HEAD /)'
+  echo "## config --local --list"
+  # With -z each entry is the key, a newline, and the value, ended by NUL, so the branch
+  # name in a `branch.<name>.<var>` key is everything between `branch.` and the last dot,
+  # even when the name itself contains dots. Entries print as `key=value`.
+  { git -C "$repo" config --local --list -z || [ "$?" -eq 1 ]; } |
+    while IFS= read -r -d '' entry; do
+      key=${entry%%"$nl"*}
+      case $key in
+        branch.*.*)
+          name=${key#branch.}
+          name=${name%.*}
+          case "$nl$other_names$nl" in *"$nl$name$nl"*) continue ;; esac
+          ;;
+      esac
+      printf '%s\n' "${entry/"$nl"/=}"
+    done
+  echo "## stash list"
+  git -C "$repo" stash list
+  echo "## index"
+  index=$(git -C "$repo" rev-parse --path-format=absolute --git-path index)
+  if [ -e "$index" ]; then
+    git -C "$repo" hash-object --no-filters -- "$index"
+  else
+    echo "missing"
+  fi
+}
+
+case "$mode" in
+  snapshot)
+    state >"$file"
+    ;;
+  verify)
+    current=$(state)
+    if [ "$current" != "$(cat "$file")" ]; then
+      echo "repo-guard: $repo changed while the tests ran:" >&2
+      diff -u "$file" <(printf '%s\n' "$current") >&2 || true
+      exit 1
+    fi
+    ;;
+  *)
+    usage
+    ;;
+esac
