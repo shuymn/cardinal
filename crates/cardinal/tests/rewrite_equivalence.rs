@@ -494,9 +494,18 @@ const CASES: &[Case] = &[
 
 /// Runs every case in every shell with `dirs`' rewrite and compares it with the original.
 fn check(bench: &Bench, dirs: &Sandbox, expect_calls: bool) {
+    check_after(bench, dirs, expect_calls, || {});
+}
+
+/// [`check`], with `change` applied after the hook rewrote every case and before any runs.
+fn check_after(bench: &Bench, dirs: &Sandbox, expect_calls: bool, change: impl FnOnce()) {
     let shells = &bench.shells;
-    for case in CASES {
-        let rewritten = bench.rewrite(dirs, case.command);
+    let rewrites: Vec<String> = CASES
+        .iter()
+        .map(|case| bench.rewrite(dirs, case.command))
+        .collect();
+    change();
+    for (case, rewritten) in CASES.iter().zip(rewrites) {
         for shell in shells.iter().filter(|s| {
             (case.only.is_empty() || case.only.contains(&s.name)) && (!case.pipefail || s.pipefail)
         }) {
@@ -533,8 +542,8 @@ fn runner_present() {
     check(&bench, &bench.present, true);
 }
 
-/// C5: with the runner path missing or not executable, the fallback runs each original
-/// stage, and the command keeps its meaning.
+/// C5: with the runner path missing, not executable, or a directory, the fallback runs each
+/// original stage, and the command keeps its meaning.
 #[test]
 fn runner_missing() {
     let bench = Bench::new();
@@ -552,6 +561,19 @@ fn runner_missing() {
     )
     .unwrap();
     check(&bench, &bench.present, false);
+
+    // A directory in its place passes `-x` but not `-f`; the hook, which refuses a directory
+    // runner, rewrote while the runner was a file.
+    let bench = Bench::new();
+    check_after(&bench, &bench.present, false, || {
+        std::fs::remove_file(&bench.runner).unwrap();
+        std::fs::create_dir(&bench.runner).unwrap();
+        std::fs::set_permissions(
+            &bench.runner,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .unwrap();
+    });
 }
 
 /// The first stage of a generated pipeline. Only `2>&1` sends anything to stderr, so the
@@ -653,7 +675,7 @@ fn piped_redirection_stays_unwrapped() {
     let stage = "probe out >> out.log";
     let original = format!("{stage} | cat; cat out.log");
     let wrapped = format!(
-        "if [ -x {runner} ]; then {runner} run -- {stage}; else {stage}; fi | cat; cat out.log",
+        "if [ -f {runner} ] && [ -x {runner} ]; then {runner} run -- {stage}; else {stage}; fi | cat; cat out.log",
         runner = bench.runner
     );
     for shell in &bench.shells {

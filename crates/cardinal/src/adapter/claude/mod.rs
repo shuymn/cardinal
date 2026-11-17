@@ -9,6 +9,7 @@ mod repo;
 mod session;
 
 use std::io::{Read, Write};
+use std::path::Path;
 use std::time::Instant;
 
 use serde_json::{Map, Value};
@@ -113,10 +114,18 @@ fn run_pre_tool_use(
     if !config.host.hook.enabled {
         return Ok(());
     }
+    // A directory passes the shell's `-x` test; the rewrite's `-f` test would only ever take
+    // the fallback.
     let runner = match config.host.hook.runner_path() {
+        Ok(runner) if Path::new(&runner).is_dir() => Err(format!(
+            "the runner path {runner} is a directory, not the cardinal binary"
+        )),
+        Ok(runner) => Ok(runner),
+        Err(err) => Err(err.to_string()),
+    };
+    let runner = match runner {
         Ok(runner) => runner,
-        Err(err) => {
-            let message = err.to_string();
+        Err(message) => {
             record_pass(Some(&config.host), &input, &Pass::Config(message.clone()));
             return Err(Error::new(ErrorCode::ConfigInvalid, message));
         }

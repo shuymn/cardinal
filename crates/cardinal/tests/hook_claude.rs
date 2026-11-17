@@ -52,7 +52,7 @@ fn rewrite_takes_no_reservation() {
     .expect("a rewrite");
     let spec = &specs(rewritten(&doc))[0];
     let expected = format!(
-        "cd sub && if [ -x {RUNNER} ]; then {RUNNER} run --spec-b64 {} -- pnpm test 2>&1; else pnpm test 2>&1; fi | tail -5 || echo failed",
+        "cd sub && if [ -f {RUNNER} ] && [ -x {RUNNER} ]; then {RUNNER} run --spec-b64 {} -- pnpm test 2>&1; else pnpm test 2>&1; fi | tail -5 || echo failed",
         spec.encode_b64()
     );
     assert_eq!(rewritten(&doc), expected);
@@ -370,6 +370,30 @@ mod never_blocks {
             assert_eq!(found.len(), 1, "{runner}");
             assert_eq!(found[0].kind, RecordKind::ConfigError);
         }
+    }
+
+    /// A directory passes the shell's `-x` test, so the hook refuses it as the runner.
+    #[cfg(unix)]
+    #[test]
+    fn directory_runner_is_recorded() {
+        let dirs = Sandbox::new();
+        let runner = dirs.fixture().root().join("cardinal");
+        std::fs::create_dir(&runner).unwrap();
+        configure(
+            &dirs,
+            &host(runner.to_str().unwrap(), ""),
+            &[("generic", PROFILE)],
+        );
+        assert_eq!(run_hook(cmd(&dirs), &input("make", Path::new("/w"))), None);
+        let found = records(&dirs);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].kind, RecordKind::ConfigError);
+        assert!(
+            found[0].data["detail"]
+                .as_str()
+                .unwrap()
+                .contains("is a directory")
+        );
     }
 
     #[test]

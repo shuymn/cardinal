@@ -809,11 +809,13 @@ fn rewrite_wraps_the_decided_stages_with_their_specs() {
         .map(|rest| RunSpec::decode_b64(rest.split(' ').next().unwrap()).unwrap())
         .collect();
     assert!(
-        text.starts_with("cd x && if [ -x /r ]; then /r run --spec-b64 "),
+        text.starts_with("cd x && if [ -f /r ] && [ -x /r ]; then /r run --spec-b64 "),
         "{text}"
     );
     assert!(
-        text.contains(" -- npx vitest run; else npx vitest run; fi | tail; if [ -x /r ]"),
+        text.contains(
+            " -- npx vitest run; else npx vitest run; fi | tail; if [ -f /r ] && [ -x /r ]"
+        ),
         "{text}"
     );
     assert_eq!(specs.len(), 2);

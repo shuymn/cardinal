@@ -1,7 +1,8 @@
 //! The rewritten command (`docs/architecture.md` section 6.4): each wrapped stage's span is
-//! replaced, in place, by `if [ -x R ]; then S'; else S; fi`, where `S'` is the stage with
-//! `R run --spec-b64 <spec> --` before its command word. Every other byte stays. The form is
-//! shell syntax, not agent knowledge: the hook and `explain command` produce it the same way.
+//! replaced, in place, by `if [ -f R ] && [ -x R ]; then S'; else S; fi`, where `S'` is the
+//! stage with `R run --spec-b64 <spec> --` before its command word. Every other byte stays.
+//! The form is shell syntax, not agent knowledge: the hook and `explain command` produce it
+//! the same way.
 
 use std::ops::Range;
 
@@ -98,7 +99,7 @@ fn replacement(command: &str, runner: &str, wrap: &Wrap) -> String {
     let stage = &command[wrap.span.clone()];
     let (before, from_command) = stage.split_at(wrap.command_start - wrap.span.start);
     format!(
-        "if [ -x {runner} ]; then {before}{runner} run --spec-b64 {spec} -- {from_command}; else {stage}; fi",
+        "if [ -f {runner} ] && [ -x {runner} ]; then {before}{runner} run --spec-b64 {spec} -- {from_command}; else {stage}; fi",
         spec = wrap.spec
     )
 }
@@ -136,7 +137,7 @@ mod tests {
         };
         assert_eq!(
             splice(command, "/usr/local/bin/cardinal", &[wrap]),
-            "cd packages/app && if [ -x /usr/local/bin/cardinal ]; then /usr/local/bin/cardinal run --spec-b64 eyJzY2hlbWEiOi -- pnpm test 2>&1; else pnpm test 2>&1; fi | tail -50 || echo failed"
+            "cd packages/app && if [ -f /usr/local/bin/cardinal ] && [ -x /usr/local/bin/cardinal ]; then /usr/local/bin/cardinal run --spec-b64 eyJzY2hlbWEiOi -- pnpm test 2>&1; else pnpm test 2>&1; fi | tail -50 || echo failed"
         );
     }
 
@@ -146,7 +147,7 @@ mod tests {
         let wraps = wraps_for(command, "S");
         assert_eq!(
             splice(command, "/r", &wraps),
-            "if [ -x /r ]; then 2>/dev/null /r run --spec-b64 S0 -- make x; else 2>/dev/null make x; fi"
+            "if [ -f /r ] && [ -x /r ]; then 2>/dev/null /r run --spec-b64 S0 -- make x; else 2>/dev/null make x; fi"
         );
     }
 
@@ -155,10 +156,10 @@ mod tests {
         let command = "a 1 && b|c;d # comment";
         assert_eq!(
             splice(command, "/r", &wraps_for(command, "S")),
-            "if [ -x /r ]; then /r run --spec-b64 S0 -- a 1; else a 1; fi && \
-             if [ -x /r ]; then /r run --spec-b64 S1 -- b; else b; fi|\
-             if [ -x /r ]; then /r run --spec-b64 S2 -- c; else c; fi;\
-             if [ -x /r ]; then /r run --spec-b64 S3 -- d; else d; fi # comment"
+            "if [ -f /r ] && [ -x /r ]; then /r run --spec-b64 S0 -- a 1; else a 1; fi && \
+             if [ -f /r ] && [ -x /r ]; then /r run --spec-b64 S1 -- b; else b; fi|\
+             if [ -f /r ] && [ -x /r ]; then /r run --spec-b64 S2 -- c; else c; fi;\
+             if [ -f /r ] && [ -x /r ]; then /r run --spec-b64 S3 -- d; else d; fi # comment"
         );
     }
 
