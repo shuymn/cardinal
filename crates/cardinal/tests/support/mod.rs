@@ -5,6 +5,7 @@
 //! - [`helper`]: helper processes started by re-running the test binary.
 //! - [`cardinal`]: the `cardinal` binary with its own state and config directories.
 //! - [`testpoints`]: driving the pause points of `cardinal::testpoint`.
+//! - [`jobs`]: jobs of the real runner, for tests that read the reservations it makes.
 
 #![allow(
     dead_code,
@@ -13,4 +14,5 @@
 
 pub mod cardinal;
 pub mod helper;
+pub mod jobs;
 pub mod testpoints;
