@@ -495,11 +495,15 @@ fn children_get_a_constructed_environment() {
     );
 }
 
+fn shipped_settings() -> Value {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/claude/settings.json");
+    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+}
+
 /// The shipped settings name hook commands the CLI accepts, with explicit timeouts.
 #[test]
 fn shipped_settings_name_the_hook_commands() {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/claude/settings.json");
-    let settings: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    let settings = shipped_settings();
     let mut events = Vec::new();
     for (event, entries) in settings["hooks"].as_object().unwrap() {
         for entry in entries.as_array().unwrap() {
@@ -527,11 +531,74 @@ fn shipped_settings_name_the_hook_commands() {
         settings["hooks"]["PreToolUse"][0]["matcher"], "Bash",
         "only Bash calls reach the hook"
     );
-    let allow = settings["permissions"]["allow"][0].as_str().unwrap();
-    assert!(
-        allow.starts_with("Bash(/") && allow.ends_with(" run:*)"),
-        "{allow}"
-    );
+}
+
+/// Whether the Bash permission rule `rule` (`Bash`, `Bash(prefix:*)`, or `Bash(pattern)` with
+/// `*` matching any text) matches the command `command`.
+fn bash_rule_matches(rule: &str, command: &str) -> bool {
+    fn glob(pattern: &str, text: &str) -> bool {
+        match pattern.split_once('*') {
+            None => pattern == text,
+            Some((head, rest)) => {
+                text.starts_with(head)
+                    && (head.len()..=text.len())
+                        .any(|at| text.is_char_boundary(at) && glob(rest, &text[at..]))
+            }
+        }
+    }
+    let Some(body) = rule.strip_prefix("Bash") else {
+        return false;
+    };
+    let Some(pattern) = body.strip_prefix('(').and_then(|b| b.strip_suffix(')')) else {
+        return body.is_empty();
+    };
+    match pattern.strip_suffix(":*") {
+        Some(prefix) => command.starts_with(prefix),
+        None => glob(pattern, command),
+    }
+}
+
+/// When an agent supplies `R run -- probe` with `Bash(probe)` denied, cardinal's shipped
+/// settings shall not authorize execution without explicit approval: they hold no allow or
+/// ask entry whose pattern can match a runner invocation, and no mode that skips approval.
+#[test]
+fn shipped_settings_grant_no_runner_execution() {
+    let settings = shipped_settings();
+    let permissions = &settings["permissions"];
+    let invocations = [
+        "cardinal run -- probe",
+        "/usr/local/bin/cardinal run -- probe",
+        "/opt/cardinal/bin/cardinal run --spec-b64 eyJ9 -- probe",
+    ];
+    for list in ["allow", "ask"] {
+        for entry in permissions[list].as_array().into_iter().flatten() {
+            let rule = entry.as_str().expect("a permission rule is a string");
+            for invocation in invocations {
+                assert!(
+                    !bash_rule_matches(rule, invocation),
+                    "permissions.{list} entry {rule} matches {invocation}"
+                );
+            }
+        }
+    }
+    assert_ne!(permissions["defaultMode"], "bypassPermissions");
+
+    // The matcher finds the rules the settings must not hold.
+    for rule in [
+        "Bash",
+        "Bash(*)",
+        "Bash(cardinal run:*)",
+        "Bash(/usr/local/bin/cardinal run:*)",
+        "Bash(cardinal run *)",
+        "Bash(* run -- probe)",
+    ] {
+        assert!(
+            invocations.iter().any(|i| bash_rule_matches(rule, i)),
+            "{rule}"
+        );
+    }
+    assert!(!bash_rule_matches("Bash(probe)", "cardinal run -- probe"));
+    assert!(!bash_rule_matches("Read(*)", "cardinal run -- probe"));
 }
 
 /// Profile matching by repository: path matching without git, remote matching through git
