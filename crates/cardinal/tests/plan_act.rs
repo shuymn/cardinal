@@ -253,6 +253,15 @@ mod identity {
         let wt = s.worktree("advanced", &[]);
         let plan = s.plan(PlanKind::ReclaimWorktree, &wt);
         s.fx.commit_file(&wt, "src/new.rs", "// new\n", "advance");
+        // A dry run stops before the re-read during deletion: the comparison after the
+        // snapshot expires the plan on its own.
+        let dry_run = cardinal::act::ActOptions {
+            dry_run: true,
+            ..arbiter()
+        };
+        let checked = s.act(&plan.id, &dry_run).unwrap();
+        assert_eq!(checked.status, ActStatus::Expired);
+        assert_eq!(checked.reasons, ["identity_changed:head"]);
         let result = s.act(&plan.id, &arbiter()).unwrap();
         assert_eq!(result.status, ActStatus::Expired);
         assert_eq!(result.reasons, ["identity_changed:head"]);
@@ -435,6 +444,19 @@ fn symlink_target_refused() {
         link_plan.target.path,
         wt.join("node_modules").display().to_string()
     );
+
+    // A directory on the way to the target replaced by a link: nothing below it is reached.
+    let deep = s.worktree("deep", &[("web/node_modules", IgnoredClass::Regenerable)]);
+    write(&deep, "web/node_modules/pkg/index.js", "x");
+    let nested = s.plan(PlanKind::ReclaimDir, &deep.join("web/node_modules"));
+    assert!(nested.invariants_ok, "{:#?}", nested.checks);
+    write(&outside, "node_modules/pkg/index.js", "shared");
+    std::fs::remove_dir_all(deep.join("web")).unwrap();
+    std::os::unix::fs::symlink(&outside, deep.join("web")).unwrap();
+    let result = s.act(&nested.id, &owner_approved()).unwrap();
+    assert_eq!(result.status, ActStatus::Rejected);
+    assert_eq!(result.reasons, ["plain_target"]);
+    assert!(outside.join("node_modules/pkg/index.js").exists());
 }
 
 /// A7: a mount point is refused. The check reads the target's device against its parent's,
