@@ -312,20 +312,40 @@ EOF
       # A fresh /dev: on the read-only bind of the host's, /dev/null cannot be opened for
       # writing, which every child with null stdio needs. Empty file systems over the places
       # that hold the host's Unix sockets (agents, the session bus, container daemons) and
-      # shared memory, so a test cannot reach them; then R, which lies under /tmp.
-      local bwrap=(bwrap --ro-bind / / --dev /dev) mask
+      # shared memory, so a test cannot reach them; then the checkout, read-only, where one
+      # of them hid it (a test's working directory and the files it reads are there; the
+      # test binaries run from the archive, extracted under R); then R, which lies under /tmp.
+      local bwrap=(bwrap --ro-bind / / --dev /dev) mask masks=()
       for mask in /tmp /var/tmp /run /var/run /dev/shm; do
         if [ "$mask" = /dev/shm ] || { [ -d "$mask" ] && [ ! -L "$mask" ]; }; then
           bwrap+=(--tmpfs "$mask")
+          masks+=("$mask")
         fi
+      done
+      for mask in "${masks[@]}"; do
+        case $root/ in
+          "$mask"/*)
+            case $root in *' '*)
+              confinement="UNCONFINED: the checkout $root has a space, which a target runner cannot carry"
+              say "$confinement"
+              return
+              ;;
+            esac
+            bwrap+=(--ro-bind "$root" "$root")
+            break
+            ;;
+        esac
       done
       bwrap+=(--bind "$R" "$R" --unshare-net --die-with-parent --)
       local error
-      if error=$("${bwrap[@]}" sh -c ': >/dev/null && : >"$1/probe"' sh "$R" 2>&1); then
+      if ! error=$("${bwrap[@]}" sh -c ': >/dev/null && : >"$1/probe"' sh "$R" 2>&1); then
+        confinement="UNCONFINED: bubblewrap does not work here (${error:-not installed}); writes outside the per-run root are found only by the repository guard"
+      elif ! "${bwrap[@]}" test -r "$root/Cargo.toml"; then
+        say "bubblewrap hides the checkout $root from the tests"
+        exit 1
+      else
         runner="${bwrap[*]}"
         confinement="bubblewrap: writes only under the per-run root, no network, host sockets masked"
-      else
-        confinement="UNCONFINED: bubblewrap does not work here (${error:-not installed}); writes outside the per-run root are found only by the repository guard"
       fi
       ;;
     *)
