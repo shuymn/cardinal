@@ -673,6 +673,23 @@ const CASES: &[Case] = &[
         0,
         0,
     ),
+    // The runner gets only the exported environment, without `PATH`; the shell still finds
+    // `probe` in its own.
+    case("unexported_path", "", "export -n PATH; probe x", 0, 0),
+    case(
+        "typeset_unexported_path",
+        "",
+        "typeset +x PATH; probe x",
+        0,
+        0,
+    ),
+    case(
+        "declare_unexported_path",
+        "",
+        "declare +x PATH; probe x",
+        0,
+        0,
+    ),
     // Arguments of other commands are text, not assignments.
     case(
         "table_element_text",

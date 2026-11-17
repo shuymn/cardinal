@@ -291,26 +291,48 @@ pub(super) fn changes_caller(name: &str, args: &[(&str, Option<&str>)]) -> bool 
 }
 
 /// `typeset` and its relatives: an option `f` (or `n`, except for `export`, where it removes
-/// the export), or a name argument that is not a plain identifier outside the tables, before
-/// or after `=`, options or not.
+/// the export), a name argument that is not a plain identifier outside the tables, before or
+/// after `=`, options or not, or removing the export of `PATH` (`export -n PATH`, `typeset
+/// +x PATH`): the shell would still find commands in its `PATH`, but the runner, which gets
+/// only the exported environment, would not.
 fn typeset_changes_caller(name: &str, args: &[(&str, Option<&str>)]) -> bool {
     let mut options = true;
-    args.iter().any(|(raw, value)| {
+    let mut unexports = false;
+    let mut names_path = false;
+    let unsafe_arg = args.iter().any(|(raw, value)| {
         if options && *value == Some("--") {
             options = false;
             return false;
         }
         if is_assignment(raw) || value.is_some_and(is_assignment) {
             options = false;
-            return assigns_unsafe_name(value.unwrap_or(raw));
+            let word = value.unwrap_or(raw);
+            names_path |= leading_name(word) == "PATH";
+            return assigns_unsafe_name(word);
         }
         let Some(value) = value else { return true };
         if options && let Some(letters) = value.strip_prefix(['-', '+']) {
+            unexports |= if value.starts_with('+') {
+                letters.contains('x')
+            } else {
+                name == "export" && letters.contains('n')
+            };
             return letters.contains('f') || (name != "export" && letters.contains('n'));
         }
         options = false;
+        names_path |= *value == "PATH";
         unsafe_name(Some(value))
-    })
+    });
+    unsafe_arg || (unexports && names_path)
+}
+
+/// The name at the start of an assignment `word`: up to its subscript, `+=`, or `=`.
+fn leading_name(word: &str) -> &str {
+    let len = word
+        .bytes()
+        .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
+        .count();
+    &word[..len]
 }
 
 /// `printf -v NAME` (and zsh's `print -v NAME`) assigns the output to `NAME`; a word with
@@ -369,11 +391,8 @@ fn emulate_changes_caller(args: &[(&str, Option<&str>)]) -> bool {
 /// array, whose subscript is arithmetic that can assign anything, or one of the shells'
 /// tables of functions, aliases, command paths, or options.
 pub(super) fn assigns_unsafe_name(word: &str) -> bool {
-    let len = word
-        .bytes()
-        .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
-        .count();
-    word[len..].starts_with('[') || CALLER_ARRAYS.contains(&&word[..len])
+    let name = leading_name(word);
+    word[name.len()..].starts_with('[') || CALLER_ARRAYS.contains(&name)
 }
 
 /// Whether `text` (a word after quote removal, without its expansions) names an element of

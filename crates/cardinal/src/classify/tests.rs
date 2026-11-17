@@ -1234,6 +1234,13 @@ fn caller_changing_builtins_refuse_the_command() {
         "setopt -x",
         "setopt \"$opt\"",
         "shopt -s extdebug",
+        // Removing the export of `PATH` hides it from the runner, not from the shell.
+        "export -n PATH",
+        "export -n PATH=/bin",
+        "typeset +x PATH",
+        "declare -g +x PATH",
+        "local +x PATH",
+        "readonly +x PATH",
     ] {
         assert!(
             matches!(tokenize(command), Err(Refusal::ChangesShell(_))),
@@ -1250,6 +1257,10 @@ fn caller_changing_builtins_refuse_the_command() {
         "unsetopt nomatch",
         "shopt -s nullglob",
         "export FOO=$x PATH=\"$PATH:/x\"",
+        "export PATH",
+        "declare -x PATH",
+        "typeset +x FOO",
+        "typeset +x MYPATH PATHS",
         "declare -a arr",
         "typeset -i n=1",
         "local x=1",
