@@ -483,6 +483,20 @@ mod tests {
         (action.sa_sigaction, action.sa_flags & behaviour)
     }
 
+    /// Whether `sig` is blocked on the calling thread.
+    fn blocked(sig: i32) -> bool {
+        let mut mask = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+        // SAFETY: with a null new mask, `pthread_sigmask` only writes the current one into
+        // `mask`, which `sigismember` then reads.
+        unsafe {
+            assert_eq!(
+                libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), mask.as_mut_ptr()),
+                0
+            );
+            libc::sigismember(mask.as_ptr(), sig) == 1
+        }
+    }
+
     /// Starts each reader on a real thread that reports on `ended` when it returns; the
     /// `fail_at`-th start (counting from 1) fails as thread creation does without resources.
     fn start_reporting(
@@ -508,7 +522,7 @@ mod tests {
     }
 
     /// A reader thread that cannot start fails the watch before any handler is installed: the
-    /// signals keep their dispositions, and the reader that did start ends.
+    /// signals keep their dispositions and stay unblocked, and the reader that did start ends.
     #[test]
     fn a_reader_that_cannot_start_leaves_no_handler() {
         let signals = [libc::SIGUSR1, libc::SIGWINCH];
@@ -523,6 +537,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::EAGAIN), "{err}");
         assert_eq!(signals.map(handler), before);
+        assert_eq!(signals.map(blocked), [false; 2]);
         ended
             .recv_timeout(Duration::from_secs(10))
             .expect("the started reader ended");
@@ -551,8 +566,8 @@ mod tests {
     }
 
     /// A handler that cannot be installed after another was takes that one back: its signal
-    /// gets its disposition back, and both readers end. A signal that arrives meanwhile reaches
-    /// the disposition put back, not the watch.
+    /// gets its disposition back, the signals stay unblocked, and both readers end. A signal
+    /// that arrives meanwhile reaches the disposition put back, not the watch.
     #[test]
     fn a_handler_that_cannot_be_installed_leaves_no_handler() {
         let signals = [libc::SIGUSR2, libc::SIGURG];
@@ -581,6 +596,7 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(handler(libc::SIGUSR2), before);
+        assert_eq!(signals.map(blocked), [false; 2]);
         for _ in signals {
             ended
                 .recv_timeout(Duration::from_secs(10))
