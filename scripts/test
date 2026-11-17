@@ -82,12 +82,18 @@ marker="CARDINAL_TEST_RUN=$run_id"
 # allows `<name>.allowed`; only this run's sandbox does both.
 sandbox_name=dev.cardinal.test-run.$run_id
 
+# Background processes the self-check starts outside the tests, killed on every exit.
+helpers=()
 cleanup() {
   local status=$?
+  local pid
+  for pid in ${helpers[@]+"${helpers[@]}"}; do
+    kill "$pid" 2>/dev/null || true
+  done
   if ! sweep; then
     status=1
   fi
-  rm -rf "$R"
+  rm -rf "$R" "$R.sock"
   exit "$status"
 }
 trap cleanup EXIT
@@ -273,12 +279,20 @@ EOF
       ;;
     Linux)
       # A fresh /dev: on the read-only bind of the host's, /dev/null cannot be opened for
-      # writing, which every child with null stdio needs.
-      local bwrap=(bwrap --ro-bind / / --dev /dev --bind "$R" "$R" --unshare-net --die-with-parent --)
+      # writing, which every child with null stdio needs. Empty file systems over the places
+      # that hold the host's Unix sockets (agents, the session bus, container daemons) and
+      # shared memory, so a test cannot reach them; then R, which lies under /tmp.
+      local bwrap=(bwrap --ro-bind / / --dev /dev) mask
+      for mask in /tmp /var/tmp /run /var/run /dev/shm; do
+        if [ "$mask" = /dev/shm ] || { [ -d "$mask" ] && [ ! -L "$mask" ]; }; then
+          bwrap+=(--tmpfs "$mask")
+        fi
+      done
+      bwrap+=(--bind "$R" "$R" --unshare-net --die-with-parent --)
       local error
       if error=$("${bwrap[@]}" sh -c ': >/dev/null && : >"$1/probe"' sh "$R" 2>&1); then
         runner="${bwrap[*]}"
-        confinement="bubblewrap: writes only under the per-run root, no network"
+        confinement="bubblewrap: writes only under the per-run root, no network, host sockets masked"
       else
         confinement="UNCONFINED: bubblewrap does not work here (${error:-not installed}); writes outside the per-run root are found only by the repository guard"
       fi
@@ -381,6 +395,15 @@ self_check() {
   fi
   rm -f "$escape"
 
+  # A Unix socket outside R, at $R.sock where a listener started before the tests accepts
+  # connections, cannot be reached; one inside R can. Without confinement the same test
+  # reaches it, which shows the listener works.
+  if [ "$os" != Windows ]; then
+    socket_check
+  else
+    check "a Unix socket outside the per-run root is unreachable" "not checked on Windows"
+  fi
+
   # Leftover processes are killed and fail the run: one with its output closed, one in a
   # session of its own, one that closed every descriptor, and a daemon (forked twice, in a
   # new session, every descriptor closed).
@@ -432,6 +455,46 @@ self_check() {
     check "inherited BASH_ENV, ENV, and GIT_* reach nothing" FAILED
   fi
   return "$failed"
+}
+
+# The socket part of the self-check: a listener (the canaries' `listen` example, which exits
+# by itself after two minutes and is killed on every exit of this script) at $R.sock.
+socket_check() {
+  local name="a Unix socket outside the per-run root is unreachable"
+  CARGO_TARGET_DIR=$canary_target cargo build --locked --quiet \
+    --manifest-path "$canaries/Cargo.toml" --example listen
+  "$canary_target/debug/examples/listen" "$R.sock" 120 &
+  local listener=$! tries=0 inside=0 outside=0 control=0
+  helpers+=("$listener")
+  while [ ! -S "$R.sock" ]; do
+    tries=$((tries + 1))
+    if [ "$tries" -ge 100 ] || ! kill -0 "$listener" 2>/dev/null; then
+      check "$name (the listener did not start)" FAILED
+      return
+    fi
+    sleep 0.1
+  done
+  run_archive "$R/canaries.tar.zst" "$canaries" -E 'test(=connects_inside_root)' || inside=$?
+  run_archive "$R/canaries.tar.zst" "$canaries" -E 'test(=connects_outside_root)' || outside=$?
+  runner='' run_archive "$R/canaries.tar.zst" "$canaries" \
+    -E 'test(=connects_outside_root)' || control=$?
+  kill "$listener" 2>/dev/null || true
+  wait "$listener" 2>/dev/null || true
+  rm -f "$R.sock"
+  if [ "$inside" -ne 0 ]; then
+    check "a Unix socket inside the per-run root is reachable" FAILED
+  else
+    check "a Unix socket inside the per-run root is reachable" ok
+  fi
+  if [ "$control" -ne 0 ]; then
+    check "$name (unconfined, the test cannot reach the listener either)" FAILED
+  elif [ -z "$runner" ]; then
+    check "$name" "not prevented on $os ($confinement)"
+  elif [ "$outside" -ne 0 ]; then
+    check "$name" ok
+  else
+    check "$name" FAILED
+  fi
 }
 
 # --- Main ----------------------------------------------------------------------------------

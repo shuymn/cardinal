@@ -34,6 +34,34 @@ fn environment_is_clean() {
     );
 }
 
+/// Connects to the Unix socket the self-check listens on beside the per-run root R, at
+/// `R.sock` (the temp dir is `R/tmp`). Confined, the connection fails and so does the test.
+#[cfg(unix)]
+#[test]
+fn connects_outside_root() {
+    let tmp = std::env::temp_dir();
+    let mut path = tmp
+        .parent()
+        .expect("temp dir has a parent")
+        .as_os_str()
+        .to_owned();
+    path.push(".sock");
+    std::os::unix::net::UnixStream::connect(&path)
+        .expect("connect to a socket outside the per-run root");
+}
+
+/// Listens on and connects to a Unix socket inside the per-run root, which stays reachable.
+#[cfg(unix)]
+#[test]
+fn connects_inside_root() {
+    let path = std::env::temp_dir().join("canary.sock");
+    let listener =
+        std::os::unix::net::UnixListener::bind(&path).expect("listen inside the per-run root");
+    let _client =
+        std::os::unix::net::UnixStream::connect(&path).expect("connect inside the per-run root");
+    listener.accept().expect("accept the connection");
+}
+
 fn sleeper() -> Command {
     let mut command = if cfg!(windows) {
         let mut command = Command::new("ping");
