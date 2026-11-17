@@ -41,7 +41,8 @@ pub use signal_hook::consts::signal::{
 /// The process group of this process before and after [`lead_group`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GroupSetup {
-    /// The group this process was in before; the stage runs in it again on fail-open.
+    /// The group this process was in before, which another process leads; the stage runs in
+    /// it again on fail-open.
     pub original: u32,
     /// The group this process now leads: its own PID.
     pub pgid: u32,
@@ -63,17 +64,19 @@ fn signal(raw: i32) -> io::Result<Signal> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("bad signal {raw}")))
 }
 
-/// Makes this process the leader of a new process group: `setpgid(0, 0)`. `EPERM` is accepted
-/// when this process already leads its group (for example as a session leader); any other
-/// failure is returned.
+/// Makes this process the leader of a new process group: `setpgid(0, 0)`. Fails when this
+/// process already leads its group: the group it was given, for example as the first command
+/// of a job-control shell's pipeline, may hold other processes, so it is not this process's
+/// own.
 pub fn lead_group() -> io::Result<GroupSetup> {
     let me = raw(rustix::process::getpid());
     let original = raw(rustix::process::getpgrp());
-    match rustix::process::setpgid(None, None) {
-        Ok(()) => {}
-        Err(rustix::io::Errno::PERM) if original == me => {}
-        Err(err) => return Err(err.into()),
+    if original == me {
+        return Err(io::Error::other(format!(
+            "already leads process group {me}, which others may share"
+        )));
     }
+    rustix::process::setpgid(None, None)?;
     let pgid = raw(rustix::process::getpgrp());
     if pgid != me {
         return Err(io::Error::other(format!(
@@ -83,12 +86,9 @@ pub fn lead_group() -> io::Result<GroupSetup> {
     Ok(GroupSetup { original, pgid })
 }
 
-/// Moves this process back into the group it was in before [`lead_group`]. A no-op when the
-/// group did not change. Fails when the original group no longer exists.
+/// Moves this process back into the group it was in before [`lead_group`]. Fails when the
+/// original group no longer exists.
 pub fn rejoin_group(setup: GroupSetup) -> io::Result<()> {
-    if setup.original == setup.pgid {
-        return Ok(());
-    }
     rustix::process::setpgid(None, Some(pid(setup.original)?)).map_err(Into::into)
 }
 

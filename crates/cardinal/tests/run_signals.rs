@@ -7,7 +7,7 @@
 mod runner_support;
 mod support;
 
-use std::os::unix::process::ExitStatusExt as _;
+use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
 use std::process::Command;
 
 use cardinal::testpoint::{ADMISSION_WAITING, RUN_BEFORE_STARTING};
@@ -215,6 +215,45 @@ fn signals_are_forwarded_to_the_group() {
     let mut lines = env.lines("got");
     lines.sort();
     assert_eq!(lines, ["grandchild", "stage"]);
+}
+
+/// A runner that already leads its group, as the first command of a job-control shell's
+/// pipeline does, shares that group with the rest of the job: it runs the stage in that group
+/// without admission, as on the fail-open path, so SIGTERM to the runner reaches the stage
+/// alone and leaves another member of the group running.
+#[test]
+fn a_runner_leading_its_callers_group_signals_only_its_stage() {
+    let env = Env::with_budget(4);
+    let ready = env.file("ready");
+    let script = format!(
+        "trap 'exit 6' TERM; : > '{}'; while :; do sleep 0.02; done",
+        ready.display()
+    );
+    let mut runner = env.run(None, &["sh", "-c", &script]);
+    runner.process_group(0);
+    let mut runner = ChildGuard::new(runner.spawn().unwrap());
+    let _group = runner_support::GroupGuard(runner.id());
+    let mut member = support::helper::command(&Mode::Sleep);
+    env.isolate(&mut member);
+    member.process_group(runner.id().cast_signed());
+    let mut member = ChildGuard::new(member.spawn().unwrap());
+    assert_eq!(cardinal::os::unix::pgid_of(member.id()), Some(runner.id()));
+    wait_for_file(&ready, WAIT);
+
+    cardinal::os::unix::signal_process(runner.id(), cardinal::os::unix::SIGTERM).unwrap();
+    assert_eq!(runner.child().wait().unwrap().code(), Some(6));
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(
+        member.child().try_wait().unwrap().is_none(),
+        "the other member of the group is still running"
+    );
+    let reasons: Vec<_> = env
+        .records_of(cardinal::contract::RecordKind::JobFailOpen)
+        .iter()
+        .map(|r| r.data["reason"].clone())
+        .collect();
+    assert_eq!(reasons, ["group_setup"]);
+    assert_eq!(env.reservations(), []);
 }
 
 /// A stopped stage is still supervised: a signal to the runner reaches its group, and the stage
