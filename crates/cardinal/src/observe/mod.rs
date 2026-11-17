@@ -123,8 +123,8 @@ struct RepoContext {
     failure: Option<String>,
     listed: Vec<ListedWorktree>,
     patterns: DataPatterns,
-    /// `Err` when the open pull requests are unknown.
-    open_prs: Result<Vec<gh::OpenPr>, String>,
+    /// `None` when the open pull requests are unknown.
+    open_prs: Option<Vec<gh::OpenPr>>,
 }
 
 /// The history facts of one worktree.
@@ -208,12 +208,11 @@ impl<'a> Observer<'a> {
             .success(&what)
     }
 
-    fn gh(&self, args: &[String]) -> Result<Output, String> {
+    fn gh(&self, args: &[OsString]) -> Result<Output, String> {
         let observe = &self.config.host.observe;
-        let command: Vec<OsString> = args.iter().map(OsString::from).collect();
         let out = child::run(
             &observe.gh,
-            &command,
+            args,
             &self.gh_env,
             None,
             Duration::from_millis(observe.gh_timeout_ms),
@@ -247,8 +246,7 @@ impl<'a> Observer<'a> {
             }
         }
 
-        let (budget, reserved, reservations) =
-            budget_view(self.config, shared.reservations.as_deref());
+        let (budget, reserved, reservations) = budget_view(self.config, shared.reservations);
         let outlived = outlived(state, shared.processes.as_ref(), &mut errors);
         Ok(Inventory {
             schema: InventorySchema,
@@ -420,19 +418,11 @@ impl<'a> Observer<'a> {
                 .gh(&gh::open_args(&repo.spec()))
                 .and_then(|out| gh::parse_open(&out.stdout))
             {
-                Ok(prs) => (GhStatus::Ok, None, Ok(prs)),
-                Err(message) => (GhStatus::Unknown, Some(message.clone()), Err(message)),
+                Ok(prs) => (GhStatus::Ok, None, Some(prs)),
+                Err(message) => (GhStatus::Unknown, Some(message), None),
             },
-            (Err(message), None) => (
-                GhStatus::Unknown,
-                Some(message.clone()),
-                Err(message.clone()),
-            ),
-            (Ok(_), None) => (
-                GhStatus::NotApplicable,
-                None,
-                Err("the origin remote is not a GitHub repository".to_owned()),
-            ),
+            (Err(message), None) => (GhStatus::Unknown, Some(message.clone()), None),
+            (Ok(_), None) => (GhStatus::NotApplicable, None, None),
         };
 
         Ok(RepoContext {
@@ -723,8 +713,8 @@ impl<'a> Observer<'a> {
         };
 
         let open_pr = match &ctx.open_prs {
-            Ok(prs) => tri(gh::open_pr_for(prs, branch, head).is_some()),
-            Err(_) => Tri::Unknown,
+            Some(prs) => tri(gh::open_pr_for(prs, branch, head).is_some()),
+            None => Tri::Unknown,
         };
         History {
             merge_evidence,
@@ -1074,10 +1064,10 @@ fn plain_target(path: &Path) -> CheckResult {
 /// The budgets, the resources of live and recovery-needed reservations, and the reservations.
 fn budget_view(
     config: &Config,
-    reservations: Option<&[ReservationView]>,
+    reservations: Option<Vec<ReservationView>>,
 ) -> (Resources, Resources, Vec<ReservationView>) {
     let mut reserved = Resources::new();
-    let list = reservations.unwrap_or_default().to_vec();
+    let list = reservations.unwrap_or_default();
     for view in list.iter().filter(|v| v.derived != DerivedState::Stale) {
         for (name, amount) in &view.reservation.resources {
             reserved

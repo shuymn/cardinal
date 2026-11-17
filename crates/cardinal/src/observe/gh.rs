@@ -1,6 +1,8 @@
 //! GitHub facts through gh (`docs/architecture.md` section 8.2): the repository of a
 //! remote, open pull requests, and merged pull requests by head object ID.
 
+use std::ffi::OsString;
+
 use serde::Deserialize;
 
 use crate::config::normalize_remote;
@@ -64,7 +66,7 @@ pub struct MergedPr {
 
 /// The arguments of the open pull request query.
 #[must_use]
-pub fn open_args(repo: &str) -> Vec<String> {
+pub fn open_args(repo: &str) -> Vec<OsString> {
     [
         "pr",
         "list",
@@ -77,13 +79,13 @@ pub fn open_args(repo: &str) -> Vec<String> {
         "--json",
         "number,headRefName,headRefOid,isCrossRepository,url",
     ]
-    .map(str::to_owned)
+    .map(OsString::from)
     .to_vec()
 }
 
 /// The arguments of the merged pull request query for a head object ID.
 #[must_use]
-pub fn merged_args(repo: &str, head: &str) -> Vec<String> {
+pub fn merged_args(repo: &str, head: &str) -> Vec<OsString> {
     [
         "pr",
         "list",
@@ -98,7 +100,7 @@ pub fn merged_args(repo: &str, head: &str) -> Vec<String> {
         "--limit",
         &MERGED_LIMIT.to_string(),
     ]
-    .map(str::to_owned)
+    .map(OsString::from)
     .to_vec()
 }
 

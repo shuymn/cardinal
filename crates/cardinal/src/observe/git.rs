@@ -152,13 +152,13 @@ pub fn parse_status(bytes: &[u8]) -> Result<Status, String> {
 
 /// Splits one `git ls-files -z --stage` entry into `"<mode> <object> <stage>"` and its
 /// path.
-pub fn parse_stage_entry(entry: &[u8]) -> Result<(String, PathBuf), String> {
+pub fn parse_stage_entry(entry: &[u8]) -> Result<(&str, PathBuf), String> {
     let tab = entry
         .iter()
         .position(|&b| b == b'\t')
         .ok_or("ls-files entry without a path")?;
     let meta = std::str::from_utf8(&entry[..tab]).map_err(|_| "ls-files entry is not UTF-8")?;
-    Ok((meta.to_owned(), path_from_bytes(&entry[tab + 1..])?))
+    Ok((meta, path_from_bytes(&entry[tab + 1..])?))
 }
 
 /// Whether `name` is a ref name by the rules of `git check-ref-format --allow-onelevel`:
