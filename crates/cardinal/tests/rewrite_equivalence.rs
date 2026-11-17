@@ -114,6 +114,9 @@ impl Bench {
         std::fs::create_dir_all(&bin).unwrap();
         let log = root.join("runner.log");
         probe(&bin);
+        // Found by zsh's `PATH_DIRS` search for `tools/probe`.
+        std::fs::create_dir_all(bin.join("tools")).unwrap();
+        probe(&bin.join("tools"));
         executable(&bin.join("npx"), "#!/bin/sh\nexec \"$@\"\n");
         let runner = runner_path(&fake_runner(&bin, &log));
         let present = Sandbox::new();
@@ -690,6 +693,8 @@ const CASES: &[Case] = &[
         0,
         0,
     ),
+    // zsh searches `PATH` for `tools/probe`; the runner looks in the cwd.
+    case("path_dirs", "", "setopt PATH_DIRS; tools/probe x", 0, 0),
     // Arguments of other commands are text, not assignments.
     case(
         "table_element_text",

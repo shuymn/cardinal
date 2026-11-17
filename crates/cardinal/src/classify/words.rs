@@ -165,6 +165,7 @@ const CALLER_CHANGING: &[&str] = &[
     "disable",
     "hash",
     "unhash",
+    "rehash",
     "trap",
     "mapfile",
     "readarray",
@@ -204,19 +205,44 @@ const CALLER_ARRAYS: &[&str] = &[
     "BASH_CMDS",
 ];
 
-/// Options that make the shell print the commands it runs: the rewrite's fallback test and
-/// runner would show up in the output.
-const TRACING_OPTIONS: &[&str] = &["xtrace", "verbose", "functrace", "extdebug"];
+/// Options that refuse the command when it sets or unsets them. The first four make the
+/// shell print the commands it runs, so the rewrite's fallback test and runner would show up
+/// in the output. The rest change how the calling shell finds a command, which the runner,
+/// searching `PATH` afresh, does not follow: zsh's `PATH_DIRS` searches `PATH` for a command
+/// word with a slash (`tools/probe`), the hashing options (zsh's `HASH_CMDS`, `HASH_DIRS`,
+/// `HASH_EXECUTABLES_ONLY`, bash's `hashall` and `checkhash`) decide whether the shell runs
+/// a remembered path instead, and `restricted` refuses the runner's path.
+const REFUSED_OPTIONS: &[&str] = &[
+    "xtrace",
+    "verbose",
+    "functrace",
+    "extdebug",
+    "pathdirs",
+    "hashcmds",
+    "hashdirs",
+    "hashexecutablesonly",
+    "hashall",
+    "checkhash",
+    "restricted",
+];
 
-/// An option name as zsh compares it (case and underscores ignored), without a `no` prefix.
-fn is_tracing_option(name: &str) -> bool {
+/// The letters of [`REFUSED_OPTIONS`] for `set`: `x`, `v`, bash's `T` (`functrace`) and `h`
+/// (`hashall`), zsh's `Q` (`PATH_DIRS`), and `r` (restricted) in both.
+const REFUSED_SET_LETTERS: [char; 6] = ['x', 'v', 'T', 'h', 'Q', 'r'];
+
+/// The letters of [`REFUSED_OPTIONS`] for zsh's `setopt` and `unsetopt`.
+const REFUSED_SETOPT_LETTERS: [char; 4] = ['x', 'v', 'Q', 'r'];
+
+/// Whether `name`, compared as zsh compares option names (case and underscores ignored,
+/// without a `no` prefix), is one of [`REFUSED_OPTIONS`].
+fn is_refused_option(name: &str) -> bool {
     let name: String = name
         .chars()
         .filter(|c| *c != '_')
         .flat_map(char::to_lowercase)
         .collect();
     let name = name.strip_prefix("no").unwrap_or(&name);
-    TRACING_OPTIONS.contains(&name)
+    REFUSED_OPTIONS.contains(&name)
 }
 
 fn is_identifier(word: &str) -> bool {
@@ -260,7 +286,7 @@ pub(super) fn changes_caller(name: &str, args: &[(&str, Option<&str>)]) -> bool 
                 let Some(letters) = value.strip_prefix(['-', '+']) else {
                     break;
                 };
-                if letters.contains(['x', 'v', 'T']) {
+                if letters.contains(REFUSED_SET_LETTERS) {
                     return true;
                 }
                 // zsh's `set -A name …` assigns an array.
@@ -269,7 +295,7 @@ pub(super) fn changes_caller(name: &str, args: &[(&str, Option<&str>)]) -> bool 
                 }
                 if letters.contains('o') {
                     match words.next() {
-                        Some(Some(option)) if !is_tracing_option(option) => {}
+                        Some(Some(option)) if !is_refused_option(option) => {}
                         None => {}
                         Some(_) => return true,
                     }
@@ -279,13 +305,13 @@ pub(super) fn changes_caller(name: &str, args: &[(&str, Option<&str>)]) -> bool 
         }
         "setopt" | "unsetopt" => values().any(|value| {
             value.is_none_or(|value| {
-                is_tracing_option(value)
+                is_refused_option(value)
                     || value
                         .strip_prefix(['-', '+'])
-                        .is_some_and(|letters| letters.contains(['x', 'v']))
+                        .is_some_and(|letters| letters.contains(REFUSED_SETOPT_LETTERS))
             })
         }),
-        "shopt" => values().any(|value| value.is_none_or(is_tracing_option)),
+        "shopt" => values().any(|value| value.is_none_or(is_refused_option)),
         _ => false,
     }
 }
