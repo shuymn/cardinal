@@ -4,8 +4,8 @@
 //! [`Fixture::git`] and the named operations, which panic unless the directory, every
 //! argument read as a path (symbolic links followed), and the git dir and common dir git
 //! resolves for the call are inside the fixture root. The isolated config disables every
-//! transport, so only [`Fixture::push`], which checks the remote's URL, moves objects
-//! between repositories. The environment is constructed, not inherited: `GIT_DIR`,
+//! transport, so only [`Fixture::push`] moves objects between repositories, and only into a
+//! [`BareRepo`] the fixture created. The environment is constructed, not inherited: `GIT_DIR`,
 //! `GIT_WORK_TREE`, `GIT_INDEX_FILE`, and every other inherited `GIT_*` never reach git, so a
 //! test run from a git hook cannot touch the repository the tests run in.
 
@@ -41,6 +41,18 @@ const GLOBAL_WITH_VALUE: &[&str] = &["-C", "-c", "--git-dir", "--work-tree", "--
 pub struct Fixture {
     _dir: TempDir,
     root: PathBuf,
+}
+
+/// A bare repository created by [`Fixture::init_bare`]: the only push target, so a push
+/// cannot name a URL or path of its own.
+pub struct BareRepo {
+    path: PathBuf,
+}
+
+impl BareRepo {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
 }
 
 impl Fixture {
@@ -164,32 +176,21 @@ impl Fixture {
             .expect("run git")
     }
 
-    /// `git push -q -u remote branch` from `repo`, where `remote` is a remote name or a
-    /// URL. Every push URL must be a local path or `file://` URL inside the root; only this
-    /// call enables the file transport.
-    pub fn push(&self, repo: &Path, remote: &str, branch: &str) {
-        let configured = self.git_output(repo, &["remote", "get-url", "--push", "--all", remote]);
-        let urls = if configured.status.success() {
-            String::from_utf8(configured.stdout).expect("git output is UTF-8")
-        } else {
-            remote.to_owned()
-        };
-        for url in urls.lines() {
-            let path = url.strip_prefix("file://").unwrap_or(url);
-            assert!(
-                !path.contains("://"),
-                "refusing git: push URL {url} is not a local path"
-            );
-            self.assert_inside(&repo.join(path), "push URL");
-        }
+    /// `git push -q -u <target> branch` from `repo`, which also sets `branch`'s upstream to
+    /// the target's path. The target must be a repository of this fixture whose git dir is
+    /// inside the root; only this call enables the file transport.
+    pub fn push(&self, repo: &Path, target: &BareRepo, branch: &str) {
+        self.assert_inside(target.path(), "push target");
+        self.check_resolved_git_dirs(target.path(), &[]);
+        let path = target.path().to_string_lossy();
         let output = self.run_git(
             repo,
             &["-c", "protocol.file.allow=always"],
-            &["push", "-q", "-u", remote, branch],
+            &["push", "-q", "-u", &path, branch],
         );
         assert!(
             output.status.success(),
-            "git push {remote} {branch} failed: {}",
+            "git push {path} {branch} failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
     }
@@ -202,13 +203,13 @@ impl Fixture {
     }
 
     /// `git init --bare` of a new repository `root/name`.
-    pub fn init_bare(&self, name: &str) -> PathBuf {
-        let repo = self.path(name);
+    pub fn init_bare(&self, name: &str) -> BareRepo {
+        let path = self.path(name);
         self.git(
             &self.root,
             &["init", "-q", "--bare", "-b", "main", "--", name],
         );
-        repo
+        BareRepo { path }
     }
 
     /// Writes `rel` in `repo`, commits it, and returns the new HEAD.

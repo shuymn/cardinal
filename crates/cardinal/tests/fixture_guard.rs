@@ -42,33 +42,23 @@ fn named_operations_work_inside_the_fixture() {
     let wt = fixture.worktree_add(&repo, "wt", "feature");
     assert!(wt.join("dir/a.txt").exists());
     let bare = fixture.init_bare("remote.git");
-    fixture.git(&repo, &["remote", "add", "origin", &bare.to_string_lossy()]);
-    fixture.push(&repo, "origin", "main");
-    assert_eq!(fixture.git(&bare, &["rev-parse", "main"]).trim(), head);
-}
-
-/// `url` as a `file://` URL with forward slashes.
-fn file_url(path: &Path) -> String {
-    let path = path.to_string_lossy().replace('\\', "/");
-    if path.starts_with('/') {
-        format!("file://{path}")
-    } else {
-        format!("file:///{path}")
-    }
+    fixture.push(&repo, &bare, "main");
+    assert_eq!(
+        fixture.git(bare.path(), &["rev-parse", "main"]).trim(),
+        head
+    );
 }
 
 #[test]
-fn pushes_cannot_leave_the_root() {
+fn plain_git_has_no_transport() {
     let fixture = Fixture::new();
     let repo = fixture.init("repo");
     fixture.commit_file(&repo, "a.txt", "a\n", "first");
-    let other = Fixture::new();
-    let outside = other.init_bare("other.git");
-    let url = file_url(&outside);
-    fixture.git(&repo, &["remote", "add", "evil", &url]);
+    let bare = fixture.init_bare("remote.git");
+    let url = bare.path().to_string_lossy().into_owned();
+    fixture.git(&repo, &["remote", "add", "origin", &url]);
 
-    // Plain git has no transport at all.
-    let output = fixture.git_output(&repo, &["push", "-q", "evil", "main"]);
+    let output = fixture.git_output(&repo, &["push", "-q", "origin", "main"]);
     assert!(!output.status.success(), "a push to {url} went through");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("not allowed"), "{stderr}");
@@ -80,7 +70,7 @@ fn pushes_cannot_leave_the_root() {
                 "protocol.file.allow=always",
                 "push",
                 "-q",
-                "evil",
+                "origin",
                 "main",
             ],
         );
@@ -88,25 +78,20 @@ fn pushes_cannot_leave_the_root() {
     refuses("re-enabling transports in config", || {
         fixture.git(&repo, &["config", "protocol.allow", "always"]);
     });
-    // The named push checks where the remote leads.
-    refuses("a push to a remote outside", || {
-        fixture.push(&repo, "evil", "main");
+    assert_eq!(fixture.git(bare.path(), &["for-each-ref"]), "");
+}
+
+#[test]
+fn push_into_another_fixture_is_refused() {
+    let fixture = Fixture::new();
+    let repo = fixture.init("repo");
+    fixture.commit_file(&repo, "a.txt", "a\n", "first");
+    let other = Fixture::new();
+    let outside = other.init_bare("other.git");
+    refuses("a push into another fixture", || {
+        fixture.push(&repo, &outside, "main");
     });
-    refuses("a push to a URL outside", || {
-        fixture.push(&repo, &url, "main");
-    });
-    fixture.git(
-        &repo,
-        &["remote", "set-url", "evil", "ssh://fixture.invalid/x.git"],
-    );
-    refuses("a push to a network remote", || {
-        fixture.push(&repo, "evil", "main");
-    });
-    assert_eq!(
-        other.git(&outside, &["for-each-ref"]),
-        "",
-        "the outside repository is untouched"
-    );
+    assert_eq!(other.git(outside.path(), &["for-each-ref"]), "");
 }
 
 #[cfg(unix)]

@@ -99,12 +99,11 @@ fn commits_in_other_worktrees_are_ignored() {
 fn pushes_and_upstreams_of_other_worktrees_are_ignored() {
     let (fixture, repo, file) = snapshotted();
     let bare = fixture.init_bare("remote.git");
-    let bare = bare.to_string_lossy().into_owned();
-    // Adding a remote is a config change of its own; snapshot after it.
-    fixture.git(&repo, &["remote", "add", "origin", &bare]);
-    assert!(guard(&fixture, "snapshot", &repo, &file).status.success());
     let wt = fixture.path("wt");
-    fixture.push(&wt, "origin", "feature");
+    // The push sets the upstream config; a push or fetch through a named remote also
+    // writes the remote-tracking ref.
+    fixture.push(&wt, &bare, "feature");
+    fixture.git(&wt, &["update-ref", "refs/remotes/origin/feature", "HEAD"]);
     fixture.git(&wt, &["config", "branch.feature.note", "x"]);
     let output = guard(&fixture, "verify", &repo, &file);
     assert!(
@@ -114,7 +113,7 @@ fn pushes_and_upstreams_of_other_worktrees_are_ignored() {
     );
 
     // The same for this worktree's own branch is a change.
-    fixture.push(&repo, "origin", "main");
+    fixture.push(&repo, &bare, "main");
     assert!(!guard(&fixture, "verify", &repo, &file).status.success());
 }
 
