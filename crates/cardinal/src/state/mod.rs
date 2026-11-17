@@ -214,13 +214,15 @@ impl StateDir {
         self.plan_dir(plan).join("plan.json")
     }
 
-    /// `plans/<plan>/claim`, created once by the `act` that executes the plan.
+    /// `plans/<plan>/claim`, for the deletion phase: the `act` that executes the plan will
+    /// create it once. Phase 0 `act` never creates it.
     #[must_use]
     pub fn plan_claim(&self, plan: &str) -> PathBuf {
         self.plan_dir(plan).join("claim")
     }
 
-    /// `plans/<plan>/result.json` (`cardinal.act-result.v1`).
+    /// `plans/<plan>/result.json` (`cardinal.act-result.v1`), for the deletion phase. Phase 0
+    /// `act` never writes it.
     #[must_use]
     pub fn plan_result(&self, plan: &str) -> PathBuf {
         self.plan_dir(plan).join("result.json")

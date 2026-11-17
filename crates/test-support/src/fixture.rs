@@ -160,6 +160,29 @@ impl Fixture {
         path
     }
 
+    /// `git worktree add root/name branch`: checks out an existing branch in a new worktree;
+    /// returns the worktree path.
+    pub fn worktree_add_existing(&self, repo: &Path, name: &str, branch: &str) -> PathBuf {
+        let branch = checked_name("branch", branch);
+        let path = self.path(name);
+        self.assert_inside(&path, "worktree");
+        let target = path.to_string_lossy().into_owned();
+        self.git(repo, &["worktree", "add", "-q", "--", &target, branch]);
+        path
+    }
+
+    /// `git worktree remove --force worktree`.
+    pub fn worktree_remove(&self, repo: &Path, worktree: &Path) {
+        self.assert_inside(worktree, "worktree");
+        let target = worktree.to_string_lossy().into_owned();
+        self.git(repo, &["worktree", "remove", "--force", "--", &target]);
+    }
+
+    /// `git worktree list --porcelain`.
+    pub fn worktree_list(&self, repo: &Path) -> String {
+        self.git(repo, &["worktree", "list", "--porcelain"])
+    }
+
     /// `git push -q -u <target> branch` from `repo`, which also sets `branch`'s upstream to
     /// the target's path. Only this call enables the file transport.
     pub fn push(&self, repo: &Path, target: &BareRepo, branch: &str) {

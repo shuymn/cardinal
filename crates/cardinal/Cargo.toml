@@ -25,7 +25,7 @@ toml.workspace = true
 # Reading a signal's disposition (`sigaction` without a new action), and blocking signals while
 # their handlers are installed (`pthread_sigmask`).
 libc.workspace = true
-rustix.workspace = true
+rustix = { workspace = true, features = ["fs"] }
 signal-hook.workspace = true
 
 [target.'cfg(windows)'.dependencies]

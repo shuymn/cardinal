@@ -421,28 +421,33 @@ pub enum DataList {
 /// `list`. Components are compared exactly; a component that is not UTF-8 matches nothing.
 #[must_use]
 pub fn data_pattern_covers(list: DataList, pattern: &str, rel: &Path) -> bool {
-    let words: Vec<&str> = pattern.split('/').filter(|w| !w.is_empty()).collect();
-    if words.is_empty() {
+    let words = pattern.split('/').filter(|w| !w.is_empty());
+    if words.clone().next().is_none() {
         return false;
     }
-    let parts: Vec<Option<&str>> = rel
-        .components()
-        .filter_map(|c| match c {
-            std::path::Component::Normal(name) => Some(name.to_str()),
-            _ => None,
-        })
-        .collect();
-    let matches_at = |start: usize| {
-        parts.len() >= start + words.len()
-            && words
-                .iter()
-                .zip(&parts[start..])
-                .all(|(word, part)| *part == Some(*word))
-    };
+    let mut parts = rel.components().filter_map(|c| match c {
+        std::path::Component::Normal(name) => Some(name.to_str()),
+        _ => None,
+    });
     match list {
-        DataList::Regenerable if words.len() > 1 => matches_at(0),
-        _ => (0..parts.len()).any(matches_at),
+        DataList::Regenerable if words.clone().nth(1).is_some() => begins_with(parts, words),
+        _ => loop {
+            if begins_with(parts.clone(), words.clone()) {
+                break true;
+            }
+            if parts.next().is_none() {
+                break false;
+            }
+        },
     }
+}
+
+/// Whether `parts` (components, `None` when not UTF-8) begin with every one of `words`.
+fn begins_with<'a>(
+    mut parts: impl Iterator<Item = Option<&'a str>>,
+    mut words: impl Iterator<Item = &'a str>,
+) -> bool {
+    words.all(|word| parts.next() == Some(Some(word)))
 }
 
 #[cfg(test)]

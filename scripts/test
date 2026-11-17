@@ -23,7 +23,9 @@
 #   PATH                       the pinned toolchain that `mise exec` put first
 #   CARGO_HOME, RUSTUP_HOME    where that toolchain and the registry live (defaulting to the
 #   RUSTUP_TOOLCHAIN           locations under HOME), and which toolchain mise pinned
-#   CI                         selects the guard's whole-repository mode
+#   CI                         selects the guard's whole-repository mode, and reaches the
+#                              tests, where it turns a skip for a missing host feature into a
+#                              failure
 #   CARGO_TERM_COLOR           output only
 #   Windows: what programs need to start (scripts/clean-env.sh), and TEMP, TMP, USERPROFILE,
 #   APPDATA, LOCALAPPDATA, ProgramData, ProgramFiles, ProgramFiles(x86), ProgramW6432 for
@@ -390,6 +392,7 @@ run_archive() {
     env+=(TMPDIR="$R/tmp")
   fi
   [ -z "${CARGO_TERM_COLOR-}" ] || env+=(CARGO_TERM_COLOR="$CARGO_TERM_COLOR")
+  [ -z "${CI-}" ] || env+=(CI="$CI")
   [ -z "$runner" ] || env+=("$runner_var=$runner")
   (clean_exec '' "${env[@]}" cargo-nextest nextest run --archive-file "$archive" \
     --workspace-remap "$workspace" --extract-to "$extract" \

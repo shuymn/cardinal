@@ -24,7 +24,8 @@ impl ActStatus {
     }
 }
 
-/// `cardinal.act-result.v1` (`plans/<plan>/result.json` and the `act` output).
+/// `cardinal.act-result.v1`: the `act` output. Phase 0 `act` prints it and records it in an
+/// `act` or `planned` record; it writes no result file (`docs/architecture.md` section 9.5).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActResult {
     pub schema: ActResultSchema,

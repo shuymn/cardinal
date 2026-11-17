@@ -49,6 +49,34 @@ pub struct Plan {
     pub checks: Vec<Check>,
     pub invariants_ok: bool,
     pub approval: Approval,
+    /// What the checks were evaluated from beyond their facts.
+    #[serde(default)]
+    pub provenance: Provenance,
+}
+
+/// What a plan's or an act's checks were evaluated from beyond each check's facts
+/// (`docs/architecture.md` section 10.2).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Provenance {
+    /// What could not be observed, and why.
+    pub errors: Vec<ObservedError>,
+    /// The configuration keys the checks used.
+    pub config: Vec<ConfigKey>,
+}
+
+/// An observation that failed: what was being read, and the error.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservedError {
+    pub source: String,
+    pub message: String,
+}
+
+/// A configuration key and its value.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigKey {
+    pub file: String,
+    pub key: String,
+    pub value: serde_json::Value,
 }
 
 /// `cardinal.plan-list.v1`
@@ -59,7 +87,8 @@ pub struct PlanList {
     pub errors: Vec<ScopedError>,
 }
 
-/// `plans/<plan>/claim`, created once by the `act` that executes the plan.
+/// `plans/<plan>/claim`, for the deletion phase: created once by the `act` that executes the
+/// plan. Phase 0 `act` never writes it (`docs/architecture.md` section 9.5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanClaim {
     pub pid: u32,

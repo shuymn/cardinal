@@ -1,15 +1,59 @@
 //! Every `cardinal …` command in the arbiter skill parses with the real CLI
-//! definition and stays inside the arbiter's reach (architecture §14.3).
+//! definition and stays inside the arbiter's reach, and the skill handles
+//! exactly the results phase 0 `act` returns (architecture §9.5 and §14.3).
 
 use std::collections::BTreeSet;
 
 use cardinal::cli::Cli;
+use cardinal::contract::ActStatus;
 use clap::Parser;
 
 const SKILL: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../integrations/claude-code/skills/cardinal-arbiter/SKILL.md"
 ));
+const AGENT: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../integrations/claude-code/agents/cardinal-arbiter.md"
+));
+const README: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../integrations/claude-code/README.md"
+));
+
+const STATUSES: [ActStatus; 6] = [
+    ActStatus::Executed,
+    ActStatus::Partial,
+    ActStatus::DryRun,
+    ActStatus::Rejected,
+    ActStatus::Expired,
+    ActStatus::AlreadyExecuted,
+];
+
+/// Whether phase 0 `act`, which only reports, can return `status`.
+fn phase0_returns(status: ActStatus) -> bool {
+    match status {
+        ActStatus::DryRun | ActStatus::Rejected | ActStatus::Expired => true,
+        ActStatus::Executed | ActStatus::Partial | ActStatus::AlreadyExecuted => false,
+    }
+}
+
+fn name(status: ActStatus) -> String {
+    serde_json::to_value(status)
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+/// The text of the `## heading` section of `text`.
+fn section<'a>(text: &'a str, heading: &str) -> &'a str {
+    let start = text
+        .split_once(&format!("\n## {heading}\n"))
+        .unwrap_or_else(|| panic!("no section {heading}"))
+        .1;
+    start.split("\n## ").next().unwrap()
+}
 
 /// Subcommands the arbiter may run.
 const ALLOWED: [&str; 5] = ["inventory", "inbox", "explain", "plan", "act"];
@@ -149,4 +193,65 @@ fn shell_words_follow_quoting() {
             "a b"
         ]
     );
+}
+
+#[test]
+fn act_results_are_what_phase_0_act_returns() {
+    let rows: BTreeSet<String> = section(SKILL, "Act results")
+        .lines()
+        .skip_while(|line| !line.starts_with("| ---"))
+        .filter_map(|line| line.strip_prefix("| `")?.split('`').next())
+        .map(str::to_owned)
+        .collect();
+    let returned: BTreeSet<String> = STATUSES
+        .into_iter()
+        .filter(|s| phase0_returns(*s))
+        .map(name)
+        .collect();
+    assert_eq!(rows, returned, "the act result table");
+
+    for status in STATUSES.into_iter().filter(|s| !phase0_returns(*s)) {
+        let code = format!("`{}`", name(status));
+        for (file, text) in [("SKILL.md", SKILL), ("agent", AGENT), ("README.md", README)] {
+            assert!(
+                !text.contains(&code),
+                "{file} handles {code}, which phase 0 act never returns"
+            );
+        }
+    }
+
+    let refusals: Vec<String> = STATUSES
+        .into_iter()
+        .filter(|s| phase0_returns(*s) && s.is_refusal())
+        .map(|s| format!("`{}`", name(s)))
+        .collect();
+    let exit_codes = format!(
+        "Exit 0 from `act` means `{}`, exit 3 means {}",
+        name(ActStatus::DryRun),
+        refusals.join(" or ")
+    );
+    assert!(SKILL.contains(&exit_codes), "missing: {exit_codes}");
+}
+
+#[test]
+fn the_report_never_claims_a_reclamation() {
+    let sections: Vec<&str> = section(SKILL, "Report")
+        .lines()
+        .filter_map(|line| line.split_once(". **")?.1.split("**").next())
+        .collect();
+    assert_eq!(
+        sections,
+        [
+            "Would reclaim",
+            "Refused",
+            "Owner decisions",
+            "Inbox",
+            "Errors"
+        ]
+    );
+    for (file, text) in [("SKILL.md", SKILL), ("agent", AGENT), ("README.md", README)] {
+        for claim in ["Reclaimed", "partially deleted", "interrupted act"] {
+            assert!(!text.contains(claim), "{file} says {claim:?}");
+        }
+    }
 }

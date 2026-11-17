@@ -3,6 +3,8 @@
 //!
 //! Process-group setup and signals (Unix) live in `os/unix.rs`, owned by the runner work unit.
 //! Short-lived children whose output the caller reads run through [`child`].
+//! Mount identity (Unix) lives in `os/mount.rs`, shared by `plan` and `act`, and listing a
+//! directory through the descriptor that identifies it (Unix, `plan`'s walk) in `os/dir.rs`.
 //!
 //! A process is identified by its PID and start time (`start_s`, Unix seconds as the OS
 //! reports it), so a reused PID never passes for the original process. A process that has
@@ -10,6 +12,10 @@
 //! an open handle on Windows.
 
 pub mod child;
+#[cfg(unix)]
+pub mod dir;
+#[cfg(unix)]
+pub mod mount;
 #[cfg(unix)]
 pub mod unix;
 #[cfg(windows)]

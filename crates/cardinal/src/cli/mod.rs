@@ -267,21 +267,35 @@ fn dispatch(command: Command) -> ExitCode {
                     OutcomeArg::Escalated => ResolutionOutcome::Escalated,
                     OutcomeArg::Dismissed => ResolutionOutcome::Dismissed,
                 };
-                inbox::resolve(&ctx.state, &resolve.key, outcome, resolve.note.as_deref())
+                inbox::resolve(
+                    &ctx.config,
+                    &ctx.state,
+                    &resolve.key,
+                    outcome,
+                    resolve.note.as_deref(),
+                )
             })),
         },
-        Command::Plan(args) => match args.command {
-            None => respond(
-                context().and_then(|ctx| plan::create_all(&ctx.config, &ctx.state, &args.repos)),
-            ),
-            Some(PlanCommand::ReclaimWorktree { path }) => respond(context().and_then(|ctx| {
-                plan::create(&ctx.config, &ctx.state, PlanKind::ReclaimWorktree, &path)
-            })),
-            Some(PlanCommand::ReclaimDir { path }) => respond(context().and_then(|ctx| {
-                plan::create(&ctx.config, &ctx.state, PlanKind::ReclaimDir, &path)
-            })),
-        },
+        Command::Plan(args) => {
+            // Observes through git and gh, so it sets their cleanup up while this is the only
+            // thread.
+            child::prepare();
+            match args.command {
+                None => respond(
+                    context()
+                        .and_then(|ctx| plan::create_all(&ctx.config, &ctx.state, &args.repos)),
+                ),
+                Some(PlanCommand::ReclaimWorktree { path }) => respond(context().and_then(|ctx| {
+                    plan::create(&ctx.config, &ctx.state, PlanKind::ReclaimWorktree, &path)
+                })),
+                Some(PlanCommand::ReclaimDir { path }) => respond(context().and_then(|ctx| {
+                    plan::create(&ctx.config, &ctx.state, PlanKind::ReclaimDir, &path)
+                })),
+            }
+        }
         Command::Act(args) => {
+            // Re-observes the worktree through git and gh, as `plan` does.
+            child::prepare();
             let options = ActOptions {
                 dry_run: args.dry_run,
                 owner_approved: args.owner_approved,

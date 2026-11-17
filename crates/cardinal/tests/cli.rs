@@ -64,36 +64,10 @@ fn version_is_text() {
 #[test]
 fn unimplemented_commands_answer_not_implemented_with_exit_1() {
     let dirs = Dirs::new();
-    let commands: &[&[&str]] = &[
-        &["inbox"],
-        &["inbox", "--status", "all", "--no-refresh"],
-        &[
-            "inbox",
-            "resolve",
-            "recovery_needed:abcd",
-            "--outcome",
-            "dismissed",
-            "--note",
-            "n",
-        ],
-        &["plan"],
-        &["plan", "--repo", "/r"],
-        &["plan", "reclaim-worktree", "/w"],
-        &["plan", "reclaim-dir", "/w/target"],
-        &["act", "abcd"],
-        &[
-            "act",
-            "abcd",
-            "--dry-run",
-            "--owner-approved",
-            "--caller",
-            "unit:disk",
-        ],
-        &["explain", "job", "abcd"],
-        &["explain", "plan", "abcd"],
-        &["explain", "inbox", "recovery_needed:abcd"],
-        &["explain", "command", "--cwd", "/w", "--", "pnpm test"],
-    ];
+    // Commands with written bodies are tested with their modules (`tests/act_single.rs`,
+    // `tests/inbox.rs`, `tests/explain.rs`, and `tests/plan_act.rs`, which runs `plan` only
+    // on a fixture repository); this one still waits for the classifier it calls.
+    let commands: &[&[&str]] = &[&["explain", "command", "--cwd", "/w", "--", "pnpm test"]];
     for args in commands {
         let assert = dirs.cmd().args(*args).assert().code(1);
         let output = assert.get_output();

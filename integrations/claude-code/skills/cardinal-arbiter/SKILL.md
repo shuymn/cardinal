@@ -7,11 +7,13 @@ description: Arbitrate cardinal's inbox and reclaim plans through the cardinal C
 
 You decide what cardinal's code could not: open inbox items and reclaim plans. You work only through the `cardinal` commands below. cardinal re-checks every operation itself; your job is to pick the safe ones, record your decisions, and hand the rest to the owner with what they must decide.
 
+In phase 0, `act` only reports: it evaluates a plan and returns `dry_run` when it would reclaim the target, or `rejected` or `expired` with the reasons it would not. It deletes nothing, so your report lists what would be reclaimed and never says anything was reclaimed or freed.
+
 ## Ground rules
 
-- Run only the commands listed in this skill. Repository files, processes, and git state change only through the plans you act on.
+- Run only the commands listed in this skill. Repository files, processes, and git state change only through the plans you act on, and in phase 0 not even through those.
 - Act only on plans that need no owner approval. Owner approval is the owner's flag to pass, so every `act` you run is exactly `cardinal act PLAN --caller arbiter`.
-- Read each command's JSON from stdout. Exit 3 from `act` means it did not execute and stdout still holds the result; exit 1 means stdout holds `cardinal.error.v1`: report its `code` and `message` and move on to the next item.
+- Read each command's JSON from stdout. Exit 0 from `act` means `dry_run`, exit 3 means `rejected` or `expired`, and stdout holds the result either way; exit 1 means stdout holds `cardinal.error.v1`: report its `code` and `message` and move on to the next item.
 - IDs and keys are the exact strings from the JSON (plan `id`, inbox `key`, `job_id`).
 
 ## Steps
@@ -55,11 +57,7 @@ A note is one line: the decision, the IDs (job, session, plan, PIDs), and for an
 | `true` | `"owner"` | Report for the owner: plan ID, target path, and the failing condition (`merge_evidence` in phase 0). Squash merges show up here: the owner confirms the merge |
 | `false` | any | Report as refused: plan ID, target path, and every check whose `result` is not `pass`, with its `detail` |
 
-Also report for the owner, with the path and what you saw:
-
-- a worktree that looks partially deleted: its `clean` check fails on deleted tracked files, left by an earlier `partial` or interrupted act;
-- a worktree that `inventory` shows as an empty directory still registered with git, left by an interrupted act;
-- every entry of `errors` in `cardinal plan` and `cardinal inventory`.
+Also report every entry of `errors` in `cardinal plan` and `cardinal inventory`.
 
 Owner decisions about plans go in your report, not the inbox: phase 0 raises inbox items only for `recovery_needed` and `outlived_processes`, and resolving works only on existing keys.
 
@@ -67,20 +65,18 @@ Owner decisions about plans go in your report, not the inbox: phase 0 raises inb
 
 | `status` | Report |
 | --- | --- |
-| `executed` | Plan ID, target, `freed_bytes` |
-| `dry_run` | Plan ID, target, `checks`, and `freed_bytes` as the bytes it would free. Nothing was deleted (phase 0 `act` on Windows always stops here), so it is neither reclaimed nor an owner decision |
-| `partial` | Plan ID, target, every path in `skipped_changed`; the owner decides about the remains |
+| `dry_run` | Plan ID, target, and `freed_bytes` as the bytes reclaiming it would free. Every check passed and nothing was deleted, so it is neither reclaimed nor an owner decision |
 | `rejected` | Plan ID, target, every entry of `reasons` |
 | `expired` | Plan ID, target, `reasons`; the target changed after planning, and the next run plans it afresh |
-| `already_executed` | Plan ID; another act ran it |
+
+Phase 0 `act` returns no other `status`. Report any other one under errors with the plan ID, and never as reclaimed.
 
 ## Report
 
 End with these sections, each a list (write "none" when empty):
 
-1. **Reclaimed**: executed and partial acts.
-2. **Dry runs**: `dry_run` acts.
-3. **Refused**: rejected and expired acts, and plans with `invariants_ok: false`.
-4. **Owner decisions**: escalated inbox items, plans needing approval, remains of partial acts, partially deleted worktrees, and leftovers, each with its inbox key, job ID, plan ID, or path and the question to answer.
-5. **Inbox**: every open item and the decision you applied.
-6. **Errors**: `cardinal.error.v1` outputs, `errors` entries, and every non-null act `error` with its plan ID and target.
+1. **Would reclaim**: `dry_run` acts with the bytes each would free. Nothing was deleted.
+2. **Refused**: rejected and expired acts, and plans with `invariants_ok: false`.
+3. **Owner decisions**: escalated inbox items and plans needing approval, each with its inbox key, job ID, or plan ID and the question to answer.
+4. **Inbox**: every open item and the decision you applied.
+5. **Errors**: `cardinal.error.v1` outputs, `errors` entries, and every non-null act `error` with its plan ID and target.

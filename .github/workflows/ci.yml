@@ -143,14 +143,20 @@ jobs:
             target/
           key: ${{ steps.cache-key.outputs.key }}
 
-      # bubblewrap confines each test process. Ubuntu restricts unprivileged user
-      # namespaces through AppArmor, which bubblewrap needs; lift that on the runner.
+      # bubblewrap confines each test process, and the bind-mount tests create a user and
+      # mount namespace inside that confinement. Ubuntu restricts unprivileged user
+      # namespaces through AppArmor, which both need: the sysctl for every program, and the
+      # bwrap profile for what bwrap runs, which may not use capabilities in a namespace it
+      # creates. Lift both on the runner.
       - name: Install bubblewrap
         run: |
           sudo apt-get update -q
           sudo apt-get install -y --no-install-recommends bubblewrap
           if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          if [ -e /etc/apparmor.d/bwrap-userns-restrict ]; then
+            sudo apparmor_parser -R /etc/apparmor.d/bwrap-userns-restrict
           fi
 
       - name: Run checks
