@@ -1060,7 +1060,7 @@ A work unit is done when its own completion tests pass; its integration gate is 
 | **#5** Claude Code hook | `src/classify/`, `src/adapter/claude/`, `examples/claude/settings.json` | `tests/hook_claude.rs`, `tests/rewrite_equivalence.rs` (with `rewrite_equivalence::piped_redirection_stays_unwrapped` for zsh's `MULTIOS`), `tests/session_end.rs`, `tests/no_repo_writes.rs`, proptest suites in `classify` |
 | **#6** observation, inventory | `src/observe/`, the `inventory` handler | `tests/observe_worktrees.rs`, `tests/observe_env.rs`, `tests/observe_readonly.rs`, `tests/inventory.rs` |
 | **#7** plan, act, inbox, explain | `src/plan/`, `src/act/`, `src/inbox/`, `src/explain.rs`, their handlers | `tests/plan_act.rs`, `tests/act_single.rs`, `tests/act_snapshot.rs`, `tests/act_report_only.rs`, `tests/inbox.rs`, `tests/unit_dry_run.rs`, `tests/explain.rs` |
-| **#8** arbiter subagent and skill | `integrations/claude-code/agents/cardinal-arbiter.md`, `integrations/claude-code/skills/cardinal-arbiter/SKILL.md`, install notes in `integrations/claude-code/README.md`, `tests/skill_commands.rs` | `tests/skill_commands.rs` parses every `cardinal …` line in the skill with the clap definitions |
+| **#8** arbiter subagent and skill | `integrations/claude-code/agents/cardinal-arbiter.md`, `integrations/claude-code/skills/cardinal-arbiter/SKILL.md`, install notes in `integrations/claude-code/README.md`, `tests/skill_commands.rs` | `tests/skill_commands.rs` parses every `cardinal …` line in the skill with the clap definitions and checks that the skill handles exactly the statuses phase 0 `act` returns |
 
 Every work unit's completion command is `mise exec -- scripts/test`.
 
@@ -1069,7 +1069,7 @@ Every work unit's completion command is `mise exec -- scripts/test`.
 The subagent runs headless, one at a time, and only through the CLI:
 
 1. `cardinal inbox` → for each `open` item, `cardinal explain inbox KEY` and `cardinal inventory`.
-2. Reclaim work: `cardinal plan` (or a targeted plan), then `cardinal act PLAN --caller arbiter` for plans with `invariants_ok: true` and `approval: "none"`. Never `--owner-approved`.
+2. Reclaim work: `cardinal plan` (or a targeted plan), then `cardinal act PLAN --caller arbiter` for plans with `invariants_ok: true` and `approval: "none"`. Never `--owner-approved`. Phase 0 `act` only reports (section 9.5), so the report lists `dry_run` plans as what would be reclaimed, with their `freed_bytes`, and never anything as reclaimed.
 3. An inbox item that needs a decision outside the reclaim scope (including `recovery_needed` items whose group is unverified): `cardinal inbox resolve KEY --outcome escalated --note "<what the owner must decide, with the job ID or processes>"`.
 4. Plans that need approval have no inbox item in phase 0, and `inbox resolve` works only on existing keys. They go into the arbiter's final report, each with its plan ID and what the owner must decide. An inbox kind for owner approval comes with the web UI (phases 1 and 3).
 5. Resolve items it handled with `--outcome resolved` and a note; report refused acts with their `reasons`.

@@ -1,6 +1,6 @@
 ---
 name: cardinal-arbiter
-description: Processes cardinal's inbox and reclaim plans through the cardinal CLI, acting only where no owner approval is needed. Use to run the cardinal arbiter.
+description: Processes cardinal's inbox and reclaim plans through the cardinal CLI, running act only where no owner approval is needed; in phase 0 act only reports what it would reclaim. Use to run the cardinal arbiter.
 tools: Bash
 skills:
   - cardinal-arbiter
