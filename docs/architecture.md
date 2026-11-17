@@ -464,7 +464,7 @@ The explicit `timeout` keeps a stuck hook from stalling Bash calls for the 600 s
 
 4. The effective timeout written into each spec: `tool_input.timeout` if it is a positive number, else `BASH_DEFAULT_TIMEOUT_MS` from the hook's environment (the hook inherits Claude Code's), else 120000; capped at `max(BASH_MAX_TIMEOUT_MS or 600000, default)`. `run_in_background: true` sets the spec's background flag.
 
-The hook writes nothing to the state dir and takes no reservation (C1). It never exits non-zero: panics are caught at the top level and turned into "no rewrite".
+On the way to a rewrite the hook writes nothing to the state dir and takes no reservation (C1); a configuration error appends `config_error`, and a missed deadline or failure appends `hook_error`. It never exits non-zero: panics are caught at the top level and turned into "no rewrite".
 
 ### 6.4 Rewritten command
 
