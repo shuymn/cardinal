@@ -7,9 +7,12 @@
 //!   child's process group (Unix) or job (Windows).
 //! - [`fixture`]: git repositories inside a scope, through typed operations only.
 //! - [`process`]: guards for processes a test did not start itself, and polling helpers.
+//! - [`pty`]: pseudo-terminals for a child's stdin (Unix).
 
 pub mod fixture;
 pub mod process;
+#[cfg(unix)]
+pub mod pty;
 mod scope;
 
 pub use scope::{Child, Command, RUN_MARKER, Scope};

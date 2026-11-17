@@ -18,7 +18,8 @@ sysinfo.workspace = true
 tempfile.workspace = true
 
 [target.'cfg(unix)'.dependencies]
-rustix.workspace = true
+# Pseudo-terminals for a child's stdin (src/pty.rs).
+rustix = { workspace = true, features = ["pty"] }
 
 # pidfd polling for the process sweep (src/bin/run-processes.rs).
 [target.'cfg(target_os = "linux")'.dependencies]

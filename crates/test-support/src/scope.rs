@@ -5,7 +5,10 @@
 //! (Windows). Its cleanup slot is registered before it starts. When the child exits, is
 //! killed, or its [`Child`] or the [`Scope`] is dropped, whatever is left of its group or job
 //! is killed. A group is signalled only while its leader is unreaped, so its ID cannot have
-//! been reused; a job holds only processes started inside it.
+//! been reused; a job holds only processes started inside it. On Unix a child can instead
+//! lead a new session ([`Command::new_session`]), whose group it leads too, or join the group
+//! another child leads ([`Command::join_group`]); a child that joined a group is cleaned up
+//! alone, and its group goes with its leader.
 
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read};
@@ -170,11 +173,11 @@ impl Scope {
         )]
         let mut inner = std::process::Command::new(program);
         inner.env_clear().envs(self.env()).current_dir(cwd);
-        #[cfg(unix)]
-        std::os::unix::process::CommandExt::process_group(&mut inner, 0);
         Command {
             inner,
             registry: Arc::clone(&self.registry),
+            #[cfg(unix)]
+            group: Group::New,
             stdin_set: false,
             stdout_set: false,
             stderr_set: false,
@@ -231,9 +234,23 @@ impl Drop for Scope {
 pub struct Command {
     inner: std::process::Command,
     registry: Arc<Registry>,
+    #[cfg(unix)]
+    group: Group,
     stdin_set: bool,
     stdout_set: bool,
     stderr_set: bool,
+}
+
+/// The process group a Unix child starts in.
+#[cfg(unix)]
+#[derive(Clone, Copy, PartialEq)]
+enum Group {
+    /// A new group the child leads.
+    New,
+    /// A new session, whose group the child leads.
+    Session,
+    /// The group of the given unreaped child, which leads it.
+    Join(i32),
 }
 
 impl Command {
@@ -260,6 +277,69 @@ impl Command {
     /// Removes one variable of the constructed environment.
     pub fn env_remove(&mut self, key: impl AsRef<OsStr>) -> &mut Self {
         self.inner.env_remove(key);
+        self
+    }
+
+    /// Sets every variable `other` sets and removes every one it removes, as [`Command::env`]
+    /// and [`Command::env_remove`] would: for a program, such as a shell, that starts the
+    /// program `other` was built for and passes its environment on. Arguments, working
+    /// directory, and stdio stay this command's.
+    pub fn copy_env(&mut self, other: &Command) -> &mut Self {
+        for (key, value) in other.get_envs() {
+            match value {
+                Some(value) => self.inner.env(key, value),
+                None => self.inner.env_remove(key),
+            };
+        }
+        self
+    }
+
+    /// Starts the child as the leader of a new session (`setsid`) instead of a new group in
+    /// the test's session; it leads the session's first group, which is cleaned up as any
+    /// child's group. For a test that needs a session of its own, such as one in which a
+    /// job-control shell gives a job its own group, independent of the session the test runs
+    /// in (a terminal's, launchd's on macOS, a container's).
+    #[cfg(unix)]
+    pub fn new_session(&mut self) -> &mut Self {
+        assert!(
+            self.group != Group::Session,
+            "refusing: new_session was already called"
+        );
+        assert!(
+            self.group == Group::New,
+            "refusing: a child that joins a group cannot lead a session"
+        );
+        self.group = Group::Session;
+        // SAFETY: the closure runs between `fork` and `exec` and calls only `setsid`, which
+        // is async-signal-safe; it allocates nothing.
+        unsafe {
+            std::os::unix::process::CommandExt::pre_exec(&mut self.inner, || {
+                rustix::process::setsid()?;
+                Ok(())
+            });
+        }
+        self
+    }
+
+    /// Starts the child in the process group `leader` leads instead of a new one, as a shell
+    /// without job control runs a command in its own group. `leader` must be unreaped and lead
+    /// its group, so the group's ID is still its own when the child starts. The group
+    /// is `leader`'s: cleaning up this child kills and reaps it alone, and the group is killed
+    /// with its leader. A group this child makes later (`setpgid(0, 0)`) is not cleaned up
+    /// here; a [`crate::process::GroupGuard`] or the harness's sweep covers it.
+    #[cfg(unix)]
+    pub fn join_group(&mut self, leader: &Child) -> &mut Self {
+        assert!(
+            self.group == Group::New,
+            "refusing: a child joins one group and does not lead a session"
+        );
+        let leads = matches!(&*lock(&leader.slot), Slot::Running(process) if process.leads_group);
+        assert!(
+            leads,
+            "refusing: join the group of child {}, which was reaped or does not lead a group",
+            leader.pid
+        );
+        self.group = Group::Join(i32::try_from(leader.pid).expect("PIDs fit in i32"));
         self
     }
 
@@ -323,13 +403,29 @@ impl Command {
 
     #[cfg(unix)]
     fn start(&mut self) -> io::Result<Started> {
+        use std::os::unix::process::CommandExt as _;
+        // A session leader's `setsid` runs in `pre_exec` (see `new_session`) and would fail
+        // in a process that already leads a group.
+        match self.group {
+            Group::New => {
+                self.inner.process_group(0);
+            }
+            Group::Join(pgid) => {
+                self.inner.process_group(pgid);
+            }
+            Group::Session => {}
+        }
         #[expect(
             clippy::disallowed_methods,
             reason = "the spawn API: the one place tests start a process"
         )]
         let mut child = self.inner.spawn()?;
         let pipes = (child.stdin.take(), child.stdout.take(), child.stderr.take());
-        Ok((Process { child }, pipes.0, pipes.1, pipes.2))
+        let process = Process {
+            child,
+            leads_group: !matches!(self.group, Group::Join(_)),
+        };
+        Ok((process, pipes.0, pipes.1, pipes.2))
     }
 
     #[cfg(windows)]
@@ -411,7 +507,8 @@ fn placeholder() -> std::process::Command {
     std::process::Command::new("")
 }
 
-/// A started child. Dropping it kills what is left of its process group or job.
+/// A started child. Dropping it kills what is left of its process group or job (a child that
+/// joined another child's group: the child alone).
 pub struct Child {
     pid: u32,
     slot: Arc<Mutex<Slot>>,
@@ -426,7 +523,8 @@ impl Child {
         self.pid
     }
 
-    /// Waits for the child to exit, kills what is left of its group or job, and reaps it.
+    /// Waits for the child to exit, kills what is left of its group or job (unless it joined
+    /// another child's group), and reaps it.
     pub fn wait(&mut self) -> io::Result<ExitStatus> {
         drop(self.stdin.take());
         if let Slot::Done(status) = &*lock(&self.slot) {
@@ -476,7 +574,7 @@ impl Child {
     }
 
     /// Kills the child with its group or job (SIGKILL on Unix, `TerminateJobObject` on
-    /// Windows) and reaps it.
+    /// Windows) and reaps it. A child that joined another child's group is killed alone.
     pub fn kill(&mut self) {
         lock(&self.slot).kill();
     }
@@ -580,6 +678,10 @@ impl Slot {
 struct Process {
     #[cfg(unix)]
     child: std::process::Child,
+    /// Whether the child leads its group; one that joined another child's group is cleaned up
+    /// alone.
+    #[cfg(unix)]
+    leads_group: bool,
     /// The child in a job object it joined before it ran (`process-wrap` starts it suspended,
     /// assigns it, then resumes it).
     #[cfg(windows)]
@@ -603,7 +705,9 @@ impl Process {
     fn finish(mut self) -> io::Result<ExitStatus> {
         #[cfg(unix)]
         {
-            unix::kill_group(self.child.id());
+            if self.leads_group {
+                unix::kill_group(self.child.id());
+            }
             self.child.wait()
         }
         #[cfg(windows)]
@@ -632,7 +736,9 @@ impl Process {
     fn kill(mut self) -> io::Result<ExitStatus> {
         #[cfg(unix)]
         {
-            unix::kill_group(self.child.id());
+            if self.leads_group {
+                unix::kill_group(self.child.id());
+            }
             let _ = self.child.kill();
             self.child.wait()
         }
