@@ -92,11 +92,12 @@ pub fn derive(
     }
 }
 
-/// The real system. The process table is read once, on the first call that needs it.
+/// The real system. The live processes and their groups are read once, on the first call
+/// that lists group members.
 #[derive(Default)]
 pub struct HostFacts {
     boot: OnceCell<Option<u64>>,
-    table: OnceCell<Option<os::ProcessTable>>,
+    grouped: OnceCell<Vec<(u32, GroupMember)>>,
 }
 
 impl HostFacts {
@@ -105,10 +106,29 @@ impl HostFacts {
         Self::default()
     }
 
-    fn table(&self) -> Option<&os::ProcessTable> {
-        self.table
-            .get_or_init(|| os::ProcessTable::snapshot(os::Detail::default()).ok())
-            .as_ref()
+    /// Every live process with its group.
+    #[cfg(unix)]
+    fn grouped(&self) -> &[(u32, GroupMember)] {
+        self.grouped.get_or_init(|| {
+            let Ok(table) = os::ProcessTable::snapshot(os::Detail::default()) else {
+                return Vec::new();
+            };
+            table
+                .iter()
+                .filter(|p| !p.zombie)
+                .filter_map(|p| {
+                    let pgid = os::unix::pgid_of(p.pid)?;
+                    Some((
+                        pgid,
+                        GroupMember {
+                            pid: p.pid,
+                            start_s: p.start_s,
+                            name: p.name.clone(),
+                        },
+                    ))
+                })
+                .collect()
+        })
     }
 }
 
@@ -146,20 +166,16 @@ impl ProcessFacts for HostFacts {
 
     #[cfg(unix)]
     fn members(&self, pgid: u32) -> Vec<GroupMember> {
-        self.table()
-            .map_or_default(|table| os::unix::group_members(table, pgid))
-            .into_iter()
-            .map(|p| GroupMember {
-                pid: p.pid,
-                start_s: p.start_s,
-                name: p.name,
-            })
+        self.grouped()
+            .iter()
+            .filter(|(group, _)| *group == pgid)
+            .map(|(_, member)| member.clone())
             .collect()
     }
 
     #[cfg(not(unix))]
     fn members(&self, _pgid: u32) -> Vec<GroupMember> {
-        let _ = self.table();
+        let _ = &self.grouped;
         Vec::new()
     }
 }

@@ -19,7 +19,7 @@ const BOOT: u64 = 1_000_000;
 
 #[derive(Default)]
 struct Fake {
-    /// pid -> (start_s, pgid)
+    /// `pid -> (start_s, pgid)`
     processes: BTreeMap<u32, (u64, u32)>,
 }
 
@@ -120,7 +120,7 @@ fn stale_reservations_and_orphaned_live_locks_are_removed() {
     let signals = Recorded::default();
     let guard = lock(&state, Duration::from_secs(1)).unwrap();
     let recovery = recover(&guard, &state, &Fake::default(), &signals).unwrap();
-    assert!(recovery.kept.is_empty());
+    assert_eq!(recovery.kept.len(), 0);
     assert_eq!(recovery.actions.len(), 1);
     assert!(read(&state, "aaaa000000000001").is_none());
     assert!(!state.live_lock("aaaa000000000001").exists());
