@@ -18,7 +18,8 @@
 #
 # - every config entry git sees in the worktree (the common `config`, `config.worktree`, and
 #   the files they include, as git resolves them) with the file it comes from, and the
-#   content of each such file but the common `config`;
+#   content of each such file but the common `config` and of each file an `include.path` or
+#   `includeIf.<condition>.path` names, which may hold no entry yet;
 # - the hooks directory git resolves (`core.hooksPath` from wherever it is set, relative to
 #   the worktree, or `hooks/`), `info/`, `packed-refs`, the stash list, the refs with HEAD,
 #   the worktree list, and each `worktrees/<name>/gitdir`;
@@ -243,7 +244,7 @@ state() {
   # origin and NUL, then the key, a newline, and the value, ended by NUL, so the branch name
   # in a `branch.<name>.<var>` key is everything between `branch.` and the last dot, even
   # when the name itself contains dots.
-  local config origin entry key name path
+  local config origin entry key name path value
   config=$({ g config --list --show-origin --includes -z || [ "$?" -eq 1 ]; } | tr '\0' '\1')
   printf '%s' "$config" | while IFS= read -r -d $'\1' origin && IFS= read -r -d $'\1' entry; do
     [ "$origin" != "command line:" ] || continue
@@ -258,19 +259,44 @@ state() {
   done
 
   echo "## config files"
-  # Comments and empty sections too. The common config is left out: other worktrees change
-  # it, and its entries are above. git names each file relative to the worktree or as an
-  # absolute path in its own form (`C:/...` with Git for Windows), so the shell resolves it
-  # from the worktree; a directory it cannot find fails the guard rather than reading as a
-  # missing file.
-  local dir
-  printf '%s' "$config" | awk -v RS=$'\1' 'NR % 2 == 1 && sub(/^file:/, "")' | sort -u |
-    while IFS= read -r path; do
-      dir=$(cd "$top" && canonical "$(dirname "$path")")
-      path=$dir/$(basename "$path")
-      [ "$path" != "$common/config" ] || continue
-      printf '%s %s\n' "$path" "$(content "$path")"
-    done
+  # Comments and empty sections too, so the files themselves: each one an entry above comes
+  # from, but the common config (other worktrees change it, and its entries are above), and
+  # each one an include names, which may hold no entry. git names a file relative to the
+  # worktree or as an absolute path in its own form (`C:/...` with Git for Windows), so the
+  # shell resolves it from the worktree; a directory it cannot find fails the guard rather
+  # than reading as a missing file. An include path is resolved as git does: `~/` from HOME,
+  # a relative one from the directory of the file that names it; one whose directory does not
+  # exist is recorded as it is, as missing.
+  local dir base
+  {
+    printf '%s' "$config" | awk -v RS=$'\1' 'NR % 2 == 1 && sub(/^file:/, "")' |
+      while IFS= read -r path; do
+        dir=$(cd "$top" && canonical "$(dirname "$path")")
+        echo "$dir/$(basename "$path")"
+      done
+    printf '%s' "$config" | awk -v RS=$'\1' '
+      NR % 2 == 1 { origin = $0; next }
+      origin ~ /^file:/ {
+        split($0, kv, "\n")
+        if (kv[1] == "include.path" || kv[1] ~ /^includeif\..*\.path$/)
+          print substr(origin, 6) "\t" substr($0, length(kv[1]) + 2)
+      }' |
+      while IFS=$'\t' read -r path value; do
+        base=$(cd "$top" && canonical "$(dirname "$path")")
+        case $value in
+          "~/"*) path=$HOME/${value#"~/"} ;;
+          /* | [A-Za-z]:/*) path=$value ;;
+          *) path=$base/$value ;;
+        esac
+        if dir=$(cd "$(dirname "$path")" 2>/dev/null && pwd -P); then
+          path=$dir/$(basename "$path")
+        fi
+        echo "$path"
+      done
+  } | sort -u | while IFS= read -r path; do
+    [ "$path" != "$common/config" ] || continue
+    printf '%s %s\n' "$path" "$(content "$path")"
+  done
 
   echo "## hooks"
   local hooks

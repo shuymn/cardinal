@@ -284,6 +284,30 @@ fn included_config_is_detected() {
     );
 }
 
+/// An included file with no entry yet is hashed too, so a comment added to it counts. It lies
+/// outside the git dir, so only the include leads to it; the relative path is resolved from
+/// the including file.
+#[test]
+fn empty_included_config_is_detected() {
+    let fixture = Fixture::new();
+    let repo = fixture.init("repo");
+    std::fs::create_dir_all(fixture.path("includes")).unwrap();
+    let included = fixture.path("includes/empty.config");
+    std::fs::write(&included, "").unwrap();
+    append(
+        &repo.join(".git/config"),
+        "[include]\n\tpath = ../../includes/empty.config\n",
+    );
+    let file = fixture.path("snapshot");
+    assert_ok(&guard(&fixture, "snapshot", &repo, &file));
+    append(&included, "# changed\n");
+    assert!(
+        !guard(&fixture, "verify", &repo, &file).status.success(),
+        "a change in an empty included config file was not detected:\n{}",
+        config_sections(&file)
+    );
+}
+
 #[test]
 fn worktree_git_dir_files_are_detected() {
     let (fixture, _, _) = snapshotted();
