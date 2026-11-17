@@ -7,6 +7,10 @@
 //! on disk (no git process), so a branch switch or a new commit made through the fixture is
 //! seen as it would be by git. `act` runs in a helper process (this test binary re-run) when a
 //! test needs pause points.
+//!
+//! Every child these helpers start (the `act` helper, the `cardinal` binary, the support
+//! helper modes) gets the fixture's constructed environment and a working directory inside
+//! the fixture, and every `act` first checks that its plan's target lies inside the fixture.
 
 #![allow(
     dead_code,
@@ -14,19 +18,24 @@
 )]
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::ffi::OsString;
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use cardinal::act::{self, ActOptions};
 use cardinal::config::Config;
 use cardinal::contract::{
     ActResult, Error, ErrorCode, Facts, GhStatus, HostInfo, IgnoredClass, IgnoredEntry, InUse,
-    Inventory, InventorySchema, MergeEvidence, Os, ReclaimSummary, Repo, Tri, Worktree,
+    Inventory, InventorySchema, MergeEvidence, Os, Plan, ReclaimSummary, Repo, Tri, Worktree,
 };
 use cardinal::observe::WorktreeObservation;
 use cardinal::plan::{Head, Sources};
 use cardinal::state::StateDir;
 use serde::{Deserialize, Serialize};
+
+use crate::support::cardinal::Dirs;
+use crate::support::fixture::Fixture;
+use crate::support::helper::{ChildGuard, Mode};
 
 /// One observed worktree with its repository.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -287,9 +296,74 @@ pub fn config(config_dir: &Path, host_toml: Option<&str>) -> Config {
     Config::load(config_dir).expect("load the test config")
 }
 
+/// Panics unless `path` is an absolute path inside the fixture root `root`, without `..`.
+pub fn assert_inside(root: &Path, path: &Path, what: &str) {
+    assert!(
+        path.is_absolute()
+            && !path.components().any(|c| c == Component::ParentDir)
+            && path.starts_with(root),
+        "refusing: {what} {} is outside the fixture root {}",
+        path.display(),
+        root.display()
+    );
+}
+
+/// Panics unless every plan in `state` whose ID starts with `prefix` targets a worktree and a
+/// path inside the fixture root `root`. A prefix no plan has passes: `act` then finds none.
+pub fn assert_plans_inside(root: &Path, state: &StateDir, prefix: &str) {
+    let Ok(entries) = std::fs::read_dir(state.plans_dir()) else {
+        return;
+    };
+    for entry in entries {
+        let id = entry.unwrap().file_name().to_string_lossy().into_owned();
+        if !id.starts_with(prefix) {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(state.plan_file(&id)) else {
+            continue;
+        };
+        let plan: Plan = serde_json::from_slice(&bytes).expect("a stored plan");
+        assert_inside(root, Path::new(&plan.target.worktree), "act worktree");
+        assert_inside(root, Path::new(&plan.target.path), "act target");
+    }
+}
+
+/// `command` with the fixture's constructed environment, keeping the variables `command`
+/// sets itself, and `dir`, inside the fixture, as its working directory.
+pub fn confined(fx: &Fixture, mut command: Command, dir: &Path) -> Command {
+    assert_inside(fx.root(), dir, "working directory");
+    let own: Vec<(OsString, OsString)> = command
+        .get_envs()
+        .filter_map(|(k, v)| Some((k.to_owned(), v?.to_owned())))
+        .collect();
+    command
+        .env_clear()
+        .envs(fx.env())
+        .envs(own)
+        .current_dir(dir);
+    command
+}
+
+/// The `cardinal` binary with `dirs` as its state and config directories, confined to `fx`.
+pub fn cardinal(fx: &Fixture, dirs: &Dirs) -> assert_cmd::Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cardinal"));
+    command
+        .env("CARDINAL_STATE_DIR", dirs.state())
+        .env("CARDINAL_CONFIG_DIR", dirs.config());
+    assert_cmd::Command::from_std(confined(fx, command, fx.root()))
+}
+
+/// Starts a support helper in `mode`, confined to `fx` and running in `cwd`.
+pub fn spawn_helper(fx: &Fixture, mode: &Mode, cwd: &Path) -> ChildGuard {
+    let mut command = confined(fx, crate::support::helper::command(mode), cwd);
+    ChildGuard::new(command.spawn().expect("start a helper process"))
+}
+
 /// What a helper process needs to run `act` against the fake.
 #[derive(Debug, Serialize, Deserialize)]
 struct ActRequest {
+    /// The fixture root every plan target must lie in.
+    root: PathBuf,
     config: PathBuf,
     state: PathBuf,
     world: PathBuf,
@@ -303,8 +377,10 @@ struct ActRequest {
 const ACT_ENV: &str = "CARDINAL_TEST_ACT";
 
 /// A command that runs `act` against the fake in a helper process (this test binary, whose
-/// `helper` test calls [`run_act_if_requested`]); the result is written to `out`.
+/// `helper` test calls [`run_act_if_requested`]), confined to `fx`; the result is written to
+/// `out`. Panics if the plan targets anything outside the fixture.
 pub fn act_command(
+    fx: &Fixture,
     config_dir: &Path,
     state: &StateDir,
     fake: &FakeSources,
@@ -312,7 +388,9 @@ pub fn act_command(
     options: &ActOptions,
     out: &Path,
 ) -> Command {
+    assert_plans_inside(fx.root(), state, plan);
     let request = ActRequest {
+        root: fx.root().to_path_buf(),
         config: config_dir.to_path_buf(),
         state: state.root().to_path_buf(),
         world: fake.file.clone(),
@@ -327,11 +405,8 @@ pub fn act_command(
         .args(["helper", "--exact", "--nocapture", "--test-threads=1"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .env(ACT_ENV, serde_json::to_string(&request).unwrap())
-        .env_remove("CARDINAL_TEST_DIR")
-        .env_remove("CARDINAL_TEST_PAUSE")
-        .env_remove("CARDINAL_TEST_FAIL");
-    command
+        .env(ACT_ENV, serde_json::to_string(&request).unwrap());
+    confined(fx, command, fx.root())
 }
 
 /// Runs the `act` a helper process was started for, then exits; returns at once otherwise.
@@ -342,6 +417,7 @@ pub fn run_act_if_requested() {
     let request: ActRequest = serde_json::from_str(&request).expect("parse the act request");
     let config = Config::load(&request.config).expect("load the config");
     let state = StateDir::open(&request.state).expect("open the state dir");
+    assert_plans_inside(&request.root, &state, &request.plan);
     let fake = FakeSources {
         file: request.world,
     };
@@ -465,14 +541,17 @@ impl Setup {
             .expect("create the plan")
     }
 
-    /// Runs `act` in this process through the fake.
+    /// Runs `act` in this process through the fake; panics first if the plan targets
+    /// anything outside the fixture.
     pub fn act(&self, plan: &str, options: &ActOptions) -> Result<ActResult, Error> {
+        assert_plans_inside(self.fx.root(), &self.state, plan);
         act::execute_with(&self.config, &self.state, &self.fake, plan, options)
     }
 
     /// A helper process running `act` through the fake, writing its result to `out`.
     pub fn act_command(&self, plan: &str, options: &ActOptions, out: &Path) -> Command {
         act_command(
+            &self.fx,
             self.dirs.config(),
             &self.state,
             &self.fake,
@@ -480,6 +559,13 @@ impl Setup {
             options,
             out,
         )
+    }
+}
+
+impl Setup {
+    /// The `cardinal` binary on this setup's state and config, confined to the fixture.
+    pub fn cardinal(&self) -> assert_cmd::Command {
+        cardinal(&self.fx, &self.dirs)
     }
 }
 

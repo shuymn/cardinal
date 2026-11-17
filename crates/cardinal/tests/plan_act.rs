@@ -209,7 +209,7 @@ mod candidates {
             .unwrap()
             .unwrap();
         let mut sleeper =
-            support::helper::spawn(&support::helper::Mode::Sleep, Some(&busy.join("src")));
+            fakes::spawn_helper(&s.fx, &support::helper::Mode::Sleep, &busy.join("src"));
         support::helper::wait_for(
             "the sleeper's cwd",
             std::time::Duration::from_secs(10),
@@ -400,8 +400,8 @@ fn nested_repository_refused() {
     write(&wt, "node_modules/pkg/.git/HEAD", "ref: refs/heads/main\n");
     for plan in [&dir, &whole] {
         let result = s.act(&plan.id, &owner_approved()).unwrap();
-        assert_eq!(result.status, ActStatus::Rejected, "{:?}", plan.kind);
-        assert_eq!(result.reasons, ["no_nested_repository"], "{:?}", plan.kind);
+        assert_eq!(result.status, ActStatus::Rejected, "{result:#?}");
+        assert_eq!(result.reasons, ["no_nested_repository"], "{result:#?}");
     }
     assert!(wt.join("node_modules/pkg/.git/HEAD").exists());
     assert!(wt.join("node_modules/pkg/index.js").exists());
@@ -511,41 +511,44 @@ fn plain_target_checks(
 #[cfg(target_os = "macos")]
 #[test]
 fn mount_point_refused() {
-    struct Attached(std::path::PathBuf);
+    struct Attached(std::process::Command);
     impl Drop for Attached {
         fn drop(&mut self) {
-            let _ = std::process::Command::new("hdiutil")
-                .args(["detach", "-force", "-quiet"])
-                .arg(&self.0)
-                .status();
+            let _ = self.0.status();
         }
     }
     let s = Setup::new();
     let wt = s.worktree("mounted", &[("node_modules", IgnoredClass::Regenerable)]);
     std::fs::create_dir(wt.join("node_modules")).unwrap();
     let image = s.fx.path("disk.dmg");
-    let created = std::process::Command::new("hdiutil")
-        .args([
-            "create", "-quiet", "-size", "1m", "-fs", "HFS+", "-layout", "NONE",
-        ])
-        .arg(&image)
-        .status()
-        .unwrap();
+    let created =
+        s.fx.command("hdiutil", s.fx.root())
+            .args([
+                "create", "-quiet", "-size", "1m", "-fs", "HFS+", "-layout", "NONE",
+            ])
+            .arg(&image)
+            .status()
+            .unwrap();
     assert!(created.success(), "hdiutil create");
-    let attached = std::process::Command::new("hdiutil")
-        .args([
-            "attach",
-            "-quiet",
-            "-nobrowse",
-            "-noautoopen",
-            "-mountpoint",
-        ])
-        .arg(wt.join("node_modules"))
-        .arg(&image)
-        .status()
-        .unwrap();
+    let attached =
+        s.fx.command("hdiutil", s.fx.root())
+            .args([
+                "attach",
+                "-quiet",
+                "-nobrowse",
+                "-noautoopen",
+                "-mountpoint",
+            ])
+            .arg(wt.join("node_modules"))
+            .arg(&image)
+            .status()
+            .unwrap();
     assert!(attached.success(), "hdiutil attach");
-    let _attached = Attached(wt.join("node_modules"));
+    let mut detach = s.fx.command("hdiutil", s.fx.root());
+    detach
+        .args(["detach", "-force", "-quiet"])
+        .arg(wt.join("node_modules"));
+    let _attached = Attached(detach);
     write(&wt, "node_modules/pkg/index.js", "on the image");
 
     let plan = s.plan(PlanKind::ReclaimDir, &wt.join("node_modules"));
@@ -680,4 +683,19 @@ fn plan_is_stored_and_recorded() {
         cardinal::contract::ErrorCode::InvalidArgument,
         "a main worktree is never reclaimed: {err}"
     );
+}
+
+/// Through the binary, only on the fixture repository: `plan --repo` answers
+/// `not_implemented` until observation is wired in (`docs/architecture.md` section 14.1).
+#[test]
+fn cli_plan_on_a_fixture_repo() {
+    let s = Setup::new();
+    let main = s.main.display().to_string();
+    let assert = s
+        .cardinal()
+        .args(["plan", "--repo", &main])
+        .assert()
+        .code(1);
+    let doc: serde_json::Value = serde_json::from_slice(&assert.get_output().stdout).unwrap();
+    assert_eq!(doc["error"]["code"], "not_implemented");
 }

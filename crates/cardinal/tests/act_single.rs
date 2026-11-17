@@ -127,25 +127,26 @@ fn plan_ids_resolve_by_unique_prefix() {
 /// Through the binary: an unknown plan is `not_found` (exit 1); a refusal exits 3.
 #[test]
 fn cli_exit_codes() {
-    let dirs = support::cardinal::Dirs::new();
-    let assert = dirs.cmd().args(["act", "abcd"]).assert().code(1);
+    let s = Setup::new();
+    let assert = s.cardinal().args(["act", "abcd"]).assert().code(1);
     let doc: serde_json::Value = serde_json::from_slice(&assert.get_output().stdout).unwrap();
     assert_eq!(doc["error"]["code"], "not_found");
 
     // A plan whose worktree no longer exists expires; `act` exits 3 and prints the result.
-    let state = cardinal::state::StateDir::open(dirs.state()).unwrap();
     let id = "abcdef0123456789";
-    std::fs::create_dir_all(state.plan_dir(id)).unwrap();
+    let gone = s.fx.path("gone");
+    std::fs::create_dir_all(s.state.plan_dir(id)).unwrap();
     let plan = serde_json::json!({
-        "schema": "cardinal.plan.v1", "id": id, "created_ms": 1, "host_id": state.host_id(),
+        "schema": "cardinal.plan.v1", "id": id, "created_ms": 1, "host_id": s.state.host_id(),
         "kind": "reclaim_dir",
-        "target": { "path": "/nonexistent-cardinal-test/wt/target", "repo": "/nonexistent-cardinal-test/main/.git",
-                    "worktree": "/nonexistent-cardinal-test/wt", "head": null, "branch": null,
+        "target": { "path": gone.join("wt/target"), "repo": gone.join("main/.git"),
+                    "worktree": gone.join("wt"), "head": null, "branch": null,
                     "root_id": null, "root_created_ms": null },
         "allocated_bytes": null, "checks": [], "invariants_ok": true, "approval": "none"
     });
-    std::fs::write(state.plan_file(id), plan.to_string()).unwrap();
-    let assert = dirs.cmd().args(["act", "abcdef"]).assert().code(3);
+    std::fs::write(s.state.plan_file(id), plan.to_string()).unwrap();
+    fakes::assert_plans_inside(s.fx.root(), &s.state, "abcdef");
+    let assert = s.cardinal().args(["act", "abcdef"]).assert().code(3);
     let doc: serde_json::Value = serde_json::from_slice(&assert.get_output().stdout).unwrap();
     assert_eq!(doc["schema"], "cardinal.act-result.v1");
     assert_eq!(doc["status"], "expired");

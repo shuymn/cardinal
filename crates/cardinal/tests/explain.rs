@@ -199,8 +199,7 @@ fn cli_prints_an_explain_document() {
     write(&wt, "target/x", "x");
     let plan = s.plan(PlanKind::ReclaimDir, &wt.join("target"));
     let assert = s
-        .dirs
-        .cmd()
+        .cardinal()
         .args(["explain", "plan", &plan.id])
         .assert()
         .success();
@@ -211,8 +210,7 @@ fn cli_prints_an_explain_document() {
         serde_json::json!({"kind": "plan", "id": plan.id})
     );
     let assert = s
-        .dirs
-        .cmd()
+        .cardinal()
         .args(["explain", "job", "abcd"])
         .assert()
         .code(1);

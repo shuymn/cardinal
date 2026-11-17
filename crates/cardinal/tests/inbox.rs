@@ -5,6 +5,7 @@
 //! The recovery pass is a fake until the integration gate runs these against the real
 //! `admission` module; sessions and processes are real.
 
+mod fakes;
 mod support;
 
 use std::time::Duration;
@@ -28,6 +29,7 @@ fn helper() {
 }
 
 struct Env {
+    fx: support::fixture::Fixture,
     dirs: Dirs,
     config: Config,
     state: StateDir,
@@ -38,9 +40,22 @@ fn env() -> Env {
     let config = Config::load(dirs.config()).unwrap();
     let state = StateDir::open(dirs.state()).unwrap();
     Env {
+        fx: support::fixture::Fixture::new(),
         dirs,
         config,
         state,
+    }
+}
+
+impl Env {
+    /// The `cardinal` binary on this state and config, confined to the fixture.
+    fn cardinal(&self) -> assert_cmd::Command {
+        fakes::cardinal(&self.fx, &self.dirs)
+    }
+
+    /// A sleeping helper process, confined to the fixture.
+    fn sleeper(&self) -> helper::ChildGuard {
+        fakes::spawn_helper(&self.fx, &Mode::Sleep, self.fx.root())
     }
 }
 
@@ -220,11 +235,11 @@ fn session_snapshot(state: &StateDir, id: &str, agent: (u32, u64), processes: &[
 #[test]
 fn outlived_processes_raised() {
     let e = env();
-    let mut agent = helper::spawn(&Mode::Sleep, None);
+    let mut agent = e.sleeper();
     let agent_id = (agent.id(), alive_start(agent.id()));
-    let mut server = helper::spawn(&Mode::Sleep, None);
+    let mut server = e.sleeper();
     let server_id = (server.id(), alive_start(server.id()));
-    let mut gone = helper::spawn(&Mode::Sleep, None);
+    let mut gone = e.sleeper();
     let gone_id = (gone.id(), alive_start(gone.id()));
     gone.kill();
     session_snapshot(&e.state, "s1", agent_id, &[server_id, gone_id]);
@@ -363,8 +378,7 @@ fn json(stdout: &[u8]) -> serde_json::Value {
 fn cli_lists_and_resolves() {
     let e = env();
     let assert = e
-        .dirs
-        .cmd()
+        .cardinal()
         .args(["inbox", "--no-refresh"])
         .assert()
         .success();
@@ -373,8 +387,7 @@ fn cli_lists_and_resolves() {
     assert_eq!(doc["items"], serde_json::json!([]));
 
     let assert = e
-        .dirs
-        .cmd()
+        .cardinal()
         .args(["inbox", "resolve", "k", "--outcome", "resolved"])
         .assert()
         .code(1);
@@ -385,8 +398,7 @@ fn cli_lists_and_resolves() {
 
     inbox::raise(&e.state, &item("k", &serde_json::json!({}))).unwrap();
     let assert = e
-        .dirs
-        .cmd()
+        .cardinal()
         .args([
             "inbox",
             "resolve",
@@ -403,8 +415,7 @@ fn cli_lists_and_resolves() {
     assert_eq!(doc["status"], "dismissed");
     assert_eq!(doc["resolution"]["note"], "known");
     let assert = e
-        .dirs
-        .cmd()
+        .cardinal()
         .args(["inbox", "--no-refresh", "--status", "all"])
         .assert()
         .success();
