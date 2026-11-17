@@ -371,6 +371,30 @@ const CASES: &[Case] = &[
         0,
     ),
     case("shell_state_stays", "", "false; probe $?", 0, 0),
+    // The fallback test sets `$?` to 0 before the runner and to 1 before the fallback.
+    case(
+        "nested_status_stays",
+        "",
+        "false; probe \"${UNSET:-$?}\"; true; probe \"${UNSET:-${?}}\"",
+        0,
+        0,
+    ),
+    case("zsh_status_stays", "", "false; probe \"$status\"", 0, 0),
+    case(
+        "nested_last_argument_stays",
+        "",
+        "probe first last; probe \"${UNSET:-$_}\"",
+        1,
+        1,
+    ),
+    case(
+        "pipeline_status_stays",
+        "",
+        "true | false; probe \"${PIPESTATUS[*]}${pipestatus[*]}\"",
+        0,
+        0,
+    ),
+    case("current_command_stays", "", "probe \"$BASH_COMMAND\"", 0, 0),
     case(
         "last_argument_stays",
         "",
@@ -408,12 +432,6 @@ fn check(bench: &Bench, dirs: &Sandbox, expect_calls: bool) {
     let shells = &bench.shells;
     for case in CASES {
         let rewritten = bench.rewrite(dirs, case.command);
-        assert_eq!(
-            rewritten.matches(" run --spec-b64 ").count(),
-            case.wraps,
-            "{}: {rewritten}",
-            case.name
-        );
         for shell in shells.iter().filter(|s| {
             (case.only.is_empty() || case.only.contains(&s.name)) && (!case.pipefail || s.pipefail)
         }) {
@@ -432,6 +450,13 @@ fn check(bench: &Bench, dirs: &Sandbox, expect_calls: bool) {
                 case.name, shell.name
             );
         }
+        // After the runs, so that a rewrite that changes the meaning shows how.
+        assert_eq!(
+            rewritten.matches(" run --spec-b64 ").count(),
+            case.wraps,
+            "{}: {rewritten}",
+            case.name
+        );
     }
 }
 

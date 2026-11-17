@@ -103,10 +103,64 @@ fn is_name_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
-/// Names whose expansion reads state that the rewrite's fallback test changes, or that
-/// section 7.2 lists.
+/// Names whose expansion reads state that the rewrite's fallback test changes (section 7.2):
+/// the last argument, zsh's exit status, the pipeline statuses, and bash's current command.
 fn is_state_name(name: &str) -> bool {
-    name == "_" || name == "PIPESTATUS" || name == "pipestatus"
+    matches!(
+        name,
+        "_" | "status" | "PIPESTATUS" | "pipestatus" | "BASH_COMMAND"
+    )
+}
+
+/// The parameter name at the start of `text`.
+fn name_prefix(text: &str) -> &str {
+    &text[..text.bytes().take_while(|&b| is_name_char(b)).count()]
+}
+
+/// Whether the parameter at the start of a `${…}` body is shell state: `?`, `!`, `-`, `$`,
+/// or a state name, after zsh's `=`, `~`, `^`, `+` prefixes and a `#` (length). zsh flags
+/// (`${(e)…}`, `${(%)…}`) and bash indirection (`${!name}`) can reach any parameter, so they
+/// count as state too.
+fn parameter_state(body: &str) -> bool {
+    let rest = body.trim_start_matches(['=', '~', '^', '+']);
+    match rest.bytes().next() {
+        Some(b'(' | b'!' | b'?' | b'-' | b'$') => true,
+        Some(b'#') => {
+            let after = &rest[1..];
+            matches!(after.bytes().next(), Some(b'?' | b'!' | b'-' | b'$'))
+                || is_state_name(name_prefix(after))
+        }
+        _ => is_state_name(name_prefix(rest)),
+    }
+}
+
+/// Whether the body of `${…}` reads shell state, at its parameter or in any expansion nested
+/// in its operands (`${UNSET:-$?}`), or expands a value as a prompt (`${x@P}`), which can.
+fn braced_state(body: &str) -> bool {
+    if parameter_state(body) || body.contains("@P") {
+        return true;
+    }
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'$' => {
+                let rest = &body[i + 1..];
+                let state = match rest.bytes().next() {
+                    Some(b'{') => parameter_state(&rest[1..]),
+                    Some(b'?' | b'!' | b'-' | b'$') => true,
+                    _ => is_state_name(name_prefix(rest)),
+                };
+                if state {
+                    return true;
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    false
 }
 
 impl<'a> Lexer<'a> {
@@ -400,14 +454,7 @@ impl<'a> Lexer<'a> {
                         }
                     }
                 }
-                let inner = &self.src[body..self.pos - 1];
-                let name_len = inner.bytes().take_while(|&b| is_name_char(b)).count();
-                let first = inner.bytes().next();
-                if matches!(first, Some(b'?' | b'!' | b'-' | b'$'))
-                    || is_state_name(&inner[..name_len])
-                    || inner.contains("PIPESTATUS")
-                    || inner.contains("pipestatus")
-                {
+                if braced_state(&self.src[body..self.pos - 1]) {
                     *state = true;
                 }
                 Ok(())
@@ -433,14 +480,11 @@ impl<'a> Lexer<'a> {
             Some(b) if is_name_start(b) => {
                 *literal = false;
                 let start = self.pos + 1;
-                let len = self.bytes[start..]
-                    .iter()
-                    .take_while(|&&b| is_name_char(b))
-                    .count();
-                if is_state_name(&self.src[start..start + len]) {
+                let name = name_prefix(&self.src[start..]);
+                if is_state_name(name) {
                     *state = true;
                 }
-                self.pos = start + len;
+                self.pos = start + name.len();
                 Ok(())
             }
             // zsh expansion flags such as `$=name` and `$~name`.

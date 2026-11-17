@@ -169,11 +169,36 @@ fn shell_state_and_newlines_are_flagged() {
         "t $pipestatus",
         "t ${_:-x}",
         "t ${!name}",
+        "t \"${UNSET:-$?}\"",
+        "t ${UNSET:-${?}}",
+        "t ${x:-${y:-$_}}",
+        "t ${x/a/$?}",
+        "t \"$status\"",
+        "t ${status}",
+        "t $BASH_COMMAND",
+        "t ${#?}",
+        "t ${#PIPESTATUS[@]}",
+        "t ${(e)x}",
+        "t ${=_}",
+        "t ${x@P}",
+        "t > \"${UNSET:-$?}\"",
     ] {
         assert!(stages(command)[0].shell_state, "{command}");
     }
     for command in [
-        "t $_x", "t ${x}", "t $#", "t $1", "t \"$@\"", "t '$?'", "t \\$?",
+        "t $_x",
+        "t ${x}",
+        "t $#",
+        "t ${#}",
+        "t $1",
+        "t \"$@\"",
+        "t \"${arr[@]}\"",
+        "t '$?'",
+        "t \\$?",
+        "t ${HOME:-/tmp}",
+        "t ${x:-$y}",
+        "t ${x:-\\$?}",
+        "t $statusx",
     ] {
         assert!(!stages(command)[0].shell_state, "{command}");
     }
