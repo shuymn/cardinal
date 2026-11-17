@@ -54,7 +54,9 @@ mod tests {
             schema: RunSpecSchema,
             class: Some("test".into()),
             rule: Some("generic/test".into()),
-            resources: [("cpu".to_owned(), 4)].into_iter().collect(),
+            resources: [("cpu".to_owned(), std::num::NonZeroU64::new(4).unwrap())]
+                .into_iter()
+                .collect(),
             timeout_ms: 120_000,
             background: false,
             stage_index: 1,

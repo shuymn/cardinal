@@ -37,7 +37,7 @@ pub enum ExplainSource {
         result: String,
     },
     Record {
-        record: serde_json::Value,
+        record: serde_json::Map<String, serde_json::Value>,
     },
 }
 

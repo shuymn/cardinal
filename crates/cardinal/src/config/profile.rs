@@ -383,10 +383,16 @@ impl RawProfile {
 }
 
 /// A data pattern is a name, or a worktree-relative path with `/`. No globs in phase 0.
+/// Configuration is portable, so absolute forms of every OS are rejected everywhere: rooted
+/// (`/x`), any backslash (`\\server\x`, `\x`), and a drive prefix (`C:/x`, `C:x`).
 fn check_data_pattern(pattern: &str) -> Result<(), String> {
+    let drive = pattern.len() >= 2
+        && pattern.as_bytes()[0].is_ascii_alphabetic()
+        && pattern.as_bytes()[1] == b':';
     let bad = pattern.is_empty()
         || pattern.starts_with('/')
         || pattern.contains('\\')
+        || drive
         || pattern.contains(['*', '?', '['])
         || pattern
             .split('/')
@@ -406,13 +412,13 @@ mod tests {
 
     use super::{Profile, Selection, git_common_dir, normalize_remote};
 
+    /// An absolute home directory on every OS.
+    fn home() -> PathBuf {
+        PathBuf::from(if cfg!(windows) { r"C:\h" } else { "/h" })
+    }
+
     fn parse(name: &str, text: &str) -> Profile {
-        Profile::parse(
-            Path::new(&format!("{name}.toml")),
-            text,
-            Some(Path::new("/h")),
-        )
-        .unwrap()
+        Profile::parse(Path::new(&format!("{name}.toml")), text, Some(&home())).unwrap()
     }
 
     #[test]
@@ -441,14 +447,14 @@ mod tests {
         );
         assert!(!profile.is_generic());
         let matcher = profile.matcher.as_ref().unwrap();
-        assert_eq!(matcher.paths, vec![PathBuf::from("/h/src/app")]);
+        assert_eq!(matcher.paths, vec![home().join("src").join("app")]);
         assert_eq!(matcher.remotes, vec!["github.com/owner/app".to_owned()]);
         let rule = &profile.rules[0];
         assert_eq!(rule.qualified_id, "app/test");
         assert_eq!(rule.patterns[1].words, ["cargo", "nextest", "run"]);
         assert_eq!(
             rule.resources.as_ref().unwrap().get("memory_mb"),
-            Some(&9000)
+            Some(&std::num::NonZeroU64::new(9000).unwrap())
         );
         assert!(profile.matches_remote("git@github.com:owner/app.git"));
         assert!(!profile.matches_remote("git@github.com:owner/other.git"));
@@ -466,13 +472,18 @@ mod tests {
             "[data]\nregenerable = [\"target/*\"]",
             "[data]\nprotected = [\"../x\"]",
             "[data]\nprotected = [\"/abs\"]",
+            "[data]\nprotected = [\"C:/target\"]",
+            "[data]\nprotected = [\"C:target\"]",
+            "[data]\nregenerable = [\"c:\\\\target\"]",
+            "[data]\nregenerable = [\"\\\\\\\\server\\\\share\"]",
+            "[data]\nregenerable = [\"\\\\target\"]",
             "[match]\npaths = [\"relative\"]",
             "[match]\nremotes = [\"not a remote\"]",
             "[classify]\nwrappers = [[]]",
             "[unknown]\nx = 1",
         ] {
             assert!(
-                Profile::parse(Path::new("p.toml"), text, Some(Path::new("/h"))).is_err(),
+                Profile::parse(Path::new("p.toml"), text, Some(&home())).is_err(),
                 "{text}"
             );
         }

@@ -54,7 +54,7 @@ pub struct InboxItem {
     pub status: InboxStatus,
     pub subject: InboxSubject,
     /// The observation that raised the item.
-    pub evidence: serde_json::Value,
+    pub evidence: serde_json::Map<String, serde_json::Value>,
     pub created_ms: u64,
     pub updated_ms: u64,
     pub seen: u64,

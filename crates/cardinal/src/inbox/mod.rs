@@ -16,7 +16,7 @@ pub struct NewItem {
     pub key: String,
     pub kind: InboxKind,
     pub subject: InboxSubject,
-    pub evidence: serde_json::Value,
+    pub evidence: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Raises or updates an item; the one function refresh and (from phase 1) units raise through.

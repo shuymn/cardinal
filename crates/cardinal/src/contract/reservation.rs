@@ -137,7 +137,9 @@ mod tests {
             }),
             stop_signal_ms: None,
             priority: Priority::Normal,
-            resources: [("cpu".to_owned(), 2)].into_iter().collect(),
+            resources: [("cpu".to_owned(), std::num::NonZeroU64::new(2).unwrap())]
+                .into_iter()
+                .collect(),
             admission: AdmissionResult::WithinBudget,
             class: None,
             rule: None,

@@ -1,6 +1,7 @@
 //! `host.toml` (`docs/architecture.md` section 3.2).
 
 use std::collections::BTreeMap;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -255,6 +256,7 @@ impl RawHost {
     ) -> Result<HostConfig, ConfigError> {
         let invalid = |message: String| ConfigError::invalid(path, message);
 
+        let cpus = NonZeroU64::new(cpus).unwrap_or(NonZeroU64::MIN);
         let mut budget = self.budget;
         budget.entry("cpu".to_owned()).or_insert(cpus);
         for name in budget.keys() {
@@ -267,9 +269,12 @@ impl RawHost {
                     .map_err(|m| invalid(format!("admission.default_resources: {m}")))?;
                 resources
             }
-            None => [("cpu".to_owned(), (cpus / 2).max(1))]
-                .into_iter()
-                .collect(),
+            None => [(
+                "cpu".to_owned(),
+                NonZeroU64::new(cpus.get() / 2).unwrap_or(NonZeroU64::MIN),
+            )]
+            .into_iter()
+            .collect(),
         };
         let wait_fraction = self.admission.wait_fraction;
         if !(0.0..=1.0).contains(&wait_fraction) {
@@ -355,15 +360,11 @@ fn check_resource_name(name: &str) -> Result<(), String> {
     }
 }
 
-/// Checks that every amount is a positive integer.
+/// Checks resource names; amounts are positive by type.
 pub(super) fn check_resources(resources: &Resources) -> Result<(), String> {
-    for (name, amount) in resources {
-        check_resource_name(name)?;
-        if *amount == 0 {
-            return Err(format!("{name} must be a positive integer"));
-        }
-    }
-    Ok(())
+    resources
+        .keys()
+        .try_for_each(|name| check_resource_name(name))
 }
 
 /// Expands `~` and requires an absolute result.
@@ -379,20 +380,30 @@ pub(super) fn absolute_path(value: &str, home: Option<&Path>) -> Result<PathBuf,
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU64;
     use std::path::{Path, PathBuf};
 
     use super::{HostConfig, validate_runner};
 
+    /// An absolute home directory on every OS.
+    fn home() -> PathBuf {
+        PathBuf::from(if cfg!(windows) { r"C:\h" } else { "/h" })
+    }
+
+    fn n(value: u64) -> NonZeroU64 {
+        NonZeroU64::new(value).unwrap()
+    }
+
     fn parse(text: &str) -> Result<HostConfig, super::ConfigError> {
-        HostConfig::parse(Path::new("host.toml"), text, 8, Some(Path::new("/h")))
+        HostConfig::parse(Path::new("host.toml"), text, 8, Some(&home()))
     }
 
     #[test]
     fn defaults_follow_the_architecture() {
         let host = parse("").unwrap();
-        assert_eq!(host.budget.get("cpu"), Some(&8));
+        assert_eq!(host.budget.get("cpu"), Some(&n(8)));
         assert_eq!(host.budget.len(), 1, "memory_mb has no default budget");
-        assert_eq!(host.admission.default_resources.get("cpu"), Some(&4));
+        assert_eq!(host.admission.default_resources.get("cpu"), Some(&n(4)));
         assert_eq!(host.admission.lock_timeout_ms, 2000);
         assert_eq!(host.admission.max_wait_ms, 30_000);
         assert!((host.admission.wait_fraction - 0.25).abs() < f64::EPSILON);
@@ -411,7 +422,7 @@ mod tests {
     #[test]
     fn single_cpu_default_resources_stay_positive() {
         let host = HostConfig::parse(Path::new("host.toml"), "", 1, None).unwrap();
-        assert_eq!(host.admission.default_resources.get("cpu"), Some(&1));
+        assert_eq!(host.admission.default_resources.get("cpu"), Some(&n(1)));
     }
 
     #[test]
@@ -426,18 +437,19 @@ mod tests {
             default_resources = { cpu = 2 }
             [observe]
             repos = ["~/src/other"]
-            managed = [{ app = "t3code", root = "/w" }]
+            managed = [{ app = "t3code", root = "~/w" }]
             [unit.disk-reclaim]
             act = true
             [unit.quiet]
             "#,
         )
         .unwrap();
-        assert_eq!(host.budget.get("cpu"), Some(&6));
-        assert_eq!(host.budget.get("gpu"), Some(&1));
-        assert_eq!(host.admission.default_resources.get("cpu"), Some(&2));
-        assert_eq!(host.observe.repos, vec![PathBuf::from("/h/src/other")]);
+        assert_eq!(host.budget.get("cpu"), Some(&n(6)));
+        assert_eq!(host.budget.get("gpu"), Some(&n(1)));
+        assert_eq!(host.admission.default_resources.get("cpu"), Some(&n(2)));
+        assert_eq!(host.observe.repos, vec![home().join("src").join("other")]);
         assert_eq!(host.observe.managed[0].app, "t3code");
+        assert_eq!(host.observe.managed[0].root, home().join("w"));
         assert!(host.unit_may_act("disk-reclaim"));
         assert!(!host.unit_may_act("quiet"));
     }
@@ -446,6 +458,7 @@ mod tests {
     fn unknown_keys_and_bad_values_are_rejected() {
         for text in [
             "[budget]\ncpu = -1",
+            "[budget]\ngpu = 0",
             "[admission]\nlock_timeout = 5",
             "[hook]\nrunner = 5",
             "typo = 1",

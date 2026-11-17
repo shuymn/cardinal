@@ -12,10 +12,15 @@ pub struct ClassifyRepo {
     pub remote: Option<String>,
 }
 
+/// The agent tool a stage comes from. Phase 0 classifies only Bash calls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ToolName {
+    Bash,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClassifyTool {
-    /// `"Bash"`
-    pub name: String,
+    pub name: ToolName,
     pub timeout_ms: u64,
     pub background: bool,
 }

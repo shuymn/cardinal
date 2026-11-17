@@ -41,7 +41,7 @@ pub struct Record {
     pub session_id: Option<String>,
     /// Kind-specific. `job_finished` has `exit`, `signal`, `waited_ms`, `admission`, and
     /// `measurements` (`[{ "kind": "wall_time", "ms": … }]` in phase 0).
-    pub data: serde_json::Value,
+    pub data: serde_json::Map<String, serde_json::Value>,
 }
 
 impl Record {
@@ -56,7 +56,7 @@ impl Record {
             plan_id: None,
             inbox_key: None,
             session_id: None,
-            data: serde_json::Value::Object(serde_json::Map::new()),
+            data: serde_json::Map::new(),
         }
     }
 }

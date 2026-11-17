@@ -18,12 +18,13 @@ mod run_spec;
 mod session;
 
 use std::collections::BTreeMap;
+use std::num::NonZeroU64;
 
 use serde::{Deserialize, Serialize};
 
 pub use act::{ActResult, ActStatus, Caller, CallerParseError};
 pub use classify::{
-    ClassifyDecision, ClassifyRepo, ClassifyRequest, ClassifyResponse, ClassifyTool,
+    ClassifyDecision, ClassifyRepo, ClassifyRequest, ClassifyResponse, ClassifyTool, ToolName,
 };
 pub use error::{Error, ErrorBody, ErrorCode, ErrorDoc};
 pub use explain::{Explain, ExplainKind, ExplainSource, ExplainSubject};
@@ -43,8 +44,9 @@ pub use reservation::{
 pub use run_spec::{RunSpec, SpecError};
 pub use session::{SessionProcess, SessionSnapshot, SnapshotAgent};
 
-/// Resource amounts by name (`cpu`, `memory_mb`, or any owner-defined name). Positive integers.
-pub type Resources = BTreeMap<String, u64>;
+/// Resource amounts by name (`cpu`, `memory_mb`, or any owner-defined name). Amounts are
+/// positive integers; zero is rejected when a document or configuration is read.
+pub type Resources = BTreeMap<String, NonZeroU64>;
 
 /// Defines a zero-sized `schema` marker that serializes as its schema string and refuses to
 /// deserialize any other value.

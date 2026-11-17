@@ -145,7 +145,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let config = Config::load_with(&tmp.path().join("absent"), 4, None).unwrap();
         assert_eq!(config.profiles, []);
-        assert_eq!(config.host.budget.get("cpu"), Some(&4));
+        assert_eq!(config.host.budget.get("cpu").map(|n| n.get()), Some(4));
     }
 
     #[test]

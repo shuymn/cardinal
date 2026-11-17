@@ -18,7 +18,10 @@ fn state() -> (tempfile::TempDir, StateDir) {
 fn numbered(recorder: &Recorder, seq: u64, writer: u64) -> Record {
     let mut record = recorder.record(RecordKind::JobFinished);
     record.job_id = Some(format!("{writer:04x}{seq:012x}"));
-    record.data = serde_json::json!({ "seq": seq, "writer": writer, "pad": "x".repeat(40) });
+    record.data = serde_json::from_value(
+        serde_json::json!({ "seq": seq, "writer": writer, "pad": "x".repeat(40) }),
+    )
+    .unwrap();
     record
 }
 
