@@ -454,10 +454,15 @@ impl<'a> Observer<'a> {
         })
     }
 
-    /// `[git] base`, else the target of `refs/remotes/origin/HEAD`, with its commit. `None`
-    /// only when git answers with the query's documented "absent" status (exit 1 with
-    /// `--quiet`); any other status, a signal, or output that is not a ref name or an object
-    /// ID is an error, a failed step.
+    /// `[git] base`, else the target of `refs/remotes/origin/HEAD`, with its commit.
+    ///
+    /// The base is always resolved as a full ref name, never through revision syntax, which
+    /// could read the index (`:path`) or reflogs (`@{…}`): a configured base must be a valid
+    /// ref name and is looked up as `refs/remotes/<base>`, then `refs/heads/<base>` (or as
+    /// itself when it starts with `refs/`); `origin/HEAD` must point under
+    /// `refs/remotes/origin/`. `None` only when git answers with the query's documented
+    /// "absent" status (exit 1 with `--quiet`); an invalid name, any other status, a signal,
+    /// or output that is not a ref name or an object ID is an error, a failed step.
     fn base(&self, dir: &Path, configured: Option<&str>) -> Result<Option<BaseRef>, String> {
         let answered = |args: &[&str]| -> Result<Option<String>, String> {
             let what = format!("git {}", args.join(" "));
@@ -472,35 +477,45 @@ impl<'a> Observer<'a> {
             }
             Ok(Some(text))
         };
-        let name = match configured {
-            Some(name) => name.to_owned(),
-            None => match answered(&[
-                "symbolic-ref",
-                "--quiet",
-                "--short",
-                "refs/remotes/origin/HEAD",
-            ])? {
-                Some(name) if name.starts_with('-') => {
-                    return Err(format!("unexpected origin/HEAD target {name:?}"));
-                }
-                Some(name) => name,
-                None => return Ok(None),
-            },
+        let (name, candidates) = if let Some(name) = configured {
+            if !git::is_ref_name(name) {
+                return Err(format!("[git] base {name:?} is not a ref name"));
+            }
+            let candidates = if name.starts_with("refs/") {
+                vec![name.to_owned()]
+            } else {
+                vec![format!("refs/remotes/{name}"), format!("refs/heads/{name}")]
+            };
+            (name.to_owned(), candidates)
+        } else {
+            let Some(target) = answered(&["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"])?
+            else {
+                return Ok(None);
+            };
+            let short = target
+                .strip_prefix("refs/remotes/")
+                .filter(|short| short.starts_with("origin/") && git::is_ref_name(&target));
+            let Some(short) = short else {
+                return Err(format!(
+                    "origin/HEAD points to {target:?}, not a ref under refs/remotes/origin/"
+                ));
+            };
+            (short.to_owned(), vec![target.clone()])
         };
-        if name.is_empty() || name.starts_with('-') {
-            return Ok(None);
+        for full in candidates {
+            let spec = format!("{full}^{{commit}}");
+            let Some(oid) = answered(&["rev-parse", "--verify", "--quiet", &spec])? else {
+                continue;
+            };
+            if !git::is_oid(&oid) {
+                return Err(format!("git rev-parse printed {oid:?} for {spec}"));
+            }
+            return Ok(Some(BaseRef {
+                ref_name: name,
+                oid,
+            }));
         }
-        let spec = format!("{name}^{{commit}}");
-        let Some(oid) = answered(&["rev-parse", "--verify", "--quiet", &spec])? else {
-            return Ok(None);
-        };
-        if !git::is_oid(&oid) {
-            return Err(format!("git rev-parse printed {oid:?} for {spec}"));
-        }
-        Ok(Some(BaseRef {
-            ref_name: name,
-            oid,
-        }))
+        Ok(None)
     }
 
     /// Observes every worktree of a repository, several at a time.
@@ -748,6 +763,9 @@ impl<'a> Observer<'a> {
                     "--porcelain=v2",
                     "-z",
                     "--branch",
+                    // Never enter a submodule: its own index could be split, and a
+                    // gitlink already fails `no_nested_repository`.
+                    "--ignore-submodules=all",
                     "--untracked-files=all",
                     "--ignored=matching",
                 ],

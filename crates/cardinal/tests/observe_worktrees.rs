@@ -459,8 +459,8 @@ fn a_full_merged_page_without_the_head_is_unknown() {
 }
 
 /// A git step that fails makes `observed` fail even when other evidence would do: each of
-/// `merge-base` and the two base queries fails (or prints garbage) while gh reports the head
-/// merged.
+/// `merge-base` and the two base queries fails (or prints something that is not a ref or an
+/// object ID) while gh reports the head merged.
 #[cfg(unix)]
 #[test]
 fn a_failed_git_step_fails_observed() {
@@ -488,6 +488,10 @@ fn a_failed_git_step_fails_observed() {
             "*\" rev-parse --verify \"*) echo garbage; exit 0;;",
         ),
         ("signal", "*\" symbolic-ref \"*) kill -9 $$;;"),
+        (
+            "symbolic-ref output",
+            "*\" symbolic-ref \"*) echo 'not a ref'; exit 0;;",
+        ),
     ];
     for (name, arm) in cases {
         let mut scene = Scene::new();

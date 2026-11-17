@@ -161,6 +161,26 @@ pub fn parse_stage_entry(entry: &[u8]) -> Result<(String, PathBuf), String> {
     Ok((meta.to_owned(), path_from_bytes(&entry[tab + 1..])?))
 }
 
+/// Whether `name` is a ref name by the rules of `git check-ref-format --allow-onelevel`:
+/// no empty, `.`-leading, or `.lock`-ending component, no `..`, `@{`, control characters,
+/// space, `~ ^ : ? * [ \\`, no leading `-`, not `@`, and no trailing `/` or `.`. Revision
+/// syntax (`:path`, `@{-1}`, `HEAD~2`) is therefore never a ref name.
+#[must_use]
+pub fn is_ref_name(name: &str) -> bool {
+    let bad_char = |c: char| c.is_control() || " ~^:?*[\\".contains(c);
+    !name.is_empty()
+        && name != "@"
+        && !name.starts_with('-')
+        && !name.ends_with('/')
+        && !name.ends_with('.')
+        && !name.contains("..")
+        && !name.contains("@{")
+        && !name.chars().any(bad_char)
+        && name.split('/').all(|c| {
+            !c.is_empty() && !c.starts_with('.') && !c.to_ascii_lowercase().ends_with(".lock")
+        })
+}
+
 /// Whether `oid` looks like a full object ID (SHA-1 or SHA-256).
 #[must_use]
 pub fn is_oid(oid: &str) -> bool {
@@ -267,6 +287,25 @@ mod tests {
 
         assert!(parse_status(b"").is_err(), "no branch header");
         assert!(parse_status(b"# branch.oid x\0garbage\0").is_err());
+    }
+
+    #[test]
+    fn ref_names() {
+        use super::is_ref_name;
+        for good in [
+            "main",
+            "origin/main",
+            "refs/remotes/origin/main",
+            "feat/x-1",
+        ] {
+            assert!(is_ref_name(good), "{good}");
+        }
+        for bad in [
+            ":missing", "main^", "main~1", "@{-1}", "main@{1}", "a..b", "-x", "@", "a b", "a\tb",
+            "a/", "a.", "a//b", ".a", "a/.b", "x.lock", "a:b", "a?", "a*", "a[", "a\\b", "",
+        ] {
+            assert!(!is_ref_name(bad), "{bad:?}");
+        }
     }
 
     #[test]
