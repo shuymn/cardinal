@@ -148,7 +148,7 @@ fn cancel_of(event: Event) -> Option<Cancel> {
     match event {
         Event::Signal(sig) => Some(Cancel::Signal(sig)),
         Event::ParentExited => Some(Cancel::ParentExited),
-        Event::ChildExited => None,
+        Event::ChildChanged => None,
     }
 }
 

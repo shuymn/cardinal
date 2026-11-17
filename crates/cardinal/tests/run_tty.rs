@@ -7,10 +7,13 @@
 mod runner_support;
 mod support;
 
+use std::io::Read as _;
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use cardinal::contract::RecordKind;
-use runner_support::{Env, Pty, output};
+use runner_support::{Env, Pty, WAIT, output};
+use support::helper::{ChildGuard, wait_for};
 
 #[test]
 fn helper() {
@@ -51,6 +54,41 @@ fn passthrough() {
     assert_eq!(env.records_of(RecordKind::TtyPassthrough).len(), 1);
     let started = env.records_of(RecordKind::JobStarted);
     assert_eq!(started[0].data["path"], "tty");
+}
+
+/// Job control: a stage that stops itself stops the runner with the same signal, as the caller
+/// would see a direct stage stop; continuing the runner continues the stage.
+#[test]
+fn a_stopped_stage_stops_the_runner() {
+    use rustix::process::{Pid, WaitOptions, waitpid};
+
+    let env = Env::with_budget(1);
+    let pty = Pty::open();
+    let mut runner = ChildGuard::new(
+        env.run(None, &["sh", "-c", "kill -STOP $$; printf resumed"])
+            .stdin(pty.stdin())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let pid = Pid::from_raw(runner.id().cast_signed()).unwrap();
+    let stopped_by = wait_for("the runner to stop", WAIT, || {
+        let (_, status) =
+            waitpid(Some(pid), WaitOptions::UNTRACED | WaitOptions::NOHANG).unwrap()?;
+        status.stopping_signal()
+    });
+    assert_eq!(stopped_by, cardinal::os::unix::SIGSTOP);
+    cardinal::os::unix::signal_process(runner.id(), cardinal::os::unix::SIGCONT).unwrap();
+    let mut stdout = String::new();
+    runner
+        .child()
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .unwrap();
+    assert_eq!(stdout, "resumed");
+    assert_eq!(runner.child().wait().unwrap().code(), Some(0));
 }
 
 /// The control: without a terminal, the same stage runs in the runner's own group.

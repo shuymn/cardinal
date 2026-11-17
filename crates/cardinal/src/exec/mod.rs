@@ -88,8 +88,8 @@ pub enum Event {
     Signal(i32),
     /// The runner's parent exited (the Bash call was cancelled).
     ParentExited,
-    /// The child exited; it is not reaped yet.
-    ChildExited,
+    /// The child exited or stopped; it is not reaped yet.
+    ChildChanged,
 }
 
 /// The signals the runner handles (Unix).
@@ -294,12 +294,21 @@ impl LocalExecutor {
             // nor kills.
             drop(child);
             let tx = self.watch.sender();
+            // A child in the caller's group is under its job control: its stops are reported.
+            let stops = self.group.get().is_none();
             // Without the waiter thread the supervisor still polls the child.
             let _ = std::thread::Builder::new()
                 .name("cardinal-child".into())
                 .spawn(move || {
-                    let _ = os::unix::wait_exited_unreaped(pid);
-                    let _ = tx.send(Event::ChildExited);
+                    loop {
+                        let exited = os::unix::wait_unreaped(pid, stops).unwrap_or(true);
+                        let _ = tx.send(Event::ChildChanged);
+                        if exited {
+                            return;
+                        }
+                        // The supervisor takes the stop report; until then it is seen again.
+                        std::thread::sleep(GROUP_POLL);
+                    }
                 });
         }
         Ok(LocalRunning {
@@ -393,7 +402,9 @@ impl LocalRunning {
     ///
     /// - in its own group: SIGINT, SIGTERM, SIGHUP, and SIGQUIT go to the whole group;
     /// - in the caller's group: SIGINT and SIGQUIT are ignored, as `system()` does, because the
-    ///   child receives terminal signals itself; SIGTERM and SIGHUP go to the child.
+    ///   child receives terminal signals itself; SIGTERM and SIGHUP go to the child. When the
+    ///   child stops, the runner stops with the same signal, so the caller's job control sees
+    ///   the stop, and continues the child once it is continued itself.
     ///
     /// The child is reaped only when the wait ends, so its PID stays reserved while the runner
     /// may signal it; the group's ID is the runner's own PID and stays reserved while the
@@ -422,6 +433,18 @@ impl LocalRunning {
                         ));
                     }
                 }
+            }
+            if !exited
+                && self.group.is_none()
+                && let Ok(Some(sig)) = os::unix::child_stopped(pid)
+            {
+                // Once the parent is gone nobody would continue the runner; the child only
+                // goes on.
+                if stopping.is_none() && !self.watch.parent_exited() {
+                    os::unix::stop_self(sig);
+                }
+                let _ = os::unix::signal_process(pid, os::unix::SIGCONT);
+                continue;
             }
             if stopping.is_none() && self.watch.parent_exited() {
                 stopping = Some(Instant::now());

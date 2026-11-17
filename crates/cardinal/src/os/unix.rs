@@ -14,7 +14,9 @@ use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, WaitIdStatus, WaitOpti
 
 use super::{Detail, ProcessInfo, ProcessTable};
 
-pub use signal_hook::consts::signal::{SIGCONT, SIGHUP, SIGINT, SIGKILL, SIGQUIT, SIGTERM};
+pub use signal_hook::consts::signal::{
+    SIGCONT, SIGHUP, SIGINT, SIGKILL, SIGQUIT, SIGSTOP, SIGTERM,
+};
 
 /// The process group of this process before and after [`lead_group`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -147,25 +149,48 @@ pub fn child_exited(raw_pid: u32) -> io::Result<bool> {
     }
 }
 
-/// Blocks until child `pid` has exited without reaping it, so no PID is reused while the
-/// caller may signal it. Returns an
-/// error when the child cannot be waited for, for example because the parent ignores
-/// SIGCHLD and the system reaped the child already.
-pub fn wait_exited_unreaped(raw_pid: u32) -> io::Result<()> {
+/// Blocks until child `pid` has exited, or, with `stops`, stopped, without reaping it or
+/// taking the report, so no PID is reused while the caller may signal it. Returns whether the
+/// child exited. Fails when the child cannot be waited for, for example because the parent
+/// ignores SIGCHLD and the system reaped the child already.
+pub fn wait_unreaped(raw_pid: u32, stops: bool) -> io::Result<bool> {
     let id = pid(raw_pid)?;
+    let mut options = WaitIdOptions::EXITED | WaitIdOptions::NOWAIT;
+    if stops {
+        options |= WaitIdOptions::STOPPED;
+    }
     loop {
-        match rustix::process::waitid(
-            WaitId::Pid(id),
-            WaitIdOptions::EXITED | WaitIdOptions::NOWAIT,
-        ) {
-            Ok(Some(status)) if ended(&status) => return Ok(()),
-            // A stop reported anyway stays until the child changes again; look again later
-            // instead of spinning on it.
+        match rustix::process::waitid(WaitId::Pid(id), options) {
+            Ok(Some(status)) if ended(&status) => return Ok(true),
+            Ok(Some(status)) if stops && status.stopped() => return Ok(false),
+            // A report that was not asked for stays until the child changes again; look again
+            // later instead of spinning on it.
             Ok(_) => std::thread::sleep(Duration::from_millis(100)),
             Err(rustix::io::Errno::INTR) => {}
             Err(err) => return Err(err.into()),
         }
     }
+}
+
+/// The signal that stopped child `pid`, if it stopped and that was not reported yet; takes
+/// the report. Never waits.
+pub fn child_stopped(raw_pid: u32) -> io::Result<Option<i32>> {
+    let id = pid(raw_pid)?;
+    loop {
+        match rustix::process::waitid(
+            WaitId::Pid(id),
+            WaitIdOptions::STOPPED | WaitIdOptions::NOHANG,
+        ) {
+            Ok(status) => return Ok(status.and_then(|s| s.stopping_signal())),
+            Err(rustix::io::Errno::INTR) => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+}
+
+/// Stops this process with `sig`, as a terminal stops a job; returns once it is continued.
+pub fn stop_self(sig: i32) {
+    let _ = signal_hook::low_level::raise(sig);
 }
 
 /// Whether this process ignores `sig` (`SIG_IGN`, inherited across `exec` from the caller).
