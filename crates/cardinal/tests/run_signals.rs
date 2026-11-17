@@ -12,7 +12,7 @@ use std::process::Command;
 
 use cardinal::testpoint::{ADMISSION_WAITING, RUN_BEFORE_STARTING};
 use runner_support::{Env, Pty, WAIT, output};
-use support::helper::{ChildGuard, wait_for_file};
+use support::helper::{ChildGuard, Mode, wait_for_file};
 
 #[test]
 fn helper() {
@@ -118,52 +118,58 @@ fn ignored_signals_stay_ignored() {
 /// A caller that ignores SIGCHLD would have the kernel reap the runner's children (Linux),
 /// leaving the runner nothing to wait for: the runner runs with SIGCHLD at its default, so it
 /// learns the stage's status on every path, and the stage still starts with SIGCHLD ignored.
+/// The stage reads its disposition with `sigaction`, because not every shell lists a signal
+/// ignored at entry in `trap` output (bash 3.2 does not).
 #[test]
 fn an_ignored_sigchld_is_reset_for_the_runner_and_kept_for_the_stage() {
     let env = Env::with_budget(4);
-    let stage = [
-        "bash",
-        "--norc",
-        "--noprofile",
-        "-c",
-        "trap -p CHLD; exit 3",
-    ];
+    // Writes SIGCHLD's disposition to the file `out` and exits 3.
+    let stage = |out: &str| support::helper::command(&Mode::ChildSignal { out: env.file(out) });
+    let read = |out: &str| std::fs::read_to_string(env.file(out)).unwrap();
     let ignoring = |inner: &Command| {
-        let mut bash = env.isolated("bash");
-        bash.args([
-            "--norc",
-            "--noprofile",
-            "-c",
-            "trap '' CHLD; exec \"$@\"",
-            "bash",
-        ])
-        .arg(inner.get_program())
-        .args(inner.get_args());
+        let mut shell = env.isolated("sh");
+        shell
+            .args(["-c", "trap '' CHLD; exec \"$@\"", "sh"])
+            .arg(inner.get_program())
+            .args(inner.get_args());
         for (key, value) in inner.get_envs() {
             match value {
-                Some(value) => bash.env(key, value),
-                None => bash.env_remove(key),
+                Some(value) => shell.env(key, value),
+                None => shell.env_remove(key),
             };
         }
-        bash
+        shell
     };
-    let mut direct = env.isolated(stage[0]);
-    direct.args(&stage[1..]);
-    let direct = output(&mut ignoring(&direct));
+    let mut plain = stage("plain");
+    env.isolate(&mut plain);
+    assert_eq!(output(&mut plain).status.code(), Some(3));
+    assert_eq!(read("plain"), "default");
+    let direct = output(&mut ignoring(&stage("direct")));
     assert_eq!(direct.status.code(), Some(3));
-    assert_eq!(direct.stdout, b"trap -- '' SIGCHLD\n");
+    assert_eq!(read("direct"), "ignored");
 
     for path in ["admitted", "fail_open", "tty"] {
         let fail = (path == "fail_open").then_some(RUN_BEFORE_STARTING);
-        let mut runner = ignoring(&env.run_at(None, &stage, &[], fail));
+        let probe = stage(path);
+        let argv: Vec<&str> = std::iter::once(probe.get_program())
+            .chain(probe.get_args())
+            .map(|arg| arg.to_str().unwrap())
+            .collect();
+        let mut inner = env.run_at(None, &argv, &[], fail);
+        inner.envs(
+            probe
+                .get_envs()
+                .filter_map(|(key, value)| Some((key, value?))),
+        );
+        let mut runner = ignoring(&inner);
         let pty = Pty::open();
         if path == "tty" {
             runner.stdin(pty.stdin());
         }
         let out = output(&mut runner);
         assert_eq!(out.status.code(), Some(3), "{path}: {:?}", out.status);
-        assert_eq!(out.stdout, direct.stdout, "{path}");
         assert_eq!(out.stderr, b"", "{path}");
+        assert_eq!(read(path), "ignored", "{path}");
     }
     let records = |kind| env.records_of(kind);
     assert_eq!(records(cardinal::contract::RecordKind::JobInfraFailure), []);

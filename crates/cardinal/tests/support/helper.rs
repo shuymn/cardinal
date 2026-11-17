@@ -50,6 +50,10 @@ pub enum Mode {
         max_bytes: u64,
         keep: u32,
     },
+    /// Write SIGCHLD's disposition as this process found it (`ignored`, `default`, or
+    /// `handled`, read with `sigaction`) to `out`, then exit 3.
+    #[cfg(unix)]
+    ChildSignal { out: PathBuf },
 }
 
 /// Runs the helper mode named on the command line, then exits; returns at once in a normal
@@ -103,9 +107,30 @@ pub fn run_if_requested() {
                 std::process::exit(3);
             }
         }
+        #[cfg(unix)]
+        "child-signal" => {
+            std::fs::write(&args[0], child_signal()).expect("write the disposition");
+            std::process::exit(3);
+        }
         other => panic!("unknown helper mode {other}"),
     }
     std::process::exit(0);
+}
+
+/// SIGCHLD's disposition in this process, read without changing it.
+#[cfg(unix)]
+fn child_signal() -> &'static str {
+    let mut current = std::mem::MaybeUninit::<libc::sigaction>::zeroed();
+    // SAFETY: without a new action, `sigaction` only writes the current one into `current`,
+    // which is valid for writes.
+    let read = unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), current.as_mut_ptr()) };
+    assert_eq!(read, 0, "sigaction: {}", std::io::Error::last_os_error());
+    // SAFETY: zero-initialized, a valid `sigaction`, and filled on success.
+    match unsafe { current.assume_init() }.sa_sigaction {
+        libc::SIG_IGN => "ignored",
+        libc::SIG_DFL => "default",
+        _ => "handled",
+    }
 }
 
 /// A command that runs this test binary in `mode`, in `cwd` inside `scope`.
@@ -142,6 +167,8 @@ pub fn command(scope: &Scope, mode: &Mode, cwd: &Path) -> Command {
                 keep.to_string(),
             ],
         ),
+        #[cfg(unix)]
+        Mode::ChildSignal { out } => ("child-signal", vec![out.to_string_lossy().into_owned()]),
     };
     let mut command = scope.command(exe, cwd);
     command
