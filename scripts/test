@@ -105,9 +105,10 @@ export HOME=$R/home XDG_CONFIG_HOME=$R/home/.config XDG_CACHE_HOME=$R/home/.cach
 
 # --- Supervisor: processes that carry this run's marker -------------------------------
 
-# Prints the PIDs of this user's processes that carry the marker; fails when the process
-# table cannot be read.
-marked_pids() {
+# Prints the PIDs of this user's processes that carry the marker, and `?<pid>` for each of
+# them whose marker cannot be read (Linux: a process that is not dumpable hides its
+# environment even from its owner); fails when the process table cannot be read.
+scan() {
   case $os in
     Darwin)
       # macOS shows a process's environment only to the process itself, so the marker
@@ -122,10 +123,15 @@ marked_pids() {
     Linux)
       [ -r /proc/self/environ ] || return 1
       local proc
+      local proc environ
       for proc in /proc/[0-9]*; do
         [ -O "$proc" ] || continue
         # A process that exits meanwhile has no environment left to read.
-        if tr '\0' '\n' <"$proc/environ" 2>/dev/null | grep -qxF "$marker"; then
+        if ! environ=$({ tr '\0' '\n' <"$proc/environ"; } 2>/dev/null); then
+          [ ! -e "$proc" ] || echo "?${proc#/proc/}"
+          continue
+        fi
+        if printf '%s\n' "$environ" | grep -qxF "$marker"; then
           echo "${proc#/proc/}"
         fi
       done
@@ -136,20 +142,34 @@ marked_pids() {
   esac
 }
 
-# Kills and lists every process this run left behind; fails if there was one or if the
-# process table cannot be read. The marker is unique to this run, so each PID found is one
-# this run started.
+# The PIDs that carry the marker.
+marked_pids() {
+  local found
+  found=$(scan) || return
+  printf '%s\n' "$found" | grep -v '^?' || true
+}
+
+# Kills and lists every process this run left behind; fails if there was one, if the
+# process table cannot be read, or if a process whose environment cannot be read appeared
+# since check_sweep (it may be a test process that hid its marker). The marker is unique to
+# this run, so each PID found is one this run started.
 swept=0
 sweep() {
-  local pids status=0
-  pids=$(marked_pids) || status=$?
+  local found pids hidden status=0 failed=0
+  found=$(scan) || status=$?
   if [ "$status" -eq 2 ]; then
     return 0
   elif [ "$status" -ne 0 ]; then
     say "cannot read the process table to find leftover test processes"
     return 1
   fi
-  [ -n "$pids" ] || return 0
+  pids=$(printf '%s\n' "$found" | grep -v '^?' || true)
+  hidden=$(printf '%s\n' "$found" | sed -n 's/^?//p' | sort)
+  for pid in $(printf '%s\n' "$hidden" | comm -13 "$R/hidden" - 2>/dev/null); do
+    say "cannot read the environment of process $(ps -o pid= -o command= -p "$pid" 2>/dev/null || echo "$pid"), which started during the run"
+    failed=1
+  done
+  [ -n "$pids" ] || return "$failed"
   for pid in $pids; do
     say "leftover test process: $(ps -o pid= -o pgid= -o command= -p "$pid" 2>/dev/null || echo "$pid")"
     kill -KILL "$pid" 2>/dev/null || true
@@ -169,6 +189,8 @@ check_sweep() {
     say "Windows: no process sweep; leftovers are found only by nextest's leak check"
     return 0
   }
+  # Processes that already hide their environment are not this run's.
+  scan | sed -n 's/^?//p' | sort >"$R/hidden"
   env -i "$marker" sleep 30 9<"$R/marker" &
   local probe=$! pids tries=0
   # The fork shows the marker only once env has run.
@@ -222,10 +244,12 @@ EOF
       confinement="sandbox-exec: writes only under the per-run root, no network"
       ;;
     Linux)
-      local probe=(bwrap --ro-bind / / --bind "$R" "$R" --unshare-net --die-with-parent --)
+      # A fresh /dev: on the read-only bind of the host's, /dev/null cannot be opened for
+      # writing, which every child with null stdio needs.
+      local bwrap=(bwrap --ro-bind / / --dev /dev --bind "$R" "$R" --unshare-net --die-with-parent --)
       local error
-      if error=$("${probe[@]}" true 2>&1); then
-        runner="bwrap --ro-bind / / --bind $R $R --unshare-net --die-with-parent --"
+      if error=$("${bwrap[@]}" sh -c ': >/dev/null && : >"$1/probe"' sh "$R" 2>&1); then
+        runner="${bwrap[*]}"
         confinement="bubblewrap: writes only under the per-run root, no network"
       else
         confinement="UNCONFINED: bubblewrap does not work here (${error:-not installed}); writes outside the per-run root are found only by the repository guard"

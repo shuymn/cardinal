@@ -121,7 +121,8 @@ manifest() {
     echo "(missing)"
     return
   fi
-  local prune=()
+  # `-false -o` keeps the list non-empty: bash before 4.4 calls an empty array unbound.
+  local prune=(-false -o)
   for pattern in "$@"; do
     prune+=(-path "$pattern" -prune -o)
   done
