@@ -533,12 +533,18 @@ enum Slot {
 }
 
 impl Slot {
+    /// Kills and reaps a running child; a slot that is not running keeps its state, so a
+    /// child killed twice still reports the status of the first kill.
     fn kill(&mut self) {
-        if let Slot::Running(process) = std::mem::replace(self, Slot::Starting) {
-            // A failed reap leaves nothing this slot could still clean up.
-            if let Ok(status) = process.kill() {
-                *self = Slot::Done(status);
-            }
+        if !matches!(self, Slot::Running(_)) {
+            return;
+        }
+        let Slot::Running(process) = std::mem::replace(self, Slot::Starting) else {
+            unreachable!("checked above")
+        };
+        // A failed reap leaves nothing this slot could still clean up.
+        if let Ok(status) = process.kill() {
+            *self = Slot::Done(status);
         }
     }
 }
@@ -742,5 +748,30 @@ fn canonical_prefix(path: &Path) -> PathBuf {
             }
             _ => return path.to_path_buf(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Scope;
+
+    /// A second kill leaves the reaped child's status in place for `wait`.
+    #[test]
+    fn repeated_kill_keeps_the_status() {
+        let scope = Scope::new();
+        let mut command = if cfg!(windows) {
+            let mut command = scope.command("ping", scope.root());
+            command.args(["-n", "30", "127.0.0.1"]);
+            command
+        } else {
+            let mut command = scope.command("sleep", scope.root());
+            command.arg("30");
+            command
+        };
+        let mut child = command.spawn().expect("start the child");
+        child.kill();
+        child.kill();
+        let status = child.wait().expect("wait after two kills");
+        assert!(!status.success(), "{status}");
     }
 }
