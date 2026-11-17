@@ -1,6 +1,7 @@
 //! Careless tests. Each one does what the harness must stop or catch; `scripts/test
 //! --self-check` runs them one at a time and checks the outcome.
 
+#[cfg(unix)]
 use std::process::{Command, Stdio};
 
 /// Outside the per-run root: the checkout's `target/`.
@@ -62,17 +63,11 @@ fn connects_inside_root() {
     listener.accept().expect("accept the connection");
 }
 
+#[cfg(unix)]
 fn sleeper() -> Command {
-    let mut command = if cfg!(windows) {
-        let mut command = Command::new("ping");
-        command.args(["-n", "120", "127.0.0.1"]);
-        command
-    } else {
-        let mut command = Command::new("sleep");
-        command.arg("120");
-        command
-    };
+    let mut command = Command::new("sleep");
     command
+        .arg("120")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -80,6 +75,7 @@ fn sleeper() -> Command {
 }
 
 /// Leaves a child running with its output closed, which nextest's leak check cannot see.
+#[cfg(unix)]
 #[test]
 fn leaves_process() {
     let child = sleeper().spawn().expect("start a child");

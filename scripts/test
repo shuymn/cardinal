@@ -386,20 +386,14 @@ run_archive() {
   if [ "$os" = Windows ]; then
     env+=(TEMP="$R/tmp" TMP="$R/tmp" USERPROFILE="$R/home" APPDATA="$R/home/AppData/Roaming"
       LOCALAPPDATA="$R/home/AppData/Local")
-    local name value
-    for name in $windows_start_vars; do
-      if value=$(printenv "$name"); then
-        env+=("$name=$value")
-      fi
-    done
   else
     env+=(TMPDIR="$R/tmp")
   fi
   [ -z "${CARGO_TERM_COLOR-}" ] || env+=(CARGO_TERM_COLOR="$CARGO_TERM_COLOR")
   [ -z "$runner" ] || env+=("$runner_var=$runner")
-  env -i "${env[@]}" cargo-nextest nextest run --archive-file "$archive" \
+  (clean_exec '' "${env[@]}" cargo-nextest nextest run --archive-file "$archive" \
     --workspace-remap "$workspace" --extract-to "$extract" \
-    --config-file "$root/.config/nextest.toml" "$@"
+    --config-file "$root/.config/nextest.toml" "$@")
 }
 
 # --- Self-check ----------------------------------------------------------------------------

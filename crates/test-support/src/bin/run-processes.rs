@@ -56,10 +56,7 @@ fn run(_kill: bool, _sandbox: &str, _marker: &str, _empty_table: bool) -> ExitCo
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn run(kill: bool, sandbox: &str, marker: &str, empty_table: bool) -> ExitCode {
-    let Some(membership) = os::Membership::new(sandbox, marker) else {
-        eprintln!("run-processes: a name contains NUL");
-        return ExitCode::from(2);
-    };
+    let membership = os::Membership::new(sandbox, marker);
     let member = |pid: i32| membership.check(pid);
     if kill {
         return sweep::kill_all(&member, empty_table);
@@ -185,11 +182,16 @@ mod os {
     }
 
     impl Membership {
-        pub(super) fn new(sandbox: &str, _marker: &str) -> Option<Self> {
-            Some(Self {
-                denied: CString::new(format!("{sandbox}.denied")).ok()?,
-                allowed: CString::new(format!("{sandbox}.allowed")).ok()?,
-            })
+        /// `sandbox` comes from the command line, which cannot hold NUL.
+        pub(super) fn new(sandbox: &str, _marker: &str) -> Self {
+            let name = |suffix| {
+                CString::new(format!("{sandbox}.{suffix}"))
+                    .expect("a command-line argument has no NUL")
+            };
+            Self {
+                denied: name("denied"),
+                allowed: name("allowed"),
+            }
         }
 
         /// Whether `pid` is in the run's sandbox. A process that is gone reads as denying
@@ -350,10 +352,10 @@ mod os {
     }
 
     impl Membership {
-        pub(super) fn new(_sandbox: &str, marker: &str) -> Option<Self> {
-            (!marker.contains('\0')).then(|| Self {
+        pub(super) fn new(_sandbox: &str, marker: &str) -> Self {
+            Self {
                 marker: marker.as_bytes().to_vec(),
-            })
+            }
         }
 
         /// Whether `pid`'s environment holds the marker, or `None` if it cannot be read (a
