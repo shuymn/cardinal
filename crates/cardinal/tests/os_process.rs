@@ -139,8 +139,9 @@ fn zombie_is_not_alive() {
     }
     assert!(!os::is_alive(pid, start_s));
     assert_eq!(os::start_time_s(pid), None);
-    assert!(
-        child.child().try_wait().unwrap().is_some(),
-        "the child was a zombie until now"
-    );
+    // Only this test reaps the child, so it was unreaped until now. macOS drops an exiting
+    // process from the table a moment before it can be reaped.
+    wait_for("the child to be reapable", WAIT, || {
+        child.child().try_wait().unwrap()
+    });
 }
