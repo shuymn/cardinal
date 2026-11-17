@@ -13,17 +13,15 @@ use cardinal::os::unix::{
     ChildState, SIGCONT, SIGSTOP, Until, signal_process, take_stop, wait_unreaped,
 };
 use runner_support::Env;
-use support::helper::ChildGuard;
 
 #[test]
 fn a_stopped_child_is_not_ended_and_stays_unreaped() {
     let env = Env::with_budget(1);
-    let mut child = ChildGuard::new(
-        env.isolated("sh")
-            .args(["-c", "kill -STOP $$; exit 3"])
-            .spawn()
-            .unwrap(),
-    );
+    let mut child = env
+        .in_worktree("sh")
+        .args(["-c", "kill -STOP $$; exit 3"])
+        .spawn()
+        .unwrap();
     let pid = child.id();
     assert_eq!(
         wait_unreaped(pid, Until::EndedOrStopped).unwrap(),
@@ -51,5 +49,5 @@ fn a_stopped_child_is_not_ended_and_stays_unreaped() {
         ChildState::Ended,
         "still unreaped"
     );
-    assert_eq!(child.child().wait().unwrap().code(), Some(3));
+    assert_eq!(child.wait().unwrap().code(), Some(3));
 }

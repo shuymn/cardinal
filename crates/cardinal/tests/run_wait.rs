@@ -11,7 +11,6 @@ use std::time::{Duration, Instant};
 use cardinal::contract::{AdmissionResult, RecordKind};
 use cardinal::testpoint::ADMISSION_RESERVED;
 use runner_support::{Env, WAIT, output, spec};
-use support::helper::ChildGuard;
 
 #[test]
 fn helper() {
@@ -33,16 +32,15 @@ fn overflow_runs_once() {
     let counter = env.file("counter");
     let script = format!("echo run >> '{}'", counter.display());
     let start = Instant::now();
-    let mut runner = ChildGuard::new(
-        env.run_at(
+    let mut runner = env
+        .run_at(
             Some(&spec(1, 600)),
             &["sh", "-c", &script],
             &[ADMISSION_RESERVED],
             None,
         )
         .spawn()
-        .unwrap(),
-    );
+        .unwrap();
     env.points
         .wait_reached(ADMISSION_RESERVED, runner.id(), WAIT);
     let waited = start.elapsed();
@@ -55,7 +53,7 @@ fn overflow_runs_once() {
     assert_eq!(ours.len(), 1);
     assert_eq!(ours[0].admission, AdmissionResult::Overflow);
     env.points.release(ADMISSION_RESERVED);
-    assert_eq!(runner.child().wait().unwrap().code(), Some(0));
+    assert_eq!(runner.wait().unwrap().code(), Some(0));
     assert_eq!(env.lines("counter"), ["run"]);
 
     let finished = env.records_of(RecordKind::JobFinished);
@@ -75,7 +73,7 @@ fn no_output_added() {
         "-c",
         "printf 'out\\n'; printf 'err\\n' >&2; printf 'tail'; exit 3",
     ];
-    let mut direct = env.isolated(stage[0]);
+    let mut direct = env.in_worktree(stage[0]);
     direct.args(&stage[1..]);
     let direct = output(&mut direct);
     assert_eq!(direct.status.code(), Some(3));

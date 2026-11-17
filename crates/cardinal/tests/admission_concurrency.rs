@@ -11,7 +11,6 @@ mod support;
 use cardinal::contract::{AdmissionResult, RecordKind};
 use cardinal::testpoint::{ADMISSION_RESERVED, ADMISSION_WAITING};
 use runner_support::{Env, WAIT, output, spec};
-use support::helper::ChildGuard;
 
 #[test]
 fn helper() {
@@ -41,27 +40,25 @@ fn second_job_waits_until_the_first_is_released() {
     let env = Env::with_budget(1);
     let first_stage = logging_stage(&env, "a");
     let second_stage = logging_stage(&env, "b");
-    let mut first = ChildGuard::new(
-        env.run_at(None, &args(&first_stage), &[ADMISSION_RESERVED], None)
-            .spawn()
-            .unwrap(),
-    );
+    let mut first = env
+        .run_at(None, &args(&first_stage), &[ADMISSION_RESERVED], None)
+        .spawn()
+        .unwrap();
     env.points
         .wait_reached(ADMISSION_RESERVED, first.id(), WAIT);
-    let mut second = ChildGuard::new(
-        env.run_at(None, &args(&second_stage), &[ADMISSION_WAITING], None)
-            .spawn()
-            .unwrap(),
-    );
+    let mut second = env
+        .run_at(None, &args(&second_stage), &[ADMISSION_WAITING], None)
+        .spawn()
+        .unwrap();
     env.points
         .wait_reached(ADMISSION_WAITING, second.id(), WAIT);
     let reserved: Vec<u32> = env.reservations().iter().map(|r| r.runner.pid).collect();
     assert_eq!(reserved, [first.id()], "the waiting job reserves nothing");
 
     env.points.release(ADMISSION_RESERVED);
-    assert_eq!(first.child().wait().unwrap().code(), Some(0));
+    assert_eq!(first.wait().unwrap().code(), Some(0));
     env.points.release(ADMISSION_WAITING);
-    assert_eq!(second.child().wait().unwrap().code(), Some(0));
+    assert_eq!(second.wait().unwrap().code(), Some(0));
 
     assert_eq!(env.lines("log"), ["a-start", "a-end", "b-start", "b-end"]);
     let finished = env.records_of(RecordKind::JobFinished);
@@ -95,11 +92,10 @@ fn all_resources_or_none() {
     }
     let mut need = spec(1, 60_000);
     need.resources = cardinal::admission::resources([("cpu", 1), ("memory_mb", 1)]);
-    let mut runner = ChildGuard::new(
-        env.run_at(Some(&need), &["true"], &[ADMISSION_WAITING], None)
-            .spawn()
-            .unwrap(),
-    );
+    let mut runner = env
+        .run_at(Some(&need), &["true"], &[ADMISSION_WAITING], None)
+        .spawn()
+        .unwrap();
     env.points
         .wait_reached(ADMISSION_WAITING, runner.id(), WAIT);
     assert_eq!(
@@ -109,7 +105,7 @@ fn all_resources_or_none() {
     );
     full.release();
     env.points.release(ADMISSION_WAITING);
-    assert_eq!(runner.child().wait().unwrap().code(), Some(0));
+    assert_eq!(runner.wait().unwrap().code(), Some(0));
     let admitted = env.records_of(RecordKind::JobAdmitted);
     assert_eq!(admitted.len(), 1);
     assert_eq!(admitted[0].data["admission"], "within_budget");
@@ -135,11 +131,11 @@ fn concurrent_runners_stay_within_the_budget() {
         dir = running.display(),
         max = env.file("seen").display()
     );
-    let mut runners: Vec<ChildGuard> = (0..5)
-        .map(|_| ChildGuard::new(env.run(None, &["sh", "-c", &script]).spawn().unwrap()))
+    let mut runners: Vec<cardinal_test_support::Child> = (0..5)
+        .map(|_| env.run(None, &["sh", "-c", &script]).spawn().unwrap())
         .collect();
     for runner in &mut runners {
-        assert_eq!(runner.child().wait().unwrap().code(), Some(0));
+        assert_eq!(runner.wait().unwrap().code(), Some(0));
     }
     let seen: Vec<u32> = env
         .lines("seen")
@@ -161,11 +157,10 @@ fn concurrent_runners_stay_within_the_budget() {
 fn default_resources_apply_without_a_spec() {
     let env =
         Env::new("[budget]\ncpu = 8\n[admission]\ndefault_resources = { cpu = 3, gpu = 1 }\n");
-    let mut runner = ChildGuard::new(
-        env.run_at(None, &["true"], &[ADMISSION_RESERVED], None)
-            .spawn()
-            .unwrap(),
-    );
+    let mut runner = env
+        .run_at(None, &["true"], &[ADMISSION_RESERVED], None)
+        .spawn()
+        .unwrap();
     env.points
         .wait_reached(ADMISSION_RESERVED, runner.id(), WAIT);
     let reservation = &env.reservations()[0];
@@ -175,7 +170,7 @@ fn default_resources_apply_without_a_spec() {
     );
     assert_eq!(reservation.admission, AdmissionResult::WithinBudget);
     env.points.release(ADMISSION_RESERVED);
-    assert_eq!(runner.child().wait().unwrap().code(), Some(0));
+    assert_eq!(runner.wait().unwrap().code(), Some(0));
     let out = output(&mut env.run(Some(&spec(2, 1000)), &["true"]));
     assert_eq!(out.status.code(), Some(0));
 }

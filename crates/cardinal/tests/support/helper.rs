@@ -54,15 +54,9 @@ pub enum Mode {
     /// `handled`, read with `sigaction`) to `out`, then exit 3.
     #[cfg(unix)]
     ChildSignal { out: PathBuf },
-    /// Exec `argv` as the leader of a new process group, without the helper's variables.
+    /// Write this process's process group ID to `out`.
     #[cfg(unix)]
-    LeadGroup { argv: Vec<String> },
-    /// Start `argv` as the leader of a new process group, without the helper's variables, and
-    /// a [`Mode::Sleep`] helper in that group; stop the sleeper, write its PID to `member`,
-    /// then sleep. The stopped member's parent, this helper, is outside the group: while this
-    /// helper lives, the group has a member whose parent is in another group of its session.
-    #[cfg(unix)]
-    AnchorGroup { argv: Vec<String>, member: PathBuf },
+    Group { out: PathBuf },
 }
 
 /// Runs the helper mode named on the command line, then exits; returns at once in a normal
@@ -122,35 +116,10 @@ pub fn run_if_requested() {
             std::process::exit(3);
         }
         #[cfg(unix)]
-        "lead-group" => {
-            use std::os::unix::process::CommandExt as _;
-            let err = Command::new(&args[0])
-                .args(&args[1..])
-                .env_remove(MODE)
-                .env_remove(ARGS)
-                .process_group(0)
-                .exec();
-            panic!("exec {}: {err}", args[0]);
-        }
-        #[cfg(unix)]
-        "anchor-group" => {
-            use std::os::unix::process::CommandExt as _;
-            let leader = Command::new(&args[1])
-                .args(&args[2..])
-                .env_remove(MODE)
-                .env_remove(ARGS)
-                .process_group(0)
-                .spawn()
-                .expect("start the group leader");
-            let mut member = command(&Mode::Sleep);
-            member.process_group(leader.id().cast_signed());
-            let member = member.spawn().expect("start the member");
-            // This helper's unreaped child: its PID is pinned.
-            cardinal::os::unix::signal_process(member.id(), cardinal::os::unix::SIGSTOP)
-                .expect("stop the member");
-            std::fs::write(&args[0], member.id().to_string()).expect("write the pid");
-            std::thread::sleep(LIFETIME);
-            drop((leader, member));
+        "group" => {
+            // SAFETY: `getpgrp` cannot fail and touches no memory of this process.
+            let group = unsafe { libc::getpgrp() };
+            std::fs::write(&args[0], group.to_string()).expect("write the group");
         }
         other => panic!("unknown helper mode {other}"),
     }
@@ -210,14 +179,7 @@ pub fn command(scope: &Scope, mode: &Mode, cwd: &Path) -> Command {
         #[cfg(unix)]
         Mode::ChildSignal { out } => ("child-signal", vec![out.to_string_lossy().into_owned()]),
         #[cfg(unix)]
-        Mode::LeadGroup { argv } => ("lead-group", argv.clone()),
-        #[cfg(unix)]
-        Mode::AnchorGroup { argv, member } => (
-            "anchor-group",
-            std::iter::once(member.to_string_lossy().into_owned())
-                .chain(argv.iter().cloned())
-                .collect(),
-        ),
+        Mode::Group { out } => ("group", vec![out.to_string_lossy().into_owned()]),
     };
     let mut command = scope.command(exe, cwd);
     command

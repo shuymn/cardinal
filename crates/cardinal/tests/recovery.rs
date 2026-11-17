@@ -135,7 +135,6 @@ fn previous_boot_is_stale_even_with_a_live_group() {
 
 #[cfg(unix)]
 mod real {
-    use std::os::unix::process::CommandExt as _;
     use std::time::{Duration, Instant};
 
     use cardinal::admission::{in_use, list_reservations, recovery_pass};
@@ -143,8 +142,10 @@ mod real {
     use cardinal::contract::{DerivedState, ProcessIdentity, RecordKind};
     use cardinal::testpoint::{RUN_AFTER_SPAWN, RUN_BEFORE_STARTING};
 
-    use crate::runner_support::{Env, GroupGuard, WAIT, fake_reservation, output, wait_gone};
-    use crate::support::helper::{self, ChildGuard, Mode, wait_for};
+    use cardinal_test_support::process::{GroupGuard, wait_for, wait_for_file};
+
+    use crate::runner_support::{Env, WAIT, fake_reservation, output, wait_gone};
+    use crate::support::helper::{self, Mode};
 
     fn host() -> HostConfig {
         HostConfig::defaults()
@@ -157,16 +158,15 @@ mod real {
     #[test]
     fn crashed_runner_group_is_kept_until_empty() {
         let env = Env::with_budget(1);
-        let mut runner = ChildGuard::new(
-            env.run_at(
+        let mut runner = env
+            .run_at(
                 None,
                 &["sh", "-c", "sleep 30 & sleep 30 & wait"],
                 &[RUN_AFTER_SPAWN],
                 None,
             )
             .spawn()
-            .unwrap(),
-        );
+            .unwrap();
         env.points.wait_reached(RUN_AFTER_SPAWN, runner.id(), WAIT);
         let pgid = runner.id();
         let group = GroupGuard(pgid);
@@ -234,11 +234,10 @@ mod real {
     #[test]
     fn runner_killed_before_starting_leaves_a_stale_reservation() {
         let env = Env::with_budget(1);
-        let mut runner = ChildGuard::new(
-            env.run_at(None, &["true"], &[RUN_BEFORE_STARTING], None)
-                .spawn()
-                .unwrap(),
-        );
+        let mut runner = env
+            .run_at(None, &["true"], &[RUN_BEFORE_STARTING], None)
+            .spawn()
+            .unwrap();
         env.points
             .wait_reached(RUN_BEFORE_STARTING, runner.id(), WAIT);
         runner.kill();
@@ -260,18 +259,17 @@ mod real {
         let env = Env::with_budget(1);
         let pids = env.file("pids");
         let script = format!("sleep 30 & echo $! > '{}'; sleep 0.3", pids.display());
-        let mut runner = ChildGuard::new(
-            env.run_at(None, &["sh", "-c", &script], &[RUN_AFTER_SPAWN], None)
-                .spawn()
-                .unwrap(),
-        );
+        let mut runner = env
+            .run_at(None, &["sh", "-c", &script], &[RUN_AFTER_SPAWN], None)
+            .spawn()
+            .unwrap();
         env.points.wait_reached(RUN_AFTER_SPAWN, runner.id(), WAIT);
         let pgid = runner.id();
         let group = GroupGuard(pgid);
         let child = env.reservations()[0].child.unwrap();
         runner.kill();
         wait_gone(child.pid, child.start_s);
-        helper::wait_for_file(&pids, WAIT);
+        wait_for_file(&pids, WAIT);
         let descendant: u32 = wait_for("the descendant's PID", WAIT, || {
             std::fs::read_to_string(&pids).ok()?.trim().parse().ok()
         });
@@ -353,10 +351,7 @@ mod real {
     #[test]
     fn previous_boot_released() {
         let env = Env::with_budget(1);
-        let mut command = helper::command(&Mode::Sleep);
-        env.isolate(&mut command);
-        command.process_group(0);
-        let mut process = ChildGuard::new(command.spawn().unwrap());
+        let mut process = helper::spawn(env.scope(), &Mode::Sleep, &env.worktree());
         let pid = process.id();
         let start_s = wait_for("the helper's start time", WAIT, || {
             cardinal::os::start_time_s(pid)
@@ -384,7 +379,7 @@ mod real {
         assert_eq!(report.released, [reservation.job_id.clone()]);
         std::thread::sleep(Duration::from_millis(100));
         assert!(
-            process.child().try_wait().unwrap().is_none(),
+            process.try_wait().unwrap().is_none(),
             "the group was never signalled"
         );
         assert!(cardinal::os::is_alive(pid, start_s));

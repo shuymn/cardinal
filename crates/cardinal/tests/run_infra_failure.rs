@@ -15,9 +15,9 @@ use cardinal::state::LockMode;
 #[cfg(unix)]
 use cardinal::testpoint::{RECORD_OPENED, RUN_AFTER_SPAWN, RUN_REAPED, RUN_SPAWNED, RUN_SPAWNING};
 #[cfg(unix)]
-use runner_support::{Env, GroupGuard, WAIT, output};
+use cardinal_test_support::process::{GroupGuard, wait_for};
 #[cfg(unix)]
-use support::helper::{ChildGuard, wait_for};
+use runner_support::{Env, WAIT, output};
 
 #[test]
 fn helper() {
@@ -144,7 +144,7 @@ fn a_panic_while_recording_after_the_spawn_keeps_the_reservation() {
     .unwrap();
     let mut command = env.run_at(None, &["sh", "-c", &script], &[RUN_SPAWNED], None);
     command.env("CARDINAL_TEST_PANIC", RECORD_OPENED);
-    let mut runner = ChildGuard::new(command.spawn().unwrap());
+    let mut runner = command.spawn().unwrap();
     let _group = GroupGuard(runner.id());
     env.wait_any_reached(RUN_SPAWNED);
     drop(records);
@@ -158,21 +158,19 @@ fn a_panic_while_recording_after_the_spawn_keeps_the_reservation() {
                 .reservations()
                 .first()
                 .is_some_and(|r| r.state == ReservationState::Running);
-            (running || runner.child().try_wait().unwrap().is_some()).then_some(())
+            (running || runner.try_wait().unwrap().is_some()).then_some(())
         },
     );
     std::thread::sleep(Duration::from_secs(1));
     assert_eq!(
-        runner.child().try_wait().unwrap(),
+        runner.try_wait().unwrap(),
         None,
         "the runner waits for the stage"
     );
     assert_eq!(env.reservations().len(), 1, "kept while the stage runs");
 
     std::fs::write(&go, b"").unwrap();
-    let status = wait_for("the runner to exit", WAIT, || {
-        runner.child().try_wait().unwrap()
-    });
+    let status = wait_for("the runner to exit", WAIT, || runner.try_wait().unwrap());
     assert_eq!(status.code(), Some(7));
     assert_eq!(env.lines("counter"), ["run"]);
     assert_eq!(env.reservations(), []);

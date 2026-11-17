@@ -7,7 +7,6 @@
 mod runner_support;
 mod support;
 
-use std::os::unix::process::CommandExt as _;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
@@ -16,13 +15,10 @@ use cardinal::config::HostConfig;
 use cardinal::contract::{DerivedState, RecordKind};
 use cardinal::os::unix::{SIGCONT, signal_process};
 use cardinal::testpoint::{ADMISSION_WAITING, RUN_AFTER_SPAWN, RUN_BEFORE_STARTING};
-use runner_support::{Env, GroupGuard, Pty, WAIT, output, wait_gone};
-use support::helper::{ChildGuard, Mode, kill_pid, wait_for, wait_for_file};
-
-#[test]
-fn helper() {
-    support::helper::run_if_requested();
-}
+use cardinal_test_support::Child;
+use cardinal_test_support::process::{GroupGuard, PidGuard, is_stopped, wait_for, wait_for_file};
+use cardinal_test_support::pty::Pty;
+use runner_support::{Env, WAIT, wait_gone};
 
 #[test]
 fn parent_exit_before_the_spawn_leaves_nothing() {
@@ -31,14 +27,14 @@ fn parent_exit_before_the_spawn_leaves_nothing() {
     let counter = env.file("counter");
     let script = format!("echo run >> '{}'", counter.display());
     let runner = env.run_at(None, &["sh", "-c", &script], &[ADMISSION_WAITING], None);
-    let mut parent = ChildGuard::new(env.in_shell(&runner, "; exit $?").spawn().unwrap());
+    let mut parent = env.in_shell(&runner, "; exit $?").spawn().unwrap();
     let runner_pid = env.wait_any_reached(ADMISSION_WAITING);
     let runner_start = cardinal::os::start_time_s(runner_pid).unwrap();
     let live_before = env.live_locks().len();
     assert_eq!(live_before, 2, "the held job and the waiting runner");
     assert!(!env.worktree_lock_free());
 
-    parent.kill();
+    parent.kill_leader();
     env.points.release(ADMISSION_WAITING);
     wait_gone(runner_pid, runner_start);
 
@@ -60,12 +56,12 @@ fn parent_exit_at_the_start_boundary_cancels() {
         let env = Env::with_budget(1);
         let script = format!("echo run >> '{}'", env.file("counter").display());
         let runner = env.run_at(None, &["sh", "-c", &script], &[RUN_BEFORE_STARTING], fail);
-        let mut parent = ChildGuard::new(env.in_shell(&runner, "; exit $?").spawn().unwrap());
+        let mut parent = env.in_shell(&runner, "; exit $?").spawn().unwrap();
         let runner_pid = env.wait_any_reached(RUN_BEFORE_STARTING);
         let runner_start = cardinal::os::start_time_s(runner_pid).unwrap();
 
         let parent_pid = parent.id();
-        parent.kill();
+        parent.kill_leader();
         wait_orphaned(runner_pid, parent_pid);
         env.points.release(RUN_BEFORE_STARTING);
         wait_gone(runner_pid, runner_start);
@@ -101,7 +97,7 @@ fn parent_exit_after_the_spawn_stops_the_group() {
         grandchild_file.display()
     );
     let runner = env.run_at(None, &["sh", "-c", &script], &[RUN_AFTER_SPAWN], None);
-    let mut parent = ChildGuard::new(env.in_shell(&runner, "; exit $?").spawn().unwrap());
+    let mut parent = env.in_shell(&runner, "; exit $?").spawn().unwrap();
     let runner_pid = env.wait_any_reached(RUN_AFTER_SPAWN);
     let _group = GroupGuard(runner_pid);
     let runner_start = cardinal::os::start_time_s(runner_pid).unwrap();
@@ -116,7 +112,7 @@ fn parent_exit_after_the_spawn_stops_the_group() {
     let grandchild_start = cardinal::os::start_time_s(grandchild).unwrap();
     let child = env.reservations()[0].child.unwrap();
 
-    parent.kill();
+    parent.kill_leader();
     let killed_at = Instant::now();
     env.points.release(RUN_AFTER_SPAWN);
 
@@ -164,7 +160,7 @@ fn parent_exit_after_the_child_exited_stops_its_descendants() {
         pids.display()
     );
     let runner = env.run_at(None, &["sh", "-c", &script], &[RUN_AFTER_SPAWN], None);
-    let mut parent = ChildGuard::new(env.in_shell(&runner, "; exit $?").spawn().unwrap());
+    let mut parent = env.in_shell(&runner, "; exit $?").spawn().unwrap();
     let runner_pid = env.wait_any_reached(RUN_AFTER_SPAWN);
     let _group = GroupGuard(runner_pid);
     let runner_start = cardinal::os::start_time_s(runner_pid).unwrap();
@@ -176,7 +172,7 @@ fn parent_exit_after_the_child_exited_stops_its_descendants() {
     wait_gone(child.pid, child.start_s);
 
     let parent_pid = parent.id();
-    parent.kill();
+    parent.kill_leader();
     wait_orphaned(runner_pid, parent_pid);
     env.points.release(RUN_AFTER_SPAWN);
 
@@ -204,10 +200,10 @@ fn a_stopped_runner_cancels_once_continued_and_leaves_its_group_alone() {
         let job = StoppedJob::start(&env, path, Caller::Anchored, "");
         let sibling = job.member.expect("an anchored group has a stopped member");
         wait_for("the sibling to stop", WAIT, || {
-            stopped(&env, sibling).then_some(())
+            is_stopped(sibling).then_some(())
         });
 
-        kill_pid(job.parent);
+        PidGuard::new(job.parent).kill();
         wait_orphaned(job.runner, job.parent);
         // Long enough for anything that watches the parent to act.
         std::thread::sleep(Duration::from_secs(1));
@@ -217,18 +213,18 @@ fn a_stopped_runner_cancels_once_continued_and_leaves_its_group_alone() {
             ("stage", job.stage),
         ] {
             assert!(
-                stopped(&env, pid),
+                is_stopped(pid),
                 "{path}: the {what} stays stopped; {}",
-                job.layout(&env)
+                job.layout()
             );
         }
         // The runner only. It stays stopped until this signal, so the PID is still its own.
         signal_process(job.runner, SIGCONT).unwrap();
         job.wait_cancelled(&env, path);
         assert!(
-            stopped(&env, sibling),
+            is_stopped(sibling),
             "{path}: the sibling stays stopped; {}",
-            job.layout(&env)
+            job.layout()
         );
     }
 }
@@ -242,21 +238,20 @@ fn orphaning_a_stopped_runner_cancels_its_stage() {
     for path in ["fail_open", "tty"] {
         let env = Env::with_budget(1);
         let job = StoppedJob::start(&env, path, Caller::Session, "trap '' HUP; ");
-        kill_pid(job.parent);
+        PidGuard::new(job.parent).kill();
         job.wait_cancelled(&env, path);
     }
 }
 
-/// The session the runner's parent shell runs in, always a session of its own: the parent
-/// leads a group of its own, as a job-control shell gives a job, and its parent leads the
-/// session.
+/// The session the runner's parent shell runs in, always a session of its own: a job-control
+/// shell leads the session and gives the parent a group of its own, as it gives a job.
 #[derive(Clone, Copy)]
 enum Caller {
-    /// The session leader also starts a stopped member in the parent's group. That member's
-    /// parent, the session leader, is in another group of the session, so the group does not
-    /// become orphaned when the parent exits. A member whose parent is this test would not do
-    /// on every host: when this test runs in launchd's session, macOS orphans the group once
-    /// the runner, adopted by launchd, exits.
+    /// The job is a pipeline whose second command, a stopped `sleep`, stays in the parent's
+    /// group. That member's parent, the session leader, is in another group of the session, so
+    /// the group does not become orphaned when the parent exits. A member whose parent is this
+    /// test would not do on every host: when this test runs in launchd's session, macOS
+    /// orphans the group once the runner, adopted by launchd, exits.
     Anchored,
     /// Once the parent exits, no member of the group has a parent in another group of the
     /// session, so the group becomes orphaned wherever the runner is adopted (a container's
@@ -278,7 +273,7 @@ struct StoppedJob {
     /// The stopped member of the caller's group on [`Caller::Anchored`].
     member: Option<u32>,
     _group: GroupGuard,
-    _caller: ChildGuard,
+    _caller: Child,
     _pty: Pty,
 }
 
@@ -292,47 +287,31 @@ impl StoppedJob {
         let fail = (path == "fail_open").then_some(RUN_BEFORE_STARTING);
         let runner = env.run_at(None, &["sh", "-c", &script], &[], fail);
         let parent = env.in_shell(&runner, "; exit $?");
-        let argv = std::iter::once(parent.get_program())
-            .chain(parent.get_args())
-            .map(|arg| arg.to_str().unwrap().to_owned())
-            .collect();
         let member_file = env.file("member");
-        let mut lead = support::helper::command(&match caller {
-            Caller::Anchored => Mode::AnchorGroup {
-                argv,
-                member: member_file.clone(),
-            },
-            Caller::Session => Mode::LeadGroup { argv },
-        });
-        lead.envs(
-            parent
-                .get_envs()
-                .filter_map(|(key, value)| Some((key, value?))),
-        );
-        let mut leader = match caller {
-            // The helper leads the session and starts the parent.
-            Caller::Anchored => {
-                env.isolate(&mut lead);
-                lead
-            }
-            // A shell leads the session, and the helper becomes the parent by `exec`: a
-            // session leader cannot lead a new group.
-            Caller::Session => env.in_shell(&lead, "; exit $?"),
+        // bash without startup files leads the session; `set -m` gives the job, started in the
+        // background so the shell never hands it a terminal, a group of its own. The parent's
+        // stdout is /dev/null, as is the leader's.
+        let job = match caller {
+            Caller::Anchored => format!(
+                "set -m; \"$0\" \"$@\" >/dev/null | sleep 60 & \
+                 kill -STOP $!; echo $! > '{}'; exec sleep 60",
+                member_file.display()
+            ),
+            Caller::Session => "set -m; \"$0\" \"$@\" >/dev/null & wait $!".to_owned(),
         };
-        // SAFETY: `setsid` is async-signal-safe.
-        unsafe {
-            leader.pre_exec(|| {
-                rustix::process::setsid()?;
-                Ok(())
-            });
-        }
+        let mut leader = env.in_worktree("bash");
+        leader
+            .args(["--norc", "--noprofile", "-c", &job])
+            .arg(parent.get_program())
+            .args(parent.get_args())
+            .copy_env(&parent)
+            .new_session()
+            .stdout(Stdio::null());
         let pty = Pty::open();
         if path == "tty" {
             leader.stdin(pty.stdin());
         }
-        // The helper's test harness prints its banner.
-        leader.stdout(Stdio::null());
-        let leader = ChildGuard::new(leader.spawn().unwrap());
+        let leader = leader.spawn().unwrap();
         let stage: u32 = wait_for("the stage PID", WAIT, || {
             std::fs::read_to_string(&pid_file).ok()?.trim().parse().ok()
         });
@@ -340,13 +319,22 @@ impl StoppedJob {
         let parent = cardinal::os::parent_pid(runner).unwrap();
         let group = GroupGuard(parent);
         assert_eq!(cardinal::os::unix::pgid_of(runner), Some(parent), "{path}");
+        assert_eq!(
+            cardinal::os::parent_pid(parent),
+            Some(leader.id()),
+            "{path}"
+        );
         let member = matches!(caller, Caller::Anchored).then(|| {
             wait_for("the member PID", WAIT, || {
-                std::fs::read_to_string(&member_file).ok()?.parse().ok()
+                std::fs::read_to_string(&member_file)
+                    .ok()?
+                    .trim()
+                    .parse()
+                    .ok()
             })
         });
         wait_for("the runner to stop", WAIT, || {
-            stopped(env, runner).then_some(())
+            is_stopped(runner).then_some(())
         });
         Self {
             stage,
@@ -363,7 +351,7 @@ impl StoppedJob {
     }
 
     /// Each process's parent, group, session, and state, for a failure message.
-    fn layout(&self, env: &Env) -> String {
+    fn layout(&self) -> String {
         let mut processes = vec![
             ("test", std::process::id()),
             ("leader", self.leader),
@@ -382,7 +370,7 @@ impl StoppedJob {
                     "{what} {pid}: parent {:?}, group {:?}, session {session:?}, state {:?}",
                     cardinal::os::parent_pid(pid),
                     cardinal::os::unix::pgid_of(pid),
-                    state(env, pid),
+                    state(pid),
                 )
             })
             .collect::<Vec<_>>()
@@ -404,14 +392,13 @@ impl StoppedJob {
     }
 }
 
-/// Whether `pid` is stopped, from `ps`.
-fn stopped(env: &Env, pid: u32) -> bool {
-    state(env, pid).starts_with('T')
-}
-
-/// The state of `pid` as `ps` shows it; empty when the process is gone.
-fn state(env: &Env, pid: u32) -> String {
-    let mut ps = env.isolated("ps");
-    ps.args(["-o", "stat=", "-p", &pid.to_string()]);
-    String::from_utf8_lossy(output(&mut ps).stdout.trim_ascii()).into_owned()
+/// `pid`'s state, for a failure message.
+fn state(pid: u32) -> &'static str {
+    if is_stopped(pid) {
+        "stopped"
+    } else if cardinal::os::start_time_s(pid).is_some() {
+        "running"
+    } else {
+        "gone"
+    }
 }

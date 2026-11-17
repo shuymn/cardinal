@@ -6,11 +6,11 @@
 mod runner_support;
 mod support;
 
+#[cfg(unix)]
+use cardinal_test_support::process::{GroupGuard, PidGuard, wait_for_file};
 use runner_support::Env;
 #[cfg(unix)]
-use runner_support::{GroupGuard, WAIT, output, wait_gone};
-#[cfg(unix)]
-use support::helper::ChildGuard;
+use runner_support::{WAIT, output, wait_gone};
 
 #[test]
 fn helper() {
@@ -101,10 +101,10 @@ fn runner_killed_before_starting_runs_the_stage_zero_times() {
         None,
     );
     let after = format!("; echo $? > '{}'", status_file.display());
-    let mut shell = ChildGuard::new(env.in_shell(&runner, &after).spawn().unwrap());
+    let mut shell = env.in_shell(&runner, &after).spawn().unwrap();
     let runner = env.wait_any_reached(cardinal::testpoint::RUN_BEFORE_STARTING);
-    support::helper::kill_pid(runner);
-    assert_eq!(shell.child().wait().unwrap().code(), Some(0));
+    PidGuard::new(runner).kill();
+    assert_eq!(shell.wait().unwrap().code(), Some(0));
     assert_eq!(
         std::fs::read_to_string(&status_file).unwrap().trim(),
         "137",
@@ -135,16 +135,15 @@ fn runner_killed_after_spawn_never_reruns_the_stage() {
             started.display()
         ),
     ];
-    let mut runner = ChildGuard::new(
-        env.run_at(
+    let mut runner = env
+        .run_at(
             None,
             &args(&stage),
             &[cardinal::testpoint::RUN_AFTER_SPAWN],
             None,
         )
         .spawn()
-        .unwrap(),
-    );
+        .unwrap();
     env.points
         .wait_reached(cardinal::testpoint::RUN_AFTER_SPAWN, runner.id(), WAIT);
     let _group = GroupGuard(runner.id());
@@ -153,10 +152,10 @@ fn runner_killed_after_spawn_never_reruns_the_stage() {
         .expect("running records the child");
     runner.kill();
     assert_eq!(
-        std::os::unix::process::ExitStatusExt::signal(&runner.child().wait().unwrap()),
+        std::os::unix::process::ExitStatusExt::signal(&runner.wait().unwrap()),
         Some(9)
     );
-    support::helper::wait_for_file(&started, WAIT);
+    wait_for_file(&started, WAIT);
     wait_gone(child.pid, child.start_s);
     assert_eq!(env.lines("counter"), ["run"], "one run, never repeated");
     let finished = env.records_of(cardinal::contract::RecordKind::JobFinished);

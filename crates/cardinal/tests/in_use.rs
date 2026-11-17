@@ -15,8 +15,9 @@ use cardinal::contract::RecordKind;
 use cardinal::testpoint::{
     ADMISSION_RESERVED, ADMISSION_WAITING, INUSE_WAITING, RUN_AFTER_SPAWN, RUN_BEFORE_STARTING,
 };
-use runner_support::{Env, Pty, WAIT, spec};
-use support::helper::{ChildGuard, wait_for_file};
+use cardinal_test_support::process::wait_for_file;
+use cardinal_test_support::pty::Pty;
+use runner_support::{Env, WAIT, spec};
 
 #[test]
 fn helper() {
@@ -44,11 +45,10 @@ fn args(stage: &[String]) -> Vec<&str> {
 fn waiting_and_running_jobs_block_act() {
     let env = Env::with_budget(1);
     let mut full = env.hold_budget(1);
-    let mut runner = ChildGuard::new(
-        env.run_at(None, &["true"], &[ADMISSION_WAITING, RUN_AFTER_SPAWN], None)
-            .spawn()
-            .unwrap(),
-    );
+    let mut runner = env
+        .run_at(None, &["true"], &[ADMISSION_WAITING, RUN_AFTER_SPAWN], None)
+        .spawn()
+        .unwrap();
     env.points
         .wait_reached(ADMISSION_WAITING, runner.id(), WAIT);
     assert!(
@@ -77,7 +77,7 @@ fn waiting_and_running_jobs_block_act() {
     assert!(worktree.protected);
 
     env.points.release(RUN_AFTER_SPAWN);
-    assert_eq!(runner.child().wait().unwrap().code(), Some(0));
+    assert_eq!(runner.wait().unwrap().code(), Some(0));
     assert!(env.worktree_lock_free());
     assert!(!in_use(&env.state(), &env.worktree_key()).unwrap().value);
 }
@@ -90,17 +90,16 @@ fn act_lock_delays_the_stage() {
     let act = env.hold_worktree_exclusive();
     let counter = env.file("counter");
     let script = format!("echo run >> '{}'", counter.display());
-    let mut runner = ChildGuard::new(
-        env.run_at(None, &["sh", "-c", &script], &[INUSE_WAITING], None)
-            .spawn()
-            .unwrap(),
-    );
+    let mut runner = env
+        .run_at(None, &["sh", "-c", &script], &[INUSE_WAITING], None)
+        .spawn()
+        .unwrap();
     env.points.wait_reached(INUSE_WAITING, runner.id(), WAIT);
     env.points.release(INUSE_WAITING);
     std::thread::sleep(std::time::Duration::from_millis(200));
     assert_eq!(env.lines("counter"), Vec::<String>::new());
     drop(act);
-    assert_eq!(runner.child().wait().unwrap().code(), Some(0));
+    assert_eq!(runner.wait().unwrap().code(), Some(0));
     assert_eq!(env.lines("counter"), ["run"]);
     assert_eq!(env.records_of(RecordKind::InUseUnprotected), []);
 }
@@ -114,23 +113,22 @@ fn unprotected_run_recorded() {
     let counter = env.file("counter");
     let script = format!("echo run >> '{}'", counter.display());
     let start = std::time::Instant::now();
-    let mut runner = ChildGuard::new(
-        env.run_at(
+    let mut runner = env
+        .run_at(
             Some(&spec(1, 400)),
             &["sh", "-c", &script],
             &[ADMISSION_RESERVED],
             None,
         )
         .spawn()
-        .unwrap(),
-    );
+        .unwrap();
     env.points
         .wait_reached(ADMISSION_RESERVED, runner.id(), WAIT);
     assert!(start.elapsed() >= std::time::Duration::from_millis(200));
     let worktree = env.reservations()[0].worktree.clone().unwrap();
     assert!(!worktree.protected);
     env.points.release(ADMISSION_RESERVED);
-    assert_eq!(runner.child().wait().unwrap().code(), Some(0));
+    assert_eq!(runner.wait().unwrap().code(), Some(0));
     assert_eq!(env.lines("counter"), ["run"]);
     let unprotected = env.records_of(RecordKind::InUseUnprotected);
     assert_eq!(unprotected.len(), 1);
@@ -159,11 +157,11 @@ fn held_on_fail_open_and_tty() {
         } else {
             command.stdin(Stdio::null());
         }
-        let mut runner = ChildGuard::new(command.spawn().unwrap());
+        let mut runner = command.spawn().unwrap();
         wait_for_file(&env.file("started"), WAIT);
         assert!(!env.worktree_lock_free(), "{path}");
         std::fs::write(env.file("go"), b"").unwrap();
-        assert_eq!(runner.child().wait().unwrap().code(), Some(0), "{path}");
+        assert_eq!(runner.wait().unwrap().code(), Some(0), "{path}");
         assert!(env.worktree_lock_free(), "{path}");
         let kind = if path == "tty" {
             RecordKind::TtyPassthrough
@@ -178,14 +176,14 @@ fn held_on_fail_open_and_tty() {
 #[test]
 fn outside_a_worktree_nothing_is_locked() {
     let env = Env::with_budget(1);
-    let mut command = env.run_at(None, &["true"], &[ADMISSION_RESERVED], None);
-    command.current_dir(env.file(""));
-    let mut runner = ChildGuard::new(command.spawn().unwrap());
+    let mut command = env.command_in(env.scope().root(), &["run", "--", "true"]);
+    env.points.apply(&mut command, &[ADMISSION_RESERVED], None);
+    let mut runner = command.spawn().unwrap();
     env.points
         .wait_reached(ADMISSION_RESERVED, runner.id(), WAIT);
     assert_eq!(env.reservations()[0].worktree, None);
     env.points.release(ADMISSION_RESERVED);
-    assert_eq!(runner.child().wait().unwrap().code(), Some(0));
+    assert_eq!(runner.wait().unwrap().code(), Some(0));
     assert_eq!(
         std::fs::read_dir(env.state().worktrees_dir())
             .unwrap()

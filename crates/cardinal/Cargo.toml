@@ -40,8 +40,8 @@ tempfile.workspace = true
 [target.'cfg(unix)'.dev-dependencies]
 # Reading a signal's disposition in a helper process, independently of the product.
 libc.workspace = true
-# Pseudo-terminals for the TTY passthrough tests.
-rustix = { workspace = true, features = ["pty"] }
+# Reading a stopped child's report, and the sessions of a test's processes.
+rustix.workspace = true
 
 [lints]
 workspace = true
