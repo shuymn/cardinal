@@ -26,6 +26,8 @@ pub enum Refusal {
     Keyword(String),
     #[error("`{0}` can change what later commands mean or trace them")]
     ChangesShell(String),
+    #[error("`{0}` holds the command text, which the rewrite changes")]
+    CommandText(String),
     #[error("command word `{0}` is not a literal")]
     NotLiteral(String),
     #[error("empty command before `{0}`")]
@@ -126,10 +128,9 @@ fn is_special_parameter(b: u8) -> bool {
 /// Parameters whose plain expansion keeps a stage unwrapped (section 7.2). The fallback
 /// test sets the status (`?`, zsh's `status`), the last argument (`_`), the pipeline
 /// statuses (`PIPESTATUS`, `pipestatus`), and, when the runner is missing, the error number
-/// (zsh's `ERRNO`); bash's `BASH_COMMAND` and the `-c` string (`BASH_EXECUTION_STRING`,
-/// `ZSH_EXECUTION_STRING`) hold command text the rewrite changes. The rest are computed per
-/// reference from the process, a clock, or a generator, so no two runs share them and no
-/// test can show that a rewrite keeps them.
+/// (zsh's `ERRNO`); bash's `BASH_COMMAND` holds the text of the command running, which
+/// the rewrite changes. The rest are computed per reference from the process, a clock, or a
+/// generator, so no two runs share them and no test can show that a rewrite keeps them.
 fn is_state_parameter(name: &str) -> bool {
     matches!(
         name,
@@ -139,8 +140,6 @@ fn is_state_parameter(name: &str) -> bool {
             | "pipestatus"
             | "ERRNO"
             | "BASH_COMMAND"
-            | "BASH_EXECUTION_STRING"
-            | "ZSH_EXECUTION_STRING"
             | "$"
             | "!"
             | "BASHPID"
@@ -150,6 +149,15 @@ fn is_state_parameter(name: &str) -> bool {
             | "EPOCHSECONDS"
             | "EPOCHREALTIME"
     )
+}
+
+/// Parameters that hold the whole `-c` string, which the rewrite of any stage changes: a
+/// command that reads one, in any stage, is not rewritten (section 7.2).
+const COMMAND_TEXT: [&str; 2] = ["BASH_EXECUTION_STRING", "ZSH_EXECUTION_STRING"];
+
+/// The parameter of [`COMMAND_TEXT`] that `text` names, if any.
+fn names_command_text(text: &str) -> Option<&'static str> {
+    COMMAND_TEXT.into_iter().find(|name| text.contains(name))
 }
 
 /// The length of a subscript that is a literal integer (`[0]`, `[-1]`) at the start of
@@ -527,6 +535,9 @@ impl<'a> Lexer<'a> {
                 return Ok(());
             }
         };
+        if COMMAND_TEXT.contains(&name) {
+            return Err(Refusal::CommandText(name.to_owned()));
+        }
         *literal = false;
         *state |= is_state_parameter(name);
         Ok(())
@@ -681,15 +692,20 @@ fn finish(
     };
     // The calling shell reads assignment words, and the arguments of its builtins, as names
     // or arithmetic (an integer variable's value, zsh's `printf %d`, `shift`, `[ … -eq … ]`),
-    // where an element assignment defines a function or an alias. It reads the arguments of
-    // other commands as text only.
+    // where an element assignment defines a function or an alias, and a name can read the
+    // command text. It reads the arguments of other commands as text only.
     let read_words = if runs.is_some_and(is_shell_command) {
         &builder.words[..]
     } else {
         &builder.words[..assignments]
     };
-    if let Some(word) = read_words.iter().find(|w| names_table_element(&w.bare)) {
-        return Err(Refusal::ChangesShell(command[word.span.clone()].to_owned()));
+    for word in read_words {
+        if names_table_element(&word.bare) {
+            return Err(Refusal::ChangesShell(command[word.span.clone()].to_owned()));
+        }
+        if let Some(name) = names_command_text(&word.bare) {
+            return Err(Refusal::CommandText(name.to_owned()));
+        }
     }
     Ok(Stage {
         index,

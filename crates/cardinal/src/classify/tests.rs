@@ -179,7 +179,6 @@ fn shell_state_and_newlines_are_flagged() {
         "t \"$status\"",
         "t ${status}",
         "t $BASH_COMMAND",
-        "t \"$BASH_EXECUTION_STRING\" $ZSH_EXECUTION_STRING",
         "t $ERRNO",
         // A literal integer subscript is plain; the parameter still decides.
         "t ${PIPESTATUS[0]}",
@@ -1117,6 +1116,38 @@ fn trace_of_another_classifier_has_no_profile_rule() {
         Some("unit/x")
     );
     assert_eq!(found[0].skip, None);
+}
+
+/// A command that reads the `-c` string in any stage is not rewritten: the rewrite of any
+/// stage changes it. A builtin can read it by name; other commands get the name as text.
+#[test]
+fn command_text_refuses_the_command() {
+    for command in [
+        "echo \"$BASH_EXECUTION_STRING\" | wc -c; make",
+        "make ${ZSH_EXECUTION_STRING}",
+        "X=$BASH_EXECUTION_STRING make",
+        "x=\"$ZSH_EXECUTION_STRING\"; make",
+        "make > \"$BASH_EXECUTION_STRING\"",
+        "declare -p BASH_EXECUTION_STRING; make",
+        "printf %d ZSH_EXECUTION_STRING",
+        "n=BASH_EXECUTION_STRING",
+    ] {
+        assert!(
+            matches!(tokenize(command), Err(Refusal::CommandText(_))),
+            "{command:?}: {:?}",
+            tokenize(command)
+        );
+    }
+    for command in [
+        "grep -r BASH_EXECUTION_STRING src",
+        "make '$ZSH_EXECUTION_STRING'",
+    ] {
+        assert!(
+            tokenize(command).is_ok(),
+            "{command:?}: {:?}",
+            tokenize(command)
+        );
+    }
 }
 
 /// The name of a table element in an argument of a command other than a builtin is text, so

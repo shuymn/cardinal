@@ -467,6 +467,21 @@ const CASES: &[Case] = &[
         0,
         0,
     ),
+    // The `-c` string holds the whole command, which the rewrite of any stage changes.
+    case(
+        "bash_execution_string",
+        "",
+        "echo \"$BASH_EXECUTION_STRING\" | wc -c; probe x",
+        0,
+        0,
+    ),
+    case(
+        "zsh_execution_string",
+        "",
+        "echo \"$ZSH_EXECUTION_STRING\" | wc -c; probe x",
+        0,
+        0,
+    ),
     // An operator can evaluate arithmetic that reads the fallback test's status (section
     // 7.2), so every expansion but a plain parameter refuses the command.
     case(
