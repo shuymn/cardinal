@@ -579,9 +579,10 @@ The built-in classifier implements `trait Classifier { fn classify(&self, req: &
 
 ### 8.1 Child processes for git and gh
 
-- **Constructed environment:** start empty and copy an allowlist: `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_*`, `TMPDIR`, `XDG_CONFIG_HOME`, `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`, `GIT_CONFIG_NOSYSTEM`, `GH_TOKEN`, `GITHUB_TOKEN`, `GH_HOST`, `GH_CONFIG_DIR`, `SSH_AUTH_SOCK`, and on Windows `SystemRoot`, `SystemDrive`, `ComSpec`, `PATHEXT`, `USERPROFILE`, `APPDATA`, `LOCALAPPDATA`, `ProgramData`, `TEMP`, `TMP`. Every other `GIT_*` (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_COMMON_DIR`, `GIT_OBJECT_DIRECTORY`, `GIT_NAMESPACE`, `GIT_CEILING_DIRECTORIES`, `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT`, …) is dropped, so a cardinal process started from a git hook can never act on another repository. Then add `GIT_OPTIONAL_LOCKS=0`, `GIT_TERMINAL_PROMPT=0`, `GH_PROMPT_DISABLED=1`, `GH_NO_UPDATE_NOTIFIER=1`, `NO_COLOR=1`. The `GIT_CONFIG_*` location variables stay because they decide where the owner's configuration lives, and git must read it the way the owner's git does (design §9).
-- **Always** `git --no-optional-locks -C <absolute path> …`, so `status` does not refresh and rewrite the index. Observation never runs `fetch` or anything else that writes to a repository; stale remote-tracking refs only make fewer worktrees look merged.
-- **Deadlines:** every child has one (`git_timeout_ms`, `gh_timeout_ms`). Output is read on threads; on the deadline the child is killed and the fact is `unknown`. Spawn failure, non-zero exit (where not meaningful), unparsable output, and timeouts all become `unknown`, never "safe".
+- **Constructed environment for git:** start empty and copy an allowlist: `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_*`, `TMPDIR`, `XDG_CONFIG_HOME`, `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`, `GIT_CONFIG_NOSYSTEM`, `GH_TOKEN`, `GITHUB_TOKEN`, `GH_HOST`, `GH_CONFIG_DIR`, `SSH_AUTH_SOCK`, and on Windows `SystemRoot`, `SystemDrive`, `ComSpec`, `PATHEXT`, `USERPROFILE`, `APPDATA`, `LOCALAPPDATA`, `ProgramData`, `TEMP`, `TMP`. Every other `GIT_*` (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_COMMON_DIR`, `GIT_OBJECT_DIRECTORY`, `GIT_NAMESPACE`, `GIT_CEILING_DIRECTORIES`, `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT`, …) is dropped, so a cardinal process started from a git hook can never act on another repository. Then add `GIT_OPTIONAL_LOCKS=0`, `GIT_TERMINAL_PROMPT=0`, `GH_PROMPT_DISABLED=1`, `GH_NO_UPDATE_NOTIFIER=1`, `NO_COLOR=1`. The `GIT_CONFIG_*` location variables stay because they decide where the owner's configuration lives, and git must read it the way the owner's git does (design §9).
+- **Constructed environment for gh:** built the same way from its own allowlist: `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_*`, `TMPDIR`, `XDG_CONFIG_HOME`, `GH_CONFIG_DIR`, the tokens gh authenticates with (`GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN`), and the Windows variables above, plus the same added variables. `GH_HOST`, `GH_REPO`, and every `GIT_*` are dropped, so gh asks exactly the host and repository observation names (section 8.2). The caller's `GH_HOST` only decides which origin hosts count as GitHub.
+- **Always** `git --no-optional-locks -c core.fsmonitor=false -C <absolute path> …`, so `status` does not refresh and rewrite the index, and a configured filesystem monitor does not start a daemon that writes inside `.git`. `observe::git` is the one function that runs git this way; `act` uses it too. Observation never runs `fetch` or anything else that writes to a repository; stale remote-tracking refs only make fewer worktrees look merged.
+- **Deadlines:** every child has one (`git_timeout_ms`, `gh_timeout_ms`). Output is read on threads; on the deadline the fact is `unknown`, also when the child exited but a descendant still holds its output open. On Unix each child leads its own process group, and the deadline or any other early exit kills the group and reaps the child, so no descendant survives. On Windows only the child is killed; a descendant can live on until it closes the pipe (phase 3 adds Job Objects). Spawn failure, non-zero exit (where not meaningful), unparsable output, and timeouts all become `unknown`, never "safe". A failed git or gh step of a worktree or its repository also makes that worktree's `observed` check fail, even when other evidence answers the fact.
 
 ### 8.2 Repositories and worktrees
 
@@ -590,9 +591,9 @@ Repositories to observe: the main worktrees of profiles with `match.paths`, plus
 | Fact | Command |
 | --- | --- |
 | Worktrees | `git worktree list --porcelain -z` (path, HEAD, branch, `locked`, `prunable`) |
-| GitHub repository | `git remote get-url origin`, parsed to `owner/name` for `github.com` (or `GH_HOST`); anything else makes PR facts `unknown` |
-| Base | `[git] base`, else `git symbolic-ref --short refs/remotes/origin/HEAD`; missing makes merge evidence `unknown` |
-| Open PRs | `gh pr list --repo O/N --state open --limit 500 --json number,headRefName,headRefOid,isCrossRepository,url`; exactly 500 results makes it `unknown` |
+| GitHub repository | `git remote get-url origin`, parsed to `HOST/OWNER/NAME` for `github.com` (or the caller's `GH_HOST`); anything else makes PR facts `unknown`. JSON shows `owner/name`; gh always gets `--repo HOST/OWNER/NAME` |
+| Base | `[git] base`, else `git symbolic-ref --short refs/remotes/origin/HEAD`; a base git reports missing makes merge evidence `unknown`, and git failing to answer is a failed step (section 8.1) |
+| Open PRs | `gh pr list --repo HOST/O/N --state open --limit 500 --json number,headRefName,headRefOid,isCrossRepository,url`; exactly 500 results makes it `unknown` |
 
 Per worktree:
 
@@ -602,8 +603,9 @@ Per worktree:
 | `has_upstream` | `# branch.upstream` header | detached HEAD: `no` |
 | `unpushed` | `git rev-list --count HEAD --not --remotes` | `0` → `no`; otherwise `yes`, unless merge evidence is `merged_pr` (the commits exist on GitHub) |
 | `base_ancestor` | `git merge-base --is-ancestor HEAD <base>` | exit 0 → `yes`, 1 → `no`, else `unknown` |
-| `merged_pr` (only if not a base ancestor) | `gh pr list --repo O/N --state merged --search <HEAD oid> --json number,headRefOid,mergedAt,url --limit 20` | `yes` if a returned PR has `headRefOid == HEAD` |
+| `merged_pr` (only if not a base ancestor) | `gh pr list --repo HOST/O/N --state merged --search <HEAD oid> --json number,headRefOid,mergedAt,url --limit 20` | `yes` if a returned PR has `headRefOid == HEAD`; a full page of 20 without one is `unknown` |
 | `open_pr` | from the repository's open PR list | `yes` if a same-repository PR has `headRefName == branch` or `headRefOid == HEAD` |
+| Tracked protected data, gitlinks | `git ls-files -z --stage` | a tracked path covered by a protected pattern fails `no_protected`; a gitlink (mode 160000) whose directory has its own `.git` entry fails `no_nested_repository`, with or without `.gitmodules` |
 
 Merge evidence is `base_ancestor` or `merged_pr`, matched on the HEAD object ID, never on the branch name. So commits added after a merged PR, or a reused branch name, give no evidence (C12). Squash merges without a matching head stay without evidence and are left to the arbiter (design §7).
 
@@ -611,11 +613,12 @@ Merge evidence is `base_ancestor` or `merged_pr`, matched on the HEAD object ID,
 
 Each `!` entry from `git status` is classified with the profile's `[data]` patterns:
 
-1. `protected` if the entry or anything below it matches a protected pattern (path patterns are checked by existence; name patterns by walking the entry);
-2. else `regenerable` if the entry is, or is inside, a regenerable match;
-3. else `unclassifiable`.
+1. `protected` if the entry, a directory it is inside, or anything below it (found by walking the entry) matches a protected pattern. Protected patterns match at any depth, a pattern with `/` as that sequence of components, so `fuzz/corpus` also protects `target/a/b/fuzz/corpus`; every module matches through `config::data_pattern_covers`;
+2. else `nested_repository` if a directory at or below the entry has its own `.git` entry;
+3. else `regenerable` if the entry is, or is inside, a regenerable match (a regenerable pattern with `/` is worktree-relative);
+4. else `unclassifiable`, also when the walk could not read part of the entry.
 
-Walks never follow symbolic links and never cross into a directory that contains its own `.git` entry, which is reported as a `nested_repository` instead.
+Walks never follow symbolic links and never cross into a directory that contains its own `.git` entry.
 
 ### 8.4 Managed worktrees
 
