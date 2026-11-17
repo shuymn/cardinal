@@ -10,7 +10,8 @@
 //! too. The first [`run`] in a process also makes a terminated process take its live
 //! children along (see `guard_termination`): on Unix it installs handlers for SIGTERM,
 //! SIGINT, and SIGHUP that end the process by the same signal, so a process that handles
-//! those signals itself must not use [`run`].
+//! those signals itself must not use [`run`]. When that fails, no child starts: this and
+//! every later [`run`] in the process return [`ChildError::Setup`].
 //!
 //! For short-lived callers only (a CLI command, a hook): a descendant that left the child's
 //! process group (`setsid`) is not killed, and a reader thread blocked on a pipe it holds
@@ -28,9 +29,13 @@ use std::path::Path;
 #[cfg(unix)]
 use std::process::Child;
 use std::process::{Command, ExitStatus, Stdio};
+#[cfg(windows)]
+use std::sync::Once;
+#[cfg(unix)]
+use std::sync::OnceLock;
+use std::sync::mpsc;
 #[cfg(unix)]
 use std::sync::{Mutex, MutexGuard, PoisonError};
-use std::sync::{Once, mpsc};
 use std::time::{Duration, Instant};
 
 /// Variables git children copy from the caller's environment (section 8.1). `LC_*` is
@@ -193,6 +198,12 @@ pub enum ChildError {
         program: String,
         source: std::io::Error,
     },
+    /// This process could not make sure its children end with it, so no child was started.
+    #[error("cannot start {program}: cannot set up signal handling: {source}")]
+    Setup {
+        program: String,
+        source: std::io::Error,
+    },
     #[error("{program} did not finish by its deadline")]
     Timeout { program: String },
     #[error("{program} wrote more than {limit} bytes to stdout or stderr")]
@@ -280,28 +291,38 @@ fn live() -> MutexGuard<'static, Vec<u32>> {
     LIVE.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Makes this process take its children along when it is terminated, once per process. On
-/// Unix, SIGTERM, SIGINT, and SIGHUP (unless ignored) kill every live child's process group,
-/// then end the process by the same signal with its default action. On Windows the process
-/// joins a job that kills its members when the process ends. Best effort: a failure leaves
-/// the default behaviour.
-fn guard_termination() {
-    static GUARD: Once = Once::new();
-    GUARD.call_once(|| {
-        #[cfg(unix)]
-        {
-            use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
+/// Makes this process take its children along when it is terminated, once per process:
+/// SIGTERM, SIGINT, and SIGHUP (unless ignored) kill every live child's process group, then
+/// end the process by the same signal with its default action. A failure installs no handler
+/// and is returned by this and every later call: signal-hook keeps a slot for a signal it
+/// once took, so a second attempt would not install its handler again.
+#[cfg(unix)]
+fn guard_termination() -> std::io::Result<()> {
+    use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
 
-            let _ = unix::watch_signals(&[SIGTERM, SIGINT, SIGHUP], |sig| {
+    static GUARD: OnceLock<Result<(), String>> = OnceLock::new();
+    GUARD
+        .get_or_init(|| {
+            unix::watch_signals(&[SIGTERM, SIGINT, SIGHUP], |sig| {
                 // Held until the process ends: no child starts or is reaped after this.
                 let live = live();
                 for &pgid in live.iter() {
                     crate::os::kill_process_group(pgid);
                 }
                 unix::die_by_signal(sig)
-            });
-        }
-        #[cfg(windows)]
+            })
+            .map_err(|err| err.to_string())
+        })
+        .clone()
+        .map_err(std::io::Error::other)
+}
+
+/// Makes this process take its children along when it ends, once per process: the process
+/// joins a job that kills its members when the process ends. Best effort.
+#[cfg(windows)]
+fn guard_termination() {
+    static GUARD: Once = Once::new();
+    GUARD.call_once(|| {
         windows::contain_self();
     });
 }
@@ -410,8 +431,30 @@ pub fn run(
     cwd: &Path,
     limits: Limits,
 ) -> Result<Output, ChildError> {
-    let program = program.as_ref();
+    #[cfg(unix)]
+    let guard = guard_termination;
+    #[cfg(windows)]
+    let guard = || {
+        guard_termination();
+        Ok(())
+    };
+    run_guarded(guard, program.as_ref(), args, env, cwd, limits)
+}
+
+/// [`run`], with `guard` run before the child is started.
+fn run_guarded(
+    guard: impl FnOnce() -> std::io::Result<()>,
+    program: &OsStr,
+    args: &[OsString],
+    env: &[(OsString, OsString)],
+    cwd: &Path,
+    limits: Limits,
+) -> Result<Output, ChildError> {
     let name = || program.to_string_lossy().into_owned();
+    guard().map_err(|source| ChildError::Setup {
+        program: name(),
+        source,
+    })?;
     let mut command = Command::new(program);
     command
         .args(args)
@@ -421,7 +464,6 @@ pub fn run(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .current_dir(cwd);
-    guard_termination();
     #[cfg(unix)]
     let mut live = live();
     let mut child = Reaper {
@@ -500,7 +542,7 @@ mod tests {
     use std::ffi::OsString;
     use std::time::{Duration, Instant};
 
-    use super::{ChildError, Limits, git_env, lookup, run};
+    use super::{ChildError, Limits, git_env, lookup, run, run_guarded};
 
     fn pairs(items: &[(&str, &str)]) -> Vec<(OsString, OsString)> {
         items
@@ -582,6 +624,24 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, ChildError::Spawn { .. }), "{err}");
+    }
+
+    /// A failed guard fails the run before the child is started: a missing program is not
+    /// even looked up.
+    #[test]
+    fn a_failed_guard_starts_no_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = run_guarded(
+            || Err(std::io::Error::other("no reader thread")),
+            "cardinal-no-such-program".as_ref(),
+            &[],
+            &[],
+            dir.path(),
+            limits(Duration::from_secs(5), 1024),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChildError::Setup { .. }), "{err}");
+        assert!(err.to_string().contains("no reader thread"), "{err}");
     }
 
     fn limits(timeout: Duration, max_output: u64) -> Limits {
