@@ -277,6 +277,20 @@ pub fn hostname() -> Option<String> {
     System::host_name().ok()
 }
 
+/// Sends SIGKILL to every process in the process group `pgid`. Returns whether the group
+/// existed. The caller must know the group is its own: a group ID is not reused while any
+/// member is alive, so it must still have members.
+#[cfg(unix)]
+pub fn kill_process_group(pgid: u32) -> bool {
+    let Some(group) = i32::try_from(pgid)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+    else {
+        return false;
+    };
+    rustix::process::kill_process_group(group, rustix::process::Signal::KILL).is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ProcessInfo, ProcessTable};
