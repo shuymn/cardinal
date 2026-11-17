@@ -2,82 +2,25 @@
 //! fake runner and probe tools that execute rewritten commands (`docs/architecture.md`
 //! section 13.5). A test crate declares `mod support;` and `mod hook_support;`.
 //!
-//! Every child a hook test starts gets a constructed environment and a work dir inside a
-//! fixture ([`Sandbox`]), never the environment or the directory the tests run in.
+//! Every child a hook test starts goes through `cardinal_test_support` (section 13.3): the
+//! hook through [`Dirs::cmd`], or [`cardinal`] in a directory of another scope, with a
+//! constructed environment and a working directory inside a scope, never the environment or
+//! the directory the tests run in.
 
 #![allow(
     dead_code,
     reason = "each test crate uses a different subset of the helpers"
 )]
 
-use std::ffi::OsStr;
-use std::ops::Deref;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::{Output, Stdio};
 
 use cardinal::contract::RunSpec;
+use cardinal_test_support::{Command, Scope};
 use serde_json::{Value, json};
 
 use crate::support::cardinal::Dirs;
-use crate::support::fixture::Fixture;
-
-/// cardinal's state and config dirs for a test, and a fixture whose constructed environment
-/// (`docs/architecture.md` section 13.3) and work dir every child of the test gets: nothing
-/// of the environment the tests run in reaches a child but `PATH` (and what Windows needs to
-/// start a program), so no `GIT_*`, `CLAUDE_*`, `CARDINAL_TEST_*`, or Bash timeout variable
-/// does; `HOME` and the git configuration are the fixture's; and the child starts in the
-/// fixture, so a hook that falls back to its own cwd never looks at the repository the tests
-/// run in.
-pub struct Sandbox {
-    dirs: Dirs,
-    fixture: Fixture,
-    work: PathBuf,
-}
-
-impl Sandbox {
-    pub fn new() -> Self {
-        let fixture = Fixture::new();
-        let work = fixture.root().join("work");
-        std::fs::create_dir_all(&work).expect("create the work dir");
-        Self {
-            dirs: Dirs::new(),
-            fixture,
-            work,
-        }
-    }
-
-    pub fn fixture(&self) -> &Fixture {
-        &self.fixture
-    }
-
-    /// The directory children start in, inside the fixture root.
-    pub fn work(&self) -> &Path {
-        &self.work
-    }
-
-    /// `program` started in the work dir with the constructed environment and the cardinal
-    /// dirs.
-    pub fn command(&self, program: impl AsRef<OsStr>) -> std::process::Command {
-        let mut command = self.fixture.command(program, &self.work);
-        command
-            .env("CARDINAL_STATE_DIR", self.dirs.state())
-            .env("CARDINAL_CONFIG_DIR", self.dirs.config());
-        command
-    }
-
-    /// `cardinal`, started as [`Sandbox::command`] starts a program. Shadows [`Dirs::cmd`],
-    /// which inherits the environment.
-    pub fn cmd(&self) -> assert_cmd::Command {
-        assert_cmd::Command::from_std(self.command(env!("CARGO_BIN_EXE_cardinal")))
-    }
-}
-
-impl Deref for Sandbox {
-    type Target = Dirs;
-
-    fn deref(&self) -> &Dirs {
-        &self.dirs
-    }
-}
 
 /// A runner path for tests that only look at the rewritten text.
 pub const RUNNER: &str = "/opt/cardinal/bin/cardinal";
@@ -134,14 +77,40 @@ pub fn input(command: &str, cwd: &Path) -> Value {
     })
 }
 
+/// `cardinal` in `dir` inside `scope`, with `dirs`' state and config dirs: for a hook that
+/// runs in a repository of a fixture.
+pub fn cardinal(scope: &Scope, dirs: &Dirs, dir: &Path) -> Command {
+    let mut command = scope.command(env!("CARGO_BIN_EXE_cardinal"), dir);
+    command
+        .env("CARDINAL_STATE_DIR", dirs.state())
+        .env("CARDINAL_CONFIG_DIR", dirs.config());
+    command
+}
+
+/// Runs `command` to completion with `stdin` written to its standard input and its stdout
+/// and stderr captured. A child that stops reading early (the hook at its input limit) cuts
+/// the write short.
+pub fn output_with_stdin(command: &mut Command, stdin: &[u8]) -> Output {
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start the child");
+    let mut pipe = child.stdin.take().expect("piped stdin");
+    let _ = pipe.write_all(stdin);
+    drop(pipe);
+    child.wait_with_output().expect("wait for the child")
+}
+
 /// Runs `cardinal hook claude pre-tool-use` with `input` on stdin. Asserts exit 0 and at
 /// most one line of output; returns the parsed output, `None` when it printed nothing.
-pub fn run_hook(mut command: assert_cmd::Command, input: &Value) -> Option<Value> {
-    let output = command
-        .args(["hook", "claude", "pre-tool-use"])
-        .write_stdin(serde_json::to_vec(input).expect("serialize the input"))
-        .output()
-        .expect("run the hook");
+pub fn run_hook(mut command: Command, input: &Value) -> Option<Value> {
+    command.args(["hook", "claude", "pre-tool-use"]);
+    let output = output_with_stdin(
+        &mut command,
+        &serde_json::to_vec(input).expect("serialize the input"),
+    );
     assert_eq!(output.status.code(), Some(0), "the hook exits 0");
     assert!(
         output.stderr.is_empty(),
@@ -190,9 +159,9 @@ pub fn executable(path: &Path, contents: &str) {
     }
 }
 
-/// A fake runner at `dir/fake-cardinal` that stands in for `cardinal run` until the real
-/// runner exists: it appends its argv to `log`, then executes the argv after `--`, as the
-/// runner does, in the same process.
+/// A fake runner at `dir/fake-cardinal` that stands in for `cardinal run` (the hook's
+/// integration gate, section 14.1, uses the real one): it appends its argv to `log`, then
+/// executes the argv after `--`, as the runner does, in the same process.
 pub fn fake_runner(dir: &Path, log: &Path) -> PathBuf {
     let path = dir.join("fake-cardinal");
     executable(
@@ -239,10 +208,4 @@ pub fn runner_path(path: &Path) -> String {
     cardinal::config::validate_runner(&text)
         .unwrap_or_else(|err| panic!("the temp dir cannot hold a runner path: {err}"));
     text
-}
-
-/// `cardinal` for `sandbox` ([`Sandbox::cmd`]); no Bash timeout variable is set, so specs get
-/// the documented defaults unless a test sets one.
-pub fn cmd(sandbox: &Sandbox) -> assert_cmd::Command {
-    sandbox.cmd()
 }

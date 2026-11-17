@@ -17,21 +17,22 @@ use std::time::Duration;
 use cardinal::contract::{Record, RecordKind};
 #[cfg(unix)]
 use cardinal::state::StateDir;
-use hook_support::{PROFILE, RUNNER, Sandbox, cmd, configure, host, input, run_hook};
+use hook_support::{PROFILE, RUNNER, configure, host, input, run_hook};
 #[cfg(unix)]
 use hook_support::{rewritten, specs};
 use serde_json::Value;
 #[cfg(unix)]
 use serde_json::json;
+use support::cardinal::Dirs;
 
 #[cfg(unix)]
-fn records(dirs: &Sandbox) -> Vec<Record> {
+fn records(dirs: &Dirs) -> Vec<Record> {
     let state = StateDir::open(dirs.state()).expect("open the state dir");
     cardinal::record::read_all(&state).expect("read records")
 }
 
-fn configured(extra_host: &str) -> Sandbox {
-    let dirs = Sandbox::new();
+fn configured(extra_host: &str) -> Dirs {
+    let dirs = Dirs::new();
     configure(&dirs, &host(RUNNER, extra_host), &[("generic", PROFILE)]);
     dirs
 }
@@ -43,7 +44,7 @@ fn configured(extra_host: &str) -> Sandbox {
 fn rewrite_takes_no_reservation() {
     let dirs = configured("");
     let doc = run_hook(
-        cmd(&dirs),
+        dirs.cmd(),
         &input(
             "cd sub && pnpm test 2>&1 | tail -5 || echo failed",
             Path::new("/w"),
@@ -73,7 +74,7 @@ fn spec_carries_the_call() {
     call["agent_id"] = json!("agent-7");
     call["tool_input"]["timeout"] = json!(5000);
     call["tool_input"]["run_in_background"] = json!(true);
-    let doc = run_hook(cmd(&dirs), &call).expect("a rewrite");
+    let doc = run_hook(dirs.cmd(), &call).expect("a rewrite");
     let found = specs(rewritten(&doc));
     assert_eq!(found.len(), 2);
     let (make, vitest) = (&found[0], &found[1]);
@@ -113,13 +114,13 @@ fn timeout_comes_from_the_environment() {
         .as_object_mut()
         .unwrap()
         .remove("timeout");
-    let mut command = cmd(&dirs);
+    let mut command = dirs.cmd();
     command.env("BASH_DEFAULT_TIMEOUT_MS", "200000");
     let doc = run_hook(command, &call).unwrap();
     assert_eq!(specs(rewritten(&doc))[0].timeout_ms, 200_000);
 
     call["tool_input"]["timeout"] = json!(900_000);
-    let mut command = cmd(&dirs);
+    let mut command = dirs.cmd();
     command.env("BASH_MAX_TIMEOUT_MS", "300000");
     let doc = run_hook(command, &call).unwrap();
     assert_eq!(specs(rewritten(&doc))[0].timeout_ms, 300_000);
@@ -135,7 +136,7 @@ fn other_fields_preserved() {
     call["tool_input"]["description"] = json!("Build ü \"quoted\"");
     call["tool_input"]["timeout"] = json!(1.5);
     call["tool_input"]["future_field"] = json!({"nested": [1, null, "x"], "flag": true});
-    let doc = run_hook(cmd(&dirs), &call).expect("a rewrite");
+    let doc = run_hook(dirs.cmd(), &call).expect("a rewrite");
     let output = doc["hookSpecificOutput"].as_object().unwrap();
     assert_eq!(
         output.keys().collect::<Vec<_>>(),
@@ -149,17 +150,6 @@ fn other_fields_preserved() {
     assert_eq!(doc.as_object().unwrap().len(), 1);
 }
 
-#[cfg(unix)]
-fn hook_process(dirs: &Sandbox) -> std::process::Command {
-    let mut command = dirs.command(env!("CARGO_BIN_EXE_cardinal"));
-    command
-        .args(["hook", "claude", "pre-tool-use"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    command
-}
-
 /// C5: a hook whose deadline passes after classification, while it rewrites and serializes
 /// the command, writes nothing and records why; the same input within the deadline is
 /// rewritten.
@@ -167,11 +157,11 @@ fn hook_process(dirs: &Sandbox) -> std::process::Command {
 #[test]
 fn deadline_no_rewrite() {
     use std::io::{Read, Write};
+    use std::process::Stdio;
 
-    use support::helper::ChildGuard;
     use support::testpoints::TestPoints;
 
-    let dirs = Sandbox::new();
+    let dirs = Dirs::new();
     configure(
         &dirs,
         &format!("[hook]\nrunner = \"{RUNNER}\"\ndeadline_ms = 300\n"),
@@ -179,11 +169,16 @@ fn deadline_no_rewrite() {
     );
     let call = serde_json::to_vec(&input("make", Path::new("/w"))).unwrap();
 
-    let points = TestPoints::new();
-    let mut command = hook_process(&dirs);
+    let points = TestPoints::new(dirs.scope());
+    let mut command = dirs.cmd();
+    command
+        .args(["hook", "claude", "pre-tool-use"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     points.apply(&mut command, &[cardinal::testpoint::HOOK_CLASSIFIED], None);
-    let mut child = ChildGuard::new(command.spawn().expect("start the hook"));
-    let mut stdin = child.child().stdin.take().unwrap();
+    let mut child = command.spawn().expect("start the hook");
+    let mut stdin = child.stdin.take().unwrap();
     stdin.write_all(&call).unwrap();
     drop(stdin);
     points.wait_reached(
@@ -195,13 +190,12 @@ fn deadline_no_rewrite() {
     points.release(cardinal::testpoint::HOOK_CLASSIFIED);
     let mut stdout = Vec::new();
     child
-        .child()
         .stdout
         .take()
         .unwrap()
         .read_to_end(&mut stdout)
         .unwrap();
-    let status = child.child().wait().unwrap();
+    let status = child.wait().unwrap();
     assert_eq!(status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&stdout), "", "past the deadline");
     let errors: Vec<Record> = records(&dirs)
@@ -212,13 +206,13 @@ fn deadline_no_rewrite() {
     assert_eq!(errors[0].data["reason"], "deadline_missed");
     assert_eq!(errors[0].session_id.as_deref(), Some("session-1"));
 
-    let control = Sandbox::new();
+    let control = Dirs::new();
     configure(
         &control,
         &format!("[hook]\nrunner = \"{RUNNER}\"\ndeadline_ms = 10000\n"),
         &[("generic", PROFILE)],
     );
-    assert!(run_hook(cmd(&control), &input("make", Path::new("/w"))).is_some());
+    assert!(run_hook(control.cmd(), &input("make", Path::new("/w"))).is_some());
 }
 
 /// A5: `auto` mode is not rewritten.
@@ -227,12 +221,12 @@ fn deadline_no_rewrite() {
 fn auto_mode_not_rewritten() {
     let dirs = configured("");
     let mut call = input("make", Path::new("/w"));
-    assert!(run_hook(cmd(&dirs), &call).is_some(), "control");
+    assert!(run_hook(dirs.cmd(), &call).is_some(), "control");
     call["permission_mode"] = json!("auto");
-    assert_eq!(run_hook(cmd(&dirs), &call), None);
+    assert_eq!(run_hook(dirs.cmd(), &call), None);
     for mode in ["default", "acceptEdits", "dontAsk", "bypassPermissions"] {
         call["permission_mode"] = json!(mode);
-        assert!(run_hook(cmd(&dirs), &call).is_some(), "{mode}");
+        assert!(run_hook(dirs.cmd(), &call).is_some(), "{mode}");
     }
 }
 
@@ -242,7 +236,7 @@ fn auto_mode_not_rewritten() {
 fn windows_not_rewritten() {
     let dirs = configured("");
     assert_eq!(
-        run_hook(cmd(&dirs), &input("make", Path::new("C:\\w"))),
+        run_hook(dirs.cmd(), &input("make", Path::new("C:\\w"))),
         None
     );
 }
@@ -259,17 +253,13 @@ mod never_blocks {
     use super::configured;
     #[cfg(unix)]
     use super::hook_support::host;
-    use super::hook_support::{PROFILE, RUNNER, Sandbox, cmd, configure, input, run_hook};
+    use super::hook_support::{PROFILE, RUNNER, configure, input, output_with_stdin, run_hook};
     #[cfg(unix)]
     use super::records;
+    use super::support::cardinal::Dirs;
 
-    fn raw(dirs: &Sandbox, stdin: Vec<u8>) {
-        let output = dirs
-            .cmd()
-            .args(["hook", "claude", "pre-tool-use"])
-            .write_stdin(stdin)
-            .output()
-            .unwrap();
+    fn raw(dirs: &Dirs, stdin: &[u8]) {
+        let output = output_with_stdin(dirs.cmd().args(["hook", "claude", "pre-tool-use"]), stdin);
         assert_eq!(output.status.code(), Some(0));
         assert_eq!(String::from_utf8_lossy(&output.stdout), "");
         assert_eq!(String::from_utf8_lossy(&output.stderr), "");
@@ -288,7 +278,7 @@ mod never_blocks {
             b"\xff\xfe".to_vec(),
             oversized,
         ] {
-            raw(&dirs, stdin);
+            raw(&dirs, &stdin);
         }
         for call in [
             json!({"tool_name": "Bash"}),
@@ -296,7 +286,7 @@ mod never_blocks {
             json!({"tool_name": "Bash", "tool_input": "make"}),
             json!({"tool_name": "Read", "tool_input": {"command": "make"}}),
         ] {
-            assert_eq!(run_hook(cmd(&dirs), &call), None, "{call}");
+            assert_eq!(run_hook(dirs.cmd(), &call), None, "{call}");
         }
         // Each input the hook cannot use leaves a record; another tool's call does not.
         #[cfg(unix)]
@@ -326,7 +316,7 @@ mod never_blocks {
             "",
         ] {
             assert_eq!(
-                run_hook(cmd(&dirs), &input(command, Path::new("/w"))),
+                run_hook(dirs.cmd(), &input(command, Path::new("/w"))),
                 None,
                 "{command:?}"
             );
@@ -336,21 +326,21 @@ mod never_blocks {
 
     #[test]
     fn disabled_hook() {
-        let dirs = Sandbox::new();
+        let dirs = Dirs::new();
         configure(
             &dirs,
             &format!("[hook]\nenabled = false\nrunner = \"{RUNNER}\"\n"),
             &[("generic", PROFILE)],
         );
-        assert_eq!(run_hook(cmd(&dirs), &input("make", Path::new("/w"))), None);
+        assert_eq!(run_hook(dirs.cmd(), &input("make", Path::new("/w"))), None);
     }
 
     #[cfg(unix)]
     #[test]
     fn invalid_config_is_recorded() {
-        let dirs = Sandbox::new();
+        let dirs = Dirs::new();
         configure(&dirs, "[hook]\ntypo = 1\n", &[("generic", PROFILE)]);
-        assert_eq!(run_hook(cmd(&dirs), &input("make", Path::new("/w"))), None);
+        assert_eq!(run_hook(dirs.cmd(), &input("make", Path::new("/w"))), None);
         let found = records(&dirs);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].kind, RecordKind::ConfigError);
@@ -370,10 +360,10 @@ mod never_blocks {
             "/opt/with space/cardinal",
             "/opt/$HOME/cardinal",
         ] {
-            let dirs = Sandbox::new();
+            let dirs = Dirs::new();
             configure(&dirs, &host(runner, ""), &[("generic", PROFILE)]);
             assert_eq!(
-                run_hook(cmd(&dirs), &input("make", Path::new("/w"))),
+                run_hook(dirs.cmd(), &input("make", Path::new("/w"))),
                 None,
                 "{runner}"
             );
@@ -387,15 +377,15 @@ mod never_blocks {
     #[cfg(unix)]
     #[test]
     fn directory_runner_is_recorded() {
-        let dirs = Sandbox::new();
-        let runner = dirs.fixture().root().join("cardinal");
+        let dirs = Dirs::new();
+        let runner = dirs.scope().path("cardinal");
         std::fs::create_dir(&runner).unwrap();
         configure(
             &dirs,
             &host(runner.to_str().unwrap(), ""),
             &[("generic", PROFILE)],
         );
-        assert_eq!(run_hook(cmd(&dirs), &input("make", Path::new("/w"))), None);
+        assert_eq!(run_hook(dirs.cmd(), &input("make", Path::new("/w"))), None);
         let found = records(&dirs);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].kind, RecordKind::ConfigError);
@@ -409,14 +399,14 @@ mod never_blocks {
 
     #[test]
     fn unusable_state_dir() {
-        let dirs = Sandbox::new();
+        let dirs = Dirs::new();
         configure(&dirs, "[hook]\ntypo = 1\n", &[("generic", PROFILE)]);
         let file = dirs.config().join("not-a-dir");
         std::fs::write(&file, b"").unwrap();
-        let mut command = cmd(&dirs);
+        let mut command = dirs.cmd();
         command.env("CARDINAL_STATE_DIR", &file);
         assert_eq!(run_hook(command, &input("make", Path::new("/w"))), None);
-        let mut command = cmd(&dirs);
+        let mut command = dirs.cmd();
         command.env("CARDINAL_STATE_DIR", "relative");
         assert_eq!(run_hook(command, &input("make", Path::new("/w"))), None);
     }
@@ -424,7 +414,7 @@ mod never_blocks {
     #[test]
     fn missing_config_and_state_locations() {
         let dirs = configured("");
-        let mut command = cmd(&dirs);
+        let mut command = dirs.cmd();
         command
             .env_remove("CARDINAL_CONFIG_DIR")
             .env_remove("CARDINAL_STATE_DIR")
@@ -439,8 +429,8 @@ mod never_blocks {
     #[test]
     fn injected_failure() {
         let dirs = configured("");
-        let points = super::support::testpoints::TestPoints::new();
-        let mut command = cmd(&dirs);
+        let points = super::support::testpoints::TestPoints::new(dirs.scope());
+        let mut command = dirs.cmd();
         command
             .env("CARDINAL_TEST_DIR", points.dir())
             .env("CARDINAL_TEST_FAIL", cardinal::testpoint::HOOK_CLASSIFIED);
@@ -450,49 +440,6 @@ mod never_blocks {
         assert_eq!(found[0].kind, RecordKind::HookError);
         assert_eq!(found[0].data["reason"], "failed");
     }
-}
-
-/// The children of these tests, the hook among them, get a constructed environment and
-/// start inside the fixture: nothing the tests run with (`GIT_*` from a git hook,
-/// `CLAUDE_*`, the Bash timeouts) reaches them but `PATH`.
-#[cfg(unix)]
-#[test]
-fn children_get_a_constructed_environment() {
-    let dirs = Sandbox::new();
-    let output = dirs.command("env").output().unwrap();
-    assert!(output.status.success());
-    let names: Vec<String> = String::from_utf8(output.stdout)
-        .unwrap()
-        .lines()
-        .filter_map(|line| Some(line.split_once('=')?.0.to_owned()))
-        .collect();
-    let allowed = [
-        "PATH",
-        "HOME",
-        "XDG_CONFIG_HOME",
-        "GIT_CONFIG_GLOBAL",
-        "GIT_CONFIG_NOSYSTEM",
-        "GIT_CEILING_DIRECTORIES",
-        "LC_ALL",
-        "CARDINAL_STATE_DIR",
-        "CARDINAL_CONFIG_DIR",
-    ];
-    for name in &names {
-        assert!(
-            allowed.contains(&name.as_str())
-                || name.starts_with("GIT_AUTHOR_")
-                || name.starts_with("GIT_COMMITTER_"),
-            "{name} reached the child"
-        );
-    }
-    let root = dirs.fixture().root();
-    let home = dirs.command("printenv").arg("HOME").output().unwrap();
-    assert!(Path::new(String::from_utf8(home.stdout).unwrap().trim()).starts_with(root));
-    let cwd = dirs.command("pwd").arg("-P").output().unwrap();
-    assert_eq!(
-        Path::new(String::from_utf8(cwd.stdout).unwrap().trim()),
-        dirs.work()
-    );
 }
 
 fn shipped_settings() -> Value {
@@ -608,11 +555,14 @@ mod repository {
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
+    use cardinal_test_support::Scope;
+    use cardinal_test_support::fixture::Fixture;
+    use cardinal_test_support::process::{PidGuard, wait_for};
+
     use super::hook_support::{
-        PROFILE, RUNNER, Sandbox, cmd, configure, executable, input, rewritten, run_hook, specs,
+        PROFILE, RUNNER, cardinal, configure, executable, input, rewritten, run_hook, specs,
     };
-    use super::support::fixture::Fixture;
-    use super::support::helper::PidGuard;
+    use super::support::cardinal::Dirs;
 
     const APP: &str = "[match]\nremotes = [\"github.com/o/app\"]\n[[rule]]\nid = \"build\"\ncommands = [\"make\"]\nclass = \"app-build\"\n";
 
@@ -644,18 +594,12 @@ mod repository {
     fn profile_matched_by_remote_ignores_inherited_git_vars() {
         let fixture = Fixture::new();
         let app = fixture.init("app");
-        fixture.git(
-            &app,
-            &["remote", "add", "origin", "https://github.com/o/app.git"],
-        );
+        fixture.remote_add_url(&app, "origin", "https://github.com/o/app.git");
         let decoy = fixture.init("decoy");
-        fixture.git(
-            &decoy,
-            &["remote", "add", "origin", "https://github.com/o/decoy.git"],
-        );
+        fixture.remote_add_url(&decoy, "origin", "https://github.com/o/decoy.git");
         std::fs::create_dir_all(app.join("sub")).unwrap();
 
-        let dirs = Sandbox::new();
+        let dirs = Dirs::new();
         let decoy_profile = APP
             .replace("o/app", "o/decoy")
             .replace("app-build", "decoy-build");
@@ -669,12 +613,7 @@ mod repository {
             ],
         );
         let run = |extra: &[(&str, &Path)]| {
-            let mut command = assert_cmd::Command::from_std(
-                fixture.command(env!("CARGO_BIN_EXE_cardinal"), &app),
-            );
-            command
-                .env("CARDINAL_STATE_DIR", dirs.state())
-                .env("CARDINAL_CONFIG_DIR", dirs.config());
+            let mut command = cardinal(fixture.scope(), &dirs, &app);
             for (name, value) in extra {
                 command.env(name, value);
             }
@@ -695,16 +634,16 @@ mod repository {
         );
         // Outside the matched repository only the generic profile applies.
         assert_eq!(
-            rule(run_hook(cmd(&dirs), &input("make", fixture.root()))).as_deref(),
+            rule(run_hook(dirs.cmd(), &input("make", fixture.root()))).as_deref(),
             Some("generic/build")
         );
     }
 
     #[test]
     fn profile_matched_by_path_needs_no_git() {
-        let dir = Fixture::new();
+        let dir = Scope::new();
         let repo = bare_dot_git(dir.root());
-        let dirs = Sandbox::new();
+        let dirs = Dirs::new();
         let app = format!(
             "[match]\npaths = [\"{}\"]\n[[rule]]\nid = \"build\"\ncommands = [\"make\"]\nclass = \"app-build\"\n",
             repo.display()
@@ -715,7 +654,7 @@ mod repository {
             &[("app", &app), ("generic", PROFILE)],
         );
         assert_eq!(
-            rule(run_hook(cmd(&dirs), &input("make", &repo.join("sub")))).as_deref(),
+            rule(run_hook(dirs.cmd(), &input("make", &repo.join("sub")))).as_deref(),
             Some("app/build")
         );
     }
@@ -724,7 +663,7 @@ mod repository {
     /// profiles that match without it.
     #[test]
     fn git_runs_only_when_needed_and_failures_fall_back() {
-        let dir = Fixture::new();
+        let dir = Scope::new();
         let repo = bare_dot_git(dir.root());
         let calls = dir.root().join("calls");
         let cases = [
@@ -746,7 +685,7 @@ mod repository {
                     calls.display()
                 ),
             );
-            let dirs = Sandbox::new();
+            let dirs = Dirs::new();
             configure(
                 &dirs,
                 &host(git.to_str().unwrap(), 10_000),
@@ -754,7 +693,7 @@ mod repository {
             );
             let _ = std::fs::remove_file(&calls);
             assert_eq!(
-                run_hook(cmd(&dirs), &input("ls | tail", &repo)),
+                run_hook(dirs.cmd(), &input("ls | tail", &repo)),
                 None,
                 "{name}"
             );
@@ -763,7 +702,7 @@ mod repository {
                 "{name}: git ran though no rule could match"
             );
             assert_eq!(
-                rule(run_hook(cmd(&dirs), &input("make", &repo))).as_deref(),
+                rule(run_hook(dirs.cmd(), &input("make", &repo))).as_deref(),
                 expected,
                 "{name}"
             );
@@ -777,21 +716,21 @@ mod repository {
                 "{name}"
             );
         }
-        let dirs = Sandbox::new();
+        let dirs = Dirs::new();
         configure(
             &dirs,
             &host("/nonexistent/git", 10_000),
             &[("app", APP), ("generic", PROFILE)],
         );
         assert_eq!(
-            rule(run_hook(cmd(&dirs), &input("make", &repo))).as_deref(),
+            rule(run_hook(dirs.cmd(), &input("make", &repo))).as_deref(),
             Some("generic/build"),
             "git that cannot start"
         );
     }
 
     fn pid_from(file: &Path) -> u32 {
-        super::support::helper::wait_for("the pid file", Duration::from_secs(10), || {
+        wait_for("the pid file", Duration::from_secs(10), || {
             std::fs::read_to_string(file).ok()?.trim().parse().ok()
         })
     }
@@ -799,7 +738,7 @@ mod repository {
     /// A git that outlives the deadline is killed and reaped, and the hook rewrites nothing.
     #[test]
     fn slow_git_is_killed_at_the_deadline() {
-        let dir = Fixture::new();
+        let dir = Scope::new();
         let repo = bare_dot_git(dir.root());
         let pid_file = dir.root().join("git.pid");
         let git = dir.root().join("git-slow");
@@ -810,17 +749,17 @@ mod repository {
                 pid_file.display()
             ),
         );
-        let dirs = Sandbox::new();
+        let dirs = Dirs::new();
         configure(
             &dirs,
             &host(git.to_str().unwrap(), DEADLINE_MS),
             &[("app", APP), ("generic", PROFILE)],
         );
         let start = Instant::now();
-        assert_eq!(run_hook(cmd(&dirs), &input("make", &repo)), None);
+        assert_eq!(run_hook(dirs.cmd(), &input("make", &repo)), None);
         assert!(start.elapsed() < Duration::from_secs(10));
         let pid = pid_from(&pid_file);
-        let _guard = PidGuard(pid);
+        let _guard = PidGuard::new(dirs.scope(), pid);
         assert!(
             cardinal::os::process(pid, cardinal::os::Detail::default()).is_none(),
             "git {pid} survived the hook"
@@ -834,7 +773,7 @@ mod repository {
     /// deadline.
     #[test]
     fn held_output_pipe_does_not_block_the_hook() {
-        let dir = Fixture::new();
+        let dir = Scope::new();
         let repo = bare_dot_git(dir.root());
         let pid_file = dir.root().join("grandchild.pid");
         let git = dir.root().join("git-detached");
@@ -845,15 +784,15 @@ mod repository {
                 pid_file.display()
             ),
         );
-        let dirs = Sandbox::new();
+        let dirs = Dirs::new();
         configure(
             &dirs,
             &host(git.to_str().unwrap(), DEADLINE_MS),
             &[("app", APP), ("generic", PROFILE)],
         );
         let start = Instant::now();
-        assert_eq!(run_hook(cmd(&dirs), &input("make", &repo)), None);
-        let _guard = PidGuard(pid_from(&pid_file));
+        assert_eq!(run_hook(dirs.cmd(), &input("make", &repo)), None);
+        let _guard = PidGuard::new(dirs.scope(), pid_from(&pid_file));
         assert!(start.elapsed() < Duration::from_secs(10));
     }
 }

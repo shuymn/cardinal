@@ -11,10 +11,10 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use hook_support::{PROFILE, configure, input};
+use cardinal_test_support::fixture::Fixture;
+use hook_support::{PROFILE, cardinal, configure, input, output_with_stdin};
 use serde_json::{Value, json};
 use support::cardinal::Dirs;
-use support::fixture::Fixture;
 
 /// A profile matched by the fixture's origin, so the hook runs git in the repository.
 const APP: &str = "[match]\nremotes = [\"github.com/o/app\"]\n[[rule]]\nid = \"test\"\ncommands = [\"probe\"]\nclass = \"app-test\"\n";
@@ -53,21 +53,8 @@ fn repository(fixture: &Fixture) -> PathBuf {
     fixture.commit_file(&repo, "sub/lib.txt", "lib\n", "add lib");
     std::fs::create_dir_all(repo.join("target/debug")).unwrap();
     std::fs::write(repo.join("target/debug/out.bin"), b"built").unwrap();
-    fixture.git(
-        &repo,
-        &["remote", "add", "origin", "https://github.com/o/app.git"],
-    );
+    fixture.remote_add_url(&repo, "origin", "https://github.com/o/app.git");
     repo
-}
-
-/// `cardinal` started in `dir` with the fixture's constructed environment.
-fn cardinal(fixture: &Fixture, dirs: &Dirs, dir: &Path) -> assert_cmd::Command {
-    let mut command =
-        assert_cmd::Command::from_std(fixture.command(env!("CARGO_BIN_EXE_cardinal"), dir));
-    command
-        .env("CARDINAL_STATE_DIR", dirs.state())
-        .env("CARDINAL_CONFIG_DIR", dirs.config());
-    command
 }
 
 fn end_input(event: &str, cwd: &Path) -> Value {
@@ -98,7 +85,7 @@ fn hooks_write_nothing_in_the_repository() {
     let before = listing(&repo);
 
     let doc = hook_support::run_hook(
-        cardinal(&fixture, &dirs, &repo.join("sub")),
+        cardinal(fixture.scope(), &dirs, &repo.join("sub")),
         &input("probe x", &repo.join("sub")),
     );
     if cfg!(windows) {
@@ -116,12 +103,12 @@ fn hooks_write_nothing_in_the_repository() {
         ("SubagentStop", "subagent-stop"),
         ("SessionEnd", "session-end"),
     ] {
-        cardinal(&fixture, &dirs, &repo)
-            .args(["hook", "claude", name])
-            .write_stdin(end_input(event, &repo).to_string())
-            .assert()
-            .success()
-            .stdout("");
+        let output = output_with_stdin(
+            cardinal(fixture.scope(), &dirs, &repo).args(["hook", "claude", name]),
+            end_input(event, &repo).to_string().as_bytes(),
+        );
+        assert_eq!(output.status.code(), Some(0), "{name}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "", "{name}");
     }
 
     assert_eq!(listing(&repo), before);
@@ -136,15 +123,14 @@ fn hooks_write_nothing_in_the_repository() {
 }
 
 /// A rewritten command whose stages write nothing runs in the repository and leaves it
-/// unchanged; the runner ran (with the fake runner of section 13.5 until the real one
-/// exists).
+/// unchanged; the runner ran (the fake runner of section 13.5).
 #[cfg(unix)]
 #[test]
 fn rewritten_command_writes_nothing_in_the_repository() {
     let fixture = Fixture::new();
     let repo = repository(&fixture);
-    let tools = tempfile::tempdir().unwrap();
-    let bin = dunce::canonicalize(tools.path()).unwrap();
+    let bin = fixture.path("bin");
+    std::fs::create_dir_all(&bin).unwrap();
     let log = bin.join("runner.log");
     hook_support::probe(&bin);
     let runner = hook_support::runner_path(&hook_support::fake_runner(&bin, &log));
@@ -155,8 +141,11 @@ fn rewritten_command_writes_nothing_in_the_repository() {
         &[("app", APP), ("generic", PROFILE)],
     );
     let command = "cd sub && probe --err x 2>&1 | tail -5 || echo failed; probe --env > /dev/null";
-    let doc = hook_support::run_hook(cardinal(&fixture, &dirs, &repo), &input(command, &repo))
-        .expect("a rewrite");
+    let doc = hook_support::run_hook(
+        cardinal(fixture.scope(), &dirs, &repo),
+        &input(command, &repo),
+    )
+    .expect("a rewrite");
     let rewritten = hook_support::rewritten(&doc);
     let before = listing(&repo);
 

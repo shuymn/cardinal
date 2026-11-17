@@ -3,9 +3,9 @@
 //! once as written and once as the hook rewrote it, and the two runs must agree on stdout,
 //! stderr, exit status, the final cwd, and the environment. Claims C5 and C6 (section 16).
 //!
-//! Until the real runner exists, a fake runner that executes its argv after `--` stands in
-//! (`hook_support::fake_runner`); the integration gate repeats these cases with
-//! `cardinal run`.
+//! A fake runner that executes its argv after `--` stands in for `cardinal run`
+//! (`hook_support::fake_runner`); the hook's integration gate repeats these cases with the
+//! real runner.
 
 #![cfg(unix)]
 
@@ -15,13 +15,14 @@ mod support;
 use std::path::PathBuf;
 use std::process::Stdio;
 
+use cardinal_test_support::Scope;
 use hook_support::{
-    PROFILE, Sandbox, configure, executable, fake_runner, host, input, probe, rewritten, run_hook,
+    PROFILE, configure, executable, fake_runner, host, input, probe, rewritten, run_hook,
     runner_path,
 };
 use proptest::prelude::{Just, Strategy, prop, prop_assert_eq, prop_oneof, proptest};
 use proptest::test_runner::Config as ProptestConfig;
-use support::fixture::Fixture;
+use support::cardinal::Dirs;
 
 /// Printed by the outer shell after the command: its status, its cwd (what Claude Code
 /// keeps for the next call), and its exported environment.
@@ -46,31 +47,26 @@ fn find(name: &str) -> Option<PathBuf> {
         .find(|path| path.is_file())
 }
 
-/// `bash` and `zsh` where installed, `sh` always, checked in `fixture`.
-fn shells(fixture: &Fixture) -> Vec<Shell> {
+/// `bash` and `zsh` where installed, `sh` always, checked in `scope`.
+fn shells(scope: &Scope) -> Vec<Shell> {
     let options: [(&'static str, &'static [&'static str]); 2] =
         [("bash", &["--norc", "--noprofile"]), ("zsh", &["-f"])];
     let mut found: Vec<Shell> = options
         .into_iter()
-        .filter_map(|(name, options)| Some(shell(fixture, name, options, find(name)?)))
+        .filter_map(|(name, options)| Some(shell(scope, name, options, find(name)?)))
         .collect();
-    found.push(shell(
-        fixture,
-        "sh",
-        &[],
-        find("sh").expect("sh is on PATH"),
-    ));
+    found.push(shell(scope, "sh", &[], find("sh").expect("sh is on PATH")));
     found
 }
 
 fn shell(
-    fixture: &Fixture,
+    scope: &Scope,
     name: &'static str,
     options: &'static [&'static str],
     path: PathBuf,
 ) -> Shell {
-    let pipefail = fixture
-        .command(&path, fixture.root())
+    let pipefail = scope
+        .command(&path, scope.root())
         .args(options)
         .args(["-c", "set -o pipefail"])
         .stdout(Stdio::null())
@@ -93,23 +89,23 @@ struct Outcome {
     status: Option<i32>,
 }
 
-/// A test bench in a fixture, whose constructed environment the shells get: tools in
-/// `bin/`, a fake runner, the shells, and two configurations whose runner path is the fake
-/// runner (`present`) or a path that does not exist (`missing`).
+/// A test bench in a scope, whose constructed environment the shells get: tools in `bin/`, a
+/// fake runner, the shells, and two configurations whose runner path is the fake runner
+/// (`present`) or a path that does not exist (`missing`).
 struct Bench {
-    fixture: Fixture,
+    scope: Scope,
     bin: PathBuf,
     log: PathBuf,
     runner: String,
     shells: Vec<Shell>,
-    present: Sandbox,
-    missing: Sandbox,
+    present: Dirs,
+    missing: Dirs,
 }
 
 impl Bench {
     fn new() -> Self {
-        let fixture = Fixture::new();
-        let root = fixture.root();
+        let scope = Scope::new();
+        let root = scope.root();
         let bin = root.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         let log = root.join("runner.log");
@@ -119,14 +115,14 @@ impl Bench {
         probe(&bin.join("tools"));
         executable(&bin.join("npx"), "#!/bin/sh\nexec \"$@\"\n");
         let runner = runner_path(&fake_runner(&bin, &log));
-        let present = Sandbox::new();
+        let present = Dirs::new();
         configure(&present, &host(&runner, ""), &[("generic", PROFILE)]);
-        let missing = Sandbox::new();
+        let missing = Dirs::new();
         let absent = runner_path(&root.join("absent").join("cardinal"));
         configure(&missing, &host(&absent, ""), &[("generic", PROFILE)]);
-        let shells = shells(&fixture);
+        let shells = shells(&scope);
         Self {
-            fixture,
+            scope,
             bin,
             log,
             runner,
@@ -139,7 +135,7 @@ impl Bench {
     /// Everything a command can change: generated commands `cd ..` at most four times from
     /// the work dir, so they stay inside it.
     fn play(&self) -> PathBuf {
-        self.fixture.root().join("play")
+        self.scope.path("play")
     }
 
     fn work(&self) -> PathBuf {
@@ -148,8 +144,8 @@ impl Bench {
 
     /// The command as the hook rewrites it with `dirs`' configuration; unchanged when the
     /// hook prints nothing.
-    fn rewrite(&self, dirs: &Sandbox, command: &str) -> String {
-        run_hook(hook_support::cmd(dirs), &input(command, &self.work()))
+    fn rewrite(&self, dirs: &Dirs, command: &str) -> String {
+        run_hook(dirs.cmd(), &input(command, &self.work()))
             .map_or_else(|| command.to_owned(), |doc| rewritten(&doc).to_owned())
     }
 
@@ -177,7 +173,7 @@ impl Bench {
         )
         .unwrap();
         let output = self
-            .fixture
+            .scope
             .command(&shell.path, &work)
             .args(shell.options)
             .arg("-c")
@@ -744,12 +740,12 @@ const CASES: &[Case] = &[
 ];
 
 /// Runs every case in every shell with `dirs`' rewrite and compares it with the original.
-fn check(bench: &Bench, dirs: &Sandbox, expect_calls: bool) {
+fn check(bench: &Bench, dirs: &Dirs, expect_calls: bool) {
     check_after(bench, dirs, expect_calls, || {});
 }
 
 /// [`check`], with `change` applied after the hook rewrote every case and before any runs.
-fn check_after(bench: &Bench, dirs: &Sandbox, expect_calls: bool, change: impl FnOnce()) {
+fn check_after(bench: &Bench, dirs: &Dirs, expect_calls: bool, change: impl FnOnce()) {
     let shells = &bench.shells;
     let rewrites: Vec<String> = CASES
         .iter()
