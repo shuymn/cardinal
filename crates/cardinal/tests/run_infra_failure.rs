@@ -66,12 +66,11 @@ fn unknown_status_exits_125_with_one_line() {
     let stage = stage(&env, 3);
     let args: Vec<&str> = stage.iter().map(String::as_str).collect();
     let runner = env.run(None, &args);
-    let mut ignoring = std::process::Command::new("perl");
+    let mut ignoring = env.isolated("perl");
     ignoring
         .args(["-e", "$SIG{CHLD} = 'IGNORE'; exec @ARGV or die"])
         .arg(runner.get_program())
-        .args(runner.get_args())
-        .current_dir(env.worktree());
+        .args(runner.get_args());
     for (key, value) in runner.get_envs() {
         match value {
             Some(value) => ignoring.env(key, value),

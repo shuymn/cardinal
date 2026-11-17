@@ -75,8 +75,8 @@ fn no_output_added() {
         "-c",
         "printf 'out\\n'; printf 'err\\n' >&2; printf 'tail'; exit 3",
     ];
-    let mut direct = std::process::Command::new(stage[0]);
-    direct.args(&stage[1..]).current_dir(env.worktree());
+    let mut direct = env.isolated(stage[0]);
+    direct.args(&stage[1..]);
     let direct = output(&mut direct);
     assert_eq!(direct.status.code(), Some(3));
 

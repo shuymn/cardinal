@@ -2,6 +2,11 @@
 //! test points, and a worktree; fake reservations that fill the budget; and guards that kill
 //! what a test started, by PID.
 //!
+//! Every child a test starts runs in the worktree with the fixture's constructed environment
+//! (`docs/architecture.md` section 13.3), so neither the runner nor a stage sees the caller's
+//! `HOME`, git configuration, or `GIT_*` variables. Dropping an [`Env`] kills every process
+//! whose working directory is still inside it and asserts that none is left.
+//!
 //! A test crate declares `mod support; mod runner_support;`.
 
 #![allow(
@@ -9,30 +14,29 @@
     reason = "each test crate uses a different subset of the helpers"
 )]
 
-use std::path::PathBuf;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+use crate::support::cardinal::Dirs;
+use crate::support::fixture::Fixture;
+use crate::support::helper::wait_for;
+use crate::support::testpoints::TestPoints;
 use cardinal::contract::{
     AdmissionResult, GroupIdentity, Priority, ProcessIdentity, Record, RecordKind, Reservation,
     ReservationSchema, ReservationState, RunSpec, RunSpecSchema,
 };
 use cardinal::state::{self, FileLock, LockMode, StateDir};
-use tempfile::TempDir;
-
-use crate::support::cardinal::Dirs;
-use crate::support::helper::wait_for;
-use crate::support::testpoints::TestPoints;
 
 pub const WAIT: Duration = Duration::from_secs(20);
 
-/// A state dir, a config dir, a test-point dir, and a worktree (a directory with a `.git`
-/// directory, outside any repository; no git runs).
+/// A state dir, a config dir, a test-point dir, and a fixture holding a worktree (a directory
+/// with a `.git` directory, outside any repository; no git runs).
 pub struct Env {
     pub dirs: Dirs,
     pub points: TestPoints,
-    _work: TempDir,
-    work: PathBuf,
+    fixture: Fixture,
 }
 
 impl Env {
@@ -40,18 +44,13 @@ impl Env {
     pub fn new(host_toml: &str) -> Self {
         let dirs = Dirs::new();
         std::fs::write(dirs.config().join("host.toml"), host_toml).expect("write host.toml");
-        let work_dir = tempfile::Builder::new()
-            .prefix("cardinal-work-")
-            .tempdir()
-            .expect("create the work dir");
-        let work = dunce::canonicalize(work_dir.path()).expect("canonical work dir");
-        std::fs::create_dir_all(work.join("wt/.git")).expect("create the worktree");
-        std::fs::create_dir_all(work.join("wt/sub")).expect("create a subdirectory");
+        let fixture = Fixture::new();
+        std::fs::create_dir_all(fixture.root().join("wt/.git")).expect("create the worktree");
+        std::fs::create_dir_all(fixture.root().join("wt/sub")).expect("create a subdirectory");
         Self {
             dirs,
             points: TestPoints::new(),
-            _work: work_dir,
-            work,
+            fixture,
         }
     }
 
@@ -65,7 +64,7 @@ impl Env {
 
     /// The canonical worktree root.
     pub fn worktree(&self) -> PathBuf {
-        self.work.join("wt")
+        self.fixture.root().join("wt")
     }
 
     /// The worktree's in-use key.
@@ -75,26 +74,45 @@ impl Env {
 
     /// A path in the work dir, outside the worktree: counters, logs, flags.
     pub fn file(&self, name: &str) -> PathBuf {
-        self.work.join(name)
+        self.fixture.root().join(name)
     }
 
     pub fn state(&self) -> StateDir {
         StateDir::open(self.dirs.state()).expect("open the state dir")
     }
 
-    /// `cardinal ARGS…` in the worktree, with its own state and config dirs, stdin from
-    /// /dev/null, and no test points.
+    /// `program` in the worktree with the constructed environment and stdin from /dev/null.
+    pub fn isolated(&self, program: impl AsRef<OsStr>) -> Command {
+        let mut command = self.fixture.command(program, &self.worktree());
+        command.stdin(Stdio::null());
+        command
+    }
+
+    /// Gives a command built elsewhere the constructed environment, keeping the variables it
+    /// set itself, and runs it in the worktree.
+    pub fn isolate(&self, command: &mut Command) {
+        let own: Vec<_> = command
+            .get_envs()
+            .map(|(key, value)| (key.to_owned(), value.map(OsStr::to_owned)))
+            .collect();
+        command.env_clear().envs(self.fixture.env());
+        for (key, value) in own {
+            match value {
+                Some(value) => command.env(key, value),
+                None => command.env_remove(key),
+            };
+        }
+        command.current_dir(self.worktree());
+    }
+
+    /// `cardinal ARGS…` as [`Env::isolated`], with its own state and config dirs and no test
+    /// points.
     pub fn command(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_cardinal"));
+        let mut command = self.isolated(env!("CARGO_BIN_EXE_cardinal"));
         command
             .args(args)
-            .current_dir(self.worktree())
             .env("CARDINAL_STATE_DIR", self.dirs.state())
-            .env("CARDINAL_CONFIG_DIR", self.dirs.config())
-            .env_remove("CARDINAL_TEST_DIR")
-            .env_remove("CARDINAL_TEST_PAUSE")
-            .env_remove("CARDINAL_TEST_FAIL")
-            .stdin(Stdio::null());
+            .env("CARDINAL_CONFIG_DIR", self.dirs.config());
         command
     }
 
@@ -124,16 +142,14 @@ impl Env {
     }
 
     /// `inner` run by `sh -c '"$0" "$@"<after>'`: the shell is the runner's parent, waits for
-    /// it, and can report its status. The environment and cwd are `inner`'s.
+    /// it, and can report its status. The environment is `inner`'s.
     pub fn in_shell(&self, inner: &Command, after: &str) -> Command {
-        let mut shell = Command::new("sh");
+        let mut shell = self.isolated("sh");
         shell
             .arg("-c")
             .arg(format!("\"$0\" \"$@\"{after}"))
             .arg(inner.get_program())
-            .args(inner.get_args())
-            .current_dir(self.worktree())
-            .stdin(Stdio::null());
+            .args(inner.get_args());
         for (key, value) in inner.get_envs() {
             match value {
                 Some(value) => shell.env(key, value),
@@ -236,6 +252,54 @@ impl Env {
     pub fn lines(&self, name: &str) -> Vec<String> {
         std::fs::read_to_string(self.file(name))
             .map_or_default(|text| text.lines().map(str::to_owned).collect())
+    }
+}
+
+impl Drop for Env {
+    fn drop(&mut self) {
+        let left = stop_processes_in(self.fixture.root());
+        if !std::thread::panicking() {
+            assert_eq!(
+                left,
+                Vec::<u32>::new(),
+                "processes left in {}",
+                self.fixture.root().display()
+            );
+        }
+    }
+}
+
+/// The live processes, other than this one, whose working directory is inside `root`.
+fn processes_in(root: &Path) -> Vec<u32> {
+    let detail = cardinal::os::Detail {
+        cwd: true,
+        ..cardinal::os::Detail::default()
+    };
+    let Ok(table) = cardinal::os::ProcessTable::snapshot(detail) else {
+        return Vec::new();
+    };
+    let me = std::process::id();
+    table
+        .iter()
+        .filter(|p| p.pid != me && !p.zombie)
+        .filter(|p| p.cwd.as_deref().is_some_and(|cwd| cwd.starts_with(root)))
+        .map(|p| p.pid)
+        .collect()
+}
+
+/// Kills, by PID, every process working inside `root` until none is left (at most 5 s), and
+/// returns the ones still there.
+fn stop_processes_in(root: &Path) -> Vec<u32> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let left = processes_in(root);
+        if left.is_empty() || Instant::now() >= deadline {
+            return left;
+        }
+        for &pid in &left {
+            crate::support::helper::kill_pid(pid);
+        }
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -344,37 +408,49 @@ pub fn since(start: Instant) -> Duration {
     start.elapsed()
 }
 
-/// Kills, by PID, every process of a process group the test caused to exist, when dropped.
-/// Never touches this test's own group.
+/// Kills, by PID, every process of a process group the test caused to exist, when dropped,
+/// and asserts that none is left. Never touches this test's own group.
 #[cfg(unix)]
 pub struct GroupGuard(pub u32);
 
 #[cfg(unix)]
 impl Drop for GroupGuard {
     fn drop(&mut self) {
-        kill_group(self.0);
+        let left = kill_group(self.0);
+        if !std::thread::panicking() {
+            assert_eq!(
+                left,
+                Vec::<u32>::new(),
+                "members of group {} are left",
+                self.0
+            );
+        }
     }
 }
 
-/// Kills every live member of group `pgid` by PID until none is left (at most 2 s).
+/// Kills every live member of group `pgid` by PID until none is left (at most 2 s), and
+/// returns the ones still there.
 #[cfg(unix)]
-pub fn kill_group(pgid: u32) {
+pub fn kill_group(pgid: u32) -> Vec<u32> {
     let me = std::process::id();
     if cardinal::os::unix::pgid_of(me) == Some(pgid) {
-        return;
+        return Vec::new();
     }
     let deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline {
+    loop {
         let Ok(table) = cardinal::os::ProcessTable::snapshot(cardinal::os::Detail::default())
         else {
-            return;
+            return Vec::new();
         };
-        let members = cardinal::os::unix::group_members(&table, pgid);
-        if members.is_empty() {
-            return;
+        let members: Vec<u32> = cardinal::os::unix::group_members(&table, pgid)
+            .iter()
+            .map(|m| m.pid)
+            .collect();
+        if members.is_empty() || Instant::now() >= deadline {
+            return members;
         }
-        for member in members {
-            crate::support::helper::kill_pid(member.pid);
+        for &pid in &members {
+            crate::support::helper::kill_pid(pid);
         }
         std::thread::sleep(Duration::from_millis(20));
     }

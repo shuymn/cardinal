@@ -299,6 +299,7 @@ mod real {
     fn previous_boot_released() {
         let env = Env::with_budget(1);
         let mut command = helper::command(&Mode::Sleep);
+        env.isolate(&mut command);
         command.process_group(0);
         let mut process = ChildGuard::new(command.spawn().unwrap());
         let pid = process.id();

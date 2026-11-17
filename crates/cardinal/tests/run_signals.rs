@@ -19,18 +19,18 @@ fn helper() {
     support::helper::run_if_requested();
 }
 
-/// `bash -c` (or `sh -c` without bash) running `inner; :`, so the shell reports a signal death
-/// of `inner` instead of exec'ing it.
-fn shell() -> &'static str {
-    if Command::new("bash")
-        .arg("-c")
-        .arg(":")
-        .status()
-        .is_ok_and(|s| s.success())
-    {
-        "bash"
+/// `bash --norc --noprofile` (or `sh` without bash) in the worktree, isolated; it runs
+/// `inner; echo …`, so it reports a signal death of `inner` instead of exec'ing it.
+fn shell(env: &Env) -> Command {
+    let bash = || {
+        let mut bash = env.isolated("bash");
+        bash.args(["--norc", "--noprofile"]);
+        bash
+    };
+    if bash().args(["-c", ":"]).status().is_ok_and(|s| s.success()) {
+        bash()
     } else {
-        "sh"
+        env.isolated("sh")
     }
 }
 
@@ -41,19 +41,14 @@ fn same_signal_death() {
     let runner_path = runner.get_program().to_str().unwrap().to_owned();
     for (signal, name, expected) in [("TERM", "Terminated", 143), ("KILL", "Killed", 137)] {
         let stage = format!("sh -c 'kill -{signal} $$'");
-        let direct = output(
-            Command::new(shell())
-                .args(["-c", &format!("{stage}; echo status=$?")])
-                .current_dir(env.worktree()),
-        );
+        let direct = output(shell(&env).args(["-c", &format!("{stage}; echo status=$?")]));
         let through = output(
-            Command::new(shell())
+            shell(&env)
                 .args([
                     "-c",
                     &format!("\"$0\" run -- {stage}; echo status=$?"),
                     &runner_path,
                 ])
-                .current_dir(env.worktree())
                 .env("CARDINAL_STATE_DIR", env.dirs.state())
                 .env("CARDINAL_CONFIG_DIR", env.dirs.config()),
         );

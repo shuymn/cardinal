@@ -172,6 +172,7 @@ fn no_arbiter() {
     let env = &isolation.env;
     // A live group with no recorded child: recovery-needed and never signalled.
     let mut group = helper::command(&Mode::Sleep);
+    env.isolate(&mut group);
     group.process_group(0);
     let mut group = ChildGuard::new(group.spawn().unwrap());
     let pgid = group.id();
