@@ -11,6 +11,11 @@
 //! children along (see `guard_termination`): on Unix it installs handlers for SIGTERM,
 //! SIGINT, and SIGHUP that end the process by the same signal, so a process that handles
 //! those signals itself must not use [`run`].
+//!
+//! For short-lived callers only (a CLI command, a hook): a descendant that left the child's
+//! process group (`setsid`) is not killed, and a reader thread blocked on a pipe it holds
+//! open outlives a [`ChildError::Timeout`] until that descendant closes the pipe or the
+//! process ends. A long-lived caller would collect such threads.
 
 #[cfg(unix)]
 mod unix;
