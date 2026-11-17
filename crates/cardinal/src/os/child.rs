@@ -951,7 +951,7 @@ mod tests {
     }
 
     /// The constructed git environment from this process, which carries the variables `cmd`
-    /// and `powershell` need.
+    /// needs.
     #[cfg(windows)]
     fn windows_env() -> Vec<(OsString, OsString)> {
         git_env(std::env::vars_os())
