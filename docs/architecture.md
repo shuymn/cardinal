@@ -912,7 +912,7 @@ These names are reserved and not registered in phase 0 (an unregistered command 
 | `rand`, `uuid`, `getrandom` | Skip | `RandomState` plus exclusive creation gives unique IDs |
 | `chrono`, `time`, `jiff` | Skip | All times are integer milliseconds |
 | `walkdir`, `ignore` | Skip | `read_dir` recursion is enough; git reports ignored entries |
-| `shlex`, `conch-parser`, `brush-parser` | Skip | Splitting words is not enough to find stage spans, and a full grammar accepts constructs whose stages cannot be wrapped safely; the subset tokenizer refuses what it cannot delimit |
+| `shlex`, `conch-parser`, `brush-parser` | Skip | `shlex` only splits words, and a parser such as `brush-parser` gives stage spans but not the safe-to-wrap policy, the caller-state analysis, zsh handling, or fail-open refusal, so a parser plus a whitelist would still need everything the subset tokenizer does |
 | `wait-timeout`, `duct` | Skip | `os::child`, with `try_wait` polling and reader threads, covers deadlines and output caps |
 | `tracing`, `log` | Skip | Records and `explain` are the diagnostics; hooks must not write to stderr |
 | `schemars` | Skip (phase 1 candidate) | Contract types in `contract` are the source of truth; generated JSON Schema files can follow when external units appear |
