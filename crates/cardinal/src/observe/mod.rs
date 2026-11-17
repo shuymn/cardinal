@@ -87,25 +87,8 @@ pub fn git<S: AsRef<OsStr>>(config: &Config, dir: &Path, args: &[S]) -> Result<O
     Observer::new(config).git(dir, args)
 }
 
-/// Where observation reads reservations: `admission` in the product, a fake in tests of
-/// observation alone.
-pub trait Reservations: Sync {
-    /// Every reservation with its derived state. Read-only.
-    fn list(&self, state: &StateDir) -> Result<Vec<ReservationView>, Error>;
-}
-
-/// [`Reservations`] from `admission::list_reservations`.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct AdmissionReservations;
-
-impl Reservations for AdmissionReservations {
-    fn list(&self, state: &StateDir) -> Result<Vec<ReservationView>, Error> {
-        admission::list_reservations(state)
-    }
-}
-
-/// Observation with its inputs: the configuration, the environment git and gh children are
-/// built from, and the reservation source.
+/// Observation with its inputs: the configuration and the environment git and gh children
+/// are built from. Reservations are read through `admission::list_reservations`.
 pub struct Observer<'a> {
     config: &'a Config,
     /// The environment of git children.
@@ -114,7 +97,6 @@ pub struct Observer<'a> {
     gh_env: Vec<(OsString, OsString)>,
     /// The caller's `GH_HOST`: a host besides `github.com` whose remotes are GitHub.
     gh_host: Option<String>,
-    reservations: &'a dyn Reservations,
 }
 
 /// Facts shared by every worktree of one inventory.
@@ -156,7 +138,7 @@ struct WorktreeResult {
 }
 
 impl<'a> Observer<'a> {
-    /// Observation with this process's environment and the admission reservations.
+    /// Observation with this process's environment.
     #[must_use]
     pub fn new(config: &'a Config) -> Self {
         Self {
@@ -164,7 +146,6 @@ impl<'a> Observer<'a> {
             env: Vec::new(),
             gh_env: Vec::new(),
             gh_host: None,
-            reservations: &AdmissionReservations,
         }
         .with_env(std::env::vars_os())
     }
@@ -178,13 +159,6 @@ impl<'a> Observer<'a> {
             .map(str::to_owned);
         self.env = child::git_env(inherited.iter().cloned());
         self.gh_env = child::gh_env(inherited);
-        self
-    }
-
-    /// Reads reservations from `reservations`.
-    #[must_use]
-    pub fn with_reservations(mut self, reservations: &'a dyn Reservations) -> Self {
-        self.reservations = reservations;
         self
     }
 
@@ -242,7 +216,7 @@ impl<'a> Observer<'a> {
         options: &InventoryOptions,
     ) -> Result<Inventory, Error> {
         let mut errors = Vec::new();
-        let shared = self.shared(state, options.sizes, &mut errors);
+        let shared = Self::shared(state, options.sizes, &mut errors);
         let host = Self::host_info(state, &mut errors);
 
         let mut repos: Vec<Repo> = Vec::new();
@@ -300,7 +274,7 @@ impl<'a> Observer<'a> {
                     format!("git does not list {} as a worktree", root.display()),
                 )
             })?;
-        let shared = self.shared(state, false, &mut Vec::new());
+        let shared = Self::shared(state, false, &mut Vec::new());
         let result = self.observe_one(&ctx, index, &shared);
         let mut repo = ctx.repo;
         if let Some(message) = result.gh_error {
@@ -313,20 +287,13 @@ impl<'a> Observer<'a> {
         })
     }
 
-    fn shared<'s>(
-        &self,
-        state: &'s StateDir,
-        sizes: bool,
-        errors: &mut Vec<ScopedError>,
-    ) -> Shared<'s> {
+    fn shared<'s>(state: &'s StateDir, sizes: bool, errors: &mut Vec<ScopedError>) -> Shared<'s> {
         // The process table is read before any git or gh child starts, so none of them can
         // be mistaken for a process working inside a worktree.
         let processes = ProcessTable::snapshot(Detail::all())
             .map_err(|err| errors.push(scoped("processes", err.to_string())))
             .ok();
-        let reservations = self
-            .reservations
-            .list(state)
+        let reservations = admission::list_reservations(state)
             .map_err(|err| errors.push(scoped("reservations", err.message)))
             .ok();
         Shared {

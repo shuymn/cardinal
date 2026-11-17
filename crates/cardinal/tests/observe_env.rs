@@ -208,10 +208,8 @@ fn gh_asks_the_origin_host() {
     env.push(("GH_HOST".into(), "evil.example.com".into()));
     env.push(("GH_REPO".into(), "evil/repo".into()));
     env.push(("GH_TOKEN".into(), "token".into()));
-    let reservations = observe_common::FakeReservations::none();
     let inv = cardinal::observe::Observer::new(&config)
         .with_env(env)
-        .with_reservations(&reservations)
         .inventory(
             &scene.state(),
             &cardinal::observe::InventoryOptions {
