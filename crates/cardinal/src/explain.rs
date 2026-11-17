@@ -3,7 +3,6 @@
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
 use crate::classify;
 use crate::config::{self, Config, Selection};
@@ -30,13 +29,93 @@ pub enum Subject {
     },
 }
 
+/// One stage's classification as the hook would see it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StageTrace {
+    pub response: ClassifyResponse,
+    /// The argv the rules were matched against (section 7.3).
+    pub normalized_argv: Vec<String>,
+    /// The `commands` entry of the rule that matched, as written.
+    pub pattern: Option<String>,
+    /// Where that rule is configured.
+    pub profile: Option<ProfileKey>,
+}
+
+/// A profile file and the key in it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProfileKey {
+    pub file: PathBuf,
+    pub key: String,
+}
+
+/// The classification `explain command` traces: the stages of a command, each stage's
+/// classification with what it matched, and the rewrite the hook would produce.
+pub trait Tracer {
+    /// The stages of `command`, or the refusal of the whole command (section 7.2).
+    fn stages(&self, command: &str) -> Result<Vec<classify::Stage>, Error>;
+    /// One stage's classification against the rules of `selection`.
+    fn trace(
+        &self,
+        request: &ClassifyRequest,
+        selection: &Selection<'_>,
+    ) -> Result<StageTrace, Error>;
+    /// The rewritten command for the classified stages and runner path, or the reasons the
+    /// command or its stages stay unwrapped.
+    fn rewrite(
+        &self,
+        command: &str,
+        classified: &[(&classify::Stage, StageTrace)],
+        runner: &Path,
+    ) -> Result<String, Vec<String>>;
+}
+
+/// The classification module. Stages come from `classify::find_stages`; the trace and the
+/// rewrite are the classification module's pure trace and rewrite functions, which the hook
+/// shares, and answer `not_implemented` and `rewrite_unavailable` until they are wired in.
+pub struct Classifier;
+
+impl Tracer for Classifier {
+    fn stages(&self, command: &str) -> Result<Vec<classify::Stage>, Error> {
+        classify::find_stages(command)
+    }
+
+    fn trace(
+        &self,
+        request: &ClassifyRequest,
+        selection: &Selection<'_>,
+    ) -> Result<StageTrace, Error> {
+        let _ = (request, selection);
+        Err(Error::not_implemented("classify::trace"))
+    }
+
+    fn rewrite(
+        &self,
+        command: &str,
+        classified: &[(&classify::Stage, StageTrace)],
+        runner: &Path,
+    ) -> Result<String, Vec<String>> {
+        let _ = (command, classified, runner);
+        Err(vec!["rewrite_unavailable".to_owned()])
+    }
+}
+
 /// `cardinal explain`.
 pub fn explain(config: &Config, state: &StateDir, subject: &Subject) -> Result<Explain, Error> {
+    explain_with(config, state, subject, &Classifier)
+}
+
+/// [`explain`] tracing commands through `tracer`.
+pub fn explain_with(
+    config: &Config,
+    state: &StateDir,
+    subject: &Subject,
+    tracer: &dyn Tracer,
+) -> Result<Explain, Error> {
     match subject {
         Subject::Job(id) => job(state, id),
         Subject::Plan(id) => plan(config, state, id),
         Subject::Inbox(key) => inbox_item(state, key),
-        Subject::Command { cwd, command } => command_trace(config, cwd.as_deref(), command),
+        Subject::Command { cwd, command } => command_trace(config, tracer, cwd.as_deref(), command),
     }
 }
 
@@ -308,13 +387,16 @@ fn inbox_item(state: &StateDir, key: &str) -> Result<Explain, Error> {
     ))
 }
 
-/// How long `explain command` gives each stage's classification.
-const CLASSIFY_DEADLINE: Duration = Duration::from_secs(2);
-
 /// `explain command [--cwd DIR] -- STRING`: the stages and their classification, without
-/// running anything. Profiles are selected by path; matching by remote needs git and is left
-/// to the hook.
-fn command_trace(config: &Config, cwd: Option<&Path>, command: &str) -> Result<Explain, Error> {
+/// running anything: for each wrapped stage, the rule, the pattern it matched, the normalized
+/// argv, and the profile key. Profiles are selected by path; matching by remote needs git and
+/// is left to the hook.
+fn command_trace(
+    config: &Config,
+    tracer: &dyn Tracer,
+    cwd: Option<&Path>,
+    command: &str,
+) -> Result<Explain, Error> {
     let cwd = match cwd {
         Some(cwd) => cwd.to_path_buf(),
         None => std::env::current_dir()
@@ -324,7 +406,7 @@ fn command_trace(config: &Config, cwd: Option<&Path>, command: &str) -> Result<E
     let common = root.as_deref().and_then(config::git_common_dir);
     let selection: Selection<'_> =
         config.select(|p| common.as_deref().is_some_and(|c| p.matches_common_dir(c)));
-    let stages = classify::find_stages(command)?;
+    let stages = tracer.stages(command)?;
     let mut sources = Vec::new();
     let mut classified = Vec::new();
     for stage in &stages {
@@ -351,28 +433,28 @@ fn command_trace(config: &Config, cwd: Option<&Path>, command: &str) -> Result<E
                 background: false,
             },
         };
-        let response =
-            classify::classify(&request, &selection, Instant::now() + CLASSIFY_DEADLINE)?;
-        if response.decision == ClassifyDecision::Wrap {
-            let rule = response.rule.clone().unwrap_or_default();
-            let pattern = selection
-                .rules()
-                .find(|(_, r)| r.qualified_id == rule)
-                .and_then(|(_, r)| r.patterns.first())
-                .map_or_else(String::new, |p| p.text.clone());
+        let trace = tracer.trace(&request, &selection)?;
+        if trace.response.decision == ClassifyDecision::Wrap {
             sources.push(ExplainSource::Rule {
-                rule,
-                pattern,
-                normalized_argv: request.argv.clone(),
+                rule: trace.response.rule.clone().unwrap_or_default(),
+                pattern: trace.pattern.clone().unwrap_or_default(),
+                normalized_argv: trace.normalized_argv.clone(),
             });
-            classified.push((stage, response));
+            if let Some(profile) = &trace.profile {
+                sources.push(ExplainSource::Config {
+                    file: profile.file.display().to_string(),
+                    key: profile.key.clone(),
+                    value: trace.pattern.clone().into(),
+                });
+            }
+            classified.push((stage, trace));
         }
     }
     let mut summary = format!("{} stages, {} classified", stages.len(), classified.len());
     let mut rewritten = None;
     if !classified.is_empty() {
         let runner = std::env::current_exe().unwrap_or_default();
-        match rewrite(command, &classified, &runner) {
+        match tracer.rewrite(command, &classified, &runner) {
             Ok(text) => rewritten = Some(text),
             Err(skips) => {
                 let _ = write!(summary, "; not rewritten: {}", skips.join(", "));
@@ -388,17 +470,4 @@ fn command_trace(config: &Config, cwd: Option<&Path>, command: &str) -> Result<E
     );
     doc.rewritten = rewritten;
     Ok(doc)
-}
-
-/// The hook's rewrite (sections 6.4 and 7.2): the command text, its classified stages, and the
-/// runner path in; the rewritten command, or the reasons it or its stages stay unwrapped, out.
-/// A stand-in until the classification module provides the function, which the hook and
-/// `explain` then share; until then every classified command reports `rewrite_unavailable`.
-fn rewrite(
-    command: &str,
-    classified: &[(&classify::Stage, ClassifyResponse)],
-    runner: &Path,
-) -> Result<String, Vec<String>> {
-    let _ = (command, classified, runner);
-    Err(vec!["rewrite_unavailable".to_owned()])
 }

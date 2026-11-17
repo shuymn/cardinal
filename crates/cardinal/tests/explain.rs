@@ -9,7 +9,7 @@ use cardinal::contract::{
     Caller, ErrorCode, ExplainKind, ExplainSource, IgnoredClass, InboxKind, InboxSubject, PlanKind,
     RecordKind, ResolutionOutcome,
 };
-use cardinal::explain::{Subject, explain};
+use cardinal::explain::{ProfileKey, StageTrace, Subject, Tracer, explain, explain_with};
 use cardinal::record::Recorder;
 use fakes::{Setup, arbiter, write};
 
@@ -216,4 +216,98 @@ fn cli_prints_an_explain_document() {
         .code(1);
     let doc: serde_json::Value = serde_json::from_slice(&assert.get_output().stdout).unwrap();
     assert_eq!(doc["error"]["code"], "not_found");
+}
+
+/// A profile whose rule lists another command first, with `npx` as a wrapper.
+const WEB_PROFILE: &str = "[classify]\nwrappers = [[\"npx\"]]\n\n[[rule]]\nid = \"test\"\ncommands = [\"cargo test\", \"vitest\"]\nclass = \"test\"\n";
+
+/// The classification of `npx vitest` under [`WEB_PROFILE`], as the classification module
+/// reports it: `npx` unwrapped, `vitest` matched.
+struct FakeTracer {
+    profile: std::path::PathBuf,
+}
+
+impl Tracer for FakeTracer {
+    fn stages(
+        &self,
+        command: &str,
+    ) -> Result<Vec<cardinal::classify::Stage>, cardinal::contract::Error> {
+        Ok(vec![cardinal::classify::Stage {
+            index: 0,
+            span: 0..command.len(),
+            words: command.split_whitespace().map(str::to_owned).collect(),
+        }])
+    }
+
+    fn trace(
+        &self,
+        request: &cardinal::contract::ClassifyRequest,
+        _: &cardinal::config::Selection<'_>,
+    ) -> Result<StageTrace, cardinal::contract::Error> {
+        assert_eq!(request.argv, ["npx", "vitest"]);
+        Ok(StageTrace {
+            response: cardinal::contract::ClassifyResponse {
+                schema: cardinal::contract::ClassifyResponseSchema,
+                decision: cardinal::contract::ClassifyDecision::Wrap,
+                class: Some("test".into()),
+                rule: Some("web/test".into()),
+                resources: None,
+                reason: "matched".into(),
+            },
+            normalized_argv: vec!["vitest".into()],
+            pattern: Some("vitest".into()),
+            profile: Some(ProfileKey {
+                file: self.profile.clone(),
+                key: "rule.test.commands".into(),
+            }),
+        })
+    }
+
+    fn rewrite(
+        &self,
+        command: &str,
+        classified: &[(&cardinal::classify::Stage, StageTrace)],
+        _: &std::path::Path,
+    ) -> Result<String, Vec<String>> {
+        assert_eq!(classified.len(), 1);
+        Ok(format!("wrapped: {command}"))
+    }
+}
+
+/// `explain command` reports what the classification matched: the normalized argv, the pattern
+/// that matched (not the rule's first one), and the profile key, with the rewrite.
+#[test]
+fn command_shows_what_matched() {
+    let s = Setup::new();
+    write(s.dirs.config(), "repos/web.toml", WEB_PROFILE);
+    let config = cardinal::config::Config::load(s.dirs.config()).unwrap();
+    let profile = s.dirs.config().join("repos/web.toml");
+    let tracer = FakeTracer {
+        profile: profile.clone(),
+    };
+    let subject = Subject::Command {
+        cwd: Some(s.main.clone()),
+        command: "npx vitest".into(),
+    };
+    let doc = explain_with(&config, &s.state, &subject, &tracer).unwrap();
+    assert_eq!(doc.subject.kind, ExplainKind::Command);
+    assert!(
+        doc.sources.contains(&ExplainSource::Rule {
+            rule: "web/test".into(),
+            pattern: "vitest".into(),
+            normalized_argv: vec!["vitest".into()],
+        }),
+        "{:#?}",
+        doc.sources
+    );
+    assert!(
+        doc.sources.contains(&ExplainSource::Config {
+            file: profile.display().to_string(),
+            key: "rule.test.commands".into(),
+            value: "vitest".into(),
+        }),
+        "{:#?}",
+        doc.sources
+    );
+    assert_eq!(doc.rewritten.as_deref(), Some("wrapped: npx vitest"));
 }
