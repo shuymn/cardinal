@@ -1,6 +1,7 @@
-//! Helpers shared by the hook tests: configuration, hook input, running the hook, and the
-//! fake runner and probe tools that execute rewritten commands (`docs/architecture.md`
-//! section 13.5). A test crate declares `mod support;` and `mod hook_support;`.
+//! Helpers shared by the hook tests: configuration, hook input, running the hook, the real
+//! runner and the probe tools that execute rewritten commands, and the jobs the runner
+//! started (`docs/architecture.md` section 13.5). A test crate declares `mod support;` and
+//! `mod hook_support;`.
 //!
 //! Every child a hook test starts goes through `cardinal_test_support` (section 13.3): the
 //! hook through [`Dirs::cmd`], or [`cardinal`] in a directory of another scope, with a
@@ -16,7 +17,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
 
-use cardinal::contract::RunSpec;
+use cardinal::contract::{Record, RecordKind, RunSpec};
+use cardinal::state::StateDir;
 use cardinal_test_support::{Command, Scope};
 use serde_json::{Value, json};
 
@@ -159,19 +161,38 @@ pub fn executable(path: &Path, contents: &str) {
     }
 }
 
-/// A fake runner at `dir/fake-cardinal` that stands in for `cardinal run` (the hook's
-/// integration gate, section 14.1, uses the real one): it appends its argv to `log`, then
-/// executes the argv after `--`, as the runner does, in the same process.
-pub fn fake_runner(dir: &Path, log: &Path) -> PathBuf {
-    let path = dir.join("fake-cardinal");
-    executable(
-        &path,
-        &format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = -- ]; then shift; break; fi\n  shift\ndone\nexec \"$@\"\n",
-            log.display()
-        ),
-    );
+/// `dir/cardinal`, a symbolic link to the `cardinal` binary under test: the real runner at a
+/// path the `[hook] runner` rule accepts wherever the build put the binary, which a test can
+/// replace with a file or a directory without touching the binary.
+#[cfg(unix)]
+pub fn real_runner(dir: &Path) -> PathBuf {
+    let path = dir.join("cardinal");
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_cardinal"), &path).expect("link the runner");
     path
+}
+
+/// The `job_started` records of the runs with the state dir `state`, one per runner that
+/// started its stage; none before the first run. Panics if a runner failed open or reported
+/// an infrastructure failure: these tests expect every run to be admitted.
+pub fn started_jobs(state: &Path) -> Vec<Record> {
+    if !state.exists() {
+        return Vec::new();
+    }
+    let state = StateDir::open(state).expect("open the state dir");
+    let records = cardinal::record::read_all(&state).expect("read records");
+    for record in &records {
+        assert!(
+            !matches!(
+                record.kind,
+                RecordKind::JobFailOpen | RecordKind::JobInfraFailure
+            ),
+            "{record:#?}"
+        );
+    }
+    records
+        .into_iter()
+        .filter(|r| r.kind == RecordKind::JobStarted)
+        .collect()
 }
 
 /// The test tool `probe` in `dir`: prints its arguments and its physical cwd; `--err` writes

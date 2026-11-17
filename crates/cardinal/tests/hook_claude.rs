@@ -64,6 +64,144 @@ fn rewrite_takes_no_reservation() {
     );
 }
 
+/// C1 with the real runner: a shell runs the rewrite, `cardinal run` starts the wrapped stage
+/// as an admitted job with the spec's rule, class, resources, and session, and the command
+/// prints and returns what it does as written. The hook itself made no state.
+#[cfg(unix)]
+#[test]
+fn rewrite_runs_through_the_real_runner() {
+    let dirs = Dirs::new();
+    let scope = dirs.scope();
+    let bin = scope.path("bin");
+    let work = scope.path("work");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&work).unwrap();
+    hook_support::probe(&bin);
+    let runner = hook_support::runner_path(&hook_support::real_runner(&bin));
+    configure(&dirs, &host(&runner, ""), &[("generic", PROFILE)]);
+    let command = "probe --err 'a b' --exit 3 2>&1 | cat; echo \"status $?\"";
+    let doc = run_hook(dirs.cmd(), &input(command, &work)).expect("a rewrite");
+    let rewritten = rewritten(&doc);
+    assert_eq!(specs(rewritten).len(), 1, "{rewritten}");
+    assert!(!dirs.state().exists(), "the hook made state");
+
+    let path = std::env::join_paths(
+        std::iter::once(bin.clone())
+            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    let run = |text: &str| {
+        scope
+            .command("sh", &work)
+            .env("PATH", &path)
+            .env("CARDINAL_STATE_DIR", dirs.state())
+            .env("CARDINAL_CONFIG_DIR", dirs.config())
+            .args(["-c", text])
+            .output()
+            .unwrap()
+    };
+    let as_written = run(command);
+    let as_rewritten = run(rewritten);
+    assert_eq!(
+        (
+            &as_rewritten.stdout,
+            &as_rewritten.stderr,
+            as_rewritten.status.code()
+        ),
+        (
+            &as_written.stdout,
+            &as_written.stderr,
+            as_written.status.code()
+        ),
+        "{rewritten}"
+    );
+    assert!(
+        String::from_utf8_lossy(&as_written.stdout).contains("probe argv: <--err> <a b>"),
+        "{as_written:?}"
+    );
+
+    let jobs = hook_support::started_jobs(dirs.state());
+    assert_eq!(jobs.len(), 1, "{jobs:#?}");
+    assert_eq!(jobs[0].data["path"], "admitted");
+    let job = jobs[0].job_id.clone();
+    let admitted: Vec<Record> = records(&dirs)
+        .into_iter()
+        .filter(|r| r.kind == RecordKind::JobAdmitted && r.job_id == job)
+        .collect();
+    assert_eq!(admitted.len(), 1, "{admitted:#?}");
+    let data = &admitted[0].data;
+    assert_eq!(data["rule"], "generic/test");
+    assert_eq!(data["class"], "test");
+    assert_eq!(data["resources"], json!({"cpu": 3}));
+    assert_eq!(admitted[0].session_id.as_deref(), Some("session-1"));
+}
+
+/// The children of these tests, the hook among them, get a constructed environment and start
+/// inside their scope: nothing the tests run with (`GIT_*` from a git hook, `CLAUDE_*`, the
+/// Bash timeouts) reaches them but `PATH` and the run marker. `env` started with the
+/// environment of [`Dirs::cmd`] shows what the hook gets.
+#[cfg(unix)]
+#[test]
+fn children_get_a_constructed_environment() {
+    let dirs = Dirs::new();
+    let scope = dirs.scope();
+    let child = |program: &str| {
+        let mut command = scope.command(program, scope.root());
+        command.copy_env(&dirs.cmd());
+        command.output().unwrap()
+    };
+    let output = child("env");
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    let vars: Vec<(&str, &str)> = text
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .collect();
+    let allowed = [
+        "PATH",
+        "HOME",
+        "TMPDIR",
+        "XDG_CONFIG_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_STATE_HOME",
+        "XDG_DATA_HOME",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_NOSYSTEM",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_TERMINAL_PROMPT",
+        "LC_ALL",
+        "CARDINAL_STATE_DIR",
+        "CARDINAL_CONFIG_DIR",
+        cardinal_test_support::RUN_MARKER,
+    ];
+    for (name, _) in &vars {
+        assert!(
+            allowed.contains(name)
+                || name.starts_with("GIT_AUTHOR_")
+                || name.starts_with("GIT_COMMITTER_"),
+            "{name} reached the child"
+        );
+    }
+    let value = |name: &str| {
+        vars.iter()
+            .find(|(n, _)| *n == name)
+            .map_or_else(|| panic!("{name} is set"), |(_, v)| Path::new(*v))
+    };
+    for name in [
+        "HOME",
+        "TMPDIR",
+        "CARDINAL_STATE_DIR",
+        "CARDINAL_CONFIG_DIR",
+    ] {
+        assert!(value(name).starts_with(scope.root()), "{name}");
+    }
+    let cwd = child("pwd");
+    assert_eq!(
+        Path::new(String::from_utf8(cwd.stdout).unwrap().trim()),
+        scope.root()
+    );
+}
+
 /// The spec carries the class, rule, resources, timeout, background flag, stage, and the
 /// call's IDs; resources come from the rule or `default_resources`.
 #[cfg(unix)]

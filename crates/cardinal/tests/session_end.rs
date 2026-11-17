@@ -5,7 +5,8 @@
 //! The test binary re-runs itself as a stand-in agent (`support::helper::Mode::Agent`): it
 //! starts a background process (the "dev server" an agent leaves running), runs the hook as
 //! its child, directly or through `sh -c` as Claude Code does, and then stays alive until the
-//! test kills it.
+//! test kills it. On Unix one case puts the session's processes in groups shared with
+//! processes outside the session.
 
 mod hook_support;
 mod support;
@@ -38,17 +39,33 @@ struct Run {
 /// Starts the stand-in agent in `dirs`' scope, with `dirs`' state and config dirs for the
 /// hook it runs.
 fn run_agent(dirs: &Dirs, event: &str, input: &Value, via_shell: bool) -> Run {
+    let work = agent_work(dirs, input);
+    let mode = agent_mode(dirs, &work, event, via_shell, false);
+    let agent = support::helper::spawn(dirs.scope(), &mode, dirs.scope().root());
+    finish_start(dirs, &work, agent)
+}
+
+/// The agent's work dir in `dirs`' scope, with `input` as `input.json`.
+fn agent_work(dirs: &Dirs, input: &Value) -> std::path::PathBuf {
     let work = dirs.scope().path("agent");
     std::fs::create_dir_all(&work).unwrap();
     std::fs::write(work.join("input.json"), input.to_string()).unwrap();
-    let mode = Mode::Agent {
-        dir: work.clone(),
+    work
+}
+
+fn agent_mode(dirs: &Dirs, work: &Path, event: &str, via_shell: bool, stray: bool) -> Mode {
+    Mode::Agent {
+        dir: work.to_path_buf(),
         event: event.to_owned(),
         state: dirs.state().to_path_buf(),
         config: dirs.config().to_path_buf(),
         via_shell,
-    };
-    let agent = support::helper::spawn(dirs.scope(), &mode, dirs.scope().root());
+        stray,
+    }
+}
+
+/// Waits until the started `agent` ran its hook.
+fn finish_start(dirs: &Dirs, work: &Path, agent: Child) -> Run {
     wait_for_file(&work.join("hook.done"), Duration::from_secs(30));
     let background: u32 = std::fs::read_to_string(work.join("background.pid"))
         .unwrap()
@@ -140,6 +157,73 @@ fn session_end_records_and_snapshots_without_stopping_processes() {
 #[test]
 fn session_end_skips_the_shell_between_agent_and_hook() {
     snapshots_and_records(true);
+}
+
+/// C9 with groups shared beyond the session: the agent runs in a group that a process outside
+/// the session leads, as under a wrapper without job control, and its background process
+/// shares its group with a process that is not the agent's descendant. The snapshot lists the
+/// background process alone, and every member of both groups keeps running.
+#[cfg(unix)]
+#[test]
+fn session_end_leaves_shared_groups_alone() {
+    use cardinal::os::unix::pgid_of;
+    use std::process::Stdio;
+
+    let dirs = Dirs::new();
+    let scope = dirs.scope();
+    let leader = scope
+        .command("cat", scope.root())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let work = agent_work(&dirs, &session_input(Path::new("/w")));
+    let agent = support::helper::command(
+        scope,
+        &agent_mode(&dirs, &work, "session-end", false, true),
+        scope.root(),
+    )
+    .join_group(&leader)
+    .spawn()
+    .unwrap();
+    let run = finish_start(&dirs, &work, agent);
+    let stray: u32 = std::fs::read_to_string(work.join("stray.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let _stray = PidGuard::new(scope, stray);
+    assert_eq!(run.status, "0");
+    assert_eq!(
+        pgid_of(run.agent.id()),
+        Some(leader.id()),
+        "the agent's group"
+    );
+    assert_eq!(
+        pgid_of(stray),
+        Some(run.background),
+        "the stray process's group"
+    );
+    assert_ne!(
+        cardinal::os::parent_pid(stray),
+        Some(run.agent.id()),
+        "the stray process is not the agent's child"
+    );
+
+    let state = StateDir::open(dirs.state()).unwrap();
+    let snapshot: SessionSnapshot =
+        serde_json::from_slice(&std::fs::read(state.session("sess-1")).unwrap()).unwrap();
+    assert_eq!(snapshot.agent.pid, run.agent.id());
+    let listed: Vec<u32> = snapshot.processes.iter().map(|p| p.pid).collect();
+    assert_eq!(listed, [run.background], "{snapshot:#?}");
+    for (pid, what) in [
+        (leader.id(), "the group leader outside the session"),
+        (run.agent.id(), "the agent"),
+        (run.background, "the background process"),
+        (stray, "the stray process"),
+    ] {
+        assert!(alive(pid), "{what} was stopped");
+    }
 }
 
 /// C9: subagent stop records and stops nothing; it takes no snapshot.
