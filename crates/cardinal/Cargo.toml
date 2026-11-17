@@ -21,6 +21,10 @@ sysinfo.workspace = true
 thiserror.workspace = true
 toml.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+signal-hook.workspace = true
+
 [target.'cfg(windows)'.dependencies]
 windows-sys.workspace = true
 
