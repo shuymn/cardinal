@@ -169,7 +169,7 @@ mod real {
             .unwrap();
         env.points.wait_reached(RUN_AFTER_SPAWN, runner.id(), WAIT);
         let pgid = runner.id();
-        let group = GroupGuard(pgid);
+        let group = GroupGuard::new(env.scope(), pgid);
         let job = env.reservations()[0].job_id.clone();
         wait_for("both sleeps in the group", WAIT, || {
             let members = list_reservations(&env.state()).ok()?[0].members.len();
@@ -265,7 +265,7 @@ mod real {
             .unwrap();
         env.points.wait_reached(RUN_AFTER_SPAWN, runner.id(), WAIT);
         let pgid = runner.id();
-        let group = GroupGuard(pgid);
+        let group = GroupGuard::new(env.scope(), pgid);
         let child = env.reservations()[0].child.unwrap();
         runner.kill();
         wait_gone(child.pid, child.start_s);
@@ -319,7 +319,7 @@ mod real {
             .unwrap()
             .try_into()
             .unwrap();
-        let group = GroupGuard(pgid);
+        let group = GroupGuard::new(env.scope(), pgid);
         let descendant: u32 = std::fs::read_to_string(&pids)
             .unwrap()
             .trim()

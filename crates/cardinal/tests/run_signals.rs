@@ -201,7 +201,7 @@ fn signals_are_forwarded_to_the_group() {
         ready = ready.display()
     );
     let mut runner = env.run(None, &["sh", "-c", &script]).spawn().unwrap();
-    let _group = GroupGuard(runner.id());
+    let _group = GroupGuard::new(env.scope(), runner.id());
     wait_for_file(&ready, WAIT);
     std::thread::sleep(std::time::Duration::from_millis(100));
     cardinal::os::unix::signal_process(runner.id(), cardinal::os::unix::SIGTERM).unwrap();
@@ -268,7 +268,7 @@ fn signals_reach_a_stopped_stage() {
         pid_file.display()
     );
     let mut runner = env.run(None, &["sh", "-c", &script]).spawn().unwrap();
-    let _group = GroupGuard(runner.id());
+    let _group = GroupGuard::new(env.scope(), runner.id());
     let stage: u32 = wait_for("the stage PID", WAIT, || {
         std::fs::read_to_string(&pid_file).ok()?.trim().parse().ok()
     });

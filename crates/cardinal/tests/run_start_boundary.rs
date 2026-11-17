@@ -146,17 +146,19 @@ fn runner_killed_after_spawn_never_reruns_the_stage() {
         .unwrap();
     env.points
         .wait_reached(cardinal::testpoint::RUN_AFTER_SPAWN, runner.id(), WAIT);
-    let _group = GroupGuard(runner.id());
+    let group = GroupGuard::new(env.scope(), runner.id());
     let child = env.reservations()[0]
         .child
         .expect("running records the child");
-    runner.kill();
+    runner.kill_leader();
+    wait_for_file(&started, WAIT);
+    wait_gone(child.pid, child.start_s);
+    // The group goes while the runner, its leader, is unreaped, so its ID is still the group's.
+    drop(group);
     assert_eq!(
         std::os::unix::process::ExitStatusExt::signal(&runner.wait().unwrap()),
         Some(9)
     );
-    wait_for_file(&started, WAIT);
-    wait_gone(child.pid, child.start_s);
     assert_eq!(env.lines("counter"), ["run"], "one run, never repeated");
     let finished = env.records_of(cardinal::contract::RecordKind::JobFinished);
     assert_eq!(

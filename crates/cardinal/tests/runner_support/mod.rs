@@ -62,7 +62,7 @@ impl Env {
                 .stdout(Stdio::null())
                 .spawn()
                 .expect("start the caller group's leader"),
-            _leftovers: LeftoverGuard::new(scope.root()),
+            _leftovers: LeftoverGuard::new(scope),
             dirs,
             points,
         }

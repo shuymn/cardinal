@@ -145,7 +145,7 @@ fn a_panic_while_recording_after_the_spawn_keeps_the_reservation() {
     let mut command = env.run_at(None, &["sh", "-c", &script], &[RUN_SPAWNED], None);
     command.env("CARDINAL_TEST_PANIC", RECORD_OPENED);
     let mut runner = command.spawn().unwrap();
-    let _group = GroupGuard(runner.id());
+    let _group = GroupGuard::new(env.scope(), runner.id());
     env.wait_any_reached(RUN_SPAWNED);
     drop(records);
     env.points.release(RUN_SPAWNED);

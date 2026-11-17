@@ -5,6 +5,8 @@ use std::time::{Duration, Instant};
 
 use sysinfo::{Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System, UpdateKind};
 
+use crate::Scope;
+
 /// Kills a process that is not this process's child (a grandchild that reported its PID), by
 /// PID and start time, when dropped. A PID that names another process by then is left alone.
 pub struct PidGuard {
@@ -32,7 +34,12 @@ impl PidGuard {
     /// names the process recorded, as dropping the guard does.
     pub fn kill(&self) {
         if let Some(start) = self.start {
-            kill_if_same(self.pid, start);
+            let found = Listed {
+                pid: self.pid,
+                start,
+                cwd: None,
+            };
+            kill_if_same(&found, false, &|_| true);
         }
     }
 }
@@ -45,31 +52,47 @@ impl Drop for PidGuard {
 
 /// Kills, when dropped, every live member of a process group that a process the test started
 /// made for itself (`setpgid(0, 0)`), which no [`crate::Child`] cleans up; then, unless the
-/// test is already panicking, asserts that none is left. Members are killed by PID until
-/// none is left, for at most 2 s, each only while its PID still names the process listed.
-/// This process's own group is never touched.
+/// test is already panicking, asserts that none is left. Only members working inside the
+/// scope's root count, so a group ID that names another group by then (once the group emptied
+/// and a new process took the ID) selects none of that group. Members are killed by PID until
+/// none is left, for at most 2 s, as [`LeftoverGuard`] kills. This process's own group is never
+/// touched.
 #[cfg(unix)]
-pub struct GroupGuard(pub u32);
+pub struct GroupGuard {
+    pgid: u32,
+    root: PathBuf,
+}
+
+#[cfg(unix)]
+impl GroupGuard {
+    #[must_use]
+    pub fn new(scope: &Scope, pgid: u32) -> Self {
+        Self {
+            pgid,
+            root: scope.root().to_path_buf(),
+        }
+    }
+}
 
 #[cfg(unix)]
 impl Drop for GroupGuard {
     fn drop(&mut self) {
-        let left = kill_group_members(self.0);
+        let left = kill_group_members(self.pgid, &self.root);
         if !std::thread::panicking() {
             assert_eq!(
                 left,
                 Vec::<u32>::new(),
                 "members of group {} are left",
-                self.0
+                self.pgid
             );
         }
     }
 }
 
-/// Kills every live member of group `pgid` by PID until none is left (at most 2 s), and
-/// returns the ones still there.
+/// Kills every live member of group `pgid` working inside `root` by PID until none is left (at
+/// most 2 s), and returns the ones still there.
 #[cfg(unix)]
-fn kill_group_members(pgid: u32) -> Vec<u32> {
+fn kill_group_members(pgid: u32, root: &Path) -> Vec<u32> {
     let pgid_of = |raw: u32| {
         let process = rustix::process::Pid::from_raw(i32::try_from(raw).ok()?)?;
         let group = rustix::process::getpgid(Some(process)).ok()?;
@@ -78,36 +101,36 @@ fn kill_group_members(pgid: u32) -> Vec<u32> {
     if pgid_of(std::process::id()) == Some(pgid) {
         return Vec::new();
     }
-    kill_until_gone(Duration::from_secs(2), false, |p| {
-        pgid_of(p.pid) == Some(pgid)
+    kill_until_gone(Duration::from_secs(2), true, &|p| {
+        p.inside(root) && pgid_of(p.pid) == Some(pgid)
     })
 }
 
-/// Kills, when dropped, what a test left working inside a directory: every process but this
-/// one whose working directory is inside `root`, by PID, until none is left or 5 s have
-/// passed, each only while its PID still names the process listed; then, unless the test is
-/// already panicking, asserts that none is left. For processes that leave every group a
-/// [`crate::Child`] or a [`GroupGuard`] cleans up.
+/// Kills, when dropped, what a test left working inside its scope: every process but this one
+/// whose working directory is inside the scope's root, by PID, until none is left or 5 s have
+/// passed; then, unless the test is already panicking, asserts that none is left. For processes
+/// that leave every group a [`crate::Child`] or a [`GroupGuard`] cleans up.
+///
+/// Each process is signalled only if its PID still names the process listed and it still works
+/// inside the root, both read right before the signal: on Linux through a pidfd opened before
+/// that read, which carries the signal; on macOS, and on Linux without pidfds, by PID right
+/// after the read (`docs/architecture.md` section 13.4).
 pub struct LeftoverGuard {
     root: PathBuf,
 }
 
 impl LeftoverGuard {
     #[must_use]
-    pub fn new(root: &Path) -> Self {
+    pub fn new(scope: &Scope) -> Self {
         Self {
-            root: root.to_path_buf(),
+            root: scope.root().to_path_buf(),
         }
     }
 }
 
 impl Drop for LeftoverGuard {
     fn drop(&mut self) {
-        let left = kill_until_gone(Duration::from_secs(5), true, |p| {
-            p.cwd
-                .as_deref()
-                .is_some_and(|cwd| cwd.starts_with(&self.root))
-        });
+        let left = kill_until_gone(Duration::from_secs(5), true, &|p| p.inside(&self.root));
         if !std::thread::panicking() {
             assert_eq!(
                 left,
@@ -126,56 +149,127 @@ struct Listed {
     cwd: Option<PathBuf>,
 }
 
+impl Listed {
+    fn inside(&self, root: &Path) -> bool {
+        self.cwd.as_deref().is_some_and(|cwd| cwd.starts_with(root))
+    }
+}
+
+fn refresh_kind(cwd: bool) -> ProcessRefreshKind {
+    let kind = ProcessRefreshKind::nothing().without_tasks();
+    if cwd {
+        kind.with_cwd(UpdateKind::Always)
+    } else {
+        kind
+    }
+}
+
+/// `process` unless it is this process, a thread, or a zombie.
+fn listed(pid: Pid, process: &sysinfo::Process) -> Option<Listed> {
+    let live = pid.as_u32() != std::process::id()
+        && process.thread_kind().is_none()
+        && !matches!(
+            process.status(),
+            ProcessStatus::Zombie | ProcessStatus::Dead
+        );
+    live.then(|| Listed {
+        pid: pid.as_u32(),
+        start: process.start_time(),
+        cwd: process.cwd().map(Path::to_path_buf),
+    })
+}
+
 /// Every live (not zombie) process other than this one; none if the table cannot be read.
 fn live_processes(cwd: bool) -> Vec<Listed> {
     let Some(mut system) = system() else {
         return Vec::new();
     };
-    let mut kind = ProcessRefreshKind::nothing().without_tasks();
-    if cwd {
-        kind = kind.with_cwd(UpdateKind::Always);
-    }
-    system.refresh_processes_specifics(ProcessesToUpdate::All, true, kind);
-    let me = std::process::id();
+    system.refresh_processes_specifics(ProcessesToUpdate::All, true, refresh_kind(cwd));
     system
         .processes()
         .iter()
-        .filter(|(pid, process)| {
-            pid.as_u32() != me
-                && process.thread_kind().is_none()
-                && !matches!(
-                    process.status(),
-                    ProcessStatus::Zombie | ProcessStatus::Dead
-                )
-        })
-        .map(|(pid, process)| Listed {
-            pid: pid.as_u32(),
-            start: process.start_time(),
-            cwd: process.cwd().map(Path::to_path_buf),
-        })
+        .filter_map(|(&pid, process)| listed(pid, process))
         .collect()
 }
 
 /// Kills the live processes `select` picks until none is left or `bound` has passed, and
 /// returns the ones still there.
-fn kill_until_gone(bound: Duration, cwd: bool, select: impl Fn(&Listed) -> bool) -> Vec<u32> {
+fn kill_until_gone(bound: Duration, cwd: bool, select: &dyn Fn(&Listed) -> bool) -> Vec<u32> {
     let deadline = Instant::now() + bound;
     loop {
-        let found: Vec<Listed> = live_processes(cwd).into_iter().filter(&select).collect();
+        let found: Vec<Listed> = live_processes(cwd)
+            .into_iter()
+            .filter(|p| select(p))
+            .collect();
         if found.is_empty() || Instant::now() >= deadline {
             return found.iter().map(|p| p.pid).collect();
         }
         for process in &found {
-            kill_if_same(process.pid, process.start);
+            kill_if_same(process, cwd, select);
         }
         std::thread::sleep(Duration::from_millis(20));
     }
 }
 
-/// Kills `pid` if it still has start time `start`.
-fn kill_if_same(pid: u32, start: u64) {
-    if start_time(pid) == Some(start) {
-        kill(pid);
+/// Kills `found` if its PID still names it (the same start time) and `select` still picks it,
+/// both read in the one refresh that leads to the signal. On Linux a pidfd opened before that
+/// refresh holds the process and carries the signal, so the signal reaches the process checked
+/// or none. Without one (macOS, Linux before 5.3 or under an emulator that lacks pidfds) the
+/// signal goes by PID right after the refresh.
+fn kill_if_same(found: &Listed, cwd: bool, select: &dyn Fn(&Listed) -> bool) {
+    #[cfg(target_os = "linux")]
+    let pidfd = match linux::hold(found.pid) {
+        linux::Hold::Gone => return,
+        linux::Hold::Pidfd(pidfd) => Some(pidfd),
+        linux::Hold::Unsupported => None,
+    };
+    let Some(mut system) = system() else {
+        return;
+    };
+    let pid = Pid::from_u32(found.pid);
+    system.refresh_processes_specifics(ProcessesToUpdate::Some(&[pid]), true, refresh_kind(cwd));
+    let Some(process) = system.process(pid) else {
+        return;
+    };
+    let Some(now) = listed(pid, process) else {
+        return;
+    };
+    if now.start != found.start || !select(&now) {
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(pidfd) = pidfd {
+        let _ = rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::KILL);
+        return;
+    }
+    process.kill();
+}
+
+/// Pidfds, which hold a process so that a signal sent through one reaches that process or none.
+#[cfg(target_os = "linux")]
+mod linux {
+    use rustix::fd::OwnedFd;
+    use rustix::io::Errno;
+    use rustix::process::{Pid, PidfdFlags, pidfd_open};
+
+    pub(super) enum Hold {
+        Gone,
+        Pidfd(OwnedFd),
+        /// No pidfds here: before Linux 5.3, or under an emulator that lacks them.
+        Unsupported,
+    }
+
+    /// A pidfd for `pid`; a process that cannot be held (gone, or any other failure) is never
+    /// signalled.
+    pub(super) fn hold(pid: u32) -> Hold {
+        let Some(pid) = i32::try_from(pid).ok().and_then(Pid::from_raw) else {
+            return Hold::Gone;
+        };
+        match pidfd_open(pid, PidfdFlags::empty()) {
+            Ok(pidfd) => Hold::Pidfd(pidfd),
+            Err(Errno::NOSYS) => Hold::Unsupported,
+            Err(_) => Hold::Gone,
+        }
     }
 }
 
@@ -188,17 +282,6 @@ fn start_time(pid: u32) -> Option<u64> {
     let pid = Pid::from_u32(pid);
     system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
     system.process(pid).map(sysinfo::Process::start_time)
-}
-
-fn kill(pid: u32) {
-    let Some(mut system) = system() else {
-        return;
-    };
-    let pid = Pid::from_u32(pid);
-    system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
-    if let Some(process) = system.process(pid) {
-        process.kill();
-    }
 }
 
 /// Whether `pid` is stopped by a signal (job control), as `ps` shows state `T`; false when it
@@ -233,4 +316,67 @@ pub fn wait_for_file(path: &Path, timeout: Duration) {
     wait_for(&path.display().to_string(), timeout, || {
         path.exists().then_some(())
     });
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::time::Duration;
+
+    use super::{GroupGuard, Listed, Pid, ProcessesToUpdate, kill_if_same, listed, refresh_kind};
+    use super::{start_time, system, wait_for};
+    use crate::Scope;
+
+    const WAIT: Duration = Duration::from_secs(5);
+
+    fn sleeper(scope: &Scope) -> crate::Child {
+        let mut command = scope.command("sleep", scope.root());
+        command.arg("30");
+        command.spawn().expect("start a sleeper")
+    }
+
+    /// A group guard selects no member outside its scope's root, as when the group's ID names
+    /// another group by the time the guard is dropped.
+    #[test]
+    fn a_group_guard_kills_only_members_inside_its_scope() {
+        let theirs = Scope::new();
+        let mut child = sleeper(&theirs);
+        drop(GroupGuard::new(&Scope::new(), child.id()));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "a process of another scope survives"
+        );
+    }
+
+    /// A process listed inside the root that has left it by the kill is not signalled: the
+    /// selection is read again in the refresh that leads to the signal.
+    #[test]
+    fn a_process_no_longer_selected_by_the_kill_is_not_signalled() {
+        let scope = Scope::new();
+        let elsewhere = Scope::new();
+        let mut command = scope.shell("cd \"$0\" && exec sleep 30", scope.root());
+        command.arg(elsewhere.root());
+        let mut child = command.spawn().expect("start the process");
+        let pid = child.id();
+        let start = wait_for("the start time", WAIT, || start_time(pid));
+        wait_for("the move out of the root", WAIT, || {
+            let mut system = system()?;
+            let id = Pid::from_u32(pid);
+            system.refresh_processes_specifics(
+                ProcessesToUpdate::Some(&[id]),
+                true,
+                refresh_kind(true),
+            );
+            listed(id, system.process(id)?)?
+                .inside(elsewhere.root())
+                .then_some(())
+        });
+        let stale = Listed {
+            pid,
+            start,
+            cwd: Some(scope.root().to_path_buf()),
+        };
+        kill_if_same(&stale, true, &|p| p.inside(scope.root()));
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(child.try_wait().unwrap().is_none(), "not signalled");
+    }
 }

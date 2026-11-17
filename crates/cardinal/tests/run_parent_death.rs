@@ -105,7 +105,7 @@ fn parent_exit_after_the_spawn_stops_the_group() {
     let runner = env.run_at(None, &["sh", "-c", &script], &[RUN_AFTER_SPAWN], None);
     let mut parent = env.in_shell(&runner, "; exit $?").spawn().unwrap();
     let runner_pid = env.wait_any_reached(RUN_AFTER_SPAWN);
-    let _group = GroupGuard(runner_pid);
+    let _group = GroupGuard::new(env.scope(), runner_pid);
     let runner_start = cardinal::os::start_time_s(runner_pid).unwrap();
     wait_for_file(&grandchild_file, WAIT);
     let grandchild: u32 = wait_for("the grandchild PID", WAIT, || {
@@ -168,7 +168,7 @@ fn parent_exit_after_the_child_exited_stops_its_descendants() {
     let runner = env.run_at(None, &["sh", "-c", &script], &[RUN_AFTER_SPAWN], None);
     let mut parent = env.in_shell(&runner, "; exit $?").spawn().unwrap();
     let runner_pid = env.wait_any_reached(RUN_AFTER_SPAWN);
-    let _group = GroupGuard(runner_pid);
+    let _group = GroupGuard::new(env.scope(), runner_pid);
     let runner_start = cardinal::os::start_time_s(runner_pid).unwrap();
     let descendant: u32 = wait_for("the descendant PID", WAIT, || {
         std::fs::read_to_string(&pids).ok()?.trim().parse().ok()
@@ -327,7 +327,7 @@ impl StoppedJob {
         });
         let runner = cardinal::os::parent_pid(stage).unwrap();
         let parent = cardinal::os::parent_pid(runner).unwrap();
-        let group = GroupGuard(parent);
+        let group = GroupGuard::new(env.scope(), parent);
         assert_eq!(cardinal::os::unix::pgid_of(runner), Some(parent), "{path}");
         assert_eq!(
             cardinal::os::parent_pid(parent),
