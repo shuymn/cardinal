@@ -22,7 +22,8 @@
 #   `includeIf.<condition>.path` names, which may hold no entry yet;
 # - the hooks directory git resolves (`core.hooksPath` from wherever it is set, relative to
 #   the worktree, or `hooks/`), `info/`, `packed-refs`, the stash list, the refs with HEAD,
-#   the worktree list, and each `worktrees/<name>/gitdir`;
+#   the worktree list, and each `worktrees/<name>/gitdir` (locally, this worktree's entry and
+#   line only);
 # - this worktree's git dir: HEAD, index, `sharedindex.*`, `config.worktree`, logs, and any
 #   other file in it, sockets included (an fsmonitor daemon's), and the reflog of the branch
 #   it has checked out;
@@ -30,17 +31,19 @@
 #   file that differs from the index or HEAD and each untracked file git does not ignore,
 #   with its content.
 #
-# Other worktrees of the same repository change legitimately while the tests run, so by
-# default their work is left out: the branches they have checked out at the snapshot or at
-# the verify (refs, remote-tracking refs, `branch.<name>.*` config, `packed-refs` lines),
-# which branch or commit they have checked out, their git dirs, and the objects. Lines that
-# belong to a branch carry an `@<branch> ` prefix in the state, and verify drops those of
-# every branch another worktree had checked out at either point from both states before
-# comparing them; a branch another worktree had checked out only in between counts as a
-# change. Refs outside git's own namespaces (heads, tags,
-# remotes, notes, stash), which other tools keep for themselves, are left out too. With
-# CI=true there are no other worktrees, and the state is the whole common git dir (objects by
-# name) and every ref.
+# Other worktrees of the same repository change legitimately while the tests run, and other
+# agents add and remove them, so by default their work is left out: the branches they have
+# checked out at the snapshot or at the verify (refs, remote-tracking refs, `branch.<name>.*`
+# config, `packed-refs` lines), their entries in the worktree list and their
+# `worktrees/<name>/gitdir` lines, their git dirs, and the objects. That is safe because,
+# where the tests run confined, their confinement already denies writes to the shared git
+# dir and the guard is the second check, and CI=true compares the whole worktree list on every
+# platform. Lines that belong to a branch carry an `@<branch> ` prefix in the state, and
+# verify drops those of every branch another worktree had checked out at either point from
+# both states before comparing them; a branch another worktree had checked out only in
+# between counts as a change. Refs outside git's own namespaces (heads, tags, remotes, notes,
+# stash), which other tools keep for themselves, are left out too. With CI=true there are no
+# other worktrees, and the state is the whole common git dir (objects by name) and every ref.
 
 # POSIX prelude: re-run under bash in a constructed environment. `sh` reads no startup file
 # when it runs a script; `bash --noprofile --norc` with BASH_ENV unset reads none either.
@@ -224,17 +227,19 @@ state() {
   fi
 
   echo "## worktree list --porcelain"
-  # Locally, which commit and branch another worktree has checked out is its own business.
+  # Locally, only this worktree's entry: other worktrees come and go while the tests run. Its
+  # lines alone, without the empty line that ends an entry, which git leaves out after the
+  # last one.
   printf '%s\n' "$worktrees" | OWN="$own" STRICT=$strict awk '
     /^worktree / { other = (substr($0, 10) != ENVIRON["OWN"]) }
-    ENVIRON["STRICT"] == "yes" || !other { print; next }
-    /^HEAD / { next }
-    /^branch / || $0 == "detached" { print "checked out"; next }
-    { print }'
+    ENVIRON["STRICT"] == "yes" { print; next }
+    !other && $0 != ""'
 
   echo "## worktrees/*/gitdir"
+  # Locally, only this worktree's, which is its git dir; the main worktree has none.
   for entry in "$common"/worktrees/*/; do
     [ -d "$entry" ] || continue
+    [ "$strict" = yes ] || [ "${entry%/}" = "$gitdir" ] || continue
     printf '%s %s\n' "$(basename "$entry")" "$(cat "$entry/gitdir" 2>/dev/null || echo missing)"
   done
 
