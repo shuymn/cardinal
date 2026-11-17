@@ -171,26 +171,20 @@ fn shell_state_and_newlines_are_flagged() {
         "t $?",
         "t ${?}",
         "t \"$_\"",
+        "t ${_}",
         "t $!",
-        "t $-",
         "t $$",
-        "t ${PIPESTATUS[0]}",
         "t $pipestatus",
-        "t ${_:-x}",
-        "t ${!name}",
-        "t \"${UNSET:-$?}\"",
-        "t ${UNSET:-${?}}",
-        "t ${x:-${y:-$_}}",
-        "t ${x/a/$?}",
+        "t \"$PIPESTATUS\"",
         "t \"$status\"",
         "t ${status}",
         "t $BASH_COMMAND",
-        "t ${#?}",
-        "t ${#PIPESTATUS[@]}",
-        "t ${(e)x}",
-        "t ${=_}",
-        "t ${x@P}",
-        "t > \"${UNSET:-$?}\"",
+        "t \"$BASH_EXECUTION_STRING\" $ZSH_EXECUTION_STRING",
+        "t $ERRNO",
+        "t $RANDOM",
+        "t ${SECONDS}",
+        "t $EPOCHREALTIME",
+        "t > \"$?\"",
     ] {
         assert!(stages(command)[0].shell_state, "{command}");
     }
@@ -200,20 +194,71 @@ fn shell_state_and_newlines_are_flagged() {
         "t $#",
         "t ${#}",
         "t $1",
-        "t \"$@\"",
-        "t \"${arr[@]}\"",
+        "t ${10}",
+        "t \"$@\" $*",
+        "t $-",
+        "t $LINENO",
         "t '$?'",
         "t \\$?",
-        "t ${HOME:-/tmp}",
-        "t ${x:-$y}",
-        "t ${x:-\\$?}",
         "t $statusx",
+        "t $HOME:/x \"$PATH:$HOME\"",
     ] {
         assert!(!stages(command)[0].shell_state, "{command}");
     }
     assert!(stages("t 'a\nb'")[0].multiline);
     assert!(stages("t \"a\nb\"")[0].multiline);
     assert!(!stages("t a\nt b")[0].multiline);
+}
+
+/// Every expansion but a plain parameter refuses the whole command, in any stage, quoted or
+/// not, nested or not: operators can read the fallback test's state
+/// (`${UNSET:-$[PIPESTATUS[0]]}`) or assign in the calling shell
+/// (`${functions[probe]:=cd sub}`), as can zsh's subscripts and modifiers on an unbraced
+/// parameter.
+#[test]
+fn non_plain_expansions_refuse_the_command() {
+    for command in [
+        "false; probe \"${UNSET:-$[PIPESTATUS[0]]}\"",
+        "false; probe \"${UNSET:-$[status]}\"",
+        "false; probe \"${text:PIPESTATUS[0]}\"",
+        ": ${functions[probe]:=cd sub}; probe x",
+        ": \"${U:-$[functions[probe]=1]}\"; probe x",
+        "echo \"${arr[i=3]}\" && make",
+        "echo $arr[i=3] && make",
+        "make \"$x[1]\"",
+        "make $x:h",
+        "make \"$x:u\"",
+        "make $@[1] $1:t",
+        "make $#name",
+        "make $#1",
+        "make ${#name}",
+        "make ${x}${y:-z}",
+        "make ${!name}",
+        "make ${(e)x}",
+        "make ${x@P}",
+        "make ${PIPESTATUS[0]}",
+        "make \"${arr[@]}\"",
+        "make ${HOME:-/tmp}",
+        "make ${x/a/b}",
+        "make ${a",
+        "make $\"x\"",
+        "make $=x",
+        "make \"$~x\"",
+        "make $^x $+x",
+        "make $x\u{e9}",
+        "X=${Y:-1} make",
+        "make > \"${UNSET:-$?}\"",
+    ] {
+        assert!(
+            matches!(tokenize(command), Err(Refusal::Expansion(_))),
+            "{command:?}: {:?}",
+            tokenize(command)
+        );
+    }
+    assert_eq!(
+        tokenize("make \"${UNSET:-${x}}\" y"),
+        Err(Refusal::Expansion("${UNSET:-${x}}".into()))
+    );
 }
 
 #[test]
@@ -247,6 +292,7 @@ fn refused_commands() {
         "echo \"unbalanced",
         "echo ${a",
         "echo ${a:-\"x\"}",
+        "echo $\"x\"",
         "echo $'a\\'b'",
         "echo $[1+2]",
         "make \\\n test",
@@ -277,7 +323,7 @@ fn refused_commands() {
     for command in [
         "$TOOL test",
         "\"$X\" test",
-        "make && ${CC:-cc} x",
+        "make && ${CC}cc x",
         "./absent*/probe cd sub",
         "pro?be x",
         "x[ab] y",
@@ -302,9 +348,9 @@ fn accepted_commands() {
         "a &&\n b",
         "a |\n b",
         "echo \"a\\\"b\" 'c\\' d\\'e",
-        "echo \"${HOME}/x\" ${a:-b} ${a//x/y}",
+        "echo \"${HOME}/x\" ${a}b $a/y",
         "echo \"!\" '!' \\!",
-        "echo $\"x\"",
+        "echo \"$\" $ \"a$\"",
         "x=1; echo $x",
         "a 2>&1 >/dev/null 1>&2 0<in",
         "a >&2 <&0",
@@ -585,7 +631,8 @@ fn part() -> impl Strategy<Value = (String, Option<String>)> {
         "[^']{0,8}".prop_map(|s| (format!("'{s}'"), Some(s))),
         "[^\"\\\\$`]{0,8}".prop_map(|s| (format!("\"{s}\""), Some(s))),
         "[ ;|&<>(){}#!'\"$`\\\\a]".prop_map(|c| (format!("\\{c}"), Some(c))),
-        "[A-Za-z_][A-Za-z0-9_]{0,4}".prop_map(|n| (format!("${n}"), None)),
+        "[A-Za-z_][A-Za-z0-9_]{0,4}".prop_map(|n| (format!("${{{n}}}"), None)),
+        "[A-Za-z_][A-Za-z0-9_]{0,4}".prop_map(|n| (format!("\"${n}\""), None)),
         "[A-Za-z_][A-Za-z0-9_]{0,4}".prop_map(|n| (format!("\"${{{n}}}x\""), None)),
     ]
 }

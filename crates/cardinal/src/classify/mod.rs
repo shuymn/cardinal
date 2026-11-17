@@ -65,7 +65,8 @@ pub struct Stage {
     pub background: bool,
     /// The stage's pipeline is followed by `&&` or `||`: its and-or list goes on after it.
     pub continued: bool,
-    /// The stage expands shell state (`$?`, `$_`, `$!`, `$-`, `$$`, `PIPESTATUS`, …).
+    /// The stage expands a parameter whose value the rewrite changes or no two runs share
+    /// (`$?`, `$_`, `PIPESTATUS`, `$$`, `RANDOM`, …).
     pub shell_state: bool,
     /// The span contains a newline (inside quotes).
     pub multiline: bool,
@@ -197,7 +198,7 @@ pub enum Skip {
     Skipped,
     /// No classifier wrapped it.
     Unclassified,
-    /// Expands shell state the fallback test could change.
+    /// Expands a parameter whose value the rewrite changes or no two runs share.
     ShellState,
     /// Has assignment prefixes.
     Assignments,

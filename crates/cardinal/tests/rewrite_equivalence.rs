@@ -437,8 +437,8 @@ const CASES: &[Case] = &[
         "nested_last_argument_stays",
         "",
         "probe first last; probe \"${UNSET:-$_}\"",
-        1,
-        1,
+        0,
+        0,
     ),
     case(
         "pipeline_status_stays",
@@ -448,6 +448,37 @@ const CASES: &[Case] = &[
         0,
     ),
     case("current_command_stays", "", "probe \"$BASH_COMMAND\"", 0, 0),
+    // An operator can evaluate arithmetic that reads the fallback test's status (section
+    // 7.2), so every expansion but a plain parameter refuses the command.
+    case(
+        "nested_arithmetic_pipestatus",
+        "",
+        "false; probe \"${UNSET:-$[PIPESTATUS[0]]}\"",
+        0,
+        0,
+    ),
+    case(
+        "nested_arithmetic_status",
+        "",
+        "false; probe \"${UNSET:-$[status]}\"",
+        0,
+        0,
+    ),
+    case(
+        "substring_offset_pipestatus",
+        "text=abcdef",
+        "false; probe \"${text:PIPESTATUS[0]}\"",
+        0,
+        0,
+    ),
+    // Plain parameters that keep their values inside the `if` still wrap.
+    case(
+        "plain_parameters",
+        "",
+        "set -- 'a b' c; probe \"$@\" $# $1 \"$*\" \"$-\" \"${2}\" \"$HOME:/x\"\nprobe $LINENO",
+        2,
+        2,
+    ),
     case(
         "last_argument_stays",
         "",
@@ -528,6 +559,43 @@ const CASES: &[Case] = &[
             0,
         )
     },
+    // Expansions of an earlier stage that write the function or command-path table, which
+    // the shell consults for `probe` and the runner does not.
+    case(
+        "default_assigns_function",
+        "",
+        ": ${functions[probe]:=cd sub}; probe x; pwd",
+        0,
+        0,
+    ),
+    case(
+        "arithmetic_assigns_function",
+        "",
+        ": \"${U:-$[functions[probe]=1]}\"; probe x",
+        0,
+        0,
+    ),
+    case(
+        "subscript_assigns_function",
+        "arr=(a b c)",
+        ": \"${arr[functions[probe]=0]}\"; probe x",
+        0,
+        0,
+    ),
+    case(
+        "unbraced_subscript_assigns_function",
+        "arr=(a b c)",
+        ": $arr[functions[probe]=0]; probe x",
+        0,
+        0,
+    ),
+    case(
+        "default_assigns_hashed_path",
+        "",
+        ": \"${BASH_CMDS[probe]:=/bin/echo}\"; probe x",
+        0,
+        0,
+    ),
     case("comment", "", "probe a # trailing comment", 1, 1),
     case("multiline", "", "probe one\nprobe two", 2, 2),
     case("env_wrapper", "", "env W=1 probe --env", 1, 1),

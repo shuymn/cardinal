@@ -19,6 +19,8 @@ pub enum Refusal {
     UnbalancedQuote,
     #[error("`{0}` is outside the supported shell subset")]
     Unsupported(&'static str),
+    #[error("expansion `{0}` is not a plain `$NAME` or `${{NAME}}`")]
+    Expansion(String),
     #[error("keyword `{0}` in command position")]
     Keyword(String),
     #[error("`{0}` can change what later commands mean or trace them")]
@@ -40,7 +42,8 @@ struct Word {
     /// The word after quote removal; `None` when it contains an expansion or an unquoted
     /// pattern character.
     value: Option<String>,
-    /// Expands shell state the fallback test could change (`$?`, `$_`, …).
+    /// Expands a parameter whose value the rewrite changes or no two runs share (`$?`,
+    /// `$_`, …).
     state: bool,
     /// Contains a newline (inside quotes).
     newline: bool,
@@ -108,64 +111,69 @@ fn is_name_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
-/// Names whose expansion reads state that the rewrite's fallback test changes (section 7.2):
-/// the last argument, zsh's exit status, the pipeline statuses, and bash's current command.
-fn is_state_name(name: &str) -> bool {
+/// Special parameters a plain expansion may name besides a name: positional parameters and
+/// the shell's own (`$#`, `$@`, `$?`, …).
+fn is_special_parameter(b: u8) -> bool {
+    b.is_ascii_digit() || matches!(b, b'#' | b'@' | b'*' | b'?' | b'!' | b'-' | b'$')
+}
+
+/// Parameters whose plain expansion keeps a stage unwrapped (section 7.2). The fallback
+/// test sets the status (`?`, zsh's `status`), the last argument (`_`), the pipeline
+/// statuses (`PIPESTATUS`, `pipestatus`), and, when the runner is missing, the error number
+/// (zsh's `ERRNO`); bash's `BASH_COMMAND` and the `-c` string (`BASH_EXECUTION_STRING`,
+/// `ZSH_EXECUTION_STRING`) hold command text the rewrite changes. The rest are computed per
+/// reference from the process, a clock, or a generator, so no two runs share them and no
+/// test can show that a rewrite keeps them.
+fn is_state_parameter(name: &str) -> bool {
     matches!(
         name,
-        "_" | "status" | "PIPESTATUS" | "pipestatus" | "BASH_COMMAND"
+        "?" | "_"
+            | "status"
+            | "PIPESTATUS"
+            | "pipestatus"
+            | "ERRNO"
+            | "BASH_COMMAND"
+            | "BASH_EXECUTION_STRING"
+            | "ZSH_EXECUTION_STRING"
+            | "$"
+            | "!"
+            | "BASHPID"
+            | "RANDOM"
+            | "SRANDOM"
+            | "SECONDS"
+            | "EPOCHSECONDS"
+            | "EPOCHREALTIME"
     )
 }
 
-/// The parameter name at the start of `text`.
-fn name_prefix(text: &str) -> &str {
-    &text[..text.bytes().take_while(|&b| is_name_char(b)).count()]
-}
-
-/// Whether the parameter at the start of a `${…}` body is shell state: `?`, `!`, `-`, `$`,
-/// or a state name, after zsh's `=`, `~`, `^`, `+` prefixes and a `#` (length). zsh flags
-/// (`${(e)…}`, `${(%)…}`) and bash indirection (`${!name}`) can reach any parameter, so they
-/// count as state too.
-fn parameter_state(body: &str) -> bool {
-    let rest = body.trim_start_matches(['=', '~', '^', '+']);
-    match rest.bytes().next() {
-        Some(b'(' | b'!' | b'?' | b'-' | b'$') => true,
-        Some(b'#') => {
-            let after = &rest[1..];
-            matches!(after.bytes().next(), Some(b'?' | b'!' | b'-' | b'$'))
-                || is_state_name(name_prefix(after))
-        }
-        _ => is_state_name(name_prefix(rest)),
+/// The length of the parameter at the start of a `${…}` body that is all parameter: a name,
+/// digits, or one special parameter. 0 when there is none.
+fn plain_parameter_len(body: &[u8]) -> usize {
+    match body.first() {
+        Some(&b) if is_name_start(b) => body.iter().take_while(|&&b| is_name_char(b)).count(),
+        Some(b) if b.is_ascii_digit() => body.iter().take_while(|b| b.is_ascii_digit()).count(),
+        Some(&b) if is_special_parameter(b) => 1,
+        _ => 0,
     }
 }
 
-/// Whether the body of `${…}` reads shell state, at its parameter or in any expansion nested
-/// in its operands (`${UNSET:-$?}`), or expands a value as a prompt (`${x@P}`), which can.
-fn braced_state(body: &str) -> bool {
-    if parameter_state(body) || body.contains("@P") {
-        return true;
-    }
-    let bytes = body.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\\' => i += 2,
-            b'$' => {
-                let rest = &body[i + 1..];
-                let state = match rest.bytes().next() {
-                    Some(b'{') => parameter_state(&rest[1..]),
-                    Some(b'?' | b'!' | b'-' | b'$') => true,
-                    _ => is_state_name(name_prefix(rest)),
-                };
-                if state {
-                    return true;
+/// The end of the `${…}` that starts at `start`: just after its closing brace, counting
+/// nested braces, or the end of `bytes` when it has none.
+fn braced_end(bytes: &[u8], start: usize) -> usize {
+    let mut depth = 0_usize;
+    for (i, &b) in bytes.iter().enumerate().skip(start + 1) {
+        match b {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return i + 1;
                 }
-                i += 1;
             }
-            _ => i += 1,
+            _ => {}
         }
     }
-    false
+    bytes.len()
 }
 
 impl<'a> Lexer<'a> {
@@ -422,7 +430,9 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    /// A `$` at `self.pos`, unquoted or inside double quotes.
+    /// A `$` at `self.pos`, unquoted or inside double quotes. Only plain parameter
+    /// expansions pass (section 7.2): `$NAME` and `${NAME}`, and the same for positional
+    /// and special parameters (`$1`, `${#}`, `$?`); every other expansion refuses the command.
     fn dollar(
         &mut self,
         quoted: bool,
@@ -430,97 +440,78 @@ impl<'a> Lexer<'a> {
         literal: &mut bool,
         state: &mut bool,
     ) -> Result<(), Refusal> {
-        match self.peek(1) {
-            Some(b'(') => Err(Refusal::Unsupported("$(")),
-            Some(b'[') => Err(Refusal::Unsupported("$[")),
+        let src = self.src;
+        let start = self.pos;
+        let name = match self.peek(1) {
+            Some(b'(') => return Err(Refusal::Unsupported("$(")),
+            Some(b'[') => return Err(Refusal::Unsupported("$[")),
+            Some(b'\'') if !quoted => return Err(Refusal::Unsupported("$'")),
             Some(b'{') => {
-                *literal = false;
-                self.pos += 2;
-                let body = self.pos;
-                let mut depth = 1;
-                loop {
-                    match self.peek(0) {
-                        None => return Err(Refusal::UnbalancedQuote),
-                        Some(b'}') => {
-                            depth -= 1;
-                            self.pos += 1;
-                            if depth == 0 {
-                                break;
-                            }
-                        }
-                        Some(b'$') if self.peek(1) == Some(b'{') => {
-                            depth += 1;
-                            self.pos += 2;
-                        }
-                        Some(b'$') if self.peek(1) == Some(b'(') => {
-                            return Err(Refusal::Unsupported("$("));
-                        }
-                        Some(b'\'' | b'"') => {
-                            return Err(Refusal::Unsupported("quote inside ${…}"));
-                        }
-                        Some(b'`') => return Err(Refusal::Unsupported("`")),
-                        Some(b'{') => return Err(Refusal::Unsupported("{")),
-                        Some(b'\n') => return Err(Refusal::Unsupported("newline inside ${…}")),
-                        Some(b'\\') => match self.peek(1) {
-                            None | Some(b'\n') => {
-                                return Err(Refusal::Unsupported("backslash inside ${…}"));
-                            }
-                            Some(_) => {
-                                let ch = self.char_at(self.pos + 1);
-                                self.pos += 1 + ch.len_utf8();
-                            }
-                        },
-                        Some(_) => {
-                            let ch = self.char_at(self.pos);
-                            self.pos += ch.len_utf8();
-                        }
-                    }
+                let body = start + 2;
+                let len = plain_parameter_len(&self.bytes[body..]);
+                if len == 0 || self.bytes.get(body + len) != Some(&b'}') {
+                    return Err(self.expansion(start, braced_end(self.bytes, start)));
                 }
-                if braced_state(&self.src[body..self.pos - 1]) {
-                    *state = true;
-                }
-                Ok(())
-            }
-            Some(b'\'') if !quoted => Err(Refusal::Unsupported("$'")),
-            Some(b'"') if !quoted => {
-                // `$"…"`: a locale-translated string; the quote is scanned next.
-                *literal = false;
-                self.pos += 1;
-                Ok(())
-            }
-            Some(b'?' | b'!' | b'-' | b'$') => {
-                *literal = false;
-                *state = true;
-                self.pos += 2;
-                Ok(())
-            }
-            Some(b'#' | b'@' | b'*' | b'0'..=b'9') => {
-                *literal = false;
-                self.pos += 2;
-                Ok(())
+                self.pos = body + len + 1;
+                &src[body..body + len]
             }
             Some(b) if is_name_start(b) => {
-                *literal = false;
-                let start = self.pos + 1;
-                let name = name_prefix(&self.src[start..]);
-                if is_state_name(name) {
-                    *state = true;
+                self.pos = start + 1 + plain_parameter_len(&self.bytes[start + 1..]);
+                // zsh reads letters beyond ASCII as part of a name.
+                if self.peek(0).is_some_and(|b| !b.is_ascii()) {
+                    return Err(self.expansion(start, self.pos + self.char_at(self.pos).len_utf8()));
                 }
-                self.pos = start + name.len();
-                Ok(())
+                self.unbraced_suffix(start)?;
+                &src[start + 1..self.pos]
             }
-            // zsh expansion flags such as `$=name` and `$~name`.
-            Some(b'=' | b'~' | b'^' | b'+') => {
-                *literal = false;
+            Some(b) if is_special_parameter(b) => {
+                self.pos = start + 2;
+                // zsh's `$#name` is the length of `name`.
+                if b == b'#'
+                    && self.peek(0).is_some_and(|b| {
+                        is_name_char(b) || b == b'{' || is_special_parameter(b) || !b.is_ascii()
+                    })
+                {
+                    return Err(self.expansion(start, self.pos + self.char_at(self.pos).len_utf8()));
+                }
+                self.unbraced_suffix(start)?;
+                &src[start + 1..self.pos]
+            }
+            // The closing quote of a double-quoted string.
+            Some(b'"') if quoted => {
+                value.push('$');
                 self.pos += 1;
-                Ok(())
+                return Ok(());
+            }
+            // `$"…"` (a translated string) and zsh's flags such as `$=name` and `$~name`.
+            Some(b'"' | b'=' | b'~' | b'^' | b'+') => {
+                return Err(self.expansion(start, start + 2));
             }
             _ => {
                 value.push('$');
                 self.pos += 1;
-                Ok(())
+                return Ok(());
             }
+        };
+        *literal = false;
+        *state |= is_state_parameter(name);
+        Ok(())
+    }
+
+    /// Refuses what zsh reads after an unbraced parameter that ends at `self.pos`, which
+    /// started at `start`: a subscript (`$name[…]`) or a modifier (`$name:h`).
+    fn unbraced_suffix(&self, start: usize) -> Result<(), Refusal> {
+        match (self.peek(0), self.peek(1)) {
+            (Some(b'['), _) => Err(self.expansion(start, self.pos + 1)),
+            (Some(b':'), Some(b)) if b.is_ascii_alphabetic() || b == b'&' => {
+                Err(self.expansion(start, self.pos + 2))
+            }
+            _ => Ok(()),
         }
+    }
+
+    fn expansion(&self, start: usize, end: usize) -> Refusal {
+        Refusal::Expansion(self.src[start..end.min(self.src.len())].to_owned())
     }
 }
 
