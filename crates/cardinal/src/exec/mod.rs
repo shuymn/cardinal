@@ -294,10 +294,18 @@ impl LocalExecutor {
             .argv
             .split_first()
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "empty command"))?;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the runner's spawn site: the stage, with the caller's environment and cwd"
+        )]
         let mut command = Command::new(program);
         command.args(args);
         #[cfg(unix)]
         os::unix::restore_child_signal(&mut command);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the runner's spawn site: the stage, with the caller's environment and cwd"
+        )]
         let child = command.spawn()?;
         let pid = child.id();
         #[cfg(unix)]
