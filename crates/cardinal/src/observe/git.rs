@@ -12,7 +12,6 @@ pub struct ListedWorktree {
     pub branch: Option<String>,
     pub bare: bool,
     pub locked: bool,
-    pub prunable: bool,
 }
 
 /// Parses `git worktree list --porcelain -z`: attribute lines end in NUL, and an empty line
@@ -62,8 +61,8 @@ pub fn parse_worktree_list(bytes: &[u8]) -> Result<Vec<ListedWorktree>, String> 
             b"detached" => entry.branch = None,
             b"bare" => entry.bare = true,
             b"locked" => entry.locked = true,
-            b"prunable" => entry.prunable = true,
-            // Attributes added by later git versions carry no fact cardinal relies on.
+            // `prunable`, and attributes added by later git versions, carry no fact cardinal
+            // relies on.
             _ => {}
         }
     }
@@ -243,7 +242,6 @@ mod tests {
                     path: "/w/two".into(),
                     head: Some(A.into()),
                     branch: Some("feat/x".into()),
-                    prunable: true,
                     ..ListedWorktree::default()
                 },
             ]
