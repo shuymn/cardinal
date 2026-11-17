@@ -6,6 +6,8 @@ use std::fs::Metadata;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use walkdir::WalkDir;
+
 use crate::contract::RootId;
 
 /// The type of an entry, as `lstat` reports it.
@@ -221,8 +223,10 @@ fn mount_id(_path: &Path) -> Result<MountKey, String> {
     Ok(MountKey)
 }
 
-/// Records the entries below `dir`. A directory on another device or mount than `dev` and
-/// `on_mount` is recorded but not entered; a mount that cannot be read fails the walk.
+/// Records the entries below `dir`, parents before children in name order, without following
+/// symbolic links, with a bounded number of directories open (`walkdir`). A directory on
+/// another device or mount than `dev` and `on_mount` is recorded but not entered; a mount that
+/// cannot be read fails the walk.
 fn walk_dir(
     dir: &Path,
     rel: &Path,
@@ -230,27 +234,41 @@ fn walk_dir(
     on_mount: &MountKey,
     out: &mut Vec<Entry>,
 ) -> io::Result<()> {
-    let mut names: Vec<_> = std::fs::read_dir(dir)?
-        .map(|entry| entry.map(|e| e.file_name()))
-        .collect::<io::Result<_>>()?;
-    names.sort();
-    for name in names {
-        let path = dir.join(&name);
-        let meta = match std::fs::symlink_metadata(&path) {
-            Ok(meta) => meta,
-            // Removed while walking: nothing to record.
-            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
-            Err(err) => return Err(err),
+    // Removed while walking: nothing to record. The walk's own root is not removed under it.
+    let vanished = |err: &walkdir::Error| {
+        err.depth() > 0
+            && err
+                .io_error()
+                .is_some_and(|e| e.kind() == io::ErrorKind::NotFound)
+    };
+    let mut found = WalkDir::new(dir)
+        .follow_links(false)
+        .follow_root_links(false)
+        .min_depth(1)
+        .sort_by_file_name()
+        .into_iter();
+    while let Some(next) = found.next() {
+        let dent = match next {
+            Ok(dent) => dent,
+            Err(err) if vanished(&err) => continue,
+            Err(err) => return Err(err.into()),
         };
-        let entry = Entry::from_metadata(rel.join(&name), &meta);
+        let meta = match dent.metadata() {
+            Ok(meta) => meta,
+            Err(err) if vanished(&err) => continue,
+            Err(err) => return Err(err.into()),
+        };
+        let below = dent.path().strip_prefix(dir).map_err(io::Error::other)?;
+        let entry = Entry::from_metadata(rel.join(below), &meta);
         let descend = entry.kind == EntryKind::Dir
             && entry.dev == dev
-            && mount_id(&path).map_err(io::Error::other)? == *on_mount;
-        let child_rel = entry.rel.clone();
-        out.push(entry);
-        if descend {
-            walk_dir(&path, &child_rel, dev, on_mount, out)?;
+            && mount_id(dent.path()).map_err(io::Error::other)? == *on_mount;
+        // `walkdir` has opened every directory it yields (and only those, so this skips
+        // nothing else); one not to enter is left before anything below it is yielded.
+        if dent.file_type().is_dir() && !descend {
+            found.skip_current_dir();
         }
+        out.push(entry);
     }
     Ok(())
 }
@@ -299,6 +317,46 @@ mod tests {
             Mount::between(1, 1, &unknown, &same),
             Mount::Unknown("statx: no mount ID".into())
         );
+    }
+
+    #[test]
+    fn entries_come_parents_first_in_name_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = dunce::canonicalize(tmp.path()).unwrap();
+        for dir in ["t/b", "t/a/y"] {
+            std::fs::create_dir_all(wt.join(dir)).unwrap();
+        }
+        for file in ["t/c", "t/a/z", "t/a/y/x"] {
+            std::fs::write(wt.join(file), b"x").unwrap();
+        }
+        let walk = super::walk(&wt, &wt.join("t")).unwrap();
+        let rels: Vec<_> = walk.entries.iter().map(|e| e.rel.clone()).collect();
+        let expected: Vec<std::path::PathBuf> = ["t/a", "t/a/y", "t/a/y/x", "t/a/z", "t/b", "t/c"]
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        assert_eq!(rels, expected);
+        for entry in &walk.entries {
+            let meta = std::fs::symlink_metadata(wt.join(&entry.rel)).unwrap();
+            assert_eq!(
+                *entry,
+                super::Entry::from_metadata(entry.rel.clone(), &meta),
+                "recorded from lstat"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_target_that_is_a_link_is_not_entered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir_all(root.join("wt")).unwrap();
+        std::fs::create_dir_all(root.join("outside/dir")).unwrap();
+        std::os::unix::fs::symlink(root.join("outside"), root.join("wt/target")).unwrap();
+        let walk = super::walk(&root.join("wt"), &root.join("wt/target")).unwrap();
+        assert_eq!(walk.root.kind, EntryKind::Symlink);
+        assert!(walk.entries.is_empty(), "{:?}", walk.entries);
     }
 
     #[test]
