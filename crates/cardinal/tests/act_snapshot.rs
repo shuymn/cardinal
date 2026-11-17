@@ -153,6 +153,29 @@ fn directory_swapped_for_a_link_is_not_followed() {
     assert!(!wt.join("node_modules/other").exists());
 }
 
+/// A directory on the way to the target replaced by a symbolic link after the checks:
+/// nothing is reached through the link, and the target is listed as skipped.
+#[cfg(unix)]
+#[test]
+fn link_on_the_way_is_not_followed() {
+    let s = Setup::new();
+    let wt = s.worktree("detour", &[("web/node_modules", IgnoredClass::Regenerable)]);
+    write(&wt, "web/node_modules/pkg/index.js", "x");
+    let elsewhere = s.fx.path("elsewhere");
+    write(&elsewhere, "node_modules/pkg/index.js", "keep me");
+    let plan = s.plan(PlanKind::ReclaimDir, &wt.join("web/node_modules"));
+    let result = act_with_change_at(&s, &plan.id, cardinal::testpoint::ACT_CHECKED, || {
+        std::fs::rename(wt.join("web"), s.fx.path("old-web")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, wt.join("web")).unwrap();
+    });
+    assert_eq!(result.status, ActStatus::Partial, "{result:#?}");
+    assert!(
+        skipped(&result, &wt.join("web/node_modules")),
+        "{result:#?}"
+    );
+    assert!(elsewhere.join("node_modules/pkg/index.js").exists());
+}
+
 /// An inspected directory replaced by another directory: its identity differs from the
 /// snapshot, so it is not entered and what is in it survives.
 #[cfg(unix)]

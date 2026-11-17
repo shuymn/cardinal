@@ -210,6 +210,11 @@ impl Target {
     /// `keep_git`, the root's `.git` and the root itself stay for [`Target::finish_worktree`].
     pub fn delete(&self, walk: &Walk, keep_git: bool) -> Deletion {
         let mut deletion = Deletion::default();
+        // With a link on the way, `parent` is not the target's parent: touch nothing.
+        if self.link_in_path.is_some() {
+            deletion.skipped.push(self.path.clone());
+            return deletion;
+        }
         let index: HashMap<&Path, &Entry> = walk.all().map(|e| (e.rel.as_path(), e)).collect();
         let current = match lstat_at(&self.parent, &self.name) {
             Ok(st) => entry(self.rel.clone(), &st),
