@@ -710,7 +710,7 @@ mod repository {
             assert_eq!(
                 logged.trim(),
                 format!(
-                    "--no-optional-locks -C {} remote get-url origin",
+                    "--no-optional-locks -c core.fsmonitor=false -C {} remote get-url origin",
                     repo.display()
                 ),
                 "{name}"
@@ -770,7 +770,9 @@ mod repository {
     }
 
     /// A descendant of git that keeps its stdout open does not hold the hook past the
-    /// deadline.
+    /// deadline, and ends with git's process group. The hook runs in a group an idle process
+    /// leads, as under a shell without job control, so only the hook ends the descendant
+    /// while that group lives on.
     #[test]
     fn held_output_pipe_does_not_block_the_hook() {
         let dir = Scope::new();
@@ -790,9 +792,24 @@ mod repository {
             &host(git.to_str().unwrap(), DEADLINE_MS),
             &[("app", APP), ("generic", PROFILE)],
         );
+        let leader = dirs
+            .scope()
+            .command("sleep", dirs.scope().root())
+            .arg("60")
+            .spawn()
+            .expect("start the group leader");
+        let mut hook = dirs.cmd();
+        hook.join_group(&leader);
         let start = Instant::now();
-        assert_eq!(run_hook(dirs.cmd(), &input("make", &repo)), None);
-        let _guard = PidGuard::new(dirs.scope(), pid_from(&pid_file));
+        assert_eq!(run_hook(hook, &input("make", &repo)), None);
+        let pid = pid_from(&pid_file);
+        let _guard = PidGuard::new(dirs.scope(), pid);
         assert!(start.elapsed() < Duration::from_secs(10));
+        wait_for(
+            "the end of git's grandchild",
+            Duration::from_secs(5),
+            || cardinal::os::start_time_s(pid).is_none().then_some(()),
+        );
+        drop(leader);
     }
 }
