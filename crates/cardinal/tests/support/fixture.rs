@@ -365,7 +365,7 @@ fn follow_links(path: &Path, depth: u32) -> PathBuf {
                 if depth < MAX_LINKS
                     && let Ok(target) = std::fs::read_link(&out)
                 {
-                    let base = out.parent().map(Path::to_path_buf).unwrap_or_default();
+                    let base = out.parent().map_or_else(PathBuf::new, Path::to_path_buf);
                     out = follow_links(&base.join(target), depth + 1);
                 }
             }
