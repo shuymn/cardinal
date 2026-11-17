@@ -108,6 +108,35 @@ fn commits_in_other_worktrees_are_ignored() {
     assert!(!guard(&fixture, "verify", &wt, &wt_file).status.success());
 }
 
+/// Another worktree that switches branch between snapshot and verify, to a new branch or to a
+/// detached HEAD, leaves the branches it had checked out at either point out of both states;
+/// a commit on this worktree's own branch still counts.
+#[test]
+fn other_worktrees_switching_branch_are_ignored() {
+    let (fixture, repo, file) = snapshotted();
+    let wt = fixture.path("wt");
+    fixture.commit_file(&wt, "w.txt", "w\n", "on feature");
+    fixture.branch(&wt, "other");
+    fixture.switch(&wt, "other");
+    fixture.commit_file(&wt, "o.txt", "o\n", "on other");
+    fixture.config_set(&wt, "branch.other.note", "x");
+    assert_ok(&guard(&fixture, "verify", &repo, &file));
+
+    assert_ok(&guard(&fixture, "snapshot", &repo, &file));
+    fixture.commit_file(&wt, "o2.txt", "o\n", "on other again");
+    fixture.detach(&wt);
+    assert_ok(&guard(&fixture, "verify", &repo, &file));
+
+    fixture.commit_file(&repo, "m.txt", "m\n", "on main");
+    let output = guard(&fixture, "verify", &repo, &file);
+    assert!(
+        !output.status.success(),
+        "a commit on this worktree's branch was ignored"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("refs/heads/main"), "{stderr}");
+}
+
 #[test]
 fn in_ci_other_worktrees_count_too() {
     let fixture = Fixture::new();

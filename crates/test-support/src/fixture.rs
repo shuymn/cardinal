@@ -177,6 +177,16 @@ impl Fixture {
         self.git(repo, &["branch", "--", checked_name("branch", name)]);
     }
 
+    /// `git switch name`: checks out an existing branch.
+    pub fn switch(&self, repo: &Path, name: &str) {
+        self.git(repo, &["switch", "-q", "--", checked_name("branch", name)]);
+    }
+
+    /// `git switch --detach`: detaches HEAD at the current commit.
+    pub fn detach(&self, repo: &Path) {
+        self.git(repo, &["switch", "-q", "--detach"]);
+    }
+
     /// `git tag name`.
     pub fn tag(&self, repo: &Path, name: &str) {
         self.git(repo, &["tag", "--", checked_name("tag", name)]);
