@@ -13,7 +13,7 @@ use cardinal::contract::{RecordKind, ReservationState};
 #[cfg(unix)]
 use cardinal::state::LockMode;
 #[cfg(unix)]
-use cardinal::testpoint::{RECORD_OPENED, RUN_AFTER_SPAWN, RUN_SPAWNED, RUN_SPAWNING};
+use cardinal::testpoint::{RECORD_OPENED, RUN_AFTER_SPAWN, RUN_REAPED, RUN_SPAWNED, RUN_SPAWNING};
 #[cfg(unix)]
 use runner_support::{Env, GroupGuard, WAIT, output};
 #[cfg(unix)]
@@ -233,27 +233,15 @@ fn a_panic_in_recovery_after_its_spawn_waits_for_the_stage() {
 }
 
 /// When the runner cannot learn the stage's status, it exits 125 with one line on stderr and
-/// does not rerun the stage. A parent that ignores SIGCHLD makes Linux reap the runner's child
-/// itself, so the runner's wait fails; macOS still reports the status, so this runs on Linux.
-#[cfg(target_os = "linux")]
+/// does not rerun the stage. The injected failure stands for a wait that reaped the child and
+/// got no status.
+#[cfg(unix)]
 #[test]
 fn unknown_status_exits_125_with_one_line() {
     let env = Env::with_budget(4);
     let stage = stage(&env, 3);
     let args: Vec<&str> = stage.iter().map(String::as_str).collect();
-    let runner = env.run(None, &args);
-    let mut ignoring = env.isolated("perl");
-    ignoring
-        .args(["-e", "$SIG{CHLD} = 'IGNORE'; exec @ARGV or die"])
-        .arg(runner.get_program())
-        .args(runner.get_args());
-    for (key, value) in runner.get_envs() {
-        match value {
-            Some(value) => ignoring.env(key, value),
-            None => ignoring.env_remove(key),
-        };
-    }
-    let out = output(&mut ignoring);
+    let out = output(&mut env.run_at(None, &args, &[], Some(RUN_REAPED)));
     assert_eq!(out.status.code(), Some(125));
     assert_eq!(out.stdout, b"out");
     let stderr = String::from_utf8(out.stderr).unwrap();

@@ -115,6 +115,65 @@ fn ignored_signals_stay_ignored() {
     assert_eq!(paths, ["admitted", "fail_open", "tty"]);
 }
 
+/// A caller that ignores SIGCHLD would have the kernel reap the runner's children (Linux),
+/// leaving the runner nothing to wait for: the runner runs with SIGCHLD at its default, so it
+/// learns the stage's status on every path, and the stage still starts with SIGCHLD ignored.
+#[test]
+fn an_ignored_sigchld_is_reset_for_the_runner_and_kept_for_the_stage() {
+    let env = Env::with_budget(4);
+    let stage = [
+        "bash",
+        "--norc",
+        "--noprofile",
+        "-c",
+        "trap -p CHLD; exit 3",
+    ];
+    let ignoring = |inner: &Command| {
+        let mut bash = env.isolated("bash");
+        bash.args([
+            "--norc",
+            "--noprofile",
+            "-c",
+            "trap '' CHLD; exec \"$@\"",
+            "bash",
+        ])
+        .arg(inner.get_program())
+        .args(inner.get_args());
+        for (key, value) in inner.get_envs() {
+            match value {
+                Some(value) => bash.env(key, value),
+                None => bash.env_remove(key),
+            };
+        }
+        bash
+    };
+    let mut direct = env.isolated(stage[0]);
+    direct.args(&stage[1..]);
+    let direct = output(&mut ignoring(&direct));
+    assert_eq!(direct.status.code(), Some(3));
+    assert_eq!(direct.stdout, b"trap -- '' SIGCHLD\n");
+
+    for path in ["admitted", "fail_open", "tty"] {
+        let fail = (path == "fail_open").then_some(RUN_BEFORE_STARTING);
+        let mut runner = ignoring(&env.run_at(None, &stage, &[], fail));
+        let pty = Pty::open();
+        if path == "tty" {
+            runner.stdin(pty.stdin());
+        }
+        let out = output(&mut runner);
+        assert_eq!(out.status.code(), Some(3), "{path}: {:?}", out.status);
+        assert_eq!(out.stdout, direct.stdout, "{path}");
+        assert_eq!(out.stderr, b"", "{path}");
+    }
+    let records = |kind| env.records_of(kind);
+    assert_eq!(records(cardinal::contract::RecordKind::JobInfraFailure), []);
+    let exits: Vec<_> = records(cardinal::contract::RecordKind::JobFinished)
+        .iter()
+        .map(|r| r.data["exit"].clone())
+        .collect();
+    assert_eq!(exits, [3, 3, 3]);
+}
+
 /// SIGTERM sent to the runner on the admitted path reaches the whole group; the runner does
 /// not die by its own forwarded copy, and exits with the stage's status.
 #[test]

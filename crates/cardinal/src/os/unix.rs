@@ -8,20 +8,26 @@
 //!   never takes a stopped child for an ended one (macOS reports a stop even to a wait for
 //!   exits alone); [`take_stop`] takes a stop report; [`reap`] reaps an ended child.
 //! - **Signals:** [`signal_process`]; [`watch_signals`] and [`ignored`] for handlers;
-//!   [`stop_self`] and [`die_by_signal`] for this process.
+//!   [`stop_self`] and [`die_by_signal`] for this process; [`reset_child_signal`] and
+//!   [`restore_child_signal`] keep children unreaped while passing SIGCHLD on unchanged.
 //!
 //! **Signal an ID only while it is pinned.** A child's PID is not reused while the child is
 //! unreaped, which [`wait_unreaped`] keeps it; a group's ID is not reused while the group has a
 //! member, and only the process with that PID can create a group with that ID, so it is pinned
 //! while its leader is this process or an unreaped child of it. Checking an ID and then
 //! signalling it is no substitute: the process can end and its ID pass to another in between.
+//! A child stays unreaped only while SIGCHLD is not ignored, which [`reset_child_signal`]
+//! ensures.
 //!
 //! Signal handlers are installed through `signal-hook`; a handler is reset to the default
 //! action by `exec`, so a child starts with default dispositions for the handled signals. A
 //! signal this process ignores gets no handler and stays ignored for its children.
 
 use std::io::{self, Read as _};
+use std::os::unix::process::CommandExt as _;
+use std::process::Command;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, WaitOptions};
@@ -230,6 +236,41 @@ pub fn ignored(sig: i32) -> bool {
     let read = unsafe { libc::sigaction(sig, std::ptr::null(), current.as_mut_ptr()) };
     // SAFETY: `current` is zero-initialized, a valid `sigaction`, and filled on success.
     read == 0 && unsafe { current.assume_init() }.sa_sigaction == libc::SIG_IGN
+}
+
+/// Whether SIGCHLD was ignored when [`reset_child_signal`] reset it.
+static CHILD_SIGNAL_IGNORED: AtomicBool = AtomicBool::new(false);
+
+/// Sets SIGCHLD to its default action, so that every child of this process stays unreaped
+/// until this process reaps it. A caller that ignores SIGCHLD passes that on across `exec`, and
+/// Linux then reaps the children itself: no wait could keep a child's PID from reuse, and the
+/// child's status is lost. Call before the first child is started; [`restore_child_signal`]
+/// gives a child the disposition this process started with.
+pub fn reset_child_signal() {
+    CHILD_SIGNAL_IGNORED.store(ignored(libc::SIGCHLD), Ordering::Relaxed);
+    let mut action = std::mem::MaybeUninit::<libc::sigaction>::zeroed();
+    // SAFETY: `action` is a zeroed `sigaction` (`SIG_DFL`, no flags) whose mask `sigemptyset`
+    // initializes; `sigaction` reads it and writes nothing back with a null old action.
+    unsafe {
+        libc::sigemptyset(&raw mut (*action.as_mut_ptr()).sa_mask);
+        libc::sigaction(libc::SIGCHLD, action.as_ptr(), std::ptr::null_mut());
+    }
+}
+
+/// Makes `command` start with SIGCHLD ignored when this process ignored it before
+/// [`reset_child_signal`], as the child would have had it if started directly.
+pub fn restore_child_signal(command: &mut Command) {
+    if !CHILD_SIGNAL_IGNORED.load(Ordering::Relaxed) {
+        return;
+    }
+    // SAFETY: the hook runs in the child between `fork` and `exec`, where only
+    // async-signal-safe calls are allowed: it makes one `signal` call and touches no memory.
+    unsafe {
+        command.pre_exec(|| {
+            libc::signal(libc::SIGCHLD, libc::SIG_IGN);
+            Ok(())
+        });
+    }
 }
 
 /// How a reaped child ended.

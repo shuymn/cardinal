@@ -18,6 +18,7 @@ use std::time::Instant;
 
 use crate::contract::{GroupIdentity, ProcessIdentity};
 use crate::os;
+use crate::testpoint;
 
 /// A local invocation: the stage's argv as the calling shell expanded it. The cwd and the
 /// environment are inherited.
@@ -286,7 +287,11 @@ impl LocalExecutor {
             .argv
             .split_first()
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "empty command"))?;
-        let child = Command::new(program).args(args).spawn()?;
+        let mut command = Command::new(program);
+        command.args(args);
+        #[cfg(unix)]
+        os::unix::restore_child_signal(&mut command);
+        let child = command.spawn()?;
         let pid = child.id();
         #[cfg(unix)]
         {
@@ -512,7 +517,11 @@ impl LocalRunning {
     /// Reaps the exited child.
     #[cfg(unix)]
     fn reap(&self) -> ExecOutcome {
-        match os::unix::reap(self.pid) {
+        let end = os::unix::reap(self.pid);
+        if let Err(err) = testpoint::hit(testpoint::RUN_REAPED) {
+            return ExecOutcome::InfraFailure(format!("cannot wait for the command: {err}"));
+        }
+        match end {
             Ok(os::unix::ChildEnd::Exited(code)) => ExecOutcome::Exited(code),
             Ok(os::unix::ChildEnd::Signaled(sig)) => ExecOutcome::Signaled(sig),
             Err(err) => ExecOutcome::InfraFailure(format!("cannot wait for the command: {err}")),
@@ -544,7 +553,11 @@ impl LocalRunning {
     #[cfg(not(unix))]
     fn supervise(mut self) -> ExecOutcome {
         let _ = &self.watch;
-        match self.child.wait() {
+        let end = self.child.wait();
+        if let Err(err) = testpoint::hit(testpoint::RUN_REAPED) {
+            return ExecOutcome::InfraFailure(format!("cannot wait for the command: {err}"));
+        }
+        match end {
             Ok(exit) => match exit.code() {
                 Some(code) => ExecOutcome::Exited(code),
                 None => ExecOutcome::InfraFailure(format!(

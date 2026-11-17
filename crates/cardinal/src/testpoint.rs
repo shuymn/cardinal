@@ -27,6 +27,9 @@ pub const RUN_SPAWNING: &str = "run.spawning";
 pub const RUN_SPAWNED: &str = "run.spawned";
 /// The child has been spawned.
 pub const RUN_AFTER_SPAWN: &str = "run.after_spawn";
+/// The stage's child has been reaped and its status not read; an injected failure stands for
+/// a status the wait could not get.
+pub const RUN_REAPED: &str = "run.reaped";
 /// `act` holds the exclusive in-use lock.
 pub const ACT_LOCKED: &str = "act.locked";
 /// `act` recorded its snapshot and has not run its checks.
@@ -48,6 +51,7 @@ pub const POINTS: &[&str] = &[
     RUN_SPAWNING,
     RUN_SPAWNED,
     RUN_AFTER_SPAWN,
+    RUN_REAPED,
     ACT_LOCKED,
     ACT_SNAPSHOTTED,
     ACT_CHECKED,

@@ -93,6 +93,9 @@ pub fn truncate_argv(argv: &[OsString]) -> Vec<String> {
 pub fn run(spec_b64: Option<&str>, command: &[OsString]) -> ExitCode {
     let started = Instant::now();
     silence_panics();
+    // Before the first child: the runner's children stay unreaped until it reaps them.
+    #[cfg(unix)]
+    os::unix::reset_child_signal();
     let watch = Watch::start();
     let tty = std::io::stdin().is_terminal();
     let mut runner = Runner::new(started, command, watch);
