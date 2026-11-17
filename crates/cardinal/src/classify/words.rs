@@ -146,12 +146,131 @@ const BUILTINS: &[&str] = &[
     "ztcp",
 ];
 
+/// Builtins that can define, remove, or redirect the commands of the calling shell (functions,
+/// aliases, hashed paths, builtins), source code into it, or set traps: a later wrapped stage
+/// could then run something else than the same stage unwrapped.
+const CALLER_CHANGING: &[&str] = &[
+    "eval",
+    ".",
+    "source",
+    "alias",
+    "unalias",
+    "unset",
+    "functions",
+    "unfunction",
+    "autoload",
+    "enable",
+    "disable",
+    "hash",
+    "unhash",
+    "trap",
+];
+
+/// Builtins whose `f` option defines, exports, or marks functions.
+const FUNCTION_OPTION: &[&str] = &["typeset", "declare", "local", "export", "readonly"];
+
+/// bash and zsh arrays whose elements are the shell's functions, aliases, command paths, or
+/// options.
+const CALLER_ARRAYS: &[&str] = &[
+    "functions",
+    "dis_functions",
+    "aliases",
+    "dis_aliases",
+    "galiases",
+    "dis_galiases",
+    "saliases",
+    "dis_saliases",
+    "commands",
+    "options",
+    "BASH_ALIASES",
+    "BASH_CMDS",
+];
+
+/// Options that make the shell print the commands it runs: the rewrite's fallback test and
+/// runner would show up in the output.
+const TRACING_OPTIONS: &[&str] = &["xtrace", "verbose", "functrace", "extdebug"];
+
+/// An option name as zsh compares it (case and underscores ignored), without a `no` prefix.
+fn is_tracing_option(name: &str) -> bool {
+    let name: String = name
+        .chars()
+        .filter(|c| *c != '_')
+        .flat_map(char::to_lowercase)
+        .collect();
+    let name = name.strip_prefix("no").unwrap_or(&name);
+    TRACING_OPTIONS.contains(&name)
+}
+
+/// Whether running the builtin `name` with `args` (each as written and, without an
+/// expansion, after quote removal) can change what a later stage means or make the shell
+/// trace commands. A word with an expansion counts as one that does.
+pub(super) fn changes_caller(name: &str, args: &[(&str, Option<&str>)]) -> bool {
+    if CALLER_CHANGING.contains(&name) {
+        return true;
+    }
+    let options = || args.iter().take_while(|(_, value)| *value != Some("--"));
+    match name {
+        _ if FUNCTION_OPTION.contains(&name) => options().any(|(raw, value)| {
+            if is_assignment(raw) || value.is_some_and(is_assignment) {
+                return assigns_caller_array(value.unwrap_or(raw));
+            }
+            value.is_none_or(|value| {
+                value
+                    .strip_prefix(['-', '+'])
+                    .is_some_and(|letters| letters.contains('f'))
+            })
+        }),
+        "set" => {
+            let mut words = options();
+            while let Some((_, value)) = words.next() {
+                let Some(value) = value else { return true };
+                let Some(letters) = value.strip_prefix(['-', '+']) else {
+                    break;
+                };
+                if letters.contains(['x', 'v', 'T']) {
+                    return true;
+                }
+                if letters.contains('o') {
+                    match words.next() {
+                        Some((_, Some(option))) if !is_tracing_option(option) => {}
+                        None => {}
+                        Some(_) => return true,
+                    }
+                }
+            }
+            false
+        }
+        "setopt" | "unsetopt" => args.iter().any(|(_, value)| {
+            value.is_none_or(|value| {
+                is_tracing_option(value)
+                    || value
+                        .strip_prefix(['-', '+'])
+                        .is_some_and(|letters| letters.contains(['x', 'v']))
+            })
+        }),
+        "shopt" => args
+            .iter()
+            .any(|(_, value)| value.is_none_or(is_tracing_option)),
+        _ => false,
+    }
+}
+
+/// Whether the assignment `word` (as written) sets an element of a shell's function, alias,
+/// command path, or option table.
+pub(super) fn assigns_caller_array(word: &str) -> bool {
+    let name = &word[..word
+        .bytes()
+        .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
+        .count()];
+    CALLER_ARRAYS.contains(&name)
+}
+
 /// Whether `word` (as written) is a keyword that refuses the whole command in command position.
 pub(super) fn is_refused_keyword(word: &str) -> bool {
     REFUSED_KEYWORDS.contains(&word)
 }
 
-/// Whether `word` (as written) is a precommand modifier.
+/// Whether `word` (after quote removal) is a precommand modifier.
 pub(super) fn is_precommand(word: &str) -> bool {
     PRECOMMANDS.contains(&word)
 }

@@ -8,7 +8,9 @@
 use std::ops::Range;
 
 use super::Stage;
-use super::words::{is_assignment, is_precommand, is_refused_keyword};
+use super::words::{
+    assigns_caller_array, changes_caller, is_assignment, is_precommand, is_refused_keyword,
+};
 
 /// Why a command is left unrewritten as a whole.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -19,8 +21,8 @@ pub enum Refusal {
     Unsupported(&'static str),
     #[error("keyword `{0}` in command position")]
     Keyword(String),
-    #[error("`{0}` in command position")]
-    Eval(String),
+    #[error("`{0}` can change what later commands mean or trace them")]
+    ChangesShell(String),
     #[error("command word `{0}` is not a literal")]
     NotLiteral(String),
     #[error("empty command before `{0}`")]
@@ -632,6 +634,13 @@ fn finish(
         .iter()
         .take_while(|w| is_assignment(&command[w.span.clone()]))
         .count();
+    if let Some(word) = builder.words[..assignments]
+        .iter()
+        .map(|w| &command[w.span.clone()])
+        .find(|raw| assigns_caller_array(raw))
+    {
+        return Err(Refusal::ChangesShell(word.to_owned()));
+    }
     let command_word = (assignments < builder.words.len()).then_some(assignments);
     if let Some(i) = command_word {
         check_command_position(command, &builder.words[i..])?;
@@ -659,8 +668,9 @@ fn finish(
 }
 
 /// Refuses keywords in command position, a command word that is not a literal (an expansion
-/// or a pattern can name any command, `eval` included), and `eval` or `alias` in command
-/// position; each also behind precommand modifiers (`command eval …`).
+/// or a pattern can name any command, `eval` included), and builtins that can change what a
+/// later stage means or trace it (`eval`, `.`, `alias`, `trap`, `set -x`, …); each after
+/// quote removal and behind precommand modifiers (`command "eval" …`).
 fn check_command_position(command: &str, words: &[Word]) -> Result<(), Refusal> {
     let first = &command[words[0].span.clone()];
     if is_refused_keyword(first) {
@@ -672,8 +682,12 @@ fn check_command_position(command: &str, words: &[Word]) -> Result<(), Refusal> 
         let Some(value) = word.value.as_deref() else {
             return Err(Refusal::NotLiteral(raw.to_owned()));
         };
-        if raw == "eval" || raw == "alias" {
-            return Err(Refusal::Eval(raw.to_owned()));
+        let args: Vec<(&str, Option<&str>)> = words[i + 1..]
+            .iter()
+            .map(|w| (&command[w.span.clone()], w.value.as_deref()))
+            .collect();
+        if changes_caller(value, &args) {
+            return Err(Refusal::ChangesShell(value.to_owned()));
         }
         if !is_precommand(value) {
             break;

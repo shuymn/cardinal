@@ -432,6 +432,49 @@ const CASES: &[Case] = &[
         1,
         1,
     ),
+    // Definitions, traps, and tracing in the calling shell would see or change what a later
+    // wrapped stage runs.
+    case(
+        "quoted_eval",
+        "",
+        "\"eval\" 'probe() { cd sub; }'; probe x; pwd",
+        0,
+        0,
+    ),
+    case(
+        "escaped_eval",
+        "",
+        "\\eval 'probe() { cd sub; }'; probe x; pwd",
+        0,
+        0,
+    ),
+    case(
+        "sourced_function",
+        "printf 'probe() { cd sub; }\\n' > defs.sh",
+        ". ./defs.sh; probe x; pwd",
+        0,
+        0,
+    ),
+    // Each ends its trap or tracing, which would otherwise race through the trailer's
+    // pipeline.
+    case(
+        "debug_trap",
+        "",
+        "trap 'echo DEBUG' DEBUG; probe x; trap - DEBUG",
+        0,
+        0,
+    ),
+    case("xtrace", "", "set -x; probe x; set +x", 0, 0),
+    Case {
+        only: &["zsh"],
+        ..case(
+            "zsh_xtrace",
+            "",
+            "setopt xtrace; probe x; unsetopt xtrace",
+            0,
+            0,
+        )
+    },
     case("comment", "", "probe a # trailing comment", 1, 1),
     case("multiline", "", "probe one\nprobe two", 2, 2),
     case("env_wrapper", "", "env W=1 probe --env", 1, 1),

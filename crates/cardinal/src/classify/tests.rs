@@ -1031,3 +1031,94 @@ fn quoted_pattern_characters_still_wrap() {
     assert_eq!(found.len(), 3);
     assert!(found.iter().all(StageOutcome::wrap), "{found:?}");
 }
+
+/// Builtins that can define, remove, or redirect commands in the calling shell, source code
+/// into it, set traps, or trace it refuse the whole command, after quote removal and behind
+/// precommand modifiers; the same names as arguments, and harmless options, do not.
+#[test]
+fn caller_changing_builtins_refuse_the_command() {
+    for command in [
+        "eval make",
+        "\"eval\" 'probe() { cd sub; }'; probe",
+        "\\eval x",
+        "'ev'al x",
+        "command \"eval\" x",
+        "builtin -x \\alias ll=ls",
+        "noglob eval x",
+        "- eval x",
+        "make && . ./defs.sh",
+        "source defs",
+        "alias x=y",
+        "unalias x",
+        "unset -f probe",
+        "unset X",
+        "functions -c a b",
+        "unfunction probe",
+        "autoload -U compinit",
+        "enable -f ./lib.so x",
+        "disable probe",
+        "hash -p ./x probe",
+        "unhash probe",
+        "typeset -f probe",
+        "declare -fx probe",
+        "export -f probe",
+        "readonly -f probe",
+        "local -f probe",
+        "declare \"$opts\" x",
+        "typeset 'functions[probe]=cd sub'",
+        "functions[probe]='cd sub'",
+        "aliases[probe]=x make",
+        "BASH_ALIASES[probe]='cd sub'",
+        "BASH_CMDS[probe]=/x",
+        "commands[probe]=/x",
+        "options[xtrace]=on",
+        "trap 'echo D' DEBUG",
+        "trap",
+        "set -x",
+        "set -xv",
+        "set -euxo pipefail",
+        "set +x",
+        "set -T",
+        "set -o xtrace",
+        "set -eo verbose",
+        "set -o functrace",
+        "set -o \"$opt\"",
+        "set $opts",
+        "setopt xtrace",
+        "setopt XTRACE",
+        "setopt x_trace",
+        "unsetopt noxtrace",
+        "setopt -x",
+        "setopt \"$opt\"",
+        "shopt -s extdebug",
+    ] {
+        assert!(
+            matches!(tokenize(command), Err(Refusal::ChangesShell(_))),
+            "{command:?}: {:?}",
+            tokenize(command)
+        );
+    }
+    for command in [
+        "set -e",
+        "set -euo pipefail",
+        "set -o pipefail",
+        "set -- -x \"$@\"",
+        "setopt nullglob",
+        "unsetopt nomatch",
+        "shopt -s nullglob",
+        "export FOO=$x PATH=\"$PATH:/x\"",
+        "declare -a arr",
+        "typeset -i n=1",
+        "local x=1",
+        "readonly X=1",
+        "echo eval trap source",
+        "probe trap 'set -x'",
+        "X=1 make",
+    ] {
+        assert!(
+            tokenize(command).is_ok(),
+            "{command:?}: {:?}",
+            tokenize(command)
+        );
+    }
+}
