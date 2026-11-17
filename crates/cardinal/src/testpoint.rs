@@ -35,6 +35,12 @@ pub const RUN_AFTER_SPAWN: &str = "run.after_spawn";
 pub const RUN_REAPED: &str = "run.reaped";
 /// `act` recorded its snapshot and has not run its checks.
 pub const ACT_SNAPSHOTTED: &str = "act.snapshotted";
+/// `plan`'s walk found the target a directory on its parent's mount, and has not opened it
+/// to list it.
+pub const WALK_TARGET_CHECKED: &str = "walk.target_checked";
+/// `plan`'s walk read the mount of a directory below the target by its path, and has not
+/// opened it to list it.
+pub const WALK_DIR_CHECKED: &str = "walk.dir_checked";
 /// The hook classified the command.
 pub const HOOK_CLASSIFIED: &str = "hook.classified";
 /// A record appender holds the shared records lock and the open current file, and has not
@@ -56,6 +62,8 @@ pub const POINTS: &[&str] = &[
     RUN_AFTER_SPAWN,
     RUN_REAPED,
     ACT_SNAPSHOTTED,
+    WALK_TARGET_CHECKED,
+    WALK_DIR_CHECKED,
     HOOK_CLASSIFIED,
     RECORD_OPENED,
     INBOX_OBSERVED,

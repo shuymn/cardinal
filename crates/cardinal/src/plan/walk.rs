@@ -1,12 +1,15 @@
 //! Walking a target without following symbolic links (`docs/architecture.md` sections 9.2
-//! and 9.5). `plan` walks by path; `act` takes its snapshot with directory descriptors and
-//! produces the same [`Entry`] values, so both evaluate the same checks.
+//! and 9.5). `plan` reaches each directory by path and, on Unix, lists it through the
+//! descriptor it identified it by; `act` takes its snapshot with directory descriptors opened
+//! relative to their parents. Both produce the same [`Entry`] values, so both evaluate the
+//! same checks.
 
 use std::fs::Metadata;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::contract::RootId;
+use crate::testpoint;
 
 /// The type of an entry, as `lstat` reports it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,6 +93,26 @@ impl Entry {
             }
         }
     }
+
+    /// An entry from what `os::dir` read of it without following a symbolic link.
+    #[cfg(unix)]
+    fn from_stat(rel: PathBuf, st: &crate::os::dir::Stat) -> Self {
+        use crate::os::dir::Kind;
+        Self {
+            rel,
+            kind: match st.kind {
+                Kind::File => EntryKind::File,
+                Kind::Dir => EntryKind::Dir,
+                Kind::Symlink => EntryKind::Symlink,
+                Kind::Other => EntryKind::Other,
+            },
+            dev: st.dev,
+            ino: st.ino,
+            size: st.size,
+            mtime_ns: st.mtime_ns,
+            allocated: st.blocks.saturating_mul(512),
+        }
+    }
 }
 
 /// Whether a target is on the mount of the directory that contains it.
@@ -97,7 +120,9 @@ impl Entry {
 pub enum Mount {
     /// The same device and mount as its parent.
     Same,
-    /// A mount point (a bind mount on the same device included), or on another device.
+    /// A mount point (a bind mount on the same device included), or on another device; for
+    /// `plan`'s walk on Unix also a target that was no longer the directory it recorded, or no
+    /// longer on its parent's mount, when the walk opened it to list it.
     Boundary,
     /// The mount could not be determined; the checks fail closed.
     Unknown(String),
@@ -136,7 +161,7 @@ pub struct Walk {
     /// link (worktree-relative), if any.
     pub link_in_path: Option<PathBuf>,
     /// Every entry below the root, parents before children. A directory on another device
-    /// or mount than the root is listed but not entered; nothing below a root that is not on
+    /// or mount than the root is recorded but not entered; nothing below a root that is not on
     /// its parent's mount is read.
     pub entries: Vec<Entry>,
 }
@@ -154,10 +179,16 @@ impl Walk {
     }
 }
 
-/// Walks `target`, which is `worktree` or a path inside it, by path without following
-/// symbolic links or entering another device or mount. Plans use it; `act` uses its own
-/// descriptor-based snapshot on Unix and this walk on Windows. Mounts are told by
-/// [`mount_id`], as `act` tells them.
+/// Walks `target`, which is `worktree` or a path inside it, without following symbolic links
+/// or entering another device or mount. Plans use it; `act` uses its own descriptor-based
+/// snapshot on Unix and this walk on Windows. Mounts are told by [`mount_id`], as `act` tells
+/// them.
+///
+/// Each directory is reached by path and listed only once it is found to be what the walk
+/// recorded: on Unix it is opened without following a final symbolic link, and listed through
+/// that descriptor only while the descriptor has the `dev` and `ino` the walk recorded and the
+/// target's mount; its entries are read relative to it. A target that fails this is reported
+/// as [`Mount::Boundary`]; a directory below it is recorded as the walk saw it and not entered.
 pub fn walk(worktree: &Path, target: &Path) -> io::Result<Walk> {
     let rel = target
         .strip_prefix(worktree)
@@ -178,13 +209,16 @@ pub fn walk(worktree: &Path, target: &Path) -> io::Result<Walk> {
     let parent_dev = Entry::from_metadata(PathBuf::new(), &std::fs::symlink_metadata(parent)?).dev;
     let root = Entry::from_metadata(rel, &std::fs::symlink_metadata(target)?);
     let root_mount = mount_id(target);
-    let mount = Mount::between(parent_dev, root.dev, &mount_id(parent), &root_mount);
+    let mut mount = Mount::between(parent_dev, root.dev, &mount_id(parent), &root_mount);
     let mut entries = Vec::new();
     // A target that is not on its parent's mount is refused, so nothing below it is read.
-    if let (EntryKind::Dir, None, Mount::Same, Ok(on_mount)) =
-        (root.kind, &link_in_path, &mount, &root_mount)
-    {
-        walk_dir(target, &root.rel, root.dev, on_mount, &mut entries)?;
+    let listable = root.kind == EntryKind::Dir && link_in_path.is_none() && mount == Mount::Same;
+    if let (true, Ok(on_mount)) = (listable, &root_mount) {
+        testpoint::hit(testpoint::WALK_TARGET_CHECKED).map_err(io::Error::other)?;
+        match Listing::open(target, &root, on_mount)? {
+            Some(listing) => walk_dir(listing, &root.rel, root.dev, on_mount, &mut entries)?,
+            None => mount = Mount::Boundary,
+        }
     }
     Ok(Walk {
         root,
@@ -221,43 +255,40 @@ fn mount_id(_path: &Path) -> Result<MountKey, String> {
     Ok(MountKey)
 }
 
-/// Records the entries below `dir`, parents before children in name order, without following
-/// symbolic links. A directory is listed only after its device and mount are found to be
-/// `dev` and `on_mount`: one on another device or mount is recorded but never listed, and a
-/// mount that cannot be read fails the walk. Each directory is listed in full and closed
-/// before anything below it is listed, so one directory is open at a time.
+/// Records the entries below the directory `listing`, parents before children in name order,
+/// without following symbolic links. A directory is listed only after its device and mount are
+/// found to be `dev` and `on_mount`, by path and then (Unix) on the descriptor it is listed
+/// through: one on another device or mount, or replaced since its entry was read, is recorded
+/// but never listed, and a mount that cannot be read fails the walk. Each directory is listed
+/// in full and closed before anything below it is opened, so one directory is open at a time.
 fn walk_dir(
-    dir: &Path,
+    listing: Listing,
     rel: &Path,
     dev: u64,
     on_mount: &MountKey,
     out: &mut Vec<Entry>,
 ) -> io::Result<()> {
-    // The remaining children of each directory being walked, innermost last.
-    let mut pending = vec![children(dir, rel)?.into_iter()];
+    // The remaining entries of each directory being walked, innermost last.
+    let mut pending = vec![listing.entries(rel)?.into_iter()];
     while let Some(level) = pending.last_mut() {
-        let Some((path, rel)) = level.next() else {
+        let Some((path, entry)) = level.next() else {
             pending.pop();
             continue;
         };
-        // `lstat` of the entry itself, not `DirEntry::metadata`: on Windows that is the copy
-        // of the entry's attributes in its parent directory's index (`FindNextFileW`), which
-        // NTFS updates lazily, so a directory's mtime there can predate an entry created below
-        // it.
-        let meta = match std::fs::symlink_metadata(&path) {
-            Ok(meta) => meta,
-            // Removed while walking: nothing to record.
-            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
-            Err(err) => return Err(err),
-        };
-        let entry = Entry::from_metadata(rel, &meta);
         let enter = entry.kind == EntryKind::Dir
             && entry.dev == dev
-            && mount_id(&path).map_err(io::Error::other)? == *on_mount;
+            && match mount_id(&path) {
+                Ok(mount) => mount == *on_mount,
+                // Removed since it was listed: the entry stays as it was seen.
+                Err(_) if gone(&path) => false,
+                Err(err) => return Err(io::Error::other(err)),
+            };
         if enter {
-            match children(&path, &entry.rel) {
-                Ok(below) => pending.push(below.into_iter()),
-                // Removed since its `lstat`: the entry stays as it was seen.
+            testpoint::hit(testpoint::WALK_DIR_CHECKED).map_err(io::Error::other)?;
+            match Listing::open(&path, &entry, on_mount) {
+                Ok(Some(below)) => pending.push(below.entries(&entry.rel)?.into_iter()),
+                // Replaced or removed since its entry was read: the entry stays as it was seen.
+                Ok(None) => {}
                 Err(err) if err.kind() == io::ErrorKind::NotFound => {}
                 Err(err) => return Err(err),
             }
@@ -267,17 +298,93 @@ fn walk_dir(
     Ok(())
 }
 
-/// The entries of the directory `dir`, as their paths and their worktree-relative paths below
-/// `rel`, in name order.
-fn children(dir: &Path, rel: &Path) -> io::Result<Vec<(PathBuf, PathBuf)>> {
-    let mut names = std::fs::read_dir(dir)?
-        .map(|entry| entry.map(|e| e.file_name()))
-        .collect::<io::Result<Vec<_>>>()?;
-    names.sort();
-    Ok(names
-        .into_iter()
-        .map(|name| (dir.join(&name), rel.join(name)))
-        .collect())
+/// Whether nothing is at `path` any more.
+fn gone(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_err_and(|err| err.kind() == io::ErrorKind::NotFound)
+}
+
+/// A directory the walk lists: on Unix, opened and found to be the directory the walk
+/// recorded, on the target's mount.
+struct Listing {
+    path: PathBuf,
+    #[cfg(unix)]
+    dir: std::fs::File,
+}
+
+impl Listing {
+    /// Opens the directory at `path`, recorded as `seen`, to list it; `None` when what is there
+    /// is no longer `seen` (another type, a symbolic link, another directory) or not on
+    /// `mount`. The check is on the descriptor the listing reads through.
+    #[cfg(unix)]
+    fn open(path: &Path, seen: &Entry, mount: &MountKey) -> io::Result<Option<Self>> {
+        let Some(dir) = crate::os::dir::open(path)? else {
+            return Ok(None);
+        };
+        let opened = Entry::from_metadata(seen.rel.clone(), &dir.metadata()?);
+        if !seen.same_identity(&opened)
+            || crate::os::mount::of_dir(&dir).map_err(io::Error::other)? != *mount
+        {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            path: path.to_owned(),
+            dir,
+        }))
+    }
+
+    /// Windows lists by path: a reparse point is recorded as a link and never listed, and
+    /// there is no mount to tell apart (see [`mount_id`]).
+    #[cfg(not(unix))]
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "the same signature as the Unix version"
+    )]
+    fn open(path: &Path, _seen: &Entry, _mount: &MountKey) -> io::Result<Option<Self>> {
+        Ok(Some(Self {
+            path: path.to_owned(),
+        }))
+    }
+
+    /// The entries of the directory, as their paths and their entries below the
+    /// worktree-relative `rel`, in name order; the directory is closed on return. An entry
+    /// removed before it is read is left out.
+    #[cfg(unix)]
+    fn entries(self, rel: &Path) -> io::Result<Vec<(PathBuf, Entry)>> {
+        Ok(crate::os::dir::list(self.dir)?
+            .into_iter()
+            .map(|(name, st)| (self.path.join(&name), Entry::from_stat(rel.join(name), &st)))
+            .collect())
+    }
+
+    /// The entries of the directory, as their paths and their entries below the
+    /// worktree-relative `rel`, in name order. An entry removed before it is read is left out.
+    #[cfg(not(unix))]
+    fn entries(self, rel: &Path) -> io::Result<Vec<(PathBuf, Entry)>> {
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir(&self.path)? {
+            match entry {
+                Ok(entry) => names.push(entry.file_name()),
+                // The directory was removed while it was read: what was read stays.
+                Err(err) if err.kind() == io::ErrorKind::NotFound => break,
+                Err(err) => return Err(err),
+            }
+        }
+        names.sort();
+        let mut entries = Vec::with_capacity(names.len());
+        for name in names {
+            let path = self.path.join(&name);
+            // `lstat` of the entry itself, not `DirEntry::metadata`: that is the copy of the
+            // entry's attributes in its parent directory's index (`FindNextFileW`), which NTFS
+            // updates lazily, so a directory's mtime there can predate an entry created below
+            // it.
+            match std::fs::symlink_metadata(&path) {
+                Ok(meta) => entries.push((path, Entry::from_metadata(rel.join(name), &meta))),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(entries)
+    }
 }
 
 /// The identity of a worktree root: `dev` and `ino` on Unix, and its creation time where

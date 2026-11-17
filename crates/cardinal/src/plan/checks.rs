@@ -570,7 +570,7 @@ fn plain_target(i: &Inspection<'_>) -> Check {
         (_, Mount::Boundary) => invariant(
             "plain_target",
             CheckResult::Fail,
-            "a mount point, or on another device than its parent",
+            "a mount point, on another device than its parent, or replaced while it was read",
         ),
         (_, Mount::Unknown(err)) => invariant(
             "plain_target",

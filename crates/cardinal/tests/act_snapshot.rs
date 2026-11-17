@@ -1,8 +1,9 @@
-//! Snapshot inspection (A7, C13, C14; `docs/architecture.md` section 9.5): `act` inspects
-//! the target before its checks, observes the worktree again after the snapshot, and on Linux
-//! does not enter a bind mount below the target or accept a target that is one. A race pauses
-//! `act` in a helper process at its test point, makes the change once the point is reached,
-//! and releases it.
+//! Snapshot inspection (A7, C13, C14; `docs/architecture.md` sections 9.2 and 9.5): `act`
+//! inspects the target before its checks, observes the worktree again after the snapshot, and
+//! on Linux does not enter a bind mount below the target or accept a target that is one;
+//! `plan`'s walk lists only the directories it recorded. A race pauses `act` or the walk in a
+//! helper process at its test point, makes the change once the point is reached, and releases
+//! it.
 //!
 //! Observation comes from the fake in `tests/fakes` until the integration gate; it reads
 //! HEAD and branch from the worktree's git files, as git would.
@@ -12,7 +13,7 @@ mod support;
 
 #[cfg(target_os = "linux")]
 use std::fmt::Write as _;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use std::path::Path;
 use std::time::Duration;
 
@@ -171,28 +172,21 @@ fn ran_in_namespace(test: &str, flags: &[&str]) {
     ));
 }
 
-/// Runs `inner` inside a private mount namespace where each `(source, target)` of `binds` is
-/// bind-mounted first. The mounts are undone after `inner`, and end with the namespace on
-/// every other path (a failed mount, a panic, a kill).
+/// `path` quoted for `sh`.
 #[cfg(target_os = "linux")]
-fn with_binds(s: &Setup, flags: &[&str], binds: &[(&Path, &Path)], inner: &std::process::Command) {
-    let quote = |path: &Path| format!("'{}'", path.display().to_string().replace('\'', "'\\''"));
-    let mut mounts = String::new();
-    let mut unmounts = String::new();
-    for (source, target) in binds {
-        let _ = writeln!(
-            mounts,
-            "mount --bind {} {} || exit 97",
-            quote(source),
-            quote(target)
-        );
-        unmounts.insert_str(0, &format!("umount {}\n", quote(target)));
-    }
-    let script = format!("{mounts}\"$@\"\nstatus=$?\n{unmounts}exit $status\n");
+fn quote(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+}
+
+/// Runs `script` with `sh` inside a private mount namespace, with `inner`'s program and
+/// arguments as its positional parameters and `inner`'s environment. Mounts made there end
+/// with the namespace on every path (a failed mount, a panic, a kill).
+#[cfg(target_os = "linux")]
+fn in_namespace(s: &Setup, flags: &[&str], script: &str, inner: &std::process::Command) {
     let mut command = std::process::Command::new("unshare");
     command
         .args(flags)
-        .args(["sh", "-c", &script, "sh"])
+        .args(["sh", "-c", script, "sh"])
         .arg(inner.get_program())
         .args(inner.get_args());
     for (key, value) in inner.get_envs() {
@@ -208,12 +202,62 @@ fn with_binds(s: &Setup, flags: &[&str], binds: &[(&Path, &Path)], inner: &std::
     assert!(status.success(), "the helper in the namespace: {status}");
 }
 
+/// Runs `inner` inside a private mount namespace where each `(source, target)` of `binds` is
+/// bind-mounted first. The mounts are undone after `inner`, and end with the namespace on
+/// every other path.
+#[cfg(target_os = "linux")]
+fn with_binds(s: &Setup, flags: &[&str], binds: &[(&Path, &Path)], inner: &std::process::Command) {
+    let mut mounts = String::new();
+    let mut unmounts = String::new();
+    for (source, target) in binds {
+        let _ = writeln!(
+            mounts,
+            "mount --bind {} {} || exit 97",
+            quote(source),
+            quote(target)
+        );
+        unmounts.insert_str(0, &format!("umount {}\n", quote(target)));
+    }
+    let script = format!("{mounts}\"$@\"\nstatus=$?\n{unmounts}exit $status\n");
+    in_namespace(s, flags, &script, inner);
+}
+
 /// Runs `act` of `plan` in a helper under `binds` (see [`with_binds`]).
 #[cfg(target_os = "linux")]
 fn act_with_binds(s: &Setup, flags: &[&str], plan: &str, binds: &[(&Path, &Path)]) -> ActResult {
     let out = s.fx.path(&format!("result-{plan}.json"));
     with_binds(s, flags, binds, &s.act_command(plan, &arbiter(), &out));
     fakes::read_result(&out)
+}
+
+/// A helper process (this test binary, see [`walk_if_requested`]) that runs `plan::walk` of
+/// `target` and writes what it found to `out`, a fresh file.
+#[cfg(unix)]
+fn walk_command(s: &Setup, worktree: &Path, target: &Path, out: &Path) -> std::process::Command {
+    match std::fs::remove_file(out) {
+        Err(err) if err.kind() != std::io::ErrorKind::NotFound => panic!("{err}"),
+        _ => {}
+    }
+    let request = serde_json::json!({
+        "root": s.fx.root(), "worktree": worktree, "target": target, "out": out,
+    });
+    let mut walk = std::process::Command::new(std::env::current_exe().unwrap());
+    walk.args(["helper", "--exact", "--nocapture", "--test-threads=1"])
+        .env(WALK_ENV, request.to_string());
+    walk
+}
+
+/// The mount and the entries a walk helper wrote to `out`.
+#[cfg(unix)]
+fn read_walk(out: &Path) -> (String, Vec<String>) {
+    let doc: serde_json::Value = serde_json::from_slice(&std::fs::read(out).unwrap()).unwrap();
+    let entries = doc["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e.as_str().unwrap().to_owned())
+        .collect();
+    (doc["mount"].as_str().unwrap().to_owned(), entries)
 }
 
 /// Runs `plan::walk` of `target` in a helper under `binds`, and returns the mount and the
@@ -227,21 +271,80 @@ fn walk_with_binds(
     binds: &[(&Path, &Path)],
 ) -> (String, Vec<String>) {
     let out = s.fx.path("walk.json");
-    let request = serde_json::json!({
-        "root": s.fx.root(), "worktree": worktree, "target": target, "out": out,
-    });
-    let mut walk = std::process::Command::new(std::env::current_exe().unwrap());
-    walk.args(["helper", "--exact", "--nocapture", "--test-threads=1"])
-        .env(WALK_ENV, request.to_string());
-    with_binds(s, flags, binds, &walk);
-    let doc: serde_json::Value = serde_json::from_slice(&std::fs::read(&out).unwrap()).unwrap();
-    let entries = doc["entries"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|e| e.as_str().unwrap().to_owned())
-        .collect();
-    (doc["mount"].as_str().unwrap().to_owned(), entries)
+    with_binds(s, flags, binds, &walk_command(s, worktree, target, &out));
+    read_walk(&out)
+}
+
+/// Runs `plan::walk` of `target` in a helper paused at `point`, calls `change` once the
+/// helper has reached it, releases it, and returns the mount and the entries it found.
+#[cfg(unix)]
+fn walk_with_change_at(
+    s: &Setup,
+    worktree: &Path,
+    target: &Path,
+    point: &str,
+    change: impl FnOnce(),
+) -> (String, Vec<String>) {
+    let points = TestPoints::new();
+    let out = s.fx.path("walk.json");
+    let mut command = walk_command(s, worktree, target, &out);
+    points.apply(&mut command, &[point], None);
+    let mut child = ChildGuard::new(
+        fakes::confined(&s.fx, command, s.fx.root())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    points.wait_reached(point, child.id(), WAIT);
+    change();
+    points.release(point);
+    assert!(child.child().wait().unwrap().success());
+    read_walk(&out)
+}
+
+/// Runs `plan::walk` of `target` in a helper inside a private mount namespace, paused at
+/// `point`; once the helper has reached it, bind-mounts `source` over `over` in that
+/// namespace and releases it. Returns the mount and the entries the walk found.
+#[cfg(target_os = "linux")]
+fn walk_with_bind_at(
+    s: &Setup,
+    flags: &[&str],
+    (worktree, target): (&Path, &Path),
+    point: &str,
+    (source, over): (&Path, &Path),
+) -> (String, Vec<String>) {
+    use cardinal::testpoint::release_file;
+    let points = TestPoints::new();
+    let out = s.fx.path("walk.json");
+    let mut walk = walk_command(s, worktree, target, &out);
+    points.apply(&mut walk, &[point], None);
+    // The helper's reached file is `<dir>/<point>.<pid>.reached`. It is waited for 20 s at
+    // most; a paused helper aborts on its own after its pause limit.
+    let script = format!(
+        r#""$@" &
+pid=$!
+reached={dir}/'{point}'."$pid".reached
+n=0
+until [ -e "$reached" ]; do
+    n=$((n + 1))
+    if [ "$n" -gt 2000 ]; then kill "$pid"; exit 96; fi
+    sleep 0.01
+done
+mount --bind {source} {over} || {{ kill "$pid"; exit 97; }}
+: > {release}
+wait "$pid"
+status=$?
+umount {over}
+exit "$status"
+"#,
+        dir = quote(points.dir()),
+        source = quote(source),
+        over = quote(over),
+        release = quote(&release_file(points.dir(), point)),
+    );
+    in_namespace(s, flags, &script, &walk);
+    read_walk(&out)
 }
 
 /// A7 on Linux: a bind mount on the same filesystem is a mount point. `act` rejects a target
@@ -378,4 +481,138 @@ fn bind_mounts_are_not_listed() {
     assert_eq!(result.status, ActStatus::DryRun, "{result:#?}");
     assert!(!watch.seen().1, "the snapshot does not list the bind mount");
     ran_in_namespace("bind_mounts_are_not_listed", flags);
+}
+
+/// A target, and a directory below it, set up for a walk race: `walk-<n>/node_modules` holds
+/// `pkg/index.js`, and `outside-<n>`, which is outside the worktree, holds `secret`. Returns
+/// the worktree, the target, and the outside directory.
+#[cfg(unix)]
+fn walk_race(s: &Setup, n: usize) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+    let wt = s.fx.path(&format!("walk-{n}"));
+    write(&wt, "node_modules/pkg/index.js", "x");
+    let outside = s.fx.path(&format!("outside-{n}"));
+    write(&outside, "secret", "x");
+    let target = wt.join("node_modules");
+    (wt, target, outside)
+}
+
+/// What a walk race at `point` replaces: the target itself at `walk.target_checked`, its only
+/// subdirectory `pkg` at `walk.dir_checked`.
+#[cfg(unix)]
+fn replaced_at(point: &str, target: &Path) -> std::path::PathBuf {
+    if point == cardinal::testpoint::WALK_TARGET_CHECKED {
+        target.to_path_buf()
+    } else {
+        target.join("pkg")
+    }
+}
+
+/// Whether `plan`'s walk found what it must after a race at `point`: a replaced target is a
+/// boundary with nothing below it read, and a replaced directory below the target is recorded
+/// as the walk saw it and not listed. Either way nothing of the replacement is in the walk.
+#[cfg(unix)]
+fn replacement_left_out(point: &str, found: &(String, Vec<String>)) -> Result<(), String> {
+    let expected = if point == cardinal::testpoint::WALK_TARGET_CHECKED {
+        ("Boundary", &[][..])
+    } else {
+        ("Same", &["node_modules/pkg"][..])
+    };
+    if found.0 == expected.0 && found.1 == expected.1 {
+        Ok(())
+    } else {
+        Err(format!("{found:?}, expected {expected:?}"))
+    }
+}
+
+/// The walk points at which a race replaces a directory: the target after its mount check,
+/// and a directory below it after its mount lookup, both before the directory is opened.
+#[cfg(unix)]
+const WALK_POINTS: [&str; 2] = [
+    cardinal::testpoint::WALK_TARGET_CHECKED,
+    cardinal::testpoint::WALK_DIR_CHECKED,
+];
+
+/// A7: a directory replaced after `plan`'s walk recorded it and checked its mount, before
+/// the walk lists it, by a symbolic link to a directory outside the worktree or by that
+/// directory moved in: the walk lists neither.
+#[cfg(unix)]
+#[test]
+fn walk_lists_only_the_directories_it_recorded() {
+    let s = Setup::new();
+    let cases = WALK_POINTS
+        .into_iter()
+        .flat_map(|point| [(point, "a symbolic link"), (point, "another directory")]);
+    let mut failed = Vec::new();
+    for (n, (point, replacement)) in cases.enumerate() {
+        let (wt, target, outside) = walk_race(&s, n);
+        let replaced = replaced_at(point, &target);
+        let found = walk_with_change_at(&s, &wt, &target, point, || {
+            let mut aside = replaced.clone().into_os_string();
+            aside.push(".old");
+            std::fs::rename(&replaced, aside).unwrap();
+            if replacement == "a symbolic link" {
+                std::os::unix::fs::symlink(&outside, &replaced).unwrap();
+            } else {
+                std::fs::rename(&outside, &replaced).unwrap();
+            }
+        });
+        if let Err(err) = replacement_left_out(point, &found) {
+            failed.push(format!("{point}, {replacement}: {err}"));
+        }
+    }
+    assert!(failed.is_empty(), "{failed:#?}");
+}
+
+/// A directory removed after `plan`'s walk listed its parent, while the walk is below an
+/// earlier one: the walk records it as it saw it and goes on.
+#[cfg(unix)]
+#[test]
+fn walk_records_a_directory_removed_after_it_was_listed() {
+    let s = Setup::new();
+    let wt = s.fx.path("removed");
+    write(&wt, "node_modules/a/index.js", "x");
+    write(&wt, "node_modules/b/index.js", "x");
+    let target = wt.join("node_modules");
+    // The walk pauses at its first directory below the target, `a`, before it opens it.
+    let (mount, entries) = walk_with_change_at(
+        &s,
+        &wt,
+        &target,
+        cardinal::testpoint::WALK_DIR_CHECKED,
+        || std::fs::remove_dir_all(target.join("b")).unwrap(),
+    );
+    assert_eq!(mount, "Same");
+    assert_eq!(
+        entries,
+        [
+            "node_modules/a",
+            "node_modules/a/index.js",
+            "node_modules/b"
+        ]
+    );
+}
+
+/// A7 on Linux: a directory outside the worktree bind-mounted over the target, or over a
+/// directory below it, after `plan`'s walk checked its mount and before the walk lists it:
+/// the walk does not list the mount.
+#[cfg(target_os = "linux")]
+#[test]
+fn walk_does_not_list_a_mount_made_after_its_check() {
+    let s = Setup::new();
+    let test = "walk_does_not_list_a_mount_made_after_its_check";
+    let Some(flags) = mount_namespace(&s, test) else {
+        return;
+    };
+    let mut failed = Vec::new();
+    for (n, point) in WALK_POINTS.into_iter().enumerate() {
+        let (wt, target, outside) = walk_race(&s, n);
+        let over = replaced_at(point, &target);
+        let found = walk_with_bind_at(&s, flags, (&wt, &target), point, (&outside, &over));
+        if let Err(err) = replacement_left_out(point, &found) {
+            failed.push(format!("{point}: {err}"));
+        }
+        assert!(outside.join("secret").exists());
+    }
+    assert!(failed.is_empty(), "{failed:#?}");
+    ran_in_namespace(test, flags);
 }
