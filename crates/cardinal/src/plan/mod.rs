@@ -14,6 +14,7 @@ use std::time::Duration;
 
 pub use checks::{
     DataLists, InUseFacts, Inspection, approval, evaluate, invariants_ok, processes_inside,
+    provenance,
 };
 pub use walk::{Entry, EntryKind, Mount, Walk, root_identity, walk};
 
@@ -257,7 +258,7 @@ fn build(
     let (root_id, root_created_ms) = root_identity(&worktree).unwrap_or((None, None));
     let in_use = probe_in_use(state, sources, &worktree, target);
     let patterns = patterns(config, &observation.repo);
-    let checks = evaluate(&Inspection {
+    let inspection = Inspection {
         kind,
         worktree: &worktree,
         target,
@@ -266,7 +267,9 @@ fn build(
         in_use: &in_use,
         patterns: &patterns,
         managed: &config.host.observe.managed,
-    });
+    };
+    let checks = evaluate(&inspection);
+    let provenance = provenance(config, &inspection);
     Plan {
         schema: PlanSchema,
         id: String::new(),
@@ -286,6 +289,7 @@ fn build(
         invariants_ok: invariants_ok(&checks),
         approval: approval(&checks),
         checks,
+        provenance,
     }
 }
 

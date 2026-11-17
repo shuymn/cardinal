@@ -311,3 +311,68 @@ fn command_shows_what_matched() {
     );
     assert_eq!(doc.rewritten.as_deref(), Some("wrapped: npx vitest"));
 }
+
+/// `explain plan` shows what the plan's checks were evaluated from: each fact with its value
+/// and source, the profile keys used, and what could not be observed. Every `act` record
+/// carries the same for its own evaluation.
+#[test]
+fn plan_shows_its_provenance() {
+    let s = Setup::new();
+    let wt = s.worktree("traced", &[("node_modules", IgnoredClass::Regenerable)]);
+    let mut world = s.fake.read();
+    world.worktrees[0].repo.gh_error = Some("HTTP 502".into());
+    s.fake.write(&world);
+    let plan = s.plan(PlanKind::ReclaimWorktree, &wt);
+    let doc = explain(&s.config, &s.state, &Subject::Plan(plan.id.clone())).unwrap();
+    let observed = |command: &str, result: &str| {
+        doc.sources.iter().any(|source| {
+            matches!(source, ExplainSource::Observation { command: c, exit: None, result: r }
+                if c == &[command] && r == result)
+        })
+    };
+    assert!(
+        observed("git", "clean: worktree.facts.dirty = \"no\""),
+        "{:#?}",
+        doc.sources
+    );
+    assert!(observed(
+        "gh",
+        "no_open_pr: worktree.facts.open_pr = \"no\""
+    ));
+    assert!(observed("gh", "error: HTTP 502"), "{:#?}", doc.sources);
+    let profile = s
+        .dirs
+        .config()
+        .join("repos/generic.toml")
+        .display()
+        .to_string();
+    assert!(
+        doc.sources.iter().any(|source| matches!(
+            source,
+            ExplainSource::Config { file, key, value }
+                if *file == profile && key == "data.protected"
+                    && value.as_array().is_some_and(|v| v.contains(&"fuzz/corpus".into()))
+        )),
+        "{:#?}",
+        doc.sources
+    );
+
+    let dry_run = ActOptions {
+        dry_run: true,
+        ..arbiter()
+    };
+    s.act(&plan.id, &dry_run).unwrap();
+    let records = cardinal::record::read_all(&s.state).unwrap();
+    let act = records
+        .iter()
+        .find(|r| r.kind == RecordKind::Act && r.plan_id.as_deref() == Some(plan.id.as_str()))
+        .expect("an act record");
+    let clean = act.data["checks"]
+        .as_array()
+        .and_then(|checks| checks.iter().find(|c| c["name"] == "clean"))
+        .expect("the act record lists its checks");
+    assert_eq!(clean["facts"][0]["name"], "worktree.facts.dirty");
+    assert_eq!(clean["facts"][0]["source"], "git");
+    assert_eq!(act.data["provenance"]["errors"][0]["message"], "HTTP 502");
+    assert_eq!(act.data["provenance"]["config"][0]["file"], profile);
+}

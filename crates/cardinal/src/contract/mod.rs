@@ -35,7 +35,10 @@ pub use inventory::{
     BaseRef, Facts, GhStatus, HostInfo, IgnoredClass, IgnoredEntry, InUse, Inventory,
     MergeEvidence, Os, Outlived, PrRef, ReclaimSummary, Repo, Worktree,
 };
-pub use plan::{Approval, Plan, PlanClaim, PlanKind, PlanList, PlanTarget, RootId};
+pub use plan::{
+    Approval, ConfigKey, ObservedError, Plan, PlanClaim, PlanKind, PlanList, PlanTarget,
+    Provenance, RootId,
+};
 pub use record::{Record, RecordKind};
 pub use reservation::{
     AdmissionResult, DerivedState, GroupMember, Priority, ProcessIdentity, Reservation,
@@ -173,6 +176,20 @@ pub struct Check {
     pub role: CheckRole,
     pub result: CheckResult,
     pub detail: String,
+    /// The facts the check read, each with where it came from.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub facts: Vec<CheckFact>,
+}
+
+/// A fact a check read (`docs/architecture.md` section 10.2).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckFact {
+    /// The observation field or input, such as `worktree.facts.dirty`.
+    pub name: String,
+    /// Its value; null when it was not observed.
+    pub value: serde_json::Value,
+    /// What produced it: the tool behind the observation (`git`, `gh`) or the local read.
+    pub source: String,
 }
 
 /// The process group a job runs in. The leader is the runner. Phase 3 adds a Job Object kind.

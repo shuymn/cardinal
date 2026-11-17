@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 
 use crate::config::Config;
 use crate::contract::{
-    ActResult, ActResultSchema, ActStatus, Approval, Caller, Check, CheckResult, CheckRole, Error,
-    ErrorCode, InUse, Plan, PlanClaim, PlanKind, RecordKind, RootId,
+    ActResult, ActResultSchema, ActStatus, Approval, Caller, Check, CheckResult, CheckRole,
+    ConfigKey, Error, ErrorCode, InUse, Plan, PlanClaim, PlanKind, Provenance, RecordKind, RootId,
 };
 use crate::observe::WorktreeObservation;
 use crate::plan::{self, DataLists, InUseFacts, Inspection, Real, Sources, Walk};
@@ -99,6 +99,7 @@ struct Outcome {
     status: Option<ActStatus>,
     reasons: Vec<String>,
     checks: Vec<Check>,
+    provenance: Provenance,
     freed_bytes: Option<u64>,
     skipped_changed: Vec<String>,
     error: Option<String>,
@@ -181,7 +182,7 @@ impl Run<'_> {
             |_| DataLists::default(),
             |o| plan::patterns(self.config, &o.repo),
         );
-        let checks = plan::evaluate(&Inspection {
+        let inspection = Inspection {
             kind: self.plan.kind,
             worktree: &worktree,
             target: &target,
@@ -190,7 +191,8 @@ impl Run<'_> {
             in_use: &in_use,
             patterns: &patterns,
             managed: &self.config.host.observe.managed,
-        });
+        };
+        let checks = plan::evaluate(&inspection);
         let failed: Vec<String> = checks
             .iter()
             .filter(|c| c.role == CheckRole::Invariant && c.result != CheckResult::Pass)
@@ -199,6 +201,7 @@ impl Run<'_> {
         let would_free = snapshot.walk.as_ref().ok().map(Walk::allocated);
         let mut outcome = Outcome {
             checks,
+            provenance: plan::provenance(self.config, &inspection),
             ..Outcome::default()
         };
         if !failed.is_empty() {
@@ -396,6 +399,14 @@ impl Run<'_> {
     /// Step 8: writes `result.json` when the plan was claimed, appends the record (`planned`
     /// for a unit that may not act), and builds the result.
     fn finish(&self, outcome: Outcome, claimed: bool, gated: bool) -> ActResult {
+        let mut provenance = outcome.provenance;
+        if let (true, Caller::Unit(unit)) = (gated, &self.options.caller) {
+            provenance.config.push(ConfigKey {
+                file: self.config.dir.join("host.toml").display().to_string(),
+                key: format!("unit.{unit}.act"),
+                value: false.into(),
+            });
+        }
         let mut result = ActResult {
             schema: ActResultSchema,
             plan_id: self.plan.id.clone(),
@@ -432,7 +443,7 @@ impl Run<'_> {
             RecordKind::Act
         });
         record.plan_id = Some(self.plan.id.clone());
-        let mut data = serde_json::json!({
+        let data = serde_json::json!({
             "caller": result.caller,
             "kind": self.plan.kind,
             "target": self.plan.target.path,
@@ -441,10 +452,9 @@ impl Run<'_> {
             "freed_bytes": result.freed_bytes,
             "skipped_changed": result.skipped_changed.len(),
             "error": result.error,
+            "checks": result.checks,
+            "provenance": provenance,
         });
-        if gated {
-            data["checks"] = serde_json::to_value(&result.checks).unwrap_or_default();
-        }
         record.data = data.as_object().cloned().unwrap_or_default();
         let _ = recorder.append(&record);
         result

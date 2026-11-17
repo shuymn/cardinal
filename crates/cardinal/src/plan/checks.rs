@@ -1,14 +1,16 @@
 //! The checks of `docs/architecture.md` section 9.2, evaluated the same way by `plan` and by
 //! `act`. Every check is computed from facts gathered by the caller: an observation, a walk
 //! (or `act`'s snapshot) of the target, and the in-use facts. Missing facts give `unknown`,
-//! which is never treated as safe.
+//! which is never treated as safe. Each check carries the facts it read, and [`provenance`]
+//! names the observation errors and configuration keys behind them (section 10.2).
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use crate::config::{DataList, Managed, Selection, data_pattern_covers};
+use crate::config::{Config, DataList, Managed, Selection, data_pattern_covers};
 use crate::contract::{
-    Approval, Check, CheckResult, CheckRole, IgnoredClass, InUse, MergeEvidence, PlanKind, Tri,
+    Approval, Check, CheckFact, CheckResult, CheckRole, ConfigKey, IgnoredClass, InUse,
+    MergeEvidence, ObservedError, PlanKind, Provenance, Tri,
 };
 use crate::observe::WorktreeObservation;
 use crate::os::{Detail, ProcessTable};
@@ -120,7 +122,177 @@ pub fn evaluate(i: &Inspection<'_>) -> Vec<Check> {
     if worktree {
         checks.push(merge_evidence(i));
     }
+    for check in &mut checks {
+        check.facts = facts(&check.name, i);
+    }
     checks
+}
+
+/// The facts the check `name` reads from `i`, each with what produced it.
+fn facts(name: &str, i: &Inspection<'_>) -> Vec<CheckFact> {
+    fn fact(name: &str, value: Option<impl serde::Serialize>, source: &str) -> CheckFact {
+        CheckFact {
+            name: name.to_owned(),
+            value: value
+                .and_then(|v| serde_json::to_value(v).ok())
+                .unwrap_or_default(),
+            source: source.to_owned(),
+        }
+    }
+    let repo = i.observation.ok().map(|o| &o.repo);
+    let wt = i.observation.ok().map(|o| &o.worktree);
+    let facts = wt.map(|w| &w.facts);
+    let walk = i.walk.ok();
+    let in_use = i.in_use;
+    match name {
+        "observed" => vec![fact("repo.gh", repo.map(|r| r.gh), "gh")],
+        "not_in_use" => vec![
+            fact(
+                "in_use.lock_held",
+                in_use.lock_held.as_ref().ok(),
+                "worktree in-use lock",
+            ),
+            fact(
+                "in_use.reservations",
+                in_use.reservations.as_ref().ok(),
+                "reservations",
+            ),
+            fact(
+                "in_use.processes",
+                in_use.processes.as_ref().ok(),
+                "process table",
+            ),
+        ],
+        "not_managed" => vec![fact(
+            "worktree.managed_by",
+            wt.map(|w| &w.managed_by),
+            "git",
+        )],
+        "clean" => vec![fact("worktree.facts.dirty", facts.map(|f| f.dirty), "git")],
+        "no_unpushed" => vec![fact(
+            "worktree.facts.unpushed",
+            facts.map(|f| f.unpushed),
+            "git",
+        )],
+        "no_open_pr" => vec![fact(
+            "worktree.facts.open_pr",
+            facts.map(|f| f.open_pr),
+            "gh",
+        )],
+        "has_upstream" => vec![
+            fact(
+                "worktree.facts.has_upstream",
+                facts.map(|f| f.has_upstream),
+                "git",
+            ),
+            fact("worktree.upstream", wt.map(|w| &w.upstream), "git"),
+        ],
+        "merge_evidence" => vec![
+            fact(
+                "worktree.facts.merge_evidence",
+                facts.map(|f| f.merge_evidence),
+                "git, gh",
+            ),
+            fact(
+                "worktree.facts.merged_pr",
+                facts.map(|f| &f.merged_pr),
+                "gh",
+            ),
+            fact("repo.base", repo.map(|r| &r.base), "git"),
+        ],
+        "regenerable" | "no_unclassifiable" | "no_nested_repository" | "no_protected" => {
+            vec![fact(
+                "worktree.ignored",
+                ignored_in_target(i).map(|found| {
+                    found
+                        .into_iter()
+                        .map(|(path, class)| serde_json::json!({ "path": path, "class": class }))
+                        .collect::<Vec<_>>()
+                }),
+                "git",
+            )]
+        }
+        "plain_target" => vec![
+            fact(
+                "walk.root.kind",
+                walk.map(|w| format!("{:?}", w.root.kind).to_lowercase()),
+                "lstat",
+            ),
+            fact(
+                "walk.mount",
+                walk.map(|w| format!("{:?}", w.mount)),
+                "stat, statx, statfs",
+            ),
+            fact("walk.link_in_path", walk.map(|w| &w.link_in_path), "lstat"),
+        ],
+        _ => Vec::new(),
+    }
+}
+
+/// What the checks of `i` were evaluated from beyond their facts: what could not be read,
+/// and the configuration keys used (the `[data]` lists of the repository's profiles and the
+/// managed roots of `host.toml`).
+#[must_use]
+pub fn provenance(config: &Config, i: &Inspection<'_>) -> Provenance {
+    let error = |source: &str, message: &str| ObservedError {
+        source: source.to_owned(),
+        message: message.to_owned(),
+    };
+    let mut errors = Vec::new();
+    match i.observation {
+        Err(err) => errors.push(error("observation", err)),
+        Ok(o) => {
+            if let Some(err) = &o.repo.gh_error {
+                errors.push(error("gh", err));
+            }
+        }
+    }
+    if let Err(err) = i.walk {
+        errors.push(error("walk", err));
+    }
+    if let Err(err) = &i.in_use.lock_held {
+        errors.push(error("worktree in-use lock", err));
+    }
+    if let Err(err) = &i.in_use.reservations {
+        errors.push(error("reservations", err));
+    }
+    if let Err(err) = &i.in_use.processes {
+        errors.push(error("process table", err));
+    }
+    let mut keys = Vec::new();
+    if let Ok(o) = i.observation {
+        // The profiles `plan::patterns` reads: the repository's, then the generic ones.
+        let selection = config.select(|p| o.repo.profiles.contains(&p.name));
+        for profile in selection.profiles {
+            for (key, list) in [
+                ("data.protected", &profile.protected),
+                ("data.regenerable", &profile.regenerable),
+            ] {
+                if !list.is_empty() {
+                    keys.push(ConfigKey {
+                        file: profile.file.display().to_string(),
+                        key: key.to_owned(),
+                        value: list.clone().into(),
+                    });
+                }
+            }
+        }
+    }
+    if !i.managed.is_empty() {
+        keys.push(ConfigKey {
+            file: config.dir.join("host.toml").display().to_string(),
+            key: "observe.managed".to_owned(),
+            value: i
+                .managed
+                .iter()
+                .map(|m| serde_json::json!({ "app": m.app, "root": m.root }))
+                .collect(),
+        });
+    }
+    Provenance {
+        errors,
+        config: keys,
+    }
 }
 
 /// Whether every invariant passed.
@@ -165,6 +337,7 @@ fn check(name: &str, role: CheckRole, result: CheckResult, detail: impl Into<Str
         role,
         result,
         detail: detail.into(),
+        facts: Vec::new(),
     }
 }
 

@@ -277,6 +277,41 @@ fn text(record: &Record, field: &str) -> String {
     }
 }
 
+/// What a plan's checks were evaluated from: the configuration keys, each check's facts as
+/// observations (the field, its value, and the tool or read that produced it), and what could
+/// not be observed. Each `act` record carries the same for its own evaluation.
+fn plan_sources(plan: &Plan) -> Vec<ExplainSource> {
+    let config = plan
+        .provenance
+        .config
+        .iter()
+        .map(|key| ExplainSource::Config {
+            file: key.file.clone(),
+            key: key.key.clone(),
+            value: key.value.clone(),
+        });
+    let facts = plan.checks.iter().flat_map(|check| {
+        check
+            .facts
+            .iter()
+            .map(move |fact| ExplainSource::Observation {
+                command: vec![fact.source.clone()],
+                exit: None,
+                result: format!("{}: {} = {}", check.name, fact.name, fact.value),
+            })
+    });
+    let errors = plan
+        .provenance
+        .errors
+        .iter()
+        .map(|error| ExplainSource::Observation {
+            command: vec![error.source.clone()],
+            exit: None,
+            result: format!("error: {}", error.message),
+        });
+    config.chain(facts).chain(errors).collect()
+}
+
 /// `explain plan ID`: the plan's checks, its act result, and its records, plus the
 /// `[unit.<name>] act` key of a unit whose `act` was turned into a dry run.
 fn plan(config: &Config, state: &StateDir, prefix: &str) -> Result<Explain, Error> {
@@ -290,7 +325,7 @@ fn plan(config: &Config, state: &StateDir, prefix: &str) -> Result<Explain, Erro
         .iter()
         .filter(|r| r.plan_id.as_deref() == Some(plan.id.as_str()))
         .collect();
-    let mut sources: Vec<ExplainSource> = Vec::new();
+    let mut sources = plan_sources(&plan);
     for record in &own {
         if record.kind == RecordKind::Planned
             && let Some(unit) = record
