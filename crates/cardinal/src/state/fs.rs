@@ -13,8 +13,8 @@ use serde::de::DeserializeOwned;
 pub enum Durability {
     /// Not fsynced: reservations, live locks, records.
     Volatile,
-    /// fsync of the file, then of its parent directory on Unix: plan claims, act results,
-    /// inbox items.
+    /// fsync of the file, then of its parent directory on Unix: inbox items, and the plan
+    /// claims and act results of the deletion phase, which phase 0 never writes.
     Durable,
 }
 
@@ -58,7 +58,8 @@ pub fn write_atomic(
 }
 
 /// Creates `path` with `create_new`, writes `bytes`, and fsyncs file and parent: the
-/// claim-once write of plan claims. Fails with `AlreadyExists` if the file exists.
+/// claim-once write the deletion phase uses for plan claims; phase 0 never writes one. Fails
+/// with `AlreadyExists` if the file exists.
 pub fn create_new_durable(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
     file.write_all(bytes)?;

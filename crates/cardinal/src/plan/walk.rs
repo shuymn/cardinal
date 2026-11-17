@@ -20,7 +20,8 @@ pub enum EntryKind {
     Other,
 }
 
-/// One entry of a target: its identity and the metadata a deletion compares.
+/// One entry of a target as a walk or snapshot records it: its identity, size, modification
+/// time, and allocation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
     /// The path relative to the worktree root (empty for the worktree root itself).
@@ -41,12 +42,6 @@ impl Entry {
     #[must_use]
     pub fn same_identity(&self, other: &Entry) -> bool {
         self.dev == other.dev && self.ino == other.ino && self.kind == other.kind
-    }
-
-    /// Whether `other` is this entry, unchanged: same identity, size, and mtime.
-    #[must_use]
-    pub fn unchanged(&self, other: &Entry) -> bool {
-        self.same_identity(other) && self.size == other.size && self.mtime_ns == other.mtime_ns
     }
 
     /// An entry from `std` metadata read without following a final symbolic link.

@@ -87,7 +87,8 @@ pub struct PlanList {
     pub errors: Vec<ScopedError>,
 }
 
-/// `plans/<plan>/claim`, created once by the `act` that executes the plan.
+/// `plans/<plan>/claim`, for the deletion phase: created once by the `act` that executes the
+/// plan. Phase 0 `act` never writes it (`docs/architecture.md` section 9.5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanClaim {
     pub pid: u32,

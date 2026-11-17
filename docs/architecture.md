@@ -208,7 +208,7 @@ protected = ["fuzz/corpus", "fuzz/artifacts", "proptest-regressions"]
   admission.lock              # empty; exclusive lock = the admission critical section
   live/<job>.lock             # empty; held exclusively by the owning runner for its lifetime
   reservations/<job>.json     # one per reserved job
-  worktrees/<key>.lock        # empty; in-use lock (shared = in use, exclusive = being reclaimed)
+  worktrees/<key>.lock        # empty; in-use lock (shared = in use; act only probes it)
   sessions/<session>.json     # SessionEnd snapshots awaiting the outlived-process sweep
   inbox/.lock                 # empty; serializes inbox upserts
   inbox/<key-hash>.json       # one per inbox item
@@ -283,7 +283,7 @@ A `recovery_needed` group is **verified** when the recorded child (PID and start
 
 - The worktree of a job is found by walking up from the runner's cwd to the nearest `.git` entry (file or directory); the key is the FNV-1a of that directory's canonical path. A job outside any worktree takes no in-use lock.
 - The runner takes `worktrees/<key>.lock` **shared** at acceptance, before admission and before any wait, and holds it until the stage has exited, on every path that runs the stage: admitted, overflow, fail-open, and TTY passthrough (C15). Several jobs can share a worktree.
-- **The lock keeps running commands from losing files under them; it does not protect data,** which `act` protects by deleting only what it inspected (section 9.5). When the lock cannot be opened or taken within the wait cap (an `act` holds it, or the state dir is broken), the runner runs the stage anyway (G4) and records `in_use_unprotected`.
+- **The lock marks a worktree in use; it does not protect data.** Phase 0 `act` only probes it and reports, deleting nothing (section 9.5). When the lock cannot be opened or taken within the wait cap (another process holds it exclusively, or the state dir is broken), the runner runs the stage anyway (G4) and records `in_use_unprotected`.
 - `act` probes the lock without taking it or waiting (section 9.5). A worktree is in use when the lock is held, when a `live` or `recovery_needed` reservation names the worktree key (read under the admission lock; this covers a crashed runner, whose shared lock the OS has already dropped), or when a process has its working directory inside the target.
 
 ### 4.7 Records
@@ -674,7 +674,7 @@ Each plan carries a list of checks. An **invariant** failing or being `unknown` 
 | Check | Kinds | Role | Pass when |
 | --- | --- | --- | --- |
 | `observed` | both | invariant | Every git and gh fact the plan depends on is known |
-| `not_in_use` | both | invariant | Exclusive in-use lock acquired, no live or recovery-needed reservation names the worktree, and no process has its working directory inside the target (section 4.6) |
+| `not_in_use` | both | invariant | A nonblocking probe finds the in-use lock not held, no live or recovery-needed reservation names the worktree, and no process has its working directory inside the target (section 4.6) |
 | `not_managed` | both | invariant | The worktree is not under a managed root and not git-locked (design §4) |
 | `clean` | `reclaim_worktree` | invariant | `dirty` is `no` |
 | `no_unpushed` | `reclaim_worktree` | invariant | `unpushed` is `no` |
@@ -921,7 +921,7 @@ These names are reserved and not registered in phase 0 (an unregistered command 
 | `serde`, `serde_json` | Use | Every JSON contract; `Value` keeps unknown hook fields intact |
 | `toml` | Use | Configuration (design §9) |
 | `sysinfo` (`system` feature only) | Use | Process table, start times, parents, working directories, boot time on all three OSes; memory sensors later come from the same crate |
-| `rustix` (`process`, `fs` features) | Use (Unix) | Safe `setpgid`, `getpgid`, `kill_process_group`, `test_kill_process_group`, and `openat`/`statat`/`unlinkat` for deletion that never follows a replaced directory; avoids raw `libc` |
+| `rustix` (`process`, `fs` features) | Use (Unix) | Safe `setpgid`, `getpgid`, `kill_process_group`, `test_kill_process_group`, and `openat`/`statat`/`fstat` for snapshot inspection relative to directory descriptors, which never follows a symbolic link or a replaced directory; avoids raw `libc` |
 | `signal-hook` | Use (Unix) | Forwarding and re-raising signals without hand-written handlers |
 | `libc` | Use (Unix) | `sigaction` and `pthread_sigmask`, which rustix does not expose: reading a signal's disposition, so an ignored signal gets no handler; putting back the one a failed setup replaced; setting SIGCHLD to its default; blocking signals while their handlers are installed |
 | `base64` | Use | `--spec-b64` encoding |
