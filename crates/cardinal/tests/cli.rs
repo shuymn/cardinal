@@ -64,20 +64,10 @@ fn version_is_text() {
 #[test]
 fn unimplemented_commands_answer_not_implemented_with_exit_1() {
     let dirs = Dirs::new();
-    // Commands with written bodies are tested with their modules
-    // (`tests/act_single.rs`); these still wait for the modules they call.
+    // Commands with written bodies are tested with their modules (`tests/act_single.rs`,
+    // `tests/inbox.rs`); these still wait for the modules they call.
     let commands: &[&[&str]] = &[
         &["inbox"],
-        &["inbox", "--status", "all", "--no-refresh"],
-        &[
-            "inbox",
-            "resolve",
-            "recovery_needed:abcd",
-            "--outcome",
-            "dismissed",
-            "--note",
-            "n",
-        ],
         &["plan"],
         &["plan", "--repo", "/r"],
         &["explain", "job", "abcd"],

@@ -267,7 +267,13 @@ fn dispatch(command: Command) -> ExitCode {
                     OutcomeArg::Escalated => ResolutionOutcome::Escalated,
                     OutcomeArg::Dismissed => ResolutionOutcome::Dismissed,
                 };
-                inbox::resolve(&ctx.state, &resolve.key, outcome, resolve.note.as_deref())
+                inbox::resolve(
+                    &ctx.config,
+                    &ctx.state,
+                    &resolve.key,
+                    outcome,
+                    resolve.note.as_deref(),
+                )
             })),
         },
         Command::Plan(args) => match args.command {
