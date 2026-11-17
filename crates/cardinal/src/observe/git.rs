@@ -1,7 +1,7 @@
 //! Parsers for the git commands of `docs/architecture.md` section 8.2. Every parser refuses
 //! output it does not understand, so the facts built from it become `unknown`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// One entry of `git worktree list --porcelain -z`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -152,13 +152,13 @@ pub fn parse_status(bytes: &[u8]) -> Result<Status, String> {
 
 /// Splits one `git ls-files -z --stage` entry into `"<mode> <object> <stage>"` and its
 /// path.
-pub fn parse_stage_entry(entry: &[u8]) -> Result<(&str, PathBuf), String> {
+pub fn parse_stage_entry(entry: &[u8]) -> Result<(&str, &Path), String> {
     let tab = entry
         .iter()
         .position(|&b| b == b'\t')
         .ok_or("ls-files entry without a path")?;
     let meta = std::str::from_utf8(&entry[..tab]).map_err(|_| "ls-files entry is not UTF-8")?;
-    Ok((meta, path_from_bytes(&entry[tab + 1..])?))
+    Ok((meta, path_ref_from_bytes(&entry[tab + 1..])?))
 }
 
 /// Whether `name` is a ref name by the rules of `git check-ref-format --allow-onelevel`:
@@ -187,20 +187,24 @@ pub fn is_oid(oid: &str) -> bool {
     matches!(oid.len(), 40 | 64) && oid.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+fn path_from_bytes(bytes: &[u8]) -> Result<PathBuf, String> {
+    path_ref_from_bytes(bytes).map(Path::to_path_buf)
+}
+
 #[cfg(unix)]
 #[allow(
     clippy::unnecessary_wraps,
     reason = "the same signature as on Windows, where a path from git can fail to decode"
 )]
-fn path_from_bytes(bytes: &[u8]) -> Result<PathBuf, String> {
+fn path_ref_from_bytes(bytes: &[u8]) -> Result<&Path, String> {
     use std::os::unix::ffi::OsStrExt;
-    Ok(PathBuf::from(std::ffi::OsStr::from_bytes(bytes)))
+    Ok(Path::new(std::ffi::OsStr::from_bytes(bytes)))
 }
 
 #[cfg(not(unix))]
-fn path_from_bytes(bytes: &[u8]) -> Result<PathBuf, String> {
+fn path_ref_from_bytes(bytes: &[u8]) -> Result<&Path, String> {
     std::str::from_utf8(bytes)
-        .map(PathBuf::from)
+        .map(Path::new)
         .map_err(|_| "a path from git is not UTF-8".to_owned())
 }
 

@@ -822,11 +822,11 @@ impl<'a> Observer<'a> {
         let mut tracked = Tracked::default();
         for entry in out.stdout.split(|&b| b == 0).filter(|e| !e.is_empty()) {
             let (meta, file) = git::parse_stage_entry(entry)?;
-            if !tracked.protected && patterns.covers(DataList::Protected, &file) {
+            if !tracked.protected && patterns.covers(DataList::Protected, file) {
                 tracked.protected = true;
             }
             if meta.starts_with("160000 ")
-                && std::fs::symlink_metadata(path.join(&file).join(".git")).is_ok()
+                && std::fs::symlink_metadata(path.join(file).join(".git")).is_ok()
             {
                 tracked.nested = true;
             }
