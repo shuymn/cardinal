@@ -111,7 +111,7 @@ fn unimplemented_commands_answer_not_implemented_with_exit_1() {
 fn hooks_always_exit_0() {
     let dirs = Dirs::new();
     for event in ["pre-tool-use", "subagent-stop", "session-end"] {
-        // Not implemented yet is an error like any other: no output, exit 0.
+        // Empty input is an error like any other: no output, exit 0.
         let assert = dirs
             .cmd()
             .args(["hook", "claude", event])
