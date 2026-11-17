@@ -64,6 +64,8 @@ fn version_is_text() {
 #[test]
 fn unimplemented_commands_answer_not_implemented_with_exit_1() {
     let dirs = Dirs::new();
+    // Commands with written bodies are tested with their modules
+    // (`tests/act_single.rs`); these still wait for the modules they call.
     let commands: &[&[&str]] = &[
         &["inbox"],
         &["inbox", "--status", "all", "--no-refresh"],
@@ -78,17 +80,6 @@ fn unimplemented_commands_answer_not_implemented_with_exit_1() {
         ],
         &["plan"],
         &["plan", "--repo", "/r"],
-        &["plan", "reclaim-worktree", "/w"],
-        &["plan", "reclaim-dir", "/w/target"],
-        &["act", "abcd"],
-        &[
-            "act",
-            "abcd",
-            "--dry-run",
-            "--owner-approved",
-            "--caller",
-            "unit:disk",
-        ],
         &["explain", "job", "abcd"],
         &["explain", "plan", "abcd"],
         &["explain", "inbox", "recovery_needed:abcd"],
