@@ -1,6 +1,6 @@
 //! `scripts/repo-guard` detects writes to a repository (`docs/architecture.md` section 13.4):
-//! snapshot a fixture, mutate it, and verify must fail; without a mutation it passes.
-#![cfg(unix)]
+//! snapshot a fixture, mutate it, and verify must fail; without a mutation it passes. On
+//! Windows the script runs in Git Bash, as `scripts/test` does.
 
 mod support;
 
@@ -167,7 +167,7 @@ fn refs_outside_git_namespaces_are_ignored() {
 #[test]
 fn local_config_is_detected() {
     assert_detected("a local config entry", |fixture, repo| {
-        fixture.git(repo, &["config", "--local", "user.name", "Someone"]);
+        fixture.git(repo, &["config", "--local", "cardinal.probe", "x"]);
     });
 }
 
