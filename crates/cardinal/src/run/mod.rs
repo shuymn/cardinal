@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 use crate::admission::{AdmissionError, Admitter, Job, Pass};
-use crate::config::{self, Config, HostConfig};
+use crate::config::{self, HostConfig};
 use crate::contract::{
     AdmissionResult, GroupIdentity, Priority, ProcessIdentity, RecordKind, Reservation,
     ReservationSchema, ReservationSession, ReservationState, ReservationWorktree, Resources,
@@ -267,8 +267,7 @@ impl Runner {
             host: defaults,
         });
         let host = config::config_dir()
-            .and_then(|dir| Config::load(&dir))
-            .map(|config| config.host)
+            .and_then(|dir| HostConfig::load(&dir))
             .map_err(|err| FailOpen::new("config_invalid", &err))?;
         let ctx = self.ctx.as_mut().expect("set above");
         ctx.recorder = Recorder::new(&ctx.state, host.records.max_bytes, host.records.keep);

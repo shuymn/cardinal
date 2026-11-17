@@ -221,6 +221,26 @@ fn configuration_spec_and_state_errors_fail_open() {
     assert_eq!(env.lines("counter"), ["run", "run"]);
 }
 
+/// The runner reads `host.toml` only: a broken profile in `repos/` does not make it fail open.
+#[cfg(unix)]
+#[test]
+fn a_broken_profile_does_not_fail_open() {
+    let env = Env::with_budget(4);
+    let repos = env.dirs.config().join("repos");
+    std::fs::create_dir(&repos).unwrap();
+    std::fs::write(repos.join("broken.toml"), "not toml [").unwrap();
+    let stage = counting_stage(&env);
+    let out = output(&mut env.run(None, &args(&stage)));
+    assert_eq!(out.status.code(), Some(7));
+    assert_eq!(fail_open_reasons(&env), Vec::<String>::new());
+    assert_eq!(
+        env.records_of(cardinal::contract::RecordKind::JobAdmitted)
+            .len(),
+        1
+    );
+    assert_eq!(env.lines("counter"), ["run"]);
+}
+
 /// Phase 0 on Windows: no process groups, so `cardinal run` always fails open and returns the
 /// stage's status.
 #[cfg(windows)]

@@ -123,6 +123,21 @@ impl Config {
     }
 }
 
+impl HostConfig {
+    /// Loads `<dir>/host.toml` (optional) and nothing else: the runner needs no profile, so a
+    /// broken profile does not affect it.
+    pub fn load(dir: &Path) -> Result<Self, ConfigError> {
+        let path = dir.join("host.toml");
+        let text = read_optional(&path)?.unwrap_or_default();
+        Self::parse(
+            &path,
+            &text,
+            logical_cpus(),
+            locations::home_dir().as_deref(),
+        )
+    }
+}
+
 fn read_optional(path: &Path) -> Result<Option<String>, ConfigError> {
     match std::fs::read_to_string(path) {
         Ok(text) => Ok(Some(text)),
