@@ -112,7 +112,11 @@ fn runner_killed_before_starting_runs_the_stage_zero_times() {
     );
     env.points.release(cardinal::testpoint::RUN_BEFORE_STARTING);
     assert_eq!(env.lines("counter"), Vec::<String>::new(), "zero runs");
-    let views = cardinal::admission::list_reservations(&env.state()).unwrap();
+    let views = cardinal::admission::list_reservations(
+        &env.state(),
+        &cardinal::config::HostConfig::defaults(),
+    )
+    .unwrap();
     assert_eq!(views.len(), 1);
     assert_eq!(
         views[0].derived,

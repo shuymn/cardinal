@@ -183,7 +183,11 @@ impl<'a> Jobs<'a> {
 
     /// The job of the reservation the runner `pid` wrote.
     fn job_of(&self, pid: u32) -> String {
-        let views = cardinal::admission::list_reservations(&self.state()).expect("reservations");
+        let views = cardinal::admission::list_reservations(
+            &self.state(),
+            &cardinal::config::HostConfig::defaults(),
+        )
+        .expect("reservations");
         views
             .into_iter()
             .find(|v| v.reservation.runner.pid == pid)
@@ -206,7 +210,11 @@ impl<'a> Jobs<'a> {
         let job = self.job_of(pgid);
         let stage = stage_line(stdout);
         wait_for("the shell and both cats in the job's group", WAIT, || {
-            let views = cardinal::admission::list_reservations(&self.state()).ok()?;
+            let views = cardinal::admission::list_reservations(
+                &self.state(),
+                &cardinal::config::HostConfig::defaults(),
+            )
+            .ok()?;
             let view = views.into_iter().find(|v| v.reservation.job_id == job)?;
             (view.members.len() >= 4).then_some(())
         });
@@ -228,7 +236,11 @@ impl<'a> Jobs<'a> {
     /// `recovery_needed` reservation.
     pub fn crashed(&self, cwd: &Path, cpu: u64) -> Crashed {
         let crashed = self.running(cwd, cpu).crash();
-        let views = cardinal::admission::list_reservations(&self.state()).expect("reservations");
+        let views = cardinal::admission::list_reservations(
+            &self.state(),
+            &cardinal::config::HostConfig::defaults(),
+        )
+        .expect("reservations");
         let view = views
             .iter()
             .find(|v| v.reservation.job_id == crashed.job)

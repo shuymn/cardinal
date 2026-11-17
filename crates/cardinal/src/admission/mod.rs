@@ -58,12 +58,17 @@ fn state_error(err: impl std::fmt::Display) -> AdmissionError {
 
 /// The admission lock: the critical section of section 4.4. Lock order is the worktree in-use
 /// lock, then this lock, then the inbox or records lock.
+///
+/// Every creation, replacement, and deletion of a reservation or a live lock file, and every
+/// listing of `reservations/`, happens while this lock is held (section 4.3): a directory
+/// listing that runs while another process renames or deletes an entry of that directory may
+/// omit entries, the unchanged ones included. The functions that touch those files take the
+/// guard as an argument.
 pub struct AdmissionLock {
     _lock: FileLock,
 }
 
-/// Takes the admission lock exclusively, waiting at most `timeout`. `act` takes it this way
-/// before it calls [`in_use`].
+/// Takes the admission lock exclusively, waiting at most `timeout`.
 pub fn lock(state: &StateDir, timeout: Duration) -> Result<AdmissionLock, AdmissionError> {
     match state::lock(
         &state.admission_lock(),
@@ -76,9 +81,24 @@ pub fn lock(state: &StateDir, timeout: Duration) -> Result<AdmissionLock, Admiss
     }
 }
 
+/// The deadline of every wait for the admission lock (`admission.lock_timeout_ms`).
+fn lock_timeout(host: &HostConfig) -> Duration {
+    Duration::from_millis(host.admission.lock_timeout_ms)
+}
+
+/// Every reservation, read under the admission lock, which is released before the caller
+/// evaluates them. A lock that cannot be taken in time is an error, never an empty list.
+pub fn snapshot(state: &StateDir, host: &HostConfig) -> Result<Vec<Reservation>, AdmissionError> {
+    let guard = lock(state, lock_timeout(host))?;
+    read_reservations(&guard, state)
+}
+
 /// One reservation file as read: the job ID from its name and the parsed document. A file
 /// that does not parse is kept (and counted by nobody) rather than deleted.
-fn read_reservations(state: &StateDir) -> Result<Vec<Reservation>, AdmissionError> {
+fn read_reservations(
+    _lock: &AdmissionLock,
+    state: &StateDir,
+) -> Result<Vec<Reservation>, AdmissionError> {
     let dir = state.reservations_dir();
     let entries =
         std::fs::read_dir(&dir).map_err(|err| state_error(format!("{}: {err}", dir.display())))?;
@@ -106,7 +126,11 @@ fn read_reservations(state: &StateDir) -> Result<Vec<Reservation>, AdmissionErro
     Ok(found)
 }
 
-fn write_reservation(state: &StateDir, reservation: &Reservation) -> Result<(), AdmissionError> {
+fn write_reservation(
+    _lock: &AdmissionLock,
+    state: &StateDir,
+    reservation: &Reservation,
+) -> Result<(), AdmissionError> {
     let bytes = serde_json::to_vec(reservation).map_err(state_error)?;
     state
         .write_atomic(
@@ -115,6 +139,17 @@ fn write_reservation(state: &StateDir, reservation: &Reservation) -> Result<(), 
             Durability::Volatile,
         )
         .map_err(state_error)
+}
+
+/// Deletes the reservation of `job`; one that is already gone is not an error.
+fn remove_reservation(_lock: &AdmissionLock, state: &StateDir, job: &str) -> io::Result<()> {
+    remove_if_exists(&state.reservation(job))
+}
+
+/// Deletes a live lock file. Callers pass only a file that nobody holds or one they hold
+/// themselves; one that is already gone is not an error.
+fn remove_live_file(_lock: &AdmissionLock, path: &std::path::Path) {
+    let _ = remove_if_exists(path);
 }
 
 fn remove_if_exists(path: &std::path::Path) -> io::Result<()> {
@@ -144,11 +179,16 @@ fn view(reservation: Reservation, derived: Derived, facts: &dyn ProcessFacts) ->
     }
 }
 
-/// Every reservation with its derived state, group members, and verification. Read-only: it
-/// never deletes or signals anything (`inventory` uses it).
-pub fn list_reservations(state: &StateDir) -> Result<Vec<ReservationView>, Error> {
+/// Every reservation with its derived state, group members, and verification, from a
+/// [`snapshot`]: the states are derived and the process table read after the admission lock is
+/// released. Read-only: it never deletes or signals anything (`inventory` uses it).
+pub fn list_reservations(
+    state: &StateDir,
+    host: &HostConfig,
+) -> Result<Vec<ReservationView>, Error> {
+    let reservations = snapshot(state, host)?;
     let facts = HostFacts::new();
-    Ok(read_reservations(state)?
+    Ok(reservations
         .into_iter()
         .map(|reservation| {
             let derived = derive(&reservation, probe_live(state, &reservation.job_id), &facts);
@@ -158,11 +198,11 @@ pub fn list_reservations(state: &StateDir) -> Result<Vec<ReservationView>, Error
 }
 
 /// Whether a live or recovery-needed reservation names the worktree with key `worktree_key`,
-/// and which jobs do. The caller holds the [`lock`]: `act` calls it under the admission lock
-/// while it holds the worktree's in-use lock exclusively.
-pub fn in_use(state: &StateDir, worktree_key: &str) -> Result<InUse, Error> {
+/// and which jobs do, from a [`snapshot`] (`plan` and `act` use it).
+pub fn in_use(state: &StateDir, host: &HostConfig, worktree_key: &str) -> Result<InUse, Error> {
+    let reservations = snapshot(state, host)?;
     let facts = HostFacts::new();
-    let jobs: Vec<String> = read_reservations(state)?
+    let jobs: Vec<String> = reservations
         .into_iter()
         .filter(|r| r.worktree.as_ref().is_some_and(|w| w.key == worktree_key))
         .filter(|r| derive(r, probe_live(state, &r.job_id), &facts).state != DerivedState::Stale)
@@ -194,19 +234,19 @@ struct Recovery {
 /// reservation. It keeps `live` and `recovery_needed` reservations as they are and signals
 /// nothing.
 fn recover(
-    _lock: &AdmissionLock,
+    guard: &AdmissionLock,
     state: &StateDir,
     facts: &dyn ProcessFacts,
 ) -> Result<Recovery, AdmissionError> {
-    let reservations = read_reservations(state)?;
+    let reservations = read_reservations(guard, state)?;
     let mut kept = Vec::new();
     let mut released = Vec::new();
     for reservation in reservations {
         let derived = derive(&reservation, probe_live(state, &reservation.job_id), facts);
         if derived.state == DerivedState::Stale {
             let GroupIdentity::Pgid { pgid, .. } = reservation.group;
-            remove_if_exists(&state.reservation(&reservation.job_id)).map_err(state_error)?;
-            let _ = remove_if_exists(&state.live_lock(&reservation.job_id));
+            remove_reservation(guard, state, &reservation.job_id).map_err(state_error)?;
+            remove_live_file(guard, &state.live_lock(&reservation.job_id));
             released.push(Recovered {
                 job_id: reservation.job_id,
                 pgid,
@@ -215,14 +255,18 @@ fn recover(
             kept.push((reservation, derived));
         }
     }
-    collect_free_live_locks(state, &kept);
+    collect_free_live_locks(guard, state, &kept);
     Ok(Recovery { kept, released })
 }
 
 /// Deletes live lock files that nobody holds and no reservation names: left by runners that
 /// died before reserving. Runs only inside the admission lock, where live lock files are
 /// created, so a file is never deleted between its creation and its locking.
-fn collect_free_live_locks(state: &StateDir, kept: &[(Reservation, Derived)]) {
+fn collect_free_live_locks(
+    guard: &AdmissionLock,
+    state: &StateDir,
+    kept: &[(Reservation, Derived)],
+) {
     let Ok(entries) = std::fs::read_dir(state.live_dir()) else {
         return;
     };
@@ -239,7 +283,7 @@ fn collect_free_live_locks(state: &StateDir, kept: &[(Reservation, Derived)]) {
             continue;
         }
         if state::probe(&path).ok() == Some(Probe::Free) {
-            let _ = std::fs::remove_file(&path);
+            remove_live_file(guard, &path);
         }
     }
 }
@@ -260,7 +304,7 @@ fn append_recovered(recorder: Option<&Recorder>, released: &[Recovered]) {
 pub fn recovery_pass(state: &StateDir, host: &HostConfig) -> Result<RecoveryReport, Error> {
     let facts = HostFacts::new();
     let recorder = Recorder::new(state, host.records.max_bytes, host.records.keep);
-    let guard = lock(state, Duration::from_millis(host.admission.lock_timeout_ms))?;
+    let guard = lock(state, lock_timeout(host))?;
     let recovery = recover(&guard, state, &facts)?;
     drop(guard);
     append_recovered(Some(&recorder), &recovery.released);
@@ -286,7 +330,8 @@ pub enum Pass {
 ///
 /// The first pass claims the job ID by creating `live/<job>.lock` and holds that lock for the
 /// runner's lifetime, before any reservation names the job. Dropping an `Admitter` that never
-/// admitted deletes its live lock file.
+/// admitted deletes its live lock file under the admission lock; when that lock cannot be
+/// taken in time, the free file is left for the recovery pass.
 pub struct Admitter {
     state: StateDir,
     budget: Resources,
@@ -307,7 +352,7 @@ impl Admitter {
         Self {
             state: state.clone(),
             budget: host.budget.clone(),
-            lock_timeout: Duration::from_millis(host.admission.lock_timeout_ms),
+            lock_timeout: lock_timeout(host),
             recorder,
             job_id,
             live: None,
@@ -347,7 +392,7 @@ impl Admitter {
             reservation.updated_ms = now;
             reservation.stop_signal_ms = None;
             reservation.child = None;
-            write_reservation(&self.state, &reservation)?;
+            write_reservation(&guard, &self.state, &reservation)?;
             Some(reservation)
         } else {
             None
@@ -357,6 +402,7 @@ impl Admitter {
         Ok(match admitted {
             Some(reservation) => Pass::Admitted(Box::new(Job {
                 state: self.state.clone(),
+                lock_timeout: self.lock_timeout,
                 reservation,
                 live: self.live.take(),
                 done: false,
@@ -383,8 +429,10 @@ impl Admitter {
 
 impl Drop for Admitter {
     fn drop(&mut self) {
-        if let Some(live) = self.live.take() {
-            let _ = std::fs::remove_file(live.path());
+        if let Some(live) = self.live.take()
+            && let Ok(guard) = lock(&self.state, self.lock_timeout)
+        {
+            remove_live_file(&guard, live.path());
         }
     }
 }
@@ -394,8 +442,14 @@ impl Drop for Admitter {
 /// leaves a reservation behind. Once [`Job::starting`] has been called, the stage may be
 /// running: dropped then, it is abandoned as by [`Job::abandon`], so no path that drops the
 /// job (an unwinding panic included) deletes the reservation of a stage that may still run.
+///
+/// Every write and deletion takes the admission lock, waiting at most
+/// `admission.lock_timeout_ms`. When the lock cannot be taken, the reservation stays as it
+/// was: a release or a drop then abandons the job, which the recovery pass releases once its
+/// group is empty (section 4.5), and nothing is ever deleted without the lock.
 pub struct Job {
     state: StateDir,
+    lock_timeout: Duration,
     reservation: Reservation,
     live: Option<FileLock>,
     done: bool,
@@ -413,28 +467,51 @@ impl Job {
     }
 
     /// Writes `starting`: the start boundary as seen from the state directory. Written
-    /// immediately before the spawn. From here on, dropping the job abandons it.
+    /// immediately before the spawn. From here on, dropping the job abandons it. On an error
+    /// the reservation stays `reserved`, in the file and here.
     pub fn starting(&mut self) -> Result<(), AdmissionError> {
-        self.reservation.state = ReservationState::Starting;
-        self.reservation.updated_ms = now_ms();
-        write_reservation(&self.state, &self.reservation)
+        let mut next = self.reservation.clone();
+        next.state = ReservationState::Starting;
+        self.replace(next)
     }
 
-    /// Writes `running` with the child's identity.
+    /// Writes `running` with the child's identity. On an error the reservation stays
+    /// `starting`, in the file and here, which counts as possibly running.
     pub fn running(&mut self, child: ProcessIdentity) -> Result<(), AdmissionError> {
-        self.reservation.state = ReservationState::Running;
-        self.reservation.child = Some(child);
-        self.reservation.updated_ms = now_ms();
-        write_reservation(&self.state, &self.reservation)
+        let mut next = self.reservation.clone();
+        next.state = ReservationState::Running;
+        next.child = Some(child);
+        self.replace(next)
+    }
+
+    /// Replaces the reservation with `next` under the admission lock.
+    fn replace(&mut self, mut next: Reservation) -> Result<(), AdmissionError> {
+        let guard = lock(&self.state, self.lock_timeout)?;
+        next.updated_ms = now_ms();
+        write_reservation(&guard, &self.state, &next)?;
+        self.reservation = next;
+        Ok(())
+    }
+
+    /// Under the admission lock, deletes the reservation, then the live lock file, then drops
+    /// the live lock. When the lock cannot be taken in time, the job is abandoned instead.
+    pub fn release(mut self) -> Result<(), AdmissionError> {
+        self.done = true;
+        let guard = match lock(&self.state, self.lock_timeout) {
+            Ok(guard) => guard,
+            Err(err) => {
+                drop(self.live.take());
+                return Err(err);
+            }
+        };
+        self.delete(&guard).map_err(state_error)
     }
 
     /// Deletes the reservation, then the live lock file, then drops the live lock.
-    pub fn release(mut self) -> Result<(), AdmissionError> {
-        self.done = true;
-        let result = remove_if_exists(&self.state.reservation(&self.reservation.job_id))
-            .map_err(state_error);
+    fn delete(&mut self, guard: &AdmissionLock) -> io::Result<()> {
+        let result = remove_reservation(guard, &self.state, &self.reservation.job_id);
         if let Some(live) = self.live.take() {
-            let _ = std::fs::remove_file(live.path());
+            remove_live_file(guard, live.path());
         }
         result
     }
@@ -453,14 +530,12 @@ impl Drop for Job {
         if self.done {
             return;
         }
-        if self.reservation.state == ReservationState::Reserved {
-            let _ = remove_if_exists(&self.state.reservation(&self.reservation.job_id));
-            if let Some(live) = self.live.take() {
-                let _ = std::fs::remove_file(live.path());
-            }
-        } else {
-            drop(self.live.take());
+        if self.reservation.state == ReservationState::Reserved
+            && let Ok(guard) = lock(&self.state, self.lock_timeout)
+        {
+            let _ = self.delete(&guard);
         }
+        drop(self.live.take());
     }
 }
 

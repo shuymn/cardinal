@@ -53,9 +53,10 @@ impl Real<'_> {
         observe::inventory(self.config, self.state, &options)
     }
 
-    /// Live and recovery-needed reservations naming the worktree with key `worktree_key`.
+    /// Live and recovery-needed reservations naming the worktree with key `worktree_key`,
+    /// read under the admission lock.
     pub fn in_use(&self, worktree_key: &str) -> Result<InUse, Error> {
-        admission::in_use(self.state, worktree_key)
+        admission::in_use(self.state, &self.config.host, worktree_key)
     }
 }
 
@@ -180,7 +181,7 @@ pub fn patterns(config: &Config, repo: &Repo) -> DataLists {
 }
 
 /// The in-use facts of `target` when nothing is held: the lock probed, reservations read
-/// without the admission lock, and processes.
+/// under the admission lock (an error when it is not free in time), and processes.
 fn probe_in_use(
     state: &StateDir,
     sources: &Real<'_>,

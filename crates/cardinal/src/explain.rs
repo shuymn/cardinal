@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::adapter::claude::{self, Repo};
+use crate::admission;
 use crate::classify::{self, BuiltIn, CallIds, Context, Origin, Rewritten};
 use crate::config::Config;
 use crate::contract::{
@@ -33,7 +34,7 @@ pub enum Subject {
 /// `cardinal explain`.
 pub fn explain(config: &Config, state: &StateDir, subject: &Subject) -> Result<Explain, Error> {
     match subject {
-        Subject::Job(id) => job(state, id),
+        Subject::Job(id) => job(config, state, id),
         Subject::Plan(id) => plan(config, state, id),
         Subject::Inbox(key) => inbox_item(state, key),
         Subject::Command { cwd, command } => command_trace(config, cwd.as_deref(), command),
@@ -84,18 +85,14 @@ fn document(
 }
 
 /// `explain job ID`: the job's records and reservation. A job with `job_started` but no
-/// `job_finished` whose runner no longer holds its live lock is `runner_died`.
-fn job(state: &StateDir, prefix: &str) -> Result<Explain, Error> {
+/// `job_finished` whose runner no longer holds its live lock is `runner_died`. The
+/// reservations are read under the admission lock; when it is not free in time, the command
+/// fails as it does when the records cannot be read.
+fn job(config: &Config, state: &StateDir, prefix: &str) -> Result<Explain, Error> {
     let records = records(state)?;
+    let reservations = admission::snapshot(state, &config.host)?;
     let mut ids: Vec<String> = records.iter().filter_map(|r| r.job_id.clone()).collect();
-    if let Ok(entries) = std::fs::read_dir(state.reservations_dir()) {
-        ids.extend(entries.filter_map(Result::ok).filter_map(|e| {
-            e.file_name()
-                .to_str()
-                .and_then(|n| n.strip_suffix(".json"))
-                .map(str::to_owned)
-        }));
-    }
+    ids.extend(reservations.iter().map(|r| r.job_id.clone()));
     ids.sort();
     ids.dedup();
     let id = state::resolve_prefix(&ids, prefix)?;
@@ -103,9 +100,7 @@ fn job(state: &StateDir, prefix: &str) -> Result<Explain, Error> {
         .iter()
         .filter(|r| r.job_id.as_deref() == Some(&id))
         .collect();
-    let reservation: Option<Reservation> = std::fs::read(state.reservation(&id))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+    let reservation: Option<Reservation> = reservations.into_iter().find(|r| r.job_id == id);
     let find = |kind: RecordKind| own.iter().rev().find(|r| r.kind == kind).copied();
     let runner_alive = matches!(state::probe(&state.live_lock(&id)), Ok(Probe::Held));
 

@@ -172,17 +172,19 @@ mod real {
         let group = GroupGuard::new(env.scope(), pgid);
         let job = env.reservations()[0].job_id.clone();
         wait_for("both sleeps in the group", WAIT, || {
-            let members = list_reservations(&env.state()).ok()?[0].members.len();
+            let members = list_reservations(&env.state(), &host()).ok()?[0]
+                .members
+                .len();
             (members >= 4).then_some(())
         });
         runner.kill();
 
-        let views = list_reservations(&env.state()).unwrap();
+        let views = list_reservations(&env.state(), &host()).unwrap();
         assert_eq!(views.len(), 1);
         assert_eq!(views[0].derived, DerivedState::RecoveryNeeded);
         assert!(views[0].verified);
         assert_eq!(views[0].members.len(), 3, "sh and two sleeps");
-        let busy = in_use(&env.state(), &env.worktree_key()).unwrap();
+        let busy = in_use(&env.state(), &host(), &env.worktree_key()).unwrap();
         assert!(busy.value);
         assert_eq!(busy.jobs, std::slice::from_ref(&job));
         assert!(
@@ -227,7 +229,11 @@ mod real {
         let next = env.records_of(RecordKind::JobFinished);
         assert_eq!(next[0].data["admission"], "within_budget");
         assert_eq!(env.reservations(), []);
-        assert!(!in_use(&env.state(), &env.worktree_key()).unwrap().value);
+        assert!(
+            !in_use(&env.state(), &host(), &env.worktree_key())
+                .unwrap()
+                .value
+        );
     }
 
     /// A runner killed before the spawn led a group of itself alone: its reservation is stale.
@@ -243,7 +249,7 @@ mod real {
         runner.kill();
         let job = env.reservations()[0].job_id.clone();
         assert_eq!(
-            list_reservations(&env.state()).unwrap()[0].derived,
+            list_reservations(&env.state(), &host()).unwrap()[0].derived,
             DerivedState::Stale
         );
         let report = recovery_pass(&env.state(), &host()).unwrap();
@@ -336,7 +342,11 @@ mod real {
         assert_eq!(report.reservations.len(), 1);
         assert_eq!(report.reservations[0].reservation.job_id, job);
         assert_eq!(report.reservations[0].derived, DerivedState::RecoveryNeeded);
-        assert!(in_use(&env.state(), &env.worktree_key()).unwrap().value);
+        assert!(
+            in_use(&env.state(), &host(), &env.worktree_key())
+                .unwrap()
+                .value
+        );
         assert!(cardinal::os::is_alive(descendant, descendant_start));
 
         drop(group);

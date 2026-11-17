@@ -150,7 +150,7 @@ fn parent_exit_after_the_spawn_stops_the_group() {
     assert!(env.worktree_lock_free());
     let finished = env.records_of(RecordKind::JobFinished);
     assert_eq!(finished.len(), 1, "recorded before SIGKILL");
-    let views = list_reservations(&env.state()).unwrap();
+    let views = list_reservations(&env.state(), &HostConfig::defaults()).unwrap();
     assert_eq!(views.len(), 1);
     assert_eq!(views[0].derived, DerivedState::Stale);
     let report = recovery_pass(&env.state(), &HostConfig::defaults()).unwrap();

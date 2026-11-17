@@ -155,6 +155,14 @@ impl FailOpen {
     }
 }
 
+/// The fail-open reason of an admission pass or the `starting` write that failed.
+fn admission_failure(err: &AdmissionError) -> FailOpen {
+    match err {
+        AdmissionError::LockTimeout => FailOpen::new("admission_lock_timeout", err),
+        AdmissionError::State(_) => FailOpen::new("state_error", err),
+    }
+}
+
 /// Why the runner stops before the spawn without running the stage.
 #[derive(Clone, Copy, Debug)]
 enum Cancel {
@@ -337,7 +345,7 @@ impl Runner {
         if let Some(job) = &mut self.job
             && let Err(err) = job.starting()
         {
-            return Next::FailOpen(FailOpen::new("state_error", &err));
+            return Next::FailOpen(admission_failure(&err));
         }
         Next::Admitted
     }
@@ -501,13 +509,7 @@ impl Runner {
                     break;
                 }
                 Ok(Pass::Full) => {}
-                Err(AdmissionError::LockTimeout) => {
-                    return Err(Next::FailOpen(FailOpen::new(
-                        "admission_lock_timeout",
-                        &AdmissionError::LockTimeout,
-                    )));
-                }
-                Err(err) => return Err(Next::FailOpen(FailOpen::new("state_error", &err))),
+                Err(err) => return Err(Next::FailOpen(admission_failure(&err))),
             }
             if let Err(err) = testpoint::hit(testpoint::ADMISSION_WAITING) {
                 return Err(Next::FailOpen(FailOpen::new("injected", &err)));

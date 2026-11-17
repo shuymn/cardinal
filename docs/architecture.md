@@ -74,7 +74,7 @@ Everything lives in the single crate `crates/cardinal` (library plus the `cardin
 | `plan` | Plan generation, identity binding | `observe`, `admission`, `state`, `record`, `contract` |
 | `act` | Plan evaluation: snapshot inspection, identity recheck, checks; report-only in phase 0 | `plan`, `observe`, `admission`, `state`, `record`, `contract`, `testpoint`, rustix |
 | `inbox` | Inbox store, dedup, refresh (recovery pass and built-in raisers) | `admission`, `observe`, `state`, `record`, `contract` |
-| `explain` | Explanation documents | `adapter::claude` (the hook's repository, origin, and timeout lookups for `explain command`), `classify`, `record`, `plan`, `inbox`, `state`, `contract` |
+| `explain` | Explanation documents | `adapter::claude` (the hook's repository, origin, and timeout lookups for `explain command`), `classify`, `record`, `plan`, `inbox`, `admission` (the reservation snapshot of `explain job`), `state`, `contract` |
 | `cli` | clap definitions and thin handlers that print JSON | everything |
 
 "May use" is read transitively: a module may also use whatever the modules it may use may use, so `run` may use `contract` through `admission`. `testpoint` is open to every module above the foundation. `tests/layering.rs` checks every `crate::` and `super::` path in `src/` against this reading; a glob import of the crate root or an alias of `crate` counts as using every module, and `clippy::wildcard_imports` is denied, so no module comes into scope without a path the test sees.
@@ -226,7 +226,7 @@ protected = ["fuzz/corpus", "fuzz/artifacts", "proptest-regressions"]
 | File | Format | Written by | Read by |
 | --- | --- | --- | --- |
 | `VERSION`, `host-id` | text | first cardinal process that finds them missing: a fully written temp file is hard-linked into place, which fails if another process won, and the loser reads the winner's file | all |
-| `reservations/<job>.json` | `cardinal.reservation.v1` | owning runner; the recovery pass deletes others' reservations, only under the admission lock | admission, observe, inbox, plan, act |
+| `reservations/<job>.json` | `cardinal.reservation.v1` | owning runner; the recovery pass deletes others' reservations; both only under the admission lock (section 4.3) | admission, observe, inbox, plan, act, explain, all under the admission lock |
 | `sessions/<session>.json` | `cardinal.session-snapshot.v1` | `hook claude session-end` | inbox refresh |
 | `inbox/<key-hash>.json` | `cardinal.inbox-item.v1` | inbox raise, refresh, resolve | `inbox`, `explain` |
 | `plans/<plan>/plan.json` | `cardinal.plan.v1` | `plan` | `act`, `explain` |
@@ -249,6 +249,7 @@ Locks use `std::fs::File::{lock, lock_shared, try_lock, try_lock_shared}` (stabl
 - std opens files close-on-exec and non-inheritable, so a child never inherits the runner's locks. A surviving child therefore cannot keep a dead runner looking alive.
 - Waiting with a deadline is a `try_lock` loop with backoff (5 ms doubling to 50 ms). Every acquisition has a deadline; there is no unbounded `lock()`.
 - Lock order is always: worktree in-use lock, then admission lock, then inbox or records lock. Nothing takes them in another order.
+- **Reservations and live lock files change only under `admission.lock`, and `reservations/` is listed only under it.** A directory listing that runs while another process renames or unlinks an entry of that directory may omit entries, unchanged ones included, so a pass that listed `reservations/` while a runner replaced its reservation could count too few and admit over budget (C2). Under the lock: the admission and recovery passes (section 4.4), each write of `starting` and `running` and each release (section 4.5), the deletion of the live lock file of a runner that never got a reservation, and the readers `inventory`, `plan`, `act`, and `explain job`. A reader holds the lock only to read every reservation file and releases it before it evaluates them: liveness probes, the process table, git, records, and the inbox stay outside. Every one of these waits at most `lock_timeout_ms`. A reader that times out reports the reservations as unreadable, never as none: `inventory` adds an error with scope `reservations`, `inventory`, `plan`, and `act` leave the `not_in_use` check `unknown`, so it does not pass, and `explain job` fails as it does when the records cannot be read. Section 4.5 gives what a timeout does to a runner's writes.
 - `admission.lock`, `worktrees/*.lock`, `inbox/.lock`, and `records/.lock` are never deleted, so no process can lock a file another process has already unlinked. `worktrees/*.lock` grows by one empty file per worktree ever used; phase 1 may prune them under the admission lock.
 
 ### 4.4 Admission protocol
@@ -261,13 +262,19 @@ The critical section only reads small files and writes one; process probes are a
 4. Sum the resources of `live` and `recovery_needed` reservations. If, for every resource the new job needs, `sum + need ≤ budget` (resources without a budget always fit), write `reservations/<job>.json` (atomic) with `state: "reserved"` and the runner's group identity (section 5.5).
 5. Release `admission.lock`.
 
-The liveness lock is held before the reservation becomes visible, so another admitter can never see the new reservation with a free liveness lock. Live lock files are created and garbage-collected only inside the admission lock, so collection can never delete a file between its creation and its locking. A missing live lock file counts as free. `cardinal inbox` runs the same recovery pass (section 10.1).
+The liveness lock is held before the reservation becomes visible, so another admitter can never see the new reservation with a free liveness lock. Live lock files are created, deleted, and garbage-collected only inside the admission lock, so collection can never delete a file between its creation and its locking. A missing live lock file counts as free. `cardinal inbox` runs the same recovery pass (section 10.1).
 
 ### 4.5 Reservation lifecycle and recovery-needed
 
 ```text
 reserved ──(written immediately before spawn)──> starting ──(after spawn)──> running ──> deleted at release
 ```
+
+Each transition, and the deletion at release, takes `admission.lock` with the deadline `lock_timeout_ms` (section 4.3). When the lock is not free in time, nothing is written or deleted:
+
+- `starting`: the reservation stays `reserved` and the runner fails open with `admission_lock_timeout` (section 5.3). The release that fail-open does takes the lock too; when it times out, the job is abandoned: the reservation and live lock file stay and the live lock is dropped, and the recovery pass releases the reservation as `stale` once the runner has left its group.
+- `running`: the reservation stays the complete `starting` one written before the spawn, `job_infra_failure` is recorded, and the stage keeps running. A `starting` reservation whose runner dies counts as `recovery_needed`, unverified, while its group lives.
+- Release, and a job dropped while still `reserved`: the job is abandoned as above, and the recovery pass releases the reservation once the group is empty.
 
 The group identity is fixed before the reservation exists: the runner makes itself a process-group leader, so the PGID is the runner's PID (section 5.5). A reservation's derived state is computed by whoever reads it; it is never stored:
 
@@ -349,7 +356,7 @@ cardinal run [--spec-b64 SPEC] -- COMMAND [ARG]...
 8. Wait for the child, forwarding signals.
 9. Release: delete the reservation when no member of the group other than the runner is left, otherwise leave it for the recovery pass (section 5.5); append `job_finished` (exit status, `waited_ms`, `measurements: [{kind: "wall_time", ms}]`), drop the live lock and the in-use lock, and exit with the child's status or re-raise its signal (section 5.6).
 
-**Fail open** (section 5.3): append `job_fail_open` if records still work, drop the reservation and live lock if taken, restore the original process group, spawn the stage in it, and finish as in step 9; the runner never `exec`s, so the in-use lock stays held until the stage exits. Nothing is printed, except `<command>: <OS error>` with exit 127 (not found) or 126 when the stage cannot be executed, as shells do.
+**Fail open** (section 5.3): append `job_fail_open` if records still work, drop the reservation and live lock if taken (abandoning them when the admission lock is not free in time, section 4.5), restore the original process group, spawn the stage in it, and finish as in step 9; the runner never `exec`s, so the in-use lock stays held until the stage exits. Nothing is printed, except `<command>: <OS error>` with exit 127 (not found) or 126 when the stage cannot be executed, as shells do.
 
 **Cancellation:** a handled signal (section 5.5) or the parent's exit before the spawn, seen during any wait or at the spawn itself on every path, ends the run without starting the stage. The runner appends `job_finished` with `cancelled`, releases what it holds, and dies by that signal, or exits 129 when the parent exited.
 
@@ -657,7 +664,7 @@ A worktree is managed by another app when its path is under a `[observe] managed
 
 ### 8.6 Processes
 
-`inventory` lists reservations with their derived state and the members of their process groups, and outlived processes from session snapshots (section 6.6). Inventory is read-only: it never deletes stale reservations or signals anything.
+`inventory` lists reservations with their derived state and the members of their process groups, read as a snapshot under the admission lock (section 4.3), and outlived processes from session snapshots (section 6.6). Inventory is read-only: it never deletes stale reservations or signals anything.
 
 ## 9. plan, act, and invariants
 
@@ -1011,7 +1018,7 @@ CI runs `scripts/test`, `scripts/test --self-check`, and `scripts/test` with `BA
 
 To reproduce the Linux job on another OS, run `scripts/test` in a container:
 
-1. Start `rust:1.100-bookworm` (the Rust version `mise.toml` resolves to) with `--platform linux/amd64` and `--security-opt seccomp=unconfined --security-opt apparmor=unconfined`, which bubblewrap needs for an unprivileged user namespace.
+1. Start `rust:1.100-bookworm` (the Rust version `mise.toml` resolves to) with `--platform linux/amd64`, `--security-opt seccomp=unconfined --security-opt apparmor=unconfined`, which bubblewrap needs for an unprivileged user namespace, and `--init`, so that PID 1 reaps the processes orphaned to it. Without it, a container whose first process does not reap (such as `sleep infinity`) keeps every orphan as a zombie in its process group: tests that wait for a group to empty time out, and the sweep reports the zombies as left by the run.
 2. Install `bubblewrap` and `procps` with apt, add the `rustfmt` and `clippy` components, and put `cargo-nextest` of the version in `mise.lock` (its release tarball) on `PATH`.
 3. Create a user that is not root and give it `CARGO_HOME` and `RUSTUP_HOME`: the sweep looks only at the current user's processes, and root would make the run differ from CI.
 4. Copy the tree in without the files git ignores and without macOS metadata (on macOS, `git ls-files -co --exclude-standard -z | COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata --null -T - -cf src.tar`; otherwise `._*` files fail the layering and config tests), then `git init` and commit it there, since the guard needs a repository.
@@ -1104,7 +1111,7 @@ Claims from design §11 that phase 0 implements, restated for phase 0, plus new 
 | ID | Claim (EARS) | Source | Test |
 | --- | --- | --- | --- |
 | C1 | When a classified stage reaches the PreToolUse hook, the hook shall rewrite it to run through `cardinal run` and shall not create a reservation. | G14 | `hook_claude::rewrite_takes_no_reservation`, `hook_claude::rewrite_runs_through_the_real_runner` |
-| C2 | When the runner decides admission, it shall decide inside the admission lock from the live and recovery-needed reservations and the new job's resources against the host budgets, and shall reserve all resources or none. (Sensors: phase 2.) | G1 | `admission_concurrency::*` |
+| C2 | When the runner decides admission, it shall decide inside the admission lock from the live and recovery-needed reservations and the new job's resources against the host budgets, and shall reserve all resources or none. (Sensors: phase 2.) | G1 | `admission_concurrency::*`, `reservation_lock::*` |
 | C5 | If the runner path is not executable, the shell fallback shall run the original stage; if the runner fails in any observable way before `spawn()` returns a child, the runner shall run the stage once; after that, cardinal shall not rerun it and shall report an infrastructure failure; if the hook misses its deadline, the command shall not be rewritten. | G4 | `run_start_boundary::*`, `run_infra_failure::*`, `hook_claude::deadline_no_rewrite`, `rewrite_equivalence::runner_missing` |
 | C6 | When the hook rewrites a command, the other Bash input fields shall be unchanged, only classified stages shall be wrapped, and the command shall keep its meaning, including lists, pipelines, shell options, cwd, persisted cwd, environment, and output. (No injection in phase 0.) | G4 | `rewrite_equivalence::*`, `hook_claude::other_fields_preserved`, `run_wait::no_output_added` |
 | C8 | When a runner dies, or its stage's direct child exits with group members left, its reservation and in-use state shall count as reserved and in use until its process group is empty or the boot changes. | G14 | `recovery::*`, `inventory::budget_reserved_and_reservations`, `inventory::jobs_make_a_worktree_in_use`, `inbox::recovery_needed_raised_and_cleared` |
