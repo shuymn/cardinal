@@ -113,13 +113,23 @@ fn branch_switch_expires_the_plan() {
     }
 }
 
-/// The flags that give `unshare` a private mount namespace where `mount --bind` works:
-/// `-m` as root, `-r -m` (a user namespace) otherwise; `None`, with the reason printed, where
-/// neither does. The probe's mount ends with its namespace.
+/// Writes `line` to this process's stderr directly, past the test harness's capture, so it
+/// shows for a passing test too.
 #[cfg(target_os = "linux")]
-fn mount_namespace(s: &Setup) -> Option<&'static [&'static str]> {
+fn report(line: &str) {
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stderr(), "{line}");
+}
+
+/// The flags that give `unshare` a private mount namespace where `mount --bind` works:
+/// `-m` as root, `-r -m` (a user namespace) otherwise. Where neither does, `test` is skipped
+/// with the reason reported, and fails instead where `CI` is `true`, so a CI run never passes
+/// it without running it. The probe's mount ends with its namespace.
+#[cfg(target_os = "linux")]
+fn mount_namespace(s: &Setup, test: &str) -> Option<&'static [&'static str]> {
     let probe = s.fx.path("probe");
     std::fs::create_dir_all(&probe).unwrap();
+    let mut tried = String::new();
     for flags in [&["-m"][..], &["-r", "-m"]] {
         let mut command = std::process::Command::new("unshare");
         command
@@ -127,16 +137,38 @@ fn mount_namespace(s: &Setup) -> Option<&'static [&'static str]> {
             .args(["mount", "--bind"])
             .arg(&probe)
             .arg(&probe);
-        let probed = fakes::confined(&s.fx, command, s.fx.root()).output();
-        if probed.is_ok_and(|o| o.status.success()) {
-            return Some(flags);
+        let flags_shown = flags.join(" ");
+        match fakes::confined(&s.fx, command, s.fx.root()).output() {
+            Ok(probed) if probed.status.success() => return Some(flags),
+            Ok(probed) => {
+                let _ = writeln!(
+                    tried,
+                    "`unshare {flags_shown} mount --bind`: {}: {}",
+                    probed.status,
+                    String::from_utf8_lossy(&probed.stderr).trim()
+                );
+            }
+            Err(err) => {
+                let _ = writeln!(tried, "`unshare {flags_shown}`: {err}");
+            }
         }
     }
-    eprintln!(
-        "skipped: no private mount namespace for a bind mount (neither `unshare -m` as root \
-         nor `unshare -rm` works here)"
+    let reason = format!("{test}: no private mount namespace for a bind mount\n{tried}");
+    assert!(
+        std::env::var("CI").as_deref() != Ok("true"),
+        "CI runs every bind-mount test: {reason}"
     );
+    report(&format!("skipped {reason}"));
     None
+}
+
+/// Reports that `test` ran its assertions in a namespace made with `flags`.
+#[cfg(target_os = "linux")]
+fn ran_in_namespace(test: &str, flags: &[&str]) {
+    report(&format!(
+        "{test}: ran in a private mount namespace (unshare {})",
+        flags.join(" ")
+    ));
 }
 
 /// Runs `inner` inside a private mount namespace where each `(source, target)` of `binds` is
@@ -220,7 +252,7 @@ fn walk_with_binds(
 #[test]
 fn bind_mounts_are_not_entered() {
     let s = Setup::new();
-    let Some(flags) = mount_namespace(&s) else {
+    let Some(flags) = mount_namespace(&s, "bind_mounts_are_not_entered") else {
         return;
     };
     let owner = s.fx.path("owner");
@@ -269,6 +301,7 @@ fn bind_mounts_are_not_entered() {
             && !entries.iter().any(|e| e.starts_with("node_modules/cache/")),
         "the bind mount is listed, not entered: {entries:?}"
     );
+    ran_in_namespace("bind_mounts_are_not_entered", flags);
 }
 
 /// Whether a directory was opened and whether its entries were read since [`Watch::new`],
@@ -316,7 +349,7 @@ impl Watch {
 #[test]
 fn bind_mounts_are_not_listed() {
     let s = Setup::new();
-    let Some(flags) = mount_namespace(&s) else {
+    let Some(flags) = mount_namespace(&s, "bind_mounts_are_not_listed") else {
         return;
     };
     let data = s.fx.path("owner/data");
@@ -344,4 +377,5 @@ fn bind_mounts_are_not_listed() {
     let result = act_with_binds(&s, flags, &plan.id, &[(&data, &cache)]);
     assert_eq!(result.status, ActStatus::DryRun, "{result:#?}");
     assert!(!watch.seen().1, "the snapshot does not list the bind mount");
+    ran_in_namespace("bind_mounts_are_not_listed", flags);
 }
