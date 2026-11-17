@@ -1039,13 +1039,31 @@ mod tests {
         Some((pid.parse().ok()?, start_s.parse().ok()?))
     }
 
-    /// Run through [`run`] by `a_process_left_after_a_normal_exit_is_killed_on_windows`:
-    /// reports itself, starts a `ping` that holds none of the run's pipes, reports it, and
-    /// exits. Its stdout and stderr, the run's pipes, stop being inheritable first, because a
-    /// child started to inherit handles gets every inheritable one, not only its own stdio.
+    /// Set for `leave_a_process_helper` by
+    /// `a_process_left_holding_the_output_ends_in_a_timeout_on_windows`: the `ping` it leaves
+    /// gets its stdout and stderr, the run's pipes.
+    #[cfg(windows)]
+    const HELPER_KEEPS_OUTPUT: &str = "CARDINAL_TEST_HELPER_KEEPS_OUTPUT";
+
+    /// The arguments that make the test binary run `leave_a_process_helper`.
+    #[cfg(windows)]
+    fn helper_args() -> [OsString; 3] {
+        [
+            "os::child::tests::leave_a_process_helper",
+            "--exact",
+            "--ignored",
+        ]
+        .map(OsString::from)
+    }
+
+    /// Run through [`run`] by the Windows tests of a process left behind: reports itself,
+    /// starts a `ping`, reports it, and exits. The `ping` holds none of the run's pipes:
+    /// stdout and stderr, the run's pipes, stop being inheritable first, because a child
+    /// started to inherit handles gets every inheritable one, not only its own stdio. With
+    /// [`HELPER_KEEPS_OUTPUT`] set, the `ping` gets stdout and stderr instead.
     #[cfg(windows)]
     #[test]
-    #[ignore = "run by a_process_left_after_a_normal_exit_is_killed_on_windows"]
+    #[ignore = "run by the Windows tests of a process left behind"]
     fn leave_a_process_helper() {
         use std::os::windows::io::AsRawHandle as _;
         use std::process::Stdio;
@@ -1056,14 +1074,24 @@ mod tests {
             return;
         };
         report(&dir, "helper", std::process::id());
-        for handle in [
-            std::io::stdout().as_raw_handle(),
-            std::io::stderr().as_raw_handle(),
-        ] {
-            // SAFETY: the handle is this process's stdout or stderr, open while it runs.
-            let set = unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) };
-            assert_ne!(set, 0, "{}", std::io::Error::last_os_error());
+        let keeps_output = std::env::var_os(HELPER_KEEPS_OUTPUT).is_some();
+        if !keeps_output {
+            for handle in [
+                std::io::stdout().as_raw_handle(),
+                std::io::stderr().as_raw_handle(),
+            ] {
+                // SAFETY: the handle is this process's stdout or stderr, open while it runs.
+                let set = unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) };
+                assert_ne!(set, 0, "{}", std::io::Error::last_os_error());
+            }
         }
+        let output = || {
+            if keeps_output {
+                Stdio::inherit()
+            } else {
+                Stdio::null()
+            }
+        };
         #[expect(
             clippy::zombie_processes,
             reason = "left running on purpose; Windows keeps no zombies, and the job ends it"
@@ -1071,43 +1099,95 @@ mod tests {
         let ping = std::process::Command::new("ping")
             .args(["-n", "31", "127.0.0.1"])
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(output())
+            .stderr(output())
             .spawn()
             .unwrap();
         report(&dir, "ping", ping.id());
     }
 
-    /// Until `done` is set, notes when each process `leave_a_process_helper` reported was last
-    /// seen alive, from `start`; returns that as text for a failure message.
+    /// What `watch_helper` saw of a process `leave_a_process_helper` reports: its ID and
+    /// start time once reported, and when it was last seen alive.
+    #[cfg(windows)]
+    #[derive(Clone, Copy, Debug)]
+    struct Seen {
+        name: &'static str,
+        process: Option<(u32, u64)>,
+        alive_at: Option<Duration>,
+    }
+
+    #[cfg(windows)]
+    impl std::fmt::Display for Seen {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            let name = self.name;
+            match (self.process, self.alive_at) {
+                (None, _) => write!(f, "{name} not started"),
+                (Some((pid, _)), None) => write!(f, "{name} {pid} never seen alive"),
+                (Some((pid, _)), Some(at)) => write!(f, "{name} {pid} last seen alive at {at:?}"),
+            }
+        }
+    }
+
+    /// Until `done` is set, notes when the helper and its `ping` were last seen alive, from
+    /// `start`.
     #[cfg(windows)]
     fn watch_helper(
         dir: std::path::PathBuf,
         start: Instant,
         done: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    ) -> std::thread::JoinHandle<String> {
+    ) -> std::thread::JoinHandle<[Seen; 2]> {
         std::thread::spawn(move || {
-            let mut seen = [("helper", None, None), ("ping", None, None)];
+            let mut seen = ["helper", "ping"].map(|name| Seen {
+                name,
+                process: None,
+                alive_at: None,
+            });
             while !done.load(std::sync::atomic::Ordering::SeqCst) {
-                for (name, process, alive_at) in &mut seen {
-                    if process.is_none() {
-                        *process = reported(&dir, name);
+                for seen in &mut seen {
+                    if seen.process.is_none() {
+                        seen.process = reported(&dir, seen.name);
                     }
-                    if let Some((pid, start_s)) = *process
+                    if let Some((pid, start_s)) = seen.process
                         && crate::os::is_alive(pid, start_s)
                     {
-                        *alive_at = Some(start.elapsed());
+                        seen.alive_at = Some(start.elapsed());
                     }
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
-            seen.map(|(name, process, alive_at)| match (process, alive_at) {
-                (None, _) => format!("{name} not started"),
-                (Some((pid, _)), None) => format!("{name} {pid} never seen alive"),
-                (Some((pid, _)), Some(at)) => format!("{name} {pid} last seen alive at {at:?}"),
-            })
-            .join(", ")
+            seen
         })
+    }
+
+    /// Runs `leave_a_process_helper` through [`run`] in `dir` with `env` added, within
+    /// `timeout`, and returns the result, how long [`run`] took, and what `watch_helper` saw,
+    /// with every process the helper reported.
+    #[cfg(windows)]
+    fn run_helper(
+        dir: &std::path::Path,
+        env: &[(&str, &str)],
+        timeout: Duration,
+    ) -> (Result<super::Output, ChildError>, Duration, [Seen; 2]) {
+        let mut full = windows_env();
+        full.push((HELPER_DIR.into(), dir.into()));
+        full.extend(env.iter().map(|(k, v)| ((*k).into(), (*v).into())));
+        let done = std::sync::Arc::default();
+        let start = Instant::now();
+        let watcher = watch_helper(dir.to_owned(), start, std::sync::Arc::clone(&done));
+        let result = run(
+            std::env::current_exe().unwrap(),
+            &helper_args(),
+            &full,
+            dir,
+            limits(timeout, 1024 * 1024),
+        );
+        let returned = start.elapsed();
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut seen = watcher.join().unwrap();
+        for seen in &mut seen {
+            seen.process = seen.process.or_else(|| reported(dir, seen.name));
+        }
+        (result, returned, seen)
     }
 
     /// After a normal exit the rest of the job goes on Windows: the helper leaves a `ping`
@@ -1121,32 +1201,46 @@ mod tests {
     #[test]
     fn a_process_left_after_a_normal_exit_is_killed_on_windows() {
         let dir = tempfile::tempdir().unwrap();
-        let mut env = windows_env();
-        env.push((HELPER_DIR.into(), dir.path().into()));
-        let args = [
-            "os::child::tests::leave_a_process_helper",
-            "--exact",
-            "--ignored",
-        ]
-        .map(OsString::from);
-        let done = std::sync::Arc::default();
-        let start = Instant::now();
-        let watcher = watch_helper(dir.path().to_owned(), start, std::sync::Arc::clone(&done));
-        let result = run(
-            std::env::current_exe().unwrap(),
-            &args,
-            &env,
-            dir.path(),
-            limits(Duration::from_secs(20), 1024 * 1024),
-        );
-        let returned = start.elapsed();
-        done.store(true, std::sync::atomic::Ordering::SeqCst);
-        let seen = watcher.join().unwrap();
-        let out = result.unwrap_or_else(|err| panic!("{err} after {returned:?}: {seen}"));
+        let (result, returned, seen) = run_helper(dir.path(), &[], Duration::from_secs(20));
+        let seen_text = seen.map(|s| s.to_string()).join(", ");
+        let out = result.unwrap_or_else(|err| panic!("{err} after {returned:?}: {seen_text}"));
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert_eq!(out.code, Some(0), "{stdout}{}", out.stderr_line());
-        let ping = reported(dir.path(), "ping");
-        assert!(ping.is_some(), "the helper left no ping: {seen}\n{stdout}");
+        let ping = seen[1].process;
+        assert!(
+            ping.is_some(),
+            "the helper left no ping: {seen_text}\n{stdout}"
+        );
         assert_gone(ping);
+    }
+
+    /// A process the child leaves holding its output keeps the run from completing on
+    /// Windows too: the helper exits at once and leaves a `ping` with its stdout and stderr,
+    /// so the run ends in a timeout at its deadline, not in success, and the job takes the
+    /// `ping` along.
+    #[cfg(windows)]
+    #[test]
+    fn a_process_left_holding_the_output_ends_in_a_timeout_on_windows() {
+        let timeout = Duration::from_secs(10);
+        let dir = tempfile::tempdir().unwrap();
+        let (result, returned, [helper, ping]) =
+            run_helper(dir.path(), &[(HELPER_KEEPS_OUTPUT, "1")], timeout);
+        let seen_text = format!("{helper}, {ping}");
+        assert!(
+            matches!(result, Err(ChildError::Timeout { .. })),
+            "{result:?} after {returned:?}: {seen_text}"
+        );
+        assert!(
+            returned < timeout + Duration::from_secs(5),
+            "{returned:?}: {seen_text}"
+        );
+        assert!(
+            helper.process.is_some()
+                && helper
+                    .alive_at
+                    .is_none_or(|at| at + Duration::from_secs(1) < timeout),
+            "the helper exited well before the deadline: {seen_text}"
+        );
+        assert_gone(ping.process);
     }
 }
