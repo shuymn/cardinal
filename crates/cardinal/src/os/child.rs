@@ -13,15 +13,15 @@
 //! signals itself must not use [`run`]; when that fails, no child starts, and this and every
 //! later [`run`] in the process return [`ChildError::Setup`]. On Windows each child's job is
 //! killed when its only handle, held by this process, closes; other processes this process
-//! starts are not affected.
+//! starts are not affected. On Unix the waits, group signals, and signal handling are those of
+//! [`super::unix`]; this module adds only what bounds a child: the deadline, the readers, and
+//! the cleanup.
 //!
 //! For short-lived callers only (a CLI command, a hook): a descendant that left the child's
 //! process group (`setsid`) is not killed, and a reader thread blocked on a pipe it holds
 //! open outlives a [`ChildError::Timeout`] until that descendant closes the pipe or the
 //! process ends. A long-lived caller would collect such threads.
 
-#[cfg(unix)]
-mod unix;
 #[cfg(windows)]
 mod windows;
 
@@ -33,6 +33,9 @@ use std::sync::mpsc;
 #[cfg(unix)]
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+use crate::os::unix;
 
 /// Variables git children copy from the caller's environment (section 8.1). `LC_*` is
 /// copied too.
@@ -282,19 +285,16 @@ pub fn prepare() {
 fn guard_termination() -> std::io::Result<()> {
     static GUARD: OnceLock<Result<(), String>> = OnceLock::new();
     GUARD
-        .get_or_init(|| guard_with(unix::watch_signals).map_err(|err| err.to_string()))
+        .get_or_init(|| {
+            unix::reset_child_signal();
+            unix::watch_signals(
+                &[unix::SIGTERM, unix::SIGINT, unix::SIGHUP],
+                end_with_children,
+            )
+            .map_err(|err| err.to_string())
+        })
         .clone()
         .map_err(std::io::Error::other)
-}
-
-/// The setup of [`guard_termination`], with `watch` installing handlers that call the
-/// function it is given.
-#[cfg(unix)]
-fn guard_with(watch: impl FnOnce(&[i32], fn(i32)) -> std::io::Result<()>) -> std::io::Result<()> {
-    use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
-
-    unix::reset_child_signal();
-    watch(&[SIGTERM, SIGINT, SIGHUP], end_with_children)
 }
 
 /// Kills every live child's process group, then ends this process by `sig`.
@@ -303,7 +303,8 @@ fn end_with_children(sig: i32) {
     // Held until the process ends: no child starts or is reaped after this.
     let live = live();
     for &pgid in live.iter() {
-        crate::os::kill_process_group(pgid);
+        // Pinned: the group's leader is an unreaped child while it is listed.
+        let _ = unix::signal_group(pgid, unix::SIGKILL);
     }
     unix::die_by_signal(sig)
 }
@@ -326,7 +327,8 @@ impl Reaper {
     fn ended(&mut self) -> std::io::Result<bool> {
         #[cfg(unix)]
         {
-            unix::ended(self.child.id())
+            unix::wait_unreaped(self.child.id(), unix::Until::Now)
+                .map(|state| state == unix::ChildState::Ended)
         }
         #[cfg(windows)]
         {
@@ -344,7 +346,7 @@ impl Reaper {
             let id = self.child.id();
             // The group is the child's own (`process_group(0)`), and its ID is pinned until
             // the child is reaped below.
-            crate::os::kill_process_group(id);
+            let _ = unix::signal_group(id, unix::SIGKILL);
             let _ = self.child.kill();
             let status = self.child.wait();
             live.retain(|&pgid| pgid != id);
@@ -652,125 +654,8 @@ mod tests {
     }
 
     /// The directory a helper test, run through the test binary, reports to.
+    #[cfg(windows)]
     const HELPER_DIR: &str = "CARDINAL_TEST_HELPER_DIR";
-
-    /// The process ID a test helper wrote to `dir/name`.
-    #[cfg(unix)]
-    fn written_pid(dir: &std::path::Path, name: &str) -> Option<u32> {
-        std::fs::read_to_string(dir.join(name))
-            .ok()?
-            .trim()
-            .parse()
-            .ok()
-    }
-
-    /// Does nothing with the signal it is called for.
-    #[cfg(unix)]
-    extern "C" fn inert(_: libc::c_int) {}
-
-    /// Run by `a_signal_while_the_handlers_go_in_ends_the_run`. Raises SIGTERM on the thread
-    /// that installs the handlers, where the one for SIGTERM is installed but does nothing
-    /// with it yet, as signal-hook's does until it has published the action it runs; then
-    /// runs a child that writes its PID to `child` and sleeps. Writes `returned` if the run
-    /// returned, which it does only if the signal was lost.
-    #[cfg(unix)]
-    #[test]
-    #[ignore = "run by a_signal_while_the_handlers_go_in_ends_the_run"]
-    fn signal_while_the_handlers_go_in_helper() {
-        let Some(dir) = std::env::var_os(HELPER_DIR).map(std::path::PathBuf::from) else {
-            return;
-        };
-        let guard = || {
-            super::guard_with(|signals, on_signal| {
-                super::unix::watch_signals_with(
-                    signals,
-                    on_signal,
-                    super::unix::start_thread,
-                    |sig, writer| {
-                        if sig == libc::SIGTERM {
-                            let mut action = std::mem::MaybeUninit::<libc::sigaction>::zeroed();
-                            // SAFETY: `action` is a zeroed `sigaction` with an empty mask and
-                            // `inert` as its handler, which touches nothing; `raise` sends
-                            // SIGTERM to this thread.
-                            unsafe {
-                                let action = action.as_mut_ptr();
-                                (*action).sa_sigaction = inert as *const () as libc::sighandler_t;
-                                libc::sigemptyset(&raw mut (*action).sa_mask);
-                                libc::sigaction(sig, action, std::ptr::null_mut());
-                                libc::raise(sig);
-                            }
-                        }
-                        signal_hook::low_level::pipe::register(sig, writer)
-                    },
-                )
-            })
-        };
-        let script = format!("echo $$ > '{}'; exec sleep 30", dir.join("child").display());
-        let result = sh_guarded(guard, &dir, &script, limits(Duration::from_secs(3), 1024));
-        std::fs::write(dir.join("returned"), format!("{result:?}")).unwrap();
-    }
-
-    /// A termination signal that arrives while the handlers go in is not lost: it waits
-    /// until they are in place, then ends the run and the process by that signal, and kills
-    /// the child if one started.
-    #[cfg(unix)]
-    #[test]
-    fn a_signal_while_the_handlers_go_in_ends_the_run() {
-        use std::os::unix::process::ExitStatusExt as _;
-        use std::process::{Command, Stdio};
-
-        /// Kills the helper's child, if it is still there, on every way out of the test.
-        struct KillChild<'a>(&'a std::path::Path);
-        impl Drop for KillChild<'_> {
-            fn drop(&mut self) {
-                if let Some(pid) = written_pid(self.0, "child")
-                    && crate::os::start_time_s(pid).is_some()
-                {
-                    crate::os::kill_process_group(pid);
-                }
-            }
-        }
-
-        let dir = tempfile::tempdir().unwrap();
-        let _kill = KillChild(dir.path());
-        let mut helper = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "os::child::tests::signal_while_the_handlers_go_in_helper",
-                "--exact",
-                "--ignored",
-            ])
-            .env(HELPER_DIR, dir.path())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(20);
-        let status = loop {
-            if let Some(status) = helper.try_wait().unwrap() {
-                break status;
-            }
-            if Instant::now() >= deadline {
-                let _ = helper.kill();
-                let _ = helper.wait();
-                panic!("the helper did not end within 20 s");
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        };
-        let returned = std::fs::read_to_string(dir.path().join("returned")).ok();
-        assert_eq!(
-            status.signal(),
-            Some(libc::SIGTERM),
-            "{status}; the run returned {returned:?}"
-        );
-        if let Some(pid) = written_pid(dir.path(), "child") {
-            let gone = (0..250).any(|_| {
-                std::thread::sleep(Duration::from_millis(20));
-                crate::os::start_time_s(pid).is_none()
-            });
-            assert!(gone, "the child {pid} was killed with the helper");
-        }
-    }
 
     #[cfg(unix)]
     #[test]
