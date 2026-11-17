@@ -211,7 +211,16 @@ pub fn walk(worktree: &Path, target: &Path) -> io::Result<Walk> {
     if let (true, Ok(on_mount)) = (listable, &root_mount) {
         testpoint::hit(testpoint::WALK_TARGET_CHECKED).map_err(io::Error::other)?;
         match Listing::open(target, &root, on_mount)? {
-            Some(listing) => walk_dir(listing, &root.rel, root.dev, on_mount, &mut entries)?,
+            Some(listing) => {
+                walk_dir(
+                    worktree,
+                    listing,
+                    &root.rel,
+                    root.dev,
+                    on_mount,
+                    &mut entries,
+                )?;
+            }
             None => mount = Mount::Boundary,
         }
     }
@@ -250,13 +259,15 @@ fn mount_id(_path: &Path) -> Result<MountKey, String> {
     Ok(MountKey)
 }
 
-/// Records the entries below the directory `listing`, parents before children in name order,
-/// without following symbolic links. A directory is listed only after its device and mount are
-/// found to be `dev` and `on_mount`, by path and then (Unix) on the descriptor it is listed
-/// through: one on another device or mount, or replaced since its entry was read, is recorded
-/// but never listed, and a mount that cannot be read fails the walk. Each directory is listed
-/// in full and closed before anything below it is opened, so one directory is open at a time.
+/// Records the entries below the directory `listing` of `worktree`, parents before children in
+/// name order, without following symbolic links. A directory is listed only after its device
+/// and mount are found to be `dev` and `on_mount`, by its path in `worktree` and then (Unix) on
+/// the descriptor it is listed through: one on another device or mount, or replaced since its
+/// entry was read, is recorded but never listed, and a mount that cannot be read fails the
+/// walk. Each directory is listed in full and closed before anything below it is opened, so
+/// one directory is open at a time.
 fn walk_dir(
+    worktree: &Path,
     listing: Listing,
     rel: &Path,
     dev: u64,
@@ -266,28 +277,30 @@ fn walk_dir(
     // The remaining entries of each directory being walked, innermost last.
     let mut pending = vec![listing.entries(rel)?.into_iter()];
     while let Some(level) = pending.last_mut() {
-        let Some((path, entry)) = level.next() else {
+        let Some(entry) = level.next() else {
             pending.pop();
             continue;
         };
-        let enter = entry.kind == EntryKind::Dir
-            && entry.dev == dev
-            && match mount_id(&path) {
+        if entry.kind == EntryKind::Dir && entry.dev == dev {
+            let path = worktree.join(&entry.rel);
+            let enter = match mount_id(&path) {
                 Ok(mount) => mount == *on_mount,
                 // Removed since it was listed: the entry stays as it was seen.
                 Err(_) if gone(&path) => false,
                 Err(err) => return Err(io::Error::other(err)),
             };
-        if enter {
-            testpoint::hit(testpoint::WALK_DIR_CHECKED).map_err(io::Error::other)?;
-            let listed = Listing::open(&path, &entry, on_mount)
-                .and_then(|below| below.map(|below| below.entries(&entry.rel)).transpose());
-            match listed {
-                Ok(Some(below)) => pending.push(below.into_iter()),
-                // Replaced or removed since its entry was read: the entry stays as it was seen.
-                Ok(None) => {}
-                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-                Err(err) => return Err(err),
+            if enter {
+                testpoint::hit(testpoint::WALK_DIR_CHECKED).map_err(io::Error::other)?;
+                let listed = Listing::open(&path, &entry, on_mount)
+                    .and_then(|below| below.map(|below| below.entries(&entry.rel)).transpose());
+                match listed {
+                    Ok(Some(below)) => pending.push(below.into_iter()),
+                    // Replaced or removed since its entry was read: the entry stays as it was
+                    // seen.
+                    Ok(None) => {}
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                    Err(err) => return Err(err),
+                }
             }
         }
         out.push(entry);
@@ -303,9 +316,10 @@ fn gone(path: &Path) -> bool {
 /// A directory the walk lists: on Unix, opened and found to be the directory the walk
 /// recorded, on the target's mount.
 struct Listing {
-    path: PathBuf,
     #[cfg(unix)]
     dir: std::fs::File,
+    #[cfg(not(unix))]
+    path: PathBuf,
 }
 
 impl Listing {
@@ -323,10 +337,7 @@ impl Listing {
         {
             return Ok(None);
         }
-        Ok(Some(Self {
-            path: path.to_owned(),
-            dir,
-        }))
+        Ok(Some(Self { dir }))
     }
 
     /// Windows lists by path: a reparse point is recorded as a link and never listed, and
@@ -342,21 +353,20 @@ impl Listing {
         }))
     }
 
-    /// The entries of the directory, as their paths and their entries below the
-    /// worktree-relative `rel`, in name order; the directory is closed on return. An entry
-    /// removed before it is read is left out.
+    /// The entries of the directory below the worktree-relative `rel`, in name order; the
+    /// directory is closed on return. An entry removed before it is read is left out.
     #[cfg(unix)]
-    fn entries(self, rel: &Path) -> io::Result<Vec<(PathBuf, Entry)>> {
+    fn entries(self, rel: &Path) -> io::Result<Vec<Entry>> {
         Ok(crate::os::dir::list(self.dir)?
             .into_iter()
-            .map(|(name, st)| (self.path.join(&name), Entry::from_stat(rel.join(name), &st)))
+            .map(|(name, st)| Entry::from_stat(rel.join(name), &st))
             .collect())
     }
 
-    /// The entries of the directory, as their paths and their entries below the
-    /// worktree-relative `rel`, in name order. An entry removed before it is read is left out.
+    /// The entries of the directory below the worktree-relative `rel`, in name order. An
+    /// entry removed before it is read is left out.
     #[cfg(not(unix))]
-    fn entries(self, rel: &Path) -> io::Result<Vec<(PathBuf, Entry)>> {
+    fn entries(self, rel: &Path) -> io::Result<Vec<Entry>> {
         let mut names = Vec::new();
         for entry in std::fs::read_dir(&self.path)? {
             match entry {
@@ -375,7 +385,7 @@ impl Listing {
             // updates lazily, so a directory's mtime there can predate an entry created below
             // it.
             match std::fs::symlink_metadata(&path) {
-                Ok(meta) => entries.push((path, Entry::from_metadata(rel.join(name), &meta))),
+                Ok(meta) => entries.push(Entry::from_metadata(rel.join(name), &meta)),
                 Err(err) if err.kind() == io::ErrorKind::NotFound => {}
                 Err(err) => return Err(err),
             }
