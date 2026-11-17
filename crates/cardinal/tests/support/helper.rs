@@ -60,6 +60,18 @@ pub enum Mode {
     /// Write this process's process group ID to `out`.
     #[cfg(unix)]
     Group { out: PathBuf },
+    /// Stand in for an agent: start a sleeping helper (a process the agent leaves running)
+    /// and write its PID to `dir/background.pid`; run `cardinal hook claude <event>` as this
+    /// process's child, or with `via_shell` as the child of `sh -c` as Claude Code runs it,
+    /// with `dir/input.json` on stdin and the state and config dirs `state` and `config`;
+    /// write its exit status to `dir/hook.done`, then sleep.
+    Agent {
+        dir: PathBuf,
+        event: String,
+        state: PathBuf,
+        config: PathBuf,
+        via_shell: bool,
+    },
     /// Run `cmd /D /C exit 0` through `cardinal::os::child`, start a sleeping helper through a
     /// scope of this process, write its PID to `out`, then sleep: the sleeper is a process
     /// started outside `os::child`.
@@ -139,6 +151,13 @@ pub fn run_if_requested() {
             let group = unsafe { libc::getpgrp() };
             std::fs::write(&args[0], group.to_string()).expect("write the group");
         }
+        "agent" => agent(
+            Path::new(&args[0]),
+            &args[1],
+            Path::new(&args[2]),
+            Path::new(&args[3]),
+            args[4] == "via-shell",
+        ),
         #[cfg(windows)]
         "outside" => {
             let limits = cardinal::os::child::Limits {
@@ -162,6 +181,41 @@ pub fn run_if_requested() {
         other => panic!("unknown helper mode {other}"),
     }
     std::process::exit(0);
+}
+
+/// The `agent` mode: see [`Mode::Agent`].
+fn agent(dir: &Path, event: &str, state: &Path, config: &Path, via_shell: bool) {
+    let scope = Scope::new();
+    let background = spawn(&scope, &Mode::Sleep, scope.root());
+    std::fs::write(dir.join("background.pid"), background.id().to_string()).expect("write the pid");
+    let input = dir.join("input.json");
+    let cardinal = env!("CARGO_BIN_EXE_cardinal");
+    let mut hook = if via_shell {
+        // `; true` keeps the shell alive as the hook's parent.
+        scope.shell(
+            &format!(
+                "'{cardinal}' hook claude {event} < '{}'; true",
+                input.display()
+            ),
+            scope.root(),
+        )
+    } else {
+        let mut hook = scope.command(cardinal, scope.root());
+        hook.args(["hook", "claude", event])
+            .stdin(std::fs::File::open(&input).expect("open the input"));
+        hook
+    };
+    let status = hook
+        .env("CARDINAL_STATE_DIR", state)
+        .env("CARDINAL_CONFIG_DIR", config)
+        .stdout(std::process::Stdio::null())
+        .status()
+        .expect("run the hook");
+    let written = dir.join("hook.tmp");
+    std::fs::write(&written, status.code().unwrap_or(-1).to_string()).expect("write the status");
+    std::fs::rename(&written, dir.join("hook.done")).expect("publish the status");
+    std::thread::sleep(LIFETIME);
+    drop((background, scope));
 }
 
 /// The `leave` mode: see [`Mode::Leave`].
@@ -271,6 +325,22 @@ pub fn args(mode: &Mode) -> Vec<String> {
         Mode::ChildSignal { out } => ("child-signal", vec![out.to_string_lossy().into_owned()]),
         #[cfg(unix)]
         Mode::Group { out } => ("group", vec![out.to_string_lossy().into_owned()]),
+        Mode::Agent {
+            dir,
+            event,
+            state,
+            config,
+            via_shell,
+        } => (
+            "agent",
+            vec![
+                dir.to_string_lossy().into_owned(),
+                event.clone(),
+                state.to_string_lossy().into_owned(),
+                config.to_string_lossy().into_owned(),
+                if *via_shell { "via-shell" } else { "" }.to_owned(),
+            ],
+        ),
         #[cfg(windows)]
         Mode::Outside { out } => ("outside", vec![out.to_string_lossy().into_owned()]),
         #[cfg(windows)]
