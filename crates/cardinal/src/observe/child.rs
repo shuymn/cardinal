@@ -316,7 +316,9 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
+    #[cfg(unix)]
+    use std::time::Instant;
 
     use super::{ChildError, constructed_env, lookup, run};
 
