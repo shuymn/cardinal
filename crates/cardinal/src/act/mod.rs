@@ -11,7 +11,6 @@
 mod unix;
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
 use crate::config::Config;
 use crate::contract::{
@@ -20,7 +19,7 @@ use crate::contract::{
 };
 use crate::observe::WorktreeObservation;
 use crate::plan::{self, DataLists, InUseFacts, Inspection, Real, Walk};
-use crate::state::{self, LockMode, Probe, StateDir};
+use crate::state::{self, Probe, StateDir};
 use crate::testpoint;
 
 /// `cardinal act` flags. In phase 0 neither `dry_run` nor `owner_approved` enables
@@ -179,10 +178,6 @@ impl Run<'_> {
 
     /// Reservations naming the worktree, read under the admission lock.
     fn reservations(&self, key: &str) -> Result<InUse, String> {
-        let deadline =
-            Instant::now() + Duration::from_millis(self.config.host.admission.lock_timeout_ms);
-        let _admission = state::lock(&self.state.admission_lock(), LockMode::Exclusive, deadline)
-            .map_err(|err| err.to_string())?;
         self.sources.in_use(key).map_err(|err| err.message)
     }
 

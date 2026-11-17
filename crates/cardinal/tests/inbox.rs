@@ -392,7 +392,9 @@ fn recovery_needed_raised_and_cleared() {
     assert_eq!(items[0]["status"], "resolved");
     assert_eq!(items[0]["resolution"]["by"], "cardinal");
     assert_eq!(items[0]["resolution"]["note"], "the reservation is gone");
-    let reservations = cardinal::admission::list_reservations(&e.state).unwrap();
+    let reservations =
+        cardinal::admission::list_reservations(&e.state, &cardinal::config::HostConfig::defaults())
+            .unwrap();
     let jobs: Vec<&str> = reservations
         .iter()
         .map(|v| v.reservation.job_id.as_str())

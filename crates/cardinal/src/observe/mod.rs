@@ -216,7 +216,7 @@ impl<'a> Observer<'a> {
         options: &InventoryOptions,
     ) -> Result<Inventory, Error> {
         let mut errors = Vec::new();
-        let shared = Self::shared(state, options.sizes, &mut errors);
+        let shared = self.shared(state, options.sizes, &mut errors);
         let host = Self::host_info(state, &mut errors);
 
         let mut repos: Vec<Repo> = Vec::new();
@@ -274,7 +274,7 @@ impl<'a> Observer<'a> {
                     format!("git does not list {} as a worktree", root.display()),
                 )
             })?;
-        let shared = Self::shared(state, false, &mut Vec::new());
+        let shared = self.shared(state, false, &mut Vec::new());
         let result = self.observe_one(&ctx, index, &shared);
         let mut repo = ctx.repo;
         if let Some(message) = result.gh_error {
@@ -287,13 +287,20 @@ impl<'a> Observer<'a> {
         })
     }
 
-    fn shared<'s>(state: &'s StateDir, sizes: bool, errors: &mut Vec<ScopedError>) -> Shared<'s> {
+    fn shared<'s>(
+        &self,
+        state: &'s StateDir,
+        sizes: bool,
+        errors: &mut Vec<ScopedError>,
+    ) -> Shared<'s> {
         // The process table is read before any git or gh child starts, so none of them can
         // be mistaken for a process working inside a worktree.
         let processes = ProcessTable::snapshot(Detail::all())
             .map_err(|err| errors.push(scoped("processes", err.to_string())))
             .ok();
-        let reservations = admission::list_reservations(state)
+        // Read under the admission lock; a lock that is not free in time makes the in-use
+        // facts unknown, never "no reservations".
+        let reservations = admission::list_reservations(state, &self.config.host)
             .map_err(|err| errors.push(scoped("reservations", err.message)))
             .ok();
         Shared {

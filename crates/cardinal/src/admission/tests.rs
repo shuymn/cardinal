@@ -9,7 +9,7 @@ use crate::contract::{
     AdmissionResult, DerivedState, GroupIdentity, GroupMember, Priority, ProcessIdentity,
     Reservation, ReservationSchema, ReservationState,
 };
-use crate::state::{self, LockMode, StateDir};
+use crate::state::{self, LockMode, Probe, StateDir};
 
 const BOOT: u64 = 1_000_000;
 
@@ -81,6 +81,12 @@ fn state() -> (tempfile::TempDir, StateDir) {
     (dir, state)
 }
 
+/// Writes `reservation` under the admission lock, as a runner does.
+fn write(state: &StateDir, reservation: &Reservation) -> Result<(), super::AdmissionError> {
+    let guard = lock(state, Duration::from_secs(1))?;
+    write_reservation(&guard, state, reservation)
+}
+
 fn read(state: &StateDir, job: &str) -> Option<Reservation> {
     std::fs::read(state.reservation(job))
         .ok()
@@ -91,7 +97,7 @@ fn read(state: &StateDir, job: &str) -> Option<Reservation> {
 fn stale_reservations_and_orphaned_live_locks_are_removed() {
     let (_dir, state) = state();
     // Runner 100 is gone and its group is empty.
-    write_reservation(
+    write(
         &state,
         &reservation("aaaa000000000001", 100, Some((101, 11)), 1),
     )
@@ -124,7 +130,7 @@ fn stale_reservations_and_orphaned_live_locks_are_removed() {
 fn verified_groups_are_kept_untouched_until_empty() {
     let (_dir, state) = state();
     let job = "bbbb000000000001";
-    write_reservation(&state, &reservation(job, 200, Some((201, 21)), 1)).unwrap();
+    write(&state, &reservation(job, 200, Some((201, 21)), 1)).unwrap();
     let written = std::fs::read(state.reservation(job)).unwrap();
     let facts = Fake {
         processes: [(201, (21, 200)), (202, (22, 200))].into_iter().collect(),
@@ -151,13 +157,13 @@ fn verified_groups_are_kept_untouched_until_empty() {
 fn unverified_groups_are_kept_and_never_signalled() {
     let (_dir, state) = state();
     // The child 301 exited; a descendant stays in group 300.
-    write_reservation(
+    write(
         &state,
         &reservation("cccc000000000001", 300, Some((301, 31)), 1),
     )
     .unwrap();
     // The runner died at `starting`: no child was recorded.
-    write_reservation(&state, &reservation("cccc000000000002", 400, None, 1)).unwrap();
+    write(&state, &reservation("cccc000000000002", 400, None, 1)).unwrap();
     let facts = Fake {
         processes: [(302, (32, 300)), (401, (41, 400))].into_iter().collect(),
     };
@@ -178,7 +184,7 @@ fn recovery_needed_reservations_count_against_the_budget() {
     let (_dir, state) = state();
     let budget = resources([("cpu", 2)]);
     // Group 500 is alive: its reservation counts although its runner is gone.
-    write_reservation(&state, &reservation("dddd000000000001", 500, None, 2)).unwrap();
+    write(&state, &reservation("dddd000000000001", 500, None, 2)).unwrap();
     let need = resources([("cpu", 1)]);
     let reserved_with = |facts: &Fake| {
         let guard = lock(&state, Duration::from_secs(1)).unwrap();
@@ -262,4 +268,51 @@ fn a_job_dropped_after_the_start_boundary_is_abandoned() {
             "{running}: the live lock is no longer held"
         );
     }
+}
+
+/// A reserved job dropped, or an admitter that never admitted dropped, while another process
+/// holds the admission lock deletes nothing: the reservation and the live lock file stay and
+/// the live lock is let go, so the next recovery pass releases them.
+#[test]
+fn drops_without_the_admission_lock_delete_nothing() {
+    let (_dir, state) = state();
+    let mut host = HostConfig::defaults();
+    host.budget = resources([("cpu", 1)]);
+    host.admission.lock_timeout_ms = 0;
+    let draft = reservation("eeee000000000002", 703, None, 1);
+    let mut admitter = Admitter::new(&state, &host, "eeee000000000002".into(), None);
+    let Pass::Admitted(job) = admitter.pass(&draft, false).unwrap() else {
+        panic!("the budget is free");
+    };
+    drop(admitter);
+    let mut waiting = Admitter::new(&state, &host, "eeee000000000003".into(), None);
+    assert!(matches!(waiting.pass(&draft, false).unwrap(), Pass::Full));
+    let before = std::fs::read_to_string(state.reservation("eeee000000000002")).unwrap();
+
+    let held = lock(&state, Duration::from_secs(1)).unwrap();
+    drop(job);
+    drop(waiting);
+    assert_eq!(
+        std::fs::read_to_string(state.reservation("eeee000000000002")).ok(),
+        Some(before),
+        "the reserved job's reservation stays"
+    );
+    for job in ["eeee000000000002", "eeee000000000003"] {
+        assert_eq!(
+            state::probe(&state.live_lock(job)).unwrap(),
+            Probe::Free,
+            "{job}: the live lock file stays, free"
+        );
+    }
+    drop(held);
+    let recovery = recover(
+        &lock(&state, Duration::from_secs(1)).unwrap(),
+        &state,
+        &Fake::default(),
+    )
+    .unwrap();
+    assert_eq!(recovery.released.len(), 1);
+    assert!(read(&state, "eeee000000000002").is_none());
+    assert!(!state.live_lock("eeee000000000002").exists());
+    assert!(!state.live_lock("eeee000000000003").exists());
 }

@@ -80,6 +80,7 @@ const TABLE: &[(&str, &[&str])] = &[
             "record",
             "plan",
             "inbox",
+            "admission",
             "state",
             "contract",
         ],

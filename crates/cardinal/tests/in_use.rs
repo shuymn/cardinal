@@ -63,7 +63,12 @@ fn waiting_and_running_jobs_block_act() {
         !env.worktree_lock_free(),
         "a running job holds the worktree"
     );
-    let busy = in_use(&env.state(), &env.worktree_key()).unwrap();
+    let busy = in_use(
+        &env.state(),
+        &cardinal::config::HostConfig::defaults(),
+        &env.worktree_key(),
+    )
+    .unwrap();
     assert!(busy.value);
     let job = env
         .reservations()
@@ -79,7 +84,15 @@ fn waiting_and_running_jobs_block_act() {
     env.points.release(RUN_AFTER_SPAWN);
     assert_eq!(runner.wait().unwrap().code(), Some(0));
     assert!(env.worktree_lock_free());
-    assert!(!in_use(&env.state(), &env.worktree_key()).unwrap().value);
+    assert!(
+        !in_use(
+            &env.state(),
+            &cardinal::config::HostConfig::defaults(),
+            &env.worktree_key()
+        )
+        .unwrap()
+        .value
+    );
 }
 
 /// While `act` holds the worktree exclusively, the stage does not start; it starts once the

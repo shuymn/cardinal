@@ -246,7 +246,9 @@ fn no_arbiter() {
     assert_eq!(out.status.code(), Some(0));
     assert!(out.stdout.is_empty() && out.stderr.is_empty());
 
-    let views = cardinal::admission::list_reservations(&state).unwrap();
+    let views =
+        cardinal::admission::list_reservations(&state, &cardinal::config::HostConfig::defaults())
+            .unwrap();
     assert_eq!(views.len(), 1);
     assert_eq!(views[0].derived, DerivedState::RecoveryNeeded);
     assert!(!views[0].verified);
