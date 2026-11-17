@@ -97,6 +97,7 @@ pub fn run(spec_b64: Option<&str>, command: &[OsString]) -> ExitCode {
     // Before the first child: the runner's children stay unreaped until it reaps them.
     #[cfg(unix)]
     os::unix::reset_child_signal();
+    // Before any other thread: no thread may take a signal while its handler is set up.
     let (watch, signals) = Watch::start();
     let tty = std::io::stdin().is_terminal();
     let unwatched = signals.err().map(|err| FailOpen::new("signal_setup", &err));

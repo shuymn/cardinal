@@ -131,7 +131,8 @@ pub struct Watch {
 impl Watch {
     /// Starts watching signals and the parent process. The result says whether the handled
     /// signals are watched: when their handlers cannot be set up, none is installed, and each
-    /// signal keeps the disposition it had. The parent is watched either way.
+    /// signal keeps the disposition it had. The parent is watched either way. Call before this
+    /// process starts any other thread, as [`os::unix::watch_signals`] requires.
     pub fn start() -> (Self, std::io::Result<()>) {
         let (tx, rx) = mpsc::channel();
         let watch = Self {

@@ -22,7 +22,8 @@ thiserror.workspace = true
 toml.workspace = true
 
 [target.'cfg(unix)'.dependencies]
-# Reading a signal's disposition (`sigaction` without a new action).
+# Reading a signal's disposition (`sigaction` without a new action), and blocking signals while
+# their handlers are installed (`pthread_sigmask`).
 libc.workspace = true
 rustix.workspace = true
 signal-hook.workspace = true

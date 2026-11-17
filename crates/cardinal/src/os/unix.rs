@@ -318,28 +318,92 @@ pub fn reap(raw_pid: u32) -> io::Result<ChildEnd> {
 /// Every reader runs before the first handler is installed, so no handler writes to a pipe
 /// nobody reads, which would swallow its signal. On a failure no handler stays installed: each
 /// signal gets back the disposition it had, and the readers end.
+///
+/// The signals stay blocked in the calling thread until every handler is installed, or every
+/// disposition put back: `signal-hook` installs a handler before it publishes the action that
+/// handler runs, and drops a signal that arrives in between. A blocked signal stays pending and
+/// is delivered once the watch is set up, or to the disposition put back on a failure. Call
+/// this before this process starts any other thread: such a thread would not block the signals
+/// and could take one in that window. The readers start with the signals blocked and keep them
+/// blocked, so the handlers run on other threads.
 pub fn watch_signals(
     signals: &[i32],
     on_signal: impl Fn(i32) + Send + Sync + 'static,
 ) -> io::Result<()> {
-    watch_signals_with(signals, on_signal, |name, body| {
-        std::thread::Builder::new().name(name).spawn(body).map(drop)
-    })
+    watch_signals_with(
+        signals,
+        on_signal,
+        |name, body| std::thread::Builder::new().name(name).spawn(body).map(drop),
+        register,
+    )
+}
+
+/// Installs the handler of `sig`, which writes one byte to `writer` on each delivery.
+fn register(sig: i32, writer: io::PipeWriter) -> io::Result<signal_hook::SigId> {
+    signal_hook::low_level::pipe::register(sig, writer)
 }
 
 /// A thread body for [`watch_signals_with`]'s `start`.
 type Body = Box<dyn FnOnce() + Send + 'static>;
 
-/// [`watch_signals`], with `start` starting each reader thread from a name and a body.
+/// [`watch_signals`], with `start` starting each reader thread from a name and a body, and
+/// `register` installing each handler as [`register`] does.
 fn watch_signals_with(
     signals: &[i32],
     on_signal: impl Fn(i32) + Send + Sync + 'static,
+    start: impl FnMut(String, Body) -> io::Result<()>,
+    register: impl FnMut(i32, io::PipeWriter) -> io::Result<signal_hook::SigId>,
+) -> io::Result<()> {
+    let watched: Vec<i32> = signals
+        .iter()
+        .copied()
+        .filter(|&sig| !ignored(sig))
+        .collect();
+    let previous = block(&watched)?;
+    let result = install(&watched, on_signal, start, register);
+    set_mask(&previous);
+    result
+}
+
+/// Blocks `signals` in the calling thread; returns the mask the thread had.
+fn block(signals: &[i32]) -> io::Result<libc::sigset_t> {
+    let mut set = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+    let mut previous = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+    // SAFETY: `sigemptyset` initializes `set`, which `sigaddset` and `pthread_sigmask` then
+    // read; `pthread_sigmask` writes the current mask into `previous` on success.
+    unsafe {
+        libc::sigemptyset(set.as_mut_ptr());
+        for &sig in signals {
+            if libc::sigaddset(set.as_mut_ptr(), sig) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        match libc::pthread_sigmask(libc::SIG_BLOCK, set.as_ptr(), previous.as_mut_ptr()) {
+            0 => Ok(previous.assume_init()),
+            err => Err(io::Error::from_raw_os_error(err)),
+        }
+    }
+}
+
+/// Sets the calling thread's mask to `mask`, delivering the signals it unblocks that are
+/// pending.
+fn set_mask(mask: &libc::sigset_t) {
+    // SAFETY: `mask` is an initialized signal set; a null old set makes `pthread_sigmask`
+    // write nothing. It fails only for an invalid `how`.
+    unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, mask, std::ptr::null_mut()) };
+}
+
+/// Starts the readers, then installs the handlers of `signals`, which are blocked.
+fn install(
+    signals: &[i32],
+    on_signal: impl Fn(i32) + Send + Sync + 'static,
     mut start: impl FnMut(String, Body) -> io::Result<()>,
+    mut register: impl FnMut(i32, io::PipeWriter) -> io::Result<signal_hook::SigId>,
 ) -> io::Result<()> {
     let on_signal = Arc::new(on_signal);
     // Dropping a writer before its handler holds it ends its reader at end of file.
     let mut writers = Vec::new();
-    for &sig in signals.iter().filter(|&&sig| !ignored(sig)) {
+    for &sig in signals {
         let (mut reader, writer) = io::pipe()?;
         let on_signal = Arc::clone(&on_signal);
         start(
@@ -360,7 +424,7 @@ fn watch_signals_with(
     let mut installed = Vec::new();
     for (sig, writer) in writers {
         let registered = disposition(sig).and_then(|previous| {
-            let id = signal_hook::low_level::pipe::register(sig, writer)?;
+            let id = register(sig, writer)?;
             Ok((sig, id, previous))
         });
         match registered {
@@ -395,11 +459,13 @@ pub fn die_by_signal(sig: i32) -> ! {
 #[cfg(test)]
 mod tests {
     use std::io;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
     use std::time::Duration;
 
     use super::{
-        Body, SIGKILL, disposition, group_exists, ignored, parent_pid, pgid_of, watch_signals_with,
+        Body, SIGKILL, disposition, group_exists, ignored, parent_pid, pgid_of, register,
+        watch_signals_with,
     };
 
     /// The handler of `sig` and the flags that change how it runs, which a failed watch must
@@ -448,8 +514,13 @@ mod tests {
         let signals = [libc::SIGUSR1, libc::SIGWINCH];
         let before = signals.map(handler);
         let (sender, ended) = mpsc::channel();
-        let err =
-            watch_signals_with(&signals, |_| {}, start_reporting(&sender, Some(2))).unwrap_err();
+        let err = watch_signals_with(
+            &signals,
+            |_| {},
+            start_reporting(&sender, Some(2)),
+            register,
+        )
+        .unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::EAGAIN), "{err}");
         assert_eq!(signals.map(handler), before);
         ended
@@ -457,21 +528,104 @@ mod tests {
             .expect("the started reader ended");
     }
 
+    /// Whether [`record_previous`] ran.
+    static PREVIOUS_RAN: AtomicBool = AtomicBool::new(false);
+
+    extern "C" fn record_previous(_: libc::c_int) {
+        PREVIOUS_RAN.store(true, Ordering::SeqCst);
+    }
+
+    /// Sets the disposition of `sig` to `handler` with no flags.
+    fn set_handler(sig: i32, handler: libc::sighandler_t) {
+        let mut action = std::mem::MaybeUninit::<libc::sigaction>::zeroed();
+        // SAFETY: `action` is a zeroed `sigaction` whose mask `sigemptyset` initializes; a null
+        // old action makes `sigaction` write nothing.
+        unsafe {
+            (*action.as_mut_ptr()).sa_sigaction = handler;
+            libc::sigemptyset(&raw mut (*action.as_mut_ptr()).sa_mask);
+            assert_eq!(
+                libc::sigaction(sig, action.as_ptr(), std::ptr::null_mut()),
+                0
+            );
+        }
+    }
+
     /// A handler that cannot be installed after another was takes that one back: its signal
-    /// gets its disposition back, and both readers end.
+    /// gets its disposition back, and both readers end. A signal that arrives meanwhile reaches
+    /// the disposition put back, not the watch.
     #[test]
     fn a_handler_that_cannot_be_installed_leaves_no_handler() {
-        // Signal 0 starts a reader, but has no disposition to read or replace.
-        let signals = [libc::SIGUSR2, 0];
+        let signals = [libc::SIGUSR2, libc::SIGURG];
+        set_handler(
+            libc::SIGUSR2,
+            record_previous as *const () as libc::sighandler_t,
+        );
         let before = handler(libc::SIGUSR2);
         let (sender, ended) = mpsc::channel();
-        watch_signals_with(&signals, |_| {}, start_reporting(&sender, None)).unwrap_err();
+        let (seen, got) = mpsc::channel();
+        let failing = |sig, writer| {
+            if sig == libc::SIGURG {
+                // SAFETY: `raise` sends the signal to this thread.
+                unsafe { libc::raise(libc::SIGUSR2) };
+                return Err(io::Error::from_raw_os_error(libc::EINVAL));
+            }
+            register(sig, writer)
+        };
+        watch_signals_with(
+            &signals,
+            move |sig| {
+                let _ = seen.send(sig);
+            },
+            start_reporting(&sender, None),
+            failing,
+        )
+        .unwrap_err();
         assert_eq!(handler(libc::SIGUSR2), before);
         for _ in signals {
             ended
                 .recv_timeout(Duration::from_secs(10))
                 .expect("every reader ended");
         }
+        assert!(PREVIOUS_RAN.load(Ordering::SeqCst));
+        assert_eq!(got.try_recv(), Err(mpsc::TryRecvError::Disconnected));
+        set_handler(libc::SIGUSR2, libc::SIG_DFL);
+    }
+
+    /// A signal that arrives while its handler is being installed reaches the watch.
+    /// `signal-hook` installs its handler before it publishes the action that handler runs, and
+    /// drops a signal delivered in between. The test makes that window: before the real
+    /// install, it gives the second signal `signal-hook`'s handler, copied from the first
+    /// signal, raises the second signal, and puts its disposition back.
+    #[test]
+    fn a_signal_while_its_handler_is_installed_reaches_the_watch() {
+        let signals = [libc::SIGVTALRM, libc::SIGALRM];
+        let (sender, ended) = mpsc::channel();
+        drop(ended);
+        let (seen, got) = mpsc::channel();
+        let in_window = |sig, writer| {
+            if sig == libc::SIGALRM {
+                let installed = disposition(libc::SIGVTALRM)?;
+                let previous = disposition(sig)?;
+                // SAFETY: both actions were read from `sigaction`, and a null old action makes
+                // `sigaction` write nothing; `raise` sends the signal to this thread.
+                unsafe {
+                    libc::sigaction(sig, &raw const installed, std::ptr::null_mut());
+                    libc::raise(sig);
+                    libc::sigaction(sig, &raw const previous, std::ptr::null_mut());
+                }
+            }
+            register(sig, writer)
+        };
+        watch_signals_with(
+            &signals,
+            move |sig| {
+                let _ = seen.send(sig);
+            },
+            start_reporting(&sender, None),
+            in_window,
+        )
+        .unwrap();
+        assert_eq!(got.recv_timeout(Duration::from_secs(10)), Ok(libc::SIGALRM));
     }
 
     #[test]
