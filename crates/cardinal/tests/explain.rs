@@ -1,20 +1,20 @@
 //! `explain` (`docs/architecture.md` section 10.2): where a job's outcome, a plan's result,
 //! and an inbox item came from, as records and configuration keys.
 
-mod fakes;
 mod hook_support;
 mod observe_common;
+mod plan_support;
 mod support;
 
 use cardinal::act::ActOptions;
 use cardinal::contract::{
-    Caller, ErrorCode, ExplainKind, ExplainSource, IgnoredClass, InboxKind, InboxSubject, PlanKind,
-    RecordKind, ResolutionOutcome,
+    Caller, ErrorCode, ExplainKind, ExplainSource, InboxKind, InboxSubject, PlanKind, RecordKind,
+    ResolutionOutcome,
 };
 use cardinal::explain::{Subject, explain};
 use cardinal::record::Recorder;
-use fakes::{Setup, arbiter, write};
 use observe_common::Scene;
+use plan_support::{Setup, arbiter, write};
 
 fn recorder(s: &Setup) -> Recorder {
     Recorder::new(&s.state, 1 << 20, 2)
@@ -73,7 +73,7 @@ fn job_outcomes_come_from_records() {
     );
     let _live = cardinal::state::create_locked(&s.state.live_lock("aaaa000000000004")).unwrap();
 
-    let job = |id: &str| explain(&s.config, &s.state, &Subject::Job(id.into())).unwrap();
+    let job = |id: &str| explain(&s.config(), &s.state, &Subject::Job(id.into())).unwrap();
     let died = job("aaaa000000000001");
     assert_eq!(died.subject.kind, ExplainKind::Job);
     assert_eq!(died.outcome.as_deref(), Some("runner_died"));
@@ -96,9 +96,9 @@ fn job_outcomes_come_from_records() {
     );
     assert_eq!(job("aaaa000000000004").outcome.as_deref(), Some("running"));
 
-    let ambiguous = explain(&s.config, &s.state, &Subject::Job("aaaa".into())).unwrap_err();
+    let ambiguous = explain(&s.config(), &s.state, &Subject::Job("aaaa".into())).unwrap_err();
     assert_eq!(ambiguous.code, ErrorCode::AmbiguousId);
-    let missing = explain(&s.config, &s.state, &Subject::Job("ffff".into())).unwrap_err();
+    let missing = explain(&s.config(), &s.state, &Subject::Job("ffff".into())).unwrap_err();
     assert_eq!(missing.code, ErrorCode::NotFound);
 }
 
@@ -106,13 +106,13 @@ fn job_outcomes_come_from_records() {
 #[test]
 fn plan_shows_its_result_and_records() {
     let s = Setup::new();
-    let wt = s.worktree("explained", &[("target", IgnoredClass::Regenerable)]);
+    let wt = s.worktree("explained");
     write(&wt, "target/x", "x");
     let plan = s.plan(PlanKind::ReclaimDir, &wt.join("target"));
-    let before = explain(&s.config, &s.state, &Subject::Plan(plan.id.clone())).unwrap();
+    let before = explain(&s.config(), &s.state, &Subject::Plan(plan.id.clone())).unwrap();
     assert_eq!(before.outcome, None, "not acted on yet");
     s.act(&plan.id, &arbiter()).unwrap();
-    let doc = explain(&s.config, &s.state, &Subject::Plan(plan.id[..5].into())).unwrap();
+    let doc = explain(&s.config(), &s.state, &Subject::Plan(plan.id[..5].into())).unwrap();
     assert_eq!(doc.subject.id, plan.id);
     assert_eq!(doc.outcome.as_deref(), Some("dry_run"));
     assert!(
@@ -124,7 +124,7 @@ fn plan_shows_its_result_and_records() {
 
     write(&wt, "target/proptest-regressions/x.txt", "keep");
     s.act(&plan.id, &arbiter()).unwrap();
-    let doc = explain(&s.config, &s.state, &Subject::Plan(plan.id.clone())).unwrap();
+    let doc = explain(&s.config(), &s.state, &Subject::Plan(plan.id.clone())).unwrap();
     assert_eq!(doc.outcome.as_deref(), Some("rejected"));
     assert_eq!(records_in(&doc), ["plan_created", "act", "act"]);
 }
@@ -133,7 +133,7 @@ fn plan_shows_its_result_and_records() {
 #[test]
 fn gated_plan_names_the_unit_key() {
     let s = Setup::new();
-    let wt = s.worktree("gated", &[("target", IgnoredClass::Regenerable)]);
+    let wt = s.worktree("gated");
     write(&wt, "target/x", "x");
     let plan = s.plan(PlanKind::ReclaimDir, &wt.join("target"));
     let unit = ActOptions {
@@ -141,7 +141,7 @@ fn gated_plan_names_the_unit_key() {
         ..arbiter()
     };
     s.act(&plan.id, &unit).unwrap();
-    let doc = explain(&s.config, &s.state, &Subject::Plan(plan.id.clone())).unwrap();
+    let doc = explain(&s.config(), &s.state, &Subject::Plan(plan.id.clone())).unwrap();
     assert!(
         doc.sources.iter().any(|source| matches!(
             source,
@@ -171,14 +171,14 @@ fn inbox_item_shows_evidence_and_resolution() {
     };
     cardinal::inbox::raise(&s.state, &item).unwrap();
     cardinal::inbox::resolve(
-        &s.config,
+        &s.config(),
         &s.state,
         "outlived:s1",
         ResolutionOutcome::Dismissed,
         Some("the dev server is meant to keep running"),
     )
     .unwrap();
-    let doc = explain(&s.config, &s.state, &Subject::Inbox("outlived:s1".into())).unwrap();
+    let doc = explain(&s.config(), &s.state, &Subject::Inbox("outlived:s1".into())).unwrap();
     assert_eq!(doc.subject.kind, ExplainKind::Inbox);
     assert_eq!(
         doc.outcome.as_deref(),
@@ -189,7 +189,7 @@ fn inbox_item_shows_evidence_and_resolution() {
         ExplainSource::Observation { result, .. } if result.contains("\"pid\":7")
     )));
     assert_eq!(records_in(&doc), ["inbox_resolved"]);
-    let missing = explain(&s.config, &s.state, &Subject::Inbox("nope".into())).unwrap_err();
+    let missing = explain(&s.config(), &s.state, &Subject::Inbox("nope".into())).unwrap_err();
     assert_eq!(missing.code, ErrorCode::NotFound);
 }
 
@@ -197,7 +197,7 @@ fn inbox_item_shows_evidence_and_resolution() {
 #[test]
 fn cli_prints_an_explain_document() {
     let s = Setup::new();
-    let wt = s.worktree("cli", &[("target", IgnoredClass::Regenerable)]);
+    let wt = s.worktree("cli");
     write(&wt, "target/x", "x");
     let plan = s.plan(PlanKind::ReclaimDir, &wt.join("target"));
     let assert = s
@@ -458,12 +458,11 @@ fn command_not_rewritten_says_why() {
 #[test]
 fn plan_shows_its_provenance() {
     let s = Setup::new();
-    let wt = s.worktree("traced", &[("node_modules", IgnoredClass::Regenerable)]);
-    let mut world = s.fake.read();
-    world.worktrees[0].repo.gh_error = Some("HTTP 502".into());
-    s.fake.write(&world);
+    let wt = s.worktree("traced");
+    s.gh_fails("merged", 1);
+    s.gh_stderr("merged", "HTTP 502");
     let plan = s.plan(PlanKind::ReclaimWorktree, &wt);
-    let doc = explain(&s.config, &s.state, &Subject::Plan(plan.id.clone())).unwrap();
+    let doc = explain(&s.config(), &s.state, &Subject::Plan(plan.id.clone())).unwrap();
     let observed = |command: &str, result: &str| {
         doc.sources.iter().any(|source| {
             matches!(source, ExplainSource::Observation { command: c, exit: None, result: r }
@@ -479,12 +478,15 @@ fn plan_shows_its_provenance() {
         "gh",
         "no_open_pr: worktree.facts.open_pr = \"no\""
     ));
-    assert!(observed("gh", "error: HTTP 502"), "{:#?}", doc.sources);
+    assert!(
+        observed("gh", "error: gh exited with 1: HTTP 502"),
+        "{:#?}",
+        doc.sources
+    );
     // The profile path as the config loader lists it: one component per join, so the
     // separators are the platform's.
     let profile = s
-        .dirs
-        .config()
+        .config_dir
         .join("repos")
         .join("generic.toml")
         .display()
@@ -516,6 +518,9 @@ fn plan_shows_its_provenance() {
         .expect("the act record lists its checks");
     assert_eq!(clean["facts"][0]["name"], "worktree.facts.dirty");
     assert_eq!(clean["facts"][0]["source"], "git");
-    assert_eq!(act.data["provenance"]["errors"][0]["message"], "HTTP 502");
+    assert_eq!(
+        act.data["provenance"]["errors"][0]["message"],
+        "gh exited with 1: HTTP 502"
+    );
     assert_eq!(act.data["provenance"]["config"][0]["file"], profile);
 }

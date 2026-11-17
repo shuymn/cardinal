@@ -3,8 +3,7 @@
 //! A plan binds a target to its identity (host, repository, worktree, worktree root, HEAD,
 //! branch, path) and carries the checks of section 9.2 as they were when it was made; `act`
 //! evaluates them again and never trusts the stored ones. Observation and admission are
-//! reached through [`Sources`], so plans and `act` run against fakes in tests; [`Real`] calls
-//! the `observe` and `admission` modules.
+//! reached through [`Real`], which calls the `observe` and `admission` modules.
 
 mod checks;
 mod walk;
@@ -31,29 +30,22 @@ use crate::state::{self, Durability, Probe, StateDir};
 /// Plan directories older than this are removed by `plan` runs.
 const PLAN_MAX_AGE: Duration = Duration::from_hours(30 * 24);
 
-/// What plans and `act` read from observation and admission.
-pub trait Sources {
-    /// Observes the worktree containing `path` from scratch.
-    fn observe_worktree(&self, path: &Path) -> Result<WorktreeObservation, Error>;
-    /// Observes the configured repositories and `repos`.
-    fn inventory(&self, repos: &[PathBuf]) -> Result<Inventory, Error>;
-    /// Live and recovery-needed reservations naming the worktree with key `worktree_key`.
-    fn in_use(&self, worktree_key: &str) -> Result<InUse, Error>;
-}
-
-/// [`Sources`] backed by the `observe` and `admission` modules.
+/// What plans and `act` read from observation and admission: the `observe` and `admission`
+/// modules.
 #[derive(Clone, Copy, Debug)]
 pub struct Real<'a> {
     pub config: &'a Config,
     pub state: &'a StateDir,
 }
 
-impl Sources for Real<'_> {
-    fn observe_worktree(&self, path: &Path) -> Result<WorktreeObservation, Error> {
+impl Real<'_> {
+    /// Observes the worktree containing `path` from scratch.
+    pub fn observe_worktree(&self, path: &Path) -> Result<WorktreeObservation, Error> {
         observe::observe_worktree(self.config, self.state, path)
     }
 
-    fn inventory(&self, repos: &[PathBuf]) -> Result<Inventory, Error> {
+    /// Observes the configured repositories and `repos`.
+    pub fn inventory(&self, repos: &[PathBuf]) -> Result<Inventory, Error> {
         let options = InventoryOptions {
             repos: repos.to_vec(),
             sizes: false,
@@ -61,7 +53,8 @@ impl Sources for Real<'_> {
         observe::inventory(self.config, self.state, &options)
     }
 
-    fn in_use(&self, worktree_key: &str) -> Result<InUse, Error> {
+    /// Live and recovery-needed reservations naming the worktree with key `worktree_key`.
+    pub fn in_use(&self, worktree_key: &str) -> Result<InUse, Error> {
         admission::in_use(self.state, worktree_key)
     }
 }
@@ -73,17 +66,7 @@ pub fn create(
     kind: PlanKind,
     target: &Path,
 ) -> Result<Plan, Error> {
-    create_with(config, state, &Real { config, state }, kind, target)
-}
-
-/// [`create`] with the given sources.
-pub fn create_with(
-    config: &Config,
-    state: &StateDir,
-    sources: &dyn Sources,
-    kind: PlanKind,
-    target: &Path,
-) -> Result<Plan, Error> {
+    let sources = Real { config, state };
     housekeeping(state);
     let target = canonical_target(kind, target)?;
     // A target that is a symbolic link is planned as the link it is (its checks refuse it),
@@ -117,23 +100,14 @@ pub fn create_with(
         }
         _ => {}
     }
-    let plan = build(config, state, sources, kind, &target, &observation);
+    let plan = build(config, state, &sources, kind, &target, &observation);
     store(config, state, plan)
 }
 
 /// `cardinal plan [--repo PATH]...`: plans for every whole-worktree candidate and every
 /// regenerable entry of worktrees that are not candidates.
 pub fn create_all(config: &Config, state: &StateDir, repos: &[PathBuf]) -> Result<PlanList, Error> {
-    create_all_with(config, state, &Real { config, state }, repos)
-}
-
-/// [`create_all`] with the given sources.
-pub fn create_all_with(
-    config: &Config,
-    state: &StateDir,
-    sources: &dyn Sources,
-    repos: &[PathBuf],
-) -> Result<PlanList, Error> {
+    let sources = Real { config, state };
     housekeeping(state);
     let inventory = sources.inventory(repos)?;
     let mut plans = Vec::new();
@@ -165,7 +139,7 @@ pub fn create_all_with(
                     .collect()
             };
             for (kind, target) in targets {
-                let plan = build(config, state, sources, kind, &target, &observation);
+                let plan = build(config, state, &sources, kind, &target, &observation);
                 match store(config, state, plan) {
                     Ok(plan) => plans.push(plan),
                     Err(err) => errors.push(ScopedError {
@@ -209,7 +183,7 @@ pub fn patterns(config: &Config, repo: &Repo) -> DataLists {
 /// without the admission lock, and processes.
 fn probe_in_use(
     state: &StateDir,
-    sources: &dyn Sources,
+    sources: &Real<'_>,
     worktree: &Path,
     target: &Path,
 ) -> InUseFacts {
@@ -228,7 +202,7 @@ fn probe_in_use(
 fn build(
     config: &Config,
     state: &StateDir,
-    sources: &dyn Sources,
+    sources: &Real<'_>,
     kind: PlanKind,
     target: &Path,
     observation: &WorktreeObservation,

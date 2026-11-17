@@ -2,12 +2,13 @@
 //! dismissed items never reopened (C19), outlived processes raised from session snapshots
 //! (C9), and `recovery_needed` items raised and cleared by the refresh.
 //!
-//! The recovery pass is a fake until the integration gate runs these against the real
-//! `admission` module; sessions and processes are real. A refresh that must pause runs in a
-//! helper process (this test binary re-run in the custom helper mode `refresh`) with the same
-//! fake.
+//! A refresh runs the recovery pass of `admission` over the reservations of the real runner
+//! (`support::jobs`); sessions and processes are real. One test keeps a fake recovery pass:
+//! [`concurrent_refresh_keeps_newer_items`] needs a reservation that a newer observation
+//! reports while an older, paused refresh observed none, and a real reservation, once
+//! released, never comes back. Its paused refresh runs in a helper process (this test binary
+//! re-run in the custom helper mode `refresh`).
 
-mod fakes;
 mod support;
 
 use std::time::Duration;
@@ -22,6 +23,8 @@ use cardinal::contract::{
 };
 use cardinal::inbox::{self, NewItem, StatusFilter};
 use cardinal::state::StateDir;
+#[cfg(unix)]
+use cardinal_test_support::fixture::Fixture;
 use cardinal_test_support::process::wait_for;
 use cardinal_test_support::{Child, Command};
 use support::cardinal::Dirs;
@@ -33,32 +36,14 @@ fn helper() {
     helper::run_if_requested();
 }
 
-/// The custom helper mode that refreshes with a fake recovery pass.
+/// The custom helper mode that refreshes.
 const REFRESH_MODE: &str = "refresh";
 
-/// What a helper process needs to refresh with a fake recovery pass that reports
-/// `recovery_needed` reservations of these jobs.
+/// The config and state dirs a helper process refreshes.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct RefreshRequest {
     config: std::path::PathBuf,
     state: std::path::PathBuf,
-    recovery_needed: Vec<String>,
-}
-
-/// A fake recovery pass reporting `jobs` as recovery-needed reservations.
-fn recovery_needed(
-    jobs: &[String],
-) -> impl Fn(&StateDir, &cardinal::config::HostConfig) -> Result<RecoveryReport, Error> {
-    let jobs = jobs.to_vec();
-    move |_, _| {
-        Ok(RecoveryReport {
-            reservations: jobs
-                .iter()
-                .map(|job| reservation_view(job, DerivedState::RecoveryNeeded))
-                .collect(),
-            ..RecoveryReport::default()
-        })
-    }
 }
 
 /// Runs the refresh a helper process was started for, then exits; returns at once otherwise.
@@ -69,8 +54,7 @@ fn run_refresh_if_requested() {
     let request: RefreshRequest = serde_json::from_str(&request).expect("a refresh request");
     let config = Config::load(&request.config).expect("load the config");
     let state = StateDir::open(&request.state).expect("open the state dir");
-    let refreshed =
-        inbox::refresh_with(&config, &state, &recovery_needed(&request.recovery_needed));
+    let refreshed = inbox::list(&config, &state, None, true);
     std::process::exit(i32::from(refreshed.is_err()));
 }
 
@@ -81,7 +65,13 @@ struct Env {
 }
 
 fn env() -> Env {
+    env_with("")
+}
+
+/// An environment whose `host.toml` is `host`.
+fn env_with(host: &str) -> Env {
     let dirs = Dirs::new();
+    std::fs::write(dirs.config().join("host.toml"), host).unwrap();
     let config = Config::load(dirs.config()).unwrap();
     let state = StateDir::open(dirs.state()).unwrap();
     Env {
@@ -97,12 +87,11 @@ impl Env {
         self.dirs.cmd()
     }
 
-    /// A helper process that refreshes with a recovery pass reporting `jobs`.
-    fn refresh_command(&self, jobs: &[&str]) -> Command {
+    /// A helper process that refreshes this state.
+    fn refresh_command(&self) -> Command {
         let request = RefreshRequest {
             config: self.dirs.config().to_path_buf(),
             state: self.state.root().to_path_buf(),
-            recovery_needed: jobs.iter().map(|&job| job.to_owned()).collect(),
         };
         let mode = Mode::Custom {
             name: REFRESH_MODE,
@@ -144,26 +133,18 @@ fn item_files(state: &StateDir) -> usize {
         .count()
 }
 
-#[allow(
-    clippy::unnecessary_wraps,
-    reason = "it has the recovery pass signature"
-)]
-fn no_recovery(_: &StateDir, _: &cardinal::config::HostConfig) -> Result<RecoveryReport, Error> {
-    Ok(RecoveryReport::default())
-}
-
 fn list(e: &Env, status: Option<StatusFilter>) -> Vec<cardinal::contract::InboxItem> {
-    inbox::list_with(&e.config, &e.state, status, false, &no_recovery)
+    inbox::list(&e.config, &e.state, status, false)
         .unwrap()
         .items
 }
 
-fn refresh(e: &Env, recovery: &inbox::RecoveryPass<'_>) -> Vec<cardinal::contract::InboxItem> {
-    inbox::list_with(&e.config, &e.state, Some(StatusFilter::All), true, recovery)
+/// Every item after a refresh that runs the real recovery pass.
+fn refresh(e: &Env) -> Vec<cardinal::contract::InboxItem> {
+    inbox::list(&e.config, &e.state, Some(StatusFilter::All), true)
         .unwrap()
         .items
 }
-
 /// C19: raising a key twice keeps one item, counts it, and replaces its evidence.
 #[test]
 fn raising_twice_updates_one_item() {
@@ -305,10 +286,10 @@ fn outlived_processes_raised() {
     session_snapshot(&e.state, "s1", agent_id, &[server_id, gone_id]);
 
     // The agent still runs (`clear`, `resume`): nothing has outlived it.
-    assert_eq!(refresh(&e, &no_recovery).len(), 0);
+    assert_eq!(refresh(&e).len(), 0);
 
     agent.kill();
-    let items = refresh(&e, &no_recovery);
+    let items = refresh(&e);
     assert_eq!(items.len(), 1, "{items:#?}");
     let raised = &items[0];
     assert_eq!(raised.key, "outlived:s1");
@@ -326,10 +307,10 @@ fn outlived_processes_raised() {
         [u64::from(server_id.0)],
         "only live processes are evidence"
     );
-    assert_eq!(refresh(&e, &no_recovery)[0].seen, 2, "no duplicate");
+    assert_eq!(refresh(&e)[0].seen, 2, "no duplicate");
 
     server.kill();
-    let items = refresh(&e, &no_recovery);
+    let items = refresh(&e);
     assert_eq!(items[0].status, InboxStatus::Resolved);
     assert_eq!(items[0].resolution.as_ref().unwrap().by, "cardinal");
     assert!(!e.state.session("s1").exists(), "the snapshot is deleted");
@@ -339,94 +320,104 @@ fn outlived_processes_raised() {
     ));
 }
 
-fn reservation_view(job: &str, derived: DerivedState) -> ReservationView {
-    ReservationView {
-        reservation: Reservation {
-            schema: ReservationSchema,
-            job_id: job.into(),
-            state: ReservationState::Running,
-            boot_s: 1,
-            created_ms: 1,
-            updated_ms: 1,
-            runner: ProcessIdentity {
-                pid: 10,
-                start_s: 1,
-            },
-            group: GroupIdentity::Pgid {
-                pgid: 10,
-                leader_start_s: 1,
-            },
-            child: Some(ProcessIdentity {
-                pid: 11,
-                start_s: 1,
-            }),
-            stop_signal_ms: None,
-            priority: Priority::Normal,
-            resources: std::collections::BTreeMap::new(),
-            admission: AdmissionResult::WithinBudget,
-            class: None,
-            rule: None,
-            worktree: Some(cardinal::contract::ReservationWorktree {
-                key: "k".into(),
-                path: "/w".into(),
-                protected: true,
-            }),
-            session: None,
-            cwd: "/w".into(),
-            argv: vec!["cargo".into(), "test".into()],
-        },
-        derived,
-        members: vec![GroupMember {
-            pid: 12,
-            start_s: 1,
-            name: "sleep".into(),
-        }],
-        verified: false,
-    }
-}
-
-/// `recovery_needed` items are raised for recovery-needed reservations only, and resolved by
-/// cardinal once the reservation is gone.
+/// A refreshing `cardinal inbox` raises a `recovery_needed` item for the reservation of a
+/// runner killed by `SIGKILL` while its group lives, naming the job's worktree and with the
+/// group's members as evidence, and none for a live job. Once the stage's shell, the child
+/// the reservation records, is gone, the group is no longer verified and the item's evidence
+/// says so with the members left. Once the group is empty, the next refresh releases the
+/// reservation and cardinal resolves the item. Both jobs run in a fixture repository, within
+/// a budget that admits them at once.
+#[cfg(unix)]
 #[test]
 fn recovery_needed_raised_and_cleared() {
-    let e = env();
-    let with_reservations = |_: &StateDir, _: &cardinal::config::HostConfig| {
-        Ok(RecoveryReport {
-            reservations: vec![
-                reservation_view("aaaaaaaaaaaaaaaa", DerivedState::RecoveryNeeded),
-                reservation_view("bbbbbbbbbbbbbbbb", DerivedState::Live),
-            ],
-            ..RecoveryReport::default()
-        })
+    let e = env_with("[budget]\ncpu = 2\n");
+    let fx = Fixture::new();
+    let repo = fx.init("repo");
+    fx.commit_file(&repo, "README.md", "hello\n", "initial");
+    let jobs = support::jobs::Jobs::new(fx.scope(), e.dirs.state(), e.dirs.config());
+    let live = jobs.running(&repo, 1);
+    let mut crashed = jobs.crashed(&repo, 1);
+    let inbox = || -> Vec<serde_json::Value> {
+        let output = e
+            .cardinal()
+            .args(["inbox", "--status", "all"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        json(&output.stdout)["items"].as_array().unwrap().clone()
     };
-    let items = refresh(&e, &with_reservations);
-    assert_eq!(items.len(), 1, "{items:#?}");
-    assert_eq!(items[0].key, "recovery_needed:aaaaaaaaaaaaaaaa");
-    assert_eq!(items[0].subject.worktree.as_deref(), Some("/w"));
-    assert_eq!(items[0].evidence["verified"], false);
-    assert_eq!(items[0].evidence["members"][0]["pid"], 12);
+    let member_pids = |item: &serde_json::Value| -> Vec<u32> {
+        let mut pids: Vec<u32> = item["evidence"]["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| u32::try_from(m["pid"].as_u64().unwrap()).unwrap())
+            .collect();
+        pids.sort_unstable();
+        pids
+    };
+    let [a, b] = crashed.stage.cats;
+    let mut cats = vec![a, b];
+    cats.sort_unstable();
+    let mut stage = vec![crashed.stage.shell, a, b];
+    stage.sort_unstable();
 
-    let items = refresh(&e, &no_recovery);
-    assert_eq!(items[0].status, InboxStatus::Resolved);
+    let items = inbox();
+    assert_eq!(items.len(), 1, "{items:#?}");
+    let raised = &items[0];
+    assert_eq!(raised["key"], format!("recovery_needed:{}", crashed.job));
+    assert_eq!(raised["status"], "open");
+    assert_eq!(raised["subject"]["job_id"], crashed.job.as_str());
+    assert_eq!(raised["subject"]["worktree"], repo.to_str().unwrap());
+    assert_eq!(raised["evidence"]["verified"], true, "{raised:#}");
     assert_eq!(
-        items[0].resolution.as_ref().unwrap().note,
-        "the reservation is gone"
+        member_pids(raised),
+        stage,
+        "the shell and both cats: {raised:#}"
+    );
+    assert_eq!(inbox()[0]["seen"], 2, "no duplicate");
+
+    crashed.end_shell(fx.scope());
+    let items = inbox();
+    assert_eq!(items.len(), 1, "{items:#?}");
+    let raised = &items[0];
+    assert_eq!(raised["status"], "open");
+    assert_eq!(raised["seen"], 3);
+    assert_eq!(raised["evidence"]["verified"], false, "{raised:#}");
+    assert_eq!(member_pids(raised), cats, "both cats: {raised:#}");
+
+    crashed.end_group();
+    let items = inbox();
+    assert_eq!(items.len(), 1, "{items:#?}");
+    assert_eq!(items[0]["status"], "resolved");
+    assert_eq!(items[0]["resolution"]["by"], "cardinal");
+    assert_eq!(items[0]["resolution"]["note"], "the reservation is gone");
+    let reservations = cardinal::admission::list_reservations(&e.state).unwrap();
+    let jobs: Vec<&str> = reservations
+        .iter()
+        .map(|v| v.reservation.job_id.as_str())
+        .collect();
+    assert_eq!(
+        jobs,
+        [live.job.as_str()],
+        "only the live job's reservation remains"
     );
 }
 
+/// A refresh whose recovery pass cannot take the admission lock in `lock_timeout_ms` fails;
+/// listing without a refresh does not take it.
 #[test]
 fn refresh_failure_is_reported() {
-    let e = env();
-    let failing =
-        |_: &StateDir, _: &cardinal::config::HostConfig| -> Result<RecoveryReport, Error> {
-            Err(Error::new(
-                ErrorCode::StateUnavailable,
-                "admission lock timed out",
-            ))
-        };
-    let err = inbox::list_with(&e.config, &e.state, None, true, &failing).unwrap_err();
-    assert_eq!(err.code, ErrorCode::StateUnavailable);
-    assert!(inbox::list_with(&e.config, &e.state, None, false, &failing).is_ok());
+    let e = env_with("[admission]\nlock_timeout_ms = 200\n");
+    let _held = cardinal::state::try_lock(
+        &e.state.admission_lock(),
+        cardinal::state::LockMode::Exclusive,
+    )
+    .unwrap()
+    .expect("the admission lock is free");
+    let err = inbox::list(&e.config, &e.state, None, true).unwrap_err();
+    assert_eq!(err.code, ErrorCode::StateUnavailable, "{err:?}");
+    assert!(inbox::list(&e.config, &e.state, None, false).is_ok());
 }
 
 fn json(stdout: &[u8]) -> serde_json::Value {
@@ -485,16 +476,16 @@ fn cli_lists_and_resolves() {
 }
 
 /// A refresh clears only the items it saw before it observed, and only while they are
-/// unchanged. Refresh A observes no reservations and pauses; refresh B, from a newer
-/// observation, updates the item A saw and raises a new one; A then closes neither. The next
-/// refresh that observes no reservations clears both.
+/// unchanged. Refresh A (the real recovery pass) observes no reservations and pauses; refresh
+/// B, from a newer (faked) observation, updates the item A saw and raises a new one; A then
+/// closes neither. The next refresh that observes no reservations clears both.
 #[test]
 fn concurrent_refresh_keeps_newer_items() {
     let e = env();
     let (old, new) = ("aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb");
-    refresh(&e, &recovery_needed(&[old.to_owned()]));
+    refresh_reporting(&e, &[old]);
     let points = support::testpoints::TestPoints::new(e.dirs.scope());
-    let mut command = e.refresh_command(&[]);
+    let mut command = e.refresh_command();
     points.apply(&mut command, &[cardinal::testpoint::INBOX_OBSERVED], None);
     let mut first = command.spawn().unwrap();
     points.wait_reached(
@@ -502,7 +493,7 @@ fn concurrent_refresh_keeps_newer_items() {
         first.id(),
         Duration::from_secs(20),
     );
-    refresh(&e, &recovery_needed(&[old.to_owned(), new.to_owned()]));
+    refresh_reporting(&e, &[old, new]);
     points.release(cardinal::testpoint::INBOX_OBSERVED);
     assert!(first.wait().unwrap().success());
 
@@ -514,9 +505,77 @@ fn concurrent_refresh_keeps_newer_items() {
     assert_eq!(status(old), Some(InboxStatus::Open), "{items:#?}");
     assert_eq!(status(new), Some(InboxStatus::Open), "{items:#?}");
 
-    let items = refresh(&e, &no_recovery);
+    let items = refresh(&e);
     assert!(
         items.iter().all(|i| i.status == InboxStatus::Resolved),
         "{items:#?}"
     );
+}
+
+/// A fake recovery pass reporting `jobs` as `recovery_needed` reservations, for
+/// [`concurrent_refresh_keeps_newer_items`] only (see the module documentation).
+fn recovery_needed(
+    jobs: &[&str],
+) -> impl Fn(&StateDir, &cardinal::config::HostConfig) -> Result<RecoveryReport, Error> {
+    let jobs: Vec<String> = jobs.iter().map(|&job| job.to_owned()).collect();
+    move |_, _| {
+        Ok(RecoveryReport {
+            reservations: jobs
+                .iter()
+                .map(|job| reservation_view(job, DerivedState::RecoveryNeeded))
+                .collect(),
+            ..RecoveryReport::default()
+        })
+    }
+}
+
+/// A refresh with the fake recovery pass [`recovery_needed`] of `jobs`.
+fn refresh_reporting(e: &Env, jobs: &[&str]) {
+    inbox::list_with(&e.config, &e.state, None, true, &recovery_needed(jobs)).unwrap();
+}
+
+fn reservation_view(job: &str, derived: DerivedState) -> ReservationView {
+    ReservationView {
+        reservation: Reservation {
+            schema: ReservationSchema,
+            job_id: job.into(),
+            state: ReservationState::Running,
+            boot_s: 1,
+            created_ms: 1,
+            updated_ms: 1,
+            runner: ProcessIdentity {
+                pid: 10,
+                start_s: 1,
+            },
+            group: GroupIdentity::Pgid {
+                pgid: 10,
+                leader_start_s: 1,
+            },
+            child: Some(ProcessIdentity {
+                pid: 11,
+                start_s: 1,
+            }),
+            stop_signal_ms: None,
+            priority: Priority::Normal,
+            resources: std::collections::BTreeMap::new(),
+            admission: AdmissionResult::WithinBudget,
+            class: None,
+            rule: None,
+            worktree: Some(cardinal::contract::ReservationWorktree {
+                key: "k".into(),
+                path: "/w".into(),
+                protected: true,
+            }),
+            session: None,
+            cwd: "/w".into(),
+            argv: vec!["cargo".into(), "test".into()],
+        },
+        derived,
+        members: vec![GroupMember {
+            pid: 12,
+            start_s: 1,
+            name: "sleep".into(),
+        }],
+        verified: false,
+    }
 }

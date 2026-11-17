@@ -2,19 +2,20 @@
 //! requires a plan ID, reports on every call, and leaves the plan unclaimed, so repeating it
 //! reports again.
 
-mod fakes;
+mod observe_common;
+mod plan_support;
 mod support;
 
 use cardinal::act::ActOptions;
-use cardinal::contract::{ActStatus, ErrorCode, IgnoredClass, PlanKind};
-use fakes::{Setup, arbiter, write};
+use cardinal::contract::{ActStatus, ErrorCode, PlanKind};
+use plan_support::{Setup, arbiter, write};
 
 /// With or without `--dry-run`, `act` evaluates every check, reports what it would free, and
 /// neither claims, records a result for, nor deletes anything; a repeated call reports again.
 #[test]
 fn act_neither_claims_nor_deletes() {
     let s = Setup::new();
-    let wt = s.worktree("dry", &[("target", IgnoredClass::Regenerable)]);
+    let wt = s.worktree("dry");
     write(&wt, "target/debug/app", "bin");
     let plan = s.plan(PlanKind::ReclaimDir, &wt.join("target"));
     let dry = ActOptions {
@@ -37,7 +38,7 @@ fn act_neither_claims_nor_deletes() {
 #[test]
 fn plan_ids_resolve_by_unique_prefix() {
     let s = Setup::new();
-    let wt = s.worktree("prefix", &[("target", IgnoredClass::Regenerable)]);
+    let wt = s.worktree("prefix");
     write(&wt, "target/x", "x");
     let plan = s.plan(PlanKind::ReclaimDir, &wt.join("target"));
     let dry = ActOptions {
@@ -77,7 +78,7 @@ fn cli_exit_codes() {
         "allocated_bytes": null, "checks": [], "invariants_ok": true, "approval": "none"
     });
     std::fs::write(s.state.plan_file(id), plan.to_string()).unwrap();
-    fakes::assert_plans_inside(s.fx.root(), &s.state, "abcdef");
+    plan_support::assert_plans_inside(s.fx.root(), &s.state, "abcdef");
     let assert = s.cardinal().args(["act", "abcdef"]).assert().code(3);
     let doc: serde_json::Value = serde_json::from_slice(&assert.get_output().stdout).unwrap();
     assert_eq!(doc["schema"], "cardinal.act-result.v1");
