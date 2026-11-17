@@ -11,17 +11,30 @@ use crate::Scope;
 /// PID and start time, when dropped. A PID that names another process by then is left alone.
 pub struct PidGuard {
     pid: u32,
-    start: Option<u64>,
+    start: Option<StartTime>,
+    /// On Linux, a pidfd opened when the guard was made, which carries the signal.
+    #[cfg(target_os = "linux")]
+    pidfd: Option<rustix::fd::OwnedFd>,
 }
 
 impl PidGuard {
-    /// Records `pid` with its current start time; a process that is already gone is never
-    /// signalled.
+    /// Records `pid` with its current start time, and on Linux holds it through a pidfd; a
+    /// process that is already gone is never signalled.
     #[must_use]
     pub fn new(pid: u32) -> Self {
+        #[cfg(target_os = "linux")]
+        let (pidfd, gone) = match linux::hold(pid) {
+            linux::Hold::Pidfd(pidfd) => (Some(pidfd), false),
+            linux::Hold::Unsupported => (None, false),
+            linux::Hold::Gone => (None, true),
+        };
+        #[cfg(not(target_os = "linux"))]
+        let gone = false;
         Self {
             pid,
-            start: start_time(pid),
+            start: if gone { None } else { start_time(pid) },
+            #[cfg(target_os = "linux")]
+            pidfd,
         }
     }
 
@@ -39,7 +52,13 @@ impl PidGuard {
                 start,
                 cwd: None,
             };
-            kill_if_same(&found, false, &|_| true);
+            kill_if_same(
+                &found,
+                false,
+                &|_| true,
+                #[cfg(target_os = "linux")]
+                self.pidfd.as_ref(),
+            );
         }
     }
 }
@@ -145,7 +164,7 @@ impl Drop for LeftoverGuard {
 /// A live process other than this one, as listed.
 struct Listed {
     pid: u32,
-    start: u64,
+    start: StartTime,
     cwd: Option<PathBuf>,
 }
 
@@ -172,9 +191,12 @@ fn listed(pid: Pid, process: &sysinfo::Process) -> Option<Listed> {
             process.status(),
             ProcessStatus::Zombie | ProcessStatus::Dead
         );
-    live.then(|| Listed {
+    if !live {
+        return None;
+    }
+    Some(Listed {
         pid: pid.as_u32(),
-        start: process.start_time(),
+        start: start_time(pid.as_u32())?,
         cwd: process.cwd().map(Path::to_path_buf),
     })
 }
@@ -205,23 +227,43 @@ fn kill_until_gone(bound: Duration, cwd: bool, select: &dyn Fn(&Listed) -> bool)
             return found.iter().map(|p| p.pid).collect();
         }
         for process in &found {
-            kill_if_same(process, cwd, select);
+            kill_if_same(
+                process,
+                cwd,
+                select,
+                #[cfg(target_os = "linux")]
+                None,
+            );
         }
         std::thread::sleep(Duration::from_millis(20));
     }
 }
 
 /// Kills `found` if its PID still names it (the same start time) and `select` still picks it,
-/// both read in the one refresh that leads to the signal. On Linux a pidfd opened before that
-/// refresh holds the process and carries the signal, so the signal reaches the process checked
-/// or none. Without one (macOS, Linux before 5.3 or under an emulator that lacks pidfds) the
-/// signal goes by PID right after the refresh.
-fn kill_if_same(found: &Listed, cwd: bool, select: &dyn Fn(&Listed) -> bool) {
+/// both read in the one refresh that leads to the signal. On Linux a pidfd holds the process
+/// and carries the signal, so the signal reaches the process checked or none: `held`, opened
+/// when the process was registered, or one opened before that refresh. Without one (macOS,
+/// Linux before 5.3 or under an emulator that lacks pidfds) the signal goes by PID right after
+/// the refresh.
+fn kill_if_same(
+    found: &Listed,
+    cwd: bool,
+    select: &dyn Fn(&Listed) -> bool,
+    #[cfg(target_os = "linux")] held: Option<&rustix::fd::OwnedFd>,
+) {
     #[cfg(target_os = "linux")]
-    let pidfd = match linux::hold(found.pid) {
-        linux::Hold::Gone => return,
-        linux::Hold::Pidfd(pidfd) => Some(pidfd),
-        linux::Hold::Unsupported => None,
+    let opened;
+    #[cfg(target_os = "linux")]
+    let pidfd = match held {
+        Some(pidfd) => Some(pidfd),
+        None => match linux::hold(found.pid) {
+            linux::Hold::Gone => return,
+            linux::Hold::Pidfd(pidfd) => {
+                opened = pidfd;
+                Some(&opened)
+            }
+            linux::Hold::Unsupported => None,
+        },
     };
     let Some(mut system) = system() else {
         return;
@@ -239,7 +281,7 @@ fn kill_if_same(found: &Listed, cwd: bool, select: &dyn Fn(&Listed) -> bool) {
     }
     #[cfg(target_os = "linux")]
     if let Some(pidfd) = pidfd {
-        let _ = rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::KILL);
+        let _ = rustix::process::pidfd_send_signal(pidfd, rustix::process::Signal::KILL);
         return;
     }
     process.kill();
@@ -277,11 +319,56 @@ fn system() -> Option<System> {
     System::new().ok()
 }
 
-fn start_time(pid: u32) -> Option<u64> {
+/// When a process started, at the finest resolution the OS reports: seconds and microseconds
+/// on macOS, clock ticks since boot on Linux, seconds elsewhere. Two processes compare equal
+/// only if they started within the same unit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StartTime(u64, u64);
+
+/// When `pid` started: `proc_pidinfo` on macOS, which `sysinfo` reads only to the second.
+#[cfg(target_os = "macos")]
+fn start_time(pid: u32) -> Option<StartTime> {
+    let pid = libc::c_int::try_from(pid).ok()?;
+    // SAFETY: proc_bsdinfo is plain data, for which all zeros is a valid value.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = libc::c_int::try_from(size_of::<libc::proc_bsdinfo>()).ok()?;
+    // SAFETY: the buffer is a proc_bsdinfo of `size` bytes, which is what the call may write
+    // for PROC_PIDTBSDINFO.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&raw mut info).cast::<libc::c_void>(),
+            size,
+        )
+    };
+    (written == size).then_some(StartTime(info.pbi_start_tvsec, info.pbi_start_tvusec))
+}
+
+/// When `pid` started, in clock ticks since boot: field 22 of `/proc/<pid>/stat`, counted after
+/// the command name, which is in parentheses and may hold spaces.
+#[cfg(target_os = "linux")]
+fn start_time(pid: u32) -> Option<StartTime> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let ticks = stat
+        .rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()?;
+    Some(StartTime(ticks, 0))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn start_time(pid: u32) -> Option<StartTime> {
     let mut system = system()?;
     let pid = Pid::from_u32(pid);
     system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
-    system.process(pid).map(sysinfo::Process::start_time)
+    system
+        .process(pid)
+        .map(|process| StartTime(process.start_time(), 0))
 }
 
 /// Whether `pid` is stopped by a signal (job control), as `ps` shows state `T`; false when it
@@ -334,6 +421,31 @@ mod tests {
         command.spawn().expect("start a sleeper")
     }
 
+    /// Start times tell apart two processes that started within the same second, as a new
+    /// process that took over a registered PID within a second would.
+    #[test]
+    fn start_times_tell_apart_processes_of_the_same_second() {
+        let scope = Scope::new();
+        let seconds = |pid: u32| {
+            let mut system = system()?;
+            let id = Pid::from_u32(pid);
+            system.refresh_processes(ProcessesToUpdate::Some(&[id]), true);
+            system.process(id).map(sysinfo::Process::start_time)
+        };
+        for _ in 0..5 {
+            let first = sleeper(&scope);
+            std::thread::sleep(Duration::from_millis(50));
+            let second = sleeper(&scope);
+            let (a, b) = (seconds(first.id()), seconds(second.id()));
+            if a.is_none() || a != b {
+                continue;
+            }
+            assert_ne!(start_time(first.id()), start_time(second.id()));
+            return;
+        }
+        panic!("no two processes started within the same second");
+    }
+
     /// A group guard selects no member outside its scope's root, as when the group's ID names
     /// another group by the time the guard is dropped.
     #[test]
@@ -375,7 +487,13 @@ mod tests {
             start,
             cwd: Some(scope.root().to_path_buf()),
         };
-        kill_if_same(&stale, true, &|p| p.inside(scope.root()));
+        kill_if_same(
+            &stale,
+            true,
+            &|p| p.inside(scope.root()),
+            #[cfg(target_os = "linux")]
+            None,
+        );
         std::thread::sleep(Duration::from_millis(200));
         assert!(child.try_wait().unwrap().is_none(), "not signalled");
     }
