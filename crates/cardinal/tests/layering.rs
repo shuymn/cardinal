@@ -9,7 +9,9 @@
 //! source with comments and string literals removed. A glob import of the crate root and an
 //! alias of `crate` would bring modules into scope without such a path, so both count as a
 //! reference to the whole crate, which no module may use; other glob imports are denied by
-//! `clippy::wildcard_imports`.
+//! `clippy::wildcard_imports`. The scanner guards against accidental imports, not against
+//! code written to slip past it; the runtime tests in `tests/admission_isolation.rs` are the
+//! real check for C17 and C18.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
