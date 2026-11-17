@@ -18,8 +18,8 @@ You decide what cardinal's code could not: open inbox items and reclaim plans. Y
 
 1. **Inbox.** Run `cardinal inbox`. It first runs the recovery pass and refreshes items, then lists them. Done when every item with `status: "open"` has a decision from the inbox table below.
 2. **Evidence.** For each open item, run `cardinal explain inbox KEY`, and run `cardinal inventory` once for the whole pass. For a `recovery_needed` item, also run `cardinal explain job JOB` with its `subject.job_id`.
-3. **Plans.** Run `cardinal plan`. To look at one target, use `cardinal plan reclaim-worktree PATH` or `cardinal plan reclaim-dir PATH` instead. Done when every plan in `plans` has a decision from the plan table below.
-4. **Act.** For each plan the table marks *act*, run `cardinal act PLAN --caller arbiter` and handle its `status` with the result table.
+3. **Plans.** Run `cardinal plan`; it prints a `cardinal.plan-list.v1` whose `plans` array holds one plan per target. To look at one target, run `cardinal plan reclaim-worktree PATH` or `cardinal plan reclaim-dir PATH` instead; each prints a single `cardinal.plan.v1`, which is the plan itself. Done when every plan you received, listed or single, has a decision from the plan table below.
+4. **Act.** For each plan the table marks *act*, run `cardinal act PLAN --caller arbiter` and handle its `status` with the result table. Whatever the `status`, a non-null `error` goes in the report under errors with the plan ID and target.
 5. **Resolve.** Apply the inbox decisions with the resolve commands below. Done when every open item is resolved, escalated, or deliberately left open per the table.
 6. **Report** (format at the end). Done when every plan, act result, inbox decision, and `errors` entry from steps 1–5 appears in it.
 
@@ -68,6 +68,7 @@ Owner decisions about plans go in your report, not the inbox: phase 0 raises inb
 | `status` | Report |
 | --- | --- |
 | `executed` | Plan ID, target, `freed_bytes` |
+| `dry_run` | Plan ID, target, `checks`, and `freed_bytes` as the bytes it would free. Nothing was deleted (phase 0 `act` on Windows always stops here), so it is neither reclaimed nor an owner decision |
 | `partial` | Plan ID, target, every path in `skipped_changed`; the owner decides about the remains |
 | `rejected` | Plan ID, target, every entry of `reasons` |
 | `expired` | Plan ID, target, `reasons`; the target changed after planning, and the next run plans it afresh |
@@ -78,7 +79,8 @@ Owner decisions about plans go in your report, not the inbox: phase 0 raises inb
 End with these sections, each a list (write "none" when empty):
 
 1. **Reclaimed**: executed and partial acts.
-2. **Refused**: rejected and expired acts, and plans with `invariants_ok: false`.
-3. **Owner decisions**: escalated inbox items, plans needing approval, remains of partial acts, partially deleted worktrees, and leftovers, each with its inbox key, job ID, plan ID, or path and the question to answer.
-4. **Inbox**: every open item and the decision you applied.
-5. **Errors**: `cardinal.error.v1` outputs and `errors` entries.
+2. **Dry runs**: `dry_run` acts.
+3. **Refused**: rejected and expired acts, and plans with `invariants_ok: false`.
+4. **Owner decisions**: escalated inbox items, plans needing approval, remains of partial acts, partially deleted worktrees, and leftovers, each with its inbox key, job ID, plan ID, or path and the question to answer.
+5. **Inbox**: every open item and the decision you applied.
+6. **Errors**: `cardinal.error.v1` outputs, `errors` entries, and every non-null act `error` with its plan ID and target.
