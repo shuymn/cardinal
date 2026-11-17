@@ -5,7 +5,8 @@
 //! Signal handlers are installed through `signal-hook`; a handler is reset to the default
 //! action by `exec`, so the stage starts with default dispositions for the handled signals.
 
-use std::io;
+use std::io::{self, Read as _};
+use std::sync::Arc;
 use std::time::Duration;
 
 use rustix::process::{Pid, Signal, WaitId, WaitIdOptions};
@@ -156,18 +157,32 @@ pub fn wait_exited_unreaped(raw_pid: u32) -> io::Result<()> {
 /// Calls `on_signal` on a background thread for every delivery of one of `signals`. The
 /// signals no longer take their default action in this process; `exec` restores it for
 /// children.
+///
+/// Each signal's handler writes one byte to an OS pipe of its own, read by a thread that calls
+/// `on_signal`; a pipe, unlike the socket pair `signal-hook`'s iterator uses, keeps the runner
+/// free of sockets. Watching is best effort: signals registered before a failure stay watched.
 pub fn watch_signals(
     signals: &[i32],
-    mut on_signal: impl FnMut(i32) + Send + 'static,
+    on_signal: impl Fn(i32) + Send + Sync + 'static,
 ) -> io::Result<()> {
-    let mut iterator = signal_hook::iterator::Signals::new(signals)?;
-    std::thread::Builder::new()
-        .name("cardinal-signals".into())
-        .spawn(move || {
-            for sig in iterator.forever() {
-                on_signal(sig);
-            }
-        })?;
+    let on_signal = Arc::new(on_signal);
+    for &sig in signals {
+        let (mut reader, writer) = io::pipe()?;
+        signal_hook::low_level::pipe::register(sig, writer)?;
+        let on_signal = Arc::clone(&on_signal);
+        std::thread::Builder::new()
+            .name(format!("cardinal-signal-{sig}"))
+            .spawn(move || {
+                let mut byte = [0u8; 1];
+                loop {
+                    match reader.read(&mut byte) {
+                        Ok(1) => on_signal(sig),
+                        Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                        _ => return,
+                    }
+                }
+            })?;
+    }
     Ok(())
 }
 
