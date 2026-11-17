@@ -1234,7 +1234,44 @@ fn caller_changing_builtins_refuse_the_command() {
         "setopt -x",
         "setopt \"$opt\"",
         "shopt -s extdebug",
-        // Removing the export of `PATH` hides it from the runner, not from the shell.
+    ] {
+        assert!(
+            matches!(tokenize(command), Err(Refusal::ChangesShell(_))),
+            "{command:?}: {:?}",
+            tokenize(command)
+        );
+    }
+    for command in [
+        "set -e",
+        "set -euo pipefail",
+        "set -o pipefail",
+        "set -- -x \"$@\"",
+        "setopt nullglob",
+        "unsetopt nomatch",
+        "shopt -s nullglob",
+        "export FOO=$x PATH=\"$PATH:/x\"",
+        "declare -a arr",
+        "typeset -i n=1",
+        "local x=1",
+        "readonly X=1",
+        "echo eval trap source",
+        "probe trap 'set -x'",
+        "X=1 make",
+    ] {
+        assert!(
+            tokenize(command).is_ok(),
+            "{command:?}: {:?}",
+            tokenize(command)
+        );
+    }
+}
+
+/// Removing the export of `PATH`, and options that change how the calling shell finds a
+/// command, refuse the whole command: the runner searches the exported `PATH` afresh. Other
+/// exports and options do not.
+#[test]
+fn lookup_changes_refuse_the_command() {
+    for command in [
         "export -n PATH",
         "export -n PATH=/bin",
         "typeset +x PATH",
@@ -1267,29 +1304,14 @@ fn caller_changing_builtins_refuse_the_command() {
         );
     }
     for command in [
-        "set -e",
-        "set -euo pipefail",
-        "set -o pipefail",
-        "set -- -x \"$@\"",
-        "setopt nullglob",
-        "unsetopt nomatch",
-        "shopt -s nullglob",
         "set -u",
         "set -o nounset",
         "setopt extendedglob",
         "shopt -s globstar",
-        "export FOO=$x PATH=\"$PATH:/x\"",
         "export PATH",
         "declare -x PATH",
         "typeset +x FOO",
         "typeset +x MYPATH PATHS",
-        "declare -a arr",
-        "typeset -i n=1",
-        "local x=1",
-        "readonly X=1",
-        "echo eval trap source",
-        "probe trap 'set -x'",
-        "X=1 make",
     ] {
         assert!(
             tokenize(command).is_ok(),
