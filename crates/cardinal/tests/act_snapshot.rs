@@ -12,12 +12,17 @@ mod plan_support;
 mod support;
 
 use std::path::Path;
+#[cfg(target_os = "linux")]
 use std::process::Stdio;
 use std::time::Duration;
 
-use cardinal::contract::{ActResult, ActStatus, PlanKind};
+#[cfg(target_os = "linux")]
+use cardinal::contract::ActResult;
+use cardinal::contract::{ActStatus, PlanKind};
 use cardinal_test_support::{Command, Scope};
-use plan_support::{Setup, act_result, arbiter, write};
+#[cfg(target_os = "linux")]
+use plan_support::act_result;
+use plan_support::{Setup, arbiter, write};
 use support::helper::Mode;
 use support::testpoints::TestPoints;
 
@@ -51,25 +56,6 @@ fn walk_if_requested() {
 
 const WAIT: Duration = Duration::from_secs(20);
 
-/// Runs `act` of `plan` paused at `point`, calls `change` once it has reached it, releases
-/// it, and returns its result.
-fn act_with_change_at(s: &Setup, plan: &str, point: &str, change: impl FnOnce()) -> ActResult {
-    // A test-point directory of its own, so no release file of an earlier race is left.
-    let scope = Scope::new();
-    let points = TestPoints::new(&scope);
-    let mut command = s.act_command(plan, &arbiter());
-    points.apply(&mut command, &[point], None);
-    let child = command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    points.wait_reached(point, child.id(), WAIT);
-    change();
-    points.release(point);
-    act_result(&child.wait_with_output().unwrap()).expect("an act result")
-}
-
 /// A tracked file edited after the snapshot, before the checks: the checks, which observe
 /// the worktree through git again, see it dirty, and nothing is touched.
 #[test]
@@ -78,9 +64,12 @@ fn edit_before_checks_is_rejected() {
     let wt = s.worktree("edited");
     write(&wt, "node_modules/pkg/index.js", "x");
     let plan = s.plan(PlanKind::ReclaimWorktree, &wt);
-    let result = act_with_change_at(&s, &plan.id, cardinal::testpoint::ACT_SNAPSHOTTED, || {
-        write(&wt, "src/lib.rs", "// edited after the snapshot\n");
-    });
+    let result = s.act_at(
+        &plan.id,
+        &arbiter(),
+        cardinal::testpoint::ACT_SNAPSHOTTED,
+        || write(&wt, "src/lib.rs", "// edited after the snapshot\n"),
+    );
     assert_eq!(result.status, ActStatus::Rejected, "{result:#?}");
     assert_eq!(result.reasons, ["clean"]);
     assert!(
@@ -167,6 +156,32 @@ fn with_binds(s: &Setup, binds: &[(&Path, &Path)], mut inner: Command) -> std::p
 fn act_with_binds(s: &Setup, plan: &str, binds: &[(&Path, &Path)]) -> ActResult {
     let output = with_binds(s, binds, s.act_command(plan, &arbiter()));
     act_result(&output).expect("an act result")
+}
+
+/// Runs `act` of `plan` under `binds` paused at `point`, calls `at` once it has reached it,
+/// releases it, and returns its result.
+#[cfg(target_os = "linux")]
+fn act_with_binds_at(
+    s: &Setup,
+    plan: &str,
+    binds: &[(&Path, &Path)],
+    point: &str,
+    at: impl FnOnce(),
+) -> ActResult {
+    let scope = Scope::new();
+    let points = TestPoints::new(&scope);
+    let mut command = s.act_command(plan, &arbiter());
+    points.apply(&mut command, &[point], None);
+    s.fx.scope().mount_namespace(&mut command, binds);
+    let child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    points.wait_reached(point, child.id(), WAIT);
+    at();
+    points.release(point);
+    act_result(&child.wait_with_output().unwrap()).expect("an act result")
 }
 
 /// A helper process (this test binary, see [`walk_if_requested`]) that runs `plan::walk` of
@@ -356,7 +371,8 @@ impl Watch {
 
 /// A7 on Linux: a bind mount below the target is told by its mount before it is read. `plan`'s
 /// walk neither opens nor lists it; `act`'s snapshot opens it to read its mount and does not
-/// list it.
+/// list it. The observation `act` runs after its snapshot walks the ignored entry, bind mount
+/// included (section 8.3), so the events are read where the snapshot has just been recorded.
 #[cfg(target_os = "linux")]
 #[test]
 fn bind_mounts_are_not_listed() {
@@ -386,9 +402,20 @@ fn bind_mounts_are_not_listed() {
         "the walk neither opens nor lists the bind mount"
     );
 
-    let result = act_with_binds(&s, &plan.id, &[(&data, &cache)]);
+    let listed = std::cell::Cell::new(None);
+    let result = act_with_binds_at(
+        &s,
+        &plan.id,
+        &[(&data, &cache)],
+        cardinal::testpoint::ACT_SNAPSHOTTED,
+        || listed.set(Some(watch.seen().1)),
+    );
     assert_eq!(result.status, ActStatus::DryRun, "{result:#?}");
-    assert!(!watch.seen().1, "the snapshot does not list the bind mount");
+    assert_eq!(
+        listed.get(),
+        Some(false),
+        "the snapshot does not list the bind mount"
+    );
     ran_in_namespace("bind_mounts_are_not_listed");
 }
 
