@@ -9,11 +9,11 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value};
 
-use super::repo::{Origin, Repo};
+use super::repo::Repo;
 use super::string;
-use crate::classify::{self, BuiltIn, CallIds, Context, Refusal, Rewritten};
+use crate::classify::{self, BuiltIn, CallIds, Context, Origin, Refusal, Rewritten};
 use crate::config::Config;
-use crate::contract::{ClassifyRepo, ClassifyTool, ToolName};
+use crate::contract::{ClassifyTool, ToolName};
 use crate::testpoint;
 
 /// The Bash timeout default and ceiling when the environment does not set them
@@ -130,35 +130,13 @@ pub(super) fn evaluate(input: &Call, settings: &Settings<'_>) -> Result<Value, P
         .map(PathBuf::from)
         .or_else(|| settings.fallback_cwd.clone());
     let repo = cwd.as_deref().and_then(Repo::locate);
-    let path_matched = |profile: &crate::config::Profile| {
-        repo.as_ref()
-            .is_some_and(|repo| profile.matches_common_dir(&repo.common_dir))
+    let origin = || match &repo {
+        Some(repo) => super::repo::origin(&config.host.observe.git, &repo.root, settings.deadline),
+        None => Origin::Unknown,
     };
-    let remote_needed = repo.is_some()
-        && config.profiles.iter().any(|profile| {
-            profile
-                .matcher
-                .as_ref()
-                .is_some_and(|m| !m.remotes.is_empty())
-                && !path_matched(profile)
-        })
-        && classify::rules_could_match(&stages, &config.profiles);
-    let remote = match (&repo, remote_needed) {
-        (Some(repo), true) => {
-            match super::repo::origin(&config.host.observe.git, &repo.root, settings.deadline) {
-                Origin::Url(url) => Some(url),
-                Origin::Unknown => None,
-                Origin::TimedOut => return Err(missed(settings.start)),
-            }
-        }
-        _ => None,
-    };
-    let selection = config.select(|profile| {
-        path_matched(profile)
-            || remote
-                .as_deref()
-                .is_some_and(|url| profile.matches_remote(url))
-    });
+    let common_dir = repo.as_ref().map(|repo| repo.common_dir.as_path());
+    let (selection, remote) = classify::select(config, &stages, common_dir, origin)
+        .ok_or_else(|| missed(settings.start))?;
 
     let timeout_ms = timeout_ms(&input.tool_input, settings.var);
     let background = input.tool_input.get("run_in_background") == Some(&Value::Bool(true));
@@ -167,11 +145,7 @@ pub(super) fn evaluate(input: &Call, settings: &Settings<'_>) -> Result<Value, P
         timeout_ms,
         background,
     };
-    let classify_repo = repo.as_ref().map(|repo| ClassifyRepo {
-        common_dir: path_text(&repo.common_dir),
-        main_worktree: path_text(&repo.main_worktree()),
-        remote: remote.as_deref().and_then(crate::config::normalize_remote),
-    });
+    let classify_repo = common_dir.map(|dir| classify::request_repo(dir, remote.as_deref()));
     let cwd_text = cwd.as_deref().map_or_else(String::new, path_text);
     let ctx = Context {
         command: &input.command,
