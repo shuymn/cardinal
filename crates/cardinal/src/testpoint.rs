@@ -33,12 +33,8 @@ pub const RUN_AFTER_SPAWN: &str = "run.after_spawn";
 /// The stage's child has been reaped and its status not read; an injected failure stands for
 /// a status the wait could not get.
 pub const RUN_REAPED: &str = "run.reaped";
-/// `act` holds the exclusive in-use lock.
-pub const ACT_LOCKED: &str = "act.locked";
 /// `act` recorded its snapshot and has not run its checks.
 pub const ACT_SNAPSHOTTED: &str = "act.snapshotted";
-/// `act` checks passed and nothing is deleted yet.
-pub const ACT_CHECKED: &str = "act.checked";
 /// The hook classified the command.
 pub const HOOK_CLASSIFIED: &str = "hook.classified";
 /// A record appender holds the shared records lock and the open current file, and has not
@@ -59,9 +55,7 @@ pub const POINTS: &[&str] = &[
     RUN_SPAWNED,
     RUN_AFTER_SPAWN,
     RUN_REAPED,
-    ACT_LOCKED,
     ACT_SNAPSHOTTED,
-    ACT_CHECKED,
     HOOK_CLASSIFIED,
     RECORD_OPENED,
     INBOX_OBSERVED,

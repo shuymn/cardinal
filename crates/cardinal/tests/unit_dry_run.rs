@@ -67,17 +67,18 @@ fn enabling_one_unit_leaves_the_others_gated() {
     assert_only_planned(Some("[unit.other]\nact = true\n"));
 }
 
-/// The control: a unit whose `act` is true executes like any caller.
-#[cfg(unix)]
+/// The control: a unit whose `act` is true is recorded like any caller, as an `act` record.
+/// Phase 0 still only reports, so the target stays.
 #[test]
-fn unit_with_act_true_executes() {
+fn unit_with_act_true_is_recorded_as_act() {
     let s = Setup::with_host(Some("[unit.disk-reclaim]\nact = true\n"));
     let wt = s.worktree("enabled", &[("target", IgnoredClass::Regenerable)]);
     write(&wt, "target/debug/app", "bin");
     let plan = s.plan(PlanKind::ReclaimDir, &wt.join("target"));
     let result = s.act(&plan.id, &unit("disk-reclaim")).unwrap();
-    assert_eq!(result.status, ActStatus::Executed, "{result:#?}");
-    assert!(!wt.join("target").exists());
+    assert_eq!(result.status, ActStatus::DryRun, "{result:#?}");
+    assert!(wt.join("target/debug/app").exists());
+    assert!(!s.state.plan_claim(&plan.id).exists());
     assert_eq!(records_of(&s, &plan.id, RecordKind::Act).len(), 1);
     assert_eq!(records_of(&s, &plan.id, RecordKind::Planned).len(), 0);
 }

@@ -1,18 +1,19 @@
 //! `plan` and `act` against observed facts (`docs/architecture.md` sections 9.2–9.5): which
 //! worktrees are plans without approval (C12), whole-target inspection (C13), identity
 //! binding (C14), recomputed approval (A6), plain targets (A7), and managed worktrees (A8).
-//! Every refusal is paired with a control that executes.
+//! Every refusal is paired with a control that passes every check and reports `dry_run`.
 //!
 //! Observation and admission come from the fake in `tests/fakes` until the integration gate
-//! runs these against the real modules. Deletion is Unix-only in phase 0, so the tests that
-//! execute plans are `#[cfg(unix)]`; on Windows `act` stops at `dry_run` (`act_snapshot`).
+//! runs these against the real modules. The tests that inspect targets run on Unix, where
+//! `act` reads its snapshot through directory descriptors; `act_report_only` runs the
+//! report-only contract on every platform.
 
 #![cfg_attr(
     not(unix),
     allow(
         dead_code,
         unused_imports,
-        reason = "deletion is Unix-only in phase 0, and so are the tests that delete"
+        reason = "the tests that inspect targets run on Unix"
     )
 )]
 
@@ -58,7 +59,7 @@ mod candidates {
     use super::*;
 
     #[test]
-    fn control_is_reclaimed_without_approval() {
+    fn control_passes_without_approval() {
         let s = Setup::new();
         let wt = s.worktree("done", &[("node_modules", IgnoredClass::Regenerable)]);
         write(&wt, "node_modules/pkg/index.js", "x");
@@ -66,13 +67,8 @@ mod candidates {
         assert_no_approval(&plan);
         assert!(plan.allocated_bytes.unwrap() > 0);
         let result = s.act(&plan.id, &arbiter()).unwrap();
-        assert_eq!(result.status, ActStatus::Executed, "{result:#?}");
-        assert!(!wt.exists(), "the worktree directory is gone");
-        assert_eq!(
-            s.fake.removed(),
-            [format!("{}\t{}", s.main.display(), wt.display())],
-            "git worktree remove ran for its administrative entry"
-        );
+        assert_eq!(result.status, ActStatus::DryRun, "{result:#?}");
+        assert!(wt.join("node_modules/pkg/index.js").exists());
     }
 
     /// Observation matches merge evidence on the HEAD object: commits added after the merged
@@ -226,7 +222,7 @@ mod candidates {
     }
 }
 
-/// C14: a plan is bound to its target's identity, checked again right before deletion.
+/// C14: a plan is bound to its target's identity, observed again whenever `act` evaluates it.
 #[cfg(unix)]
 mod identity {
     use super::*;
@@ -253,38 +249,10 @@ mod identity {
         let wt = s.worktree("advanced", &[]);
         let plan = s.plan(PlanKind::ReclaimWorktree, &wt);
         s.fx.commit_file(&wt, "src/new.rs", "// new\n", "advance");
-        // A dry run stops before the re-read during deletion: the comparison after the
-        // snapshot expires the plan on its own.
-        let dry_run = cardinal::act::ActOptions {
-            dry_run: true,
-            ..arbiter()
-        };
-        let checked = s.act(&plan.id, &dry_run).unwrap();
-        assert_eq!(checked.status, ActStatus::Expired);
-        assert_eq!(checked.reasons, ["identity_changed:head"]);
         let result = s.act(&plan.id, &arbiter()).unwrap();
         assert_eq!(result.status, ActStatus::Expired);
         assert_eq!(result.reasons, ["identity_changed:head"]);
         assert!(wt.join("src/new.rs").exists());
-    }
-
-    #[test]
-    fn redelivered_plan_runs_once() {
-        let s = Setup::new();
-        let wt = s.worktree("once", &[("target", IgnoredClass::Regenerable)]);
-        write(&wt, "target/debug/app", "bin");
-        let plan = s.plan(PlanKind::ReclaimDir, &wt.join("target"));
-        assert_eq!(
-            s.act(&plan.id, &arbiter()).unwrap().status,
-            ActStatus::Executed
-        );
-        write(&wt, "target/debug/app", "rebuilt");
-        let again = s.act(&plan.id, &arbiter()).unwrap();
-        assert_eq!(again.status, ActStatus::AlreadyExecuted);
-        assert!(
-            wt.join("target/debug/app").exists(),
-            "the rebuilt output stays"
-        );
     }
 
     #[test]
@@ -330,15 +298,15 @@ fn protected_deep_in_target_refused() {
     write(&control, "target/a/b/c.o", "obj");
     let plan = s.plan(PlanKind::ReclaimDir, &control.join("target"));
     let result = s.act(&plan.id, &arbiter()).unwrap();
-    assert_eq!(result.status, ActStatus::Executed, "{result:#?}");
-    assert!(!control.join("target").exists());
+    assert_eq!(result.status, ActStatus::DryRun, "{result:#?}");
+    assert!(control.join("target/a/b/c.o").exists());
 }
 
-/// C13: a worktree holding protected data is refused, while its regenerable `target/` is
-/// reclaimed on its own.
+/// C13: a worktree holding protected data is refused, while its regenerable `target/` passes
+/// on its own.
 #[cfg(unix)]
 #[test]
-fn protected_worktree_refused_target_dir_reclaimed() {
+fn protected_worktree_refused_target_dir_passes() {
     let s = Setup::new();
     let wt = s.worktree(
         "fuzzing",
@@ -359,8 +327,8 @@ fn protected_worktree_refused_target_dir_reclaimed() {
 
     let dir = s.plan(PlanKind::ReclaimDir, &wt.join("target"));
     let result = s.act(&dir.id, &arbiter()).unwrap();
-    assert_eq!(result.status, ActStatus::Executed, "{result:#?}");
-    assert!(!wt.join("target").exists());
+    assert_eq!(result.status, ActStatus::DryRun, "{result:#?}");
+    assert!(wt.join("target/debug/app").exists());
     assert!(wt.join("fuzz/corpus/seed").exists());
 }
 
@@ -383,8 +351,8 @@ fn approval_recomputed_when_merge_evidence_disappears() {
     let approved = s.plan(PlanKind::ReclaimWorktree, &wt);
     assert_eq!(approved.approval, Approval::Owner);
     let result = s.act(&approved.id, &owner_approved()).unwrap();
-    assert_eq!(result.status, ActStatus::Executed, "{result:#?}");
-    assert!(!wt.exists());
+    assert_eq!(result.status, ActStatus::DryRun, "{result:#?}");
+    assert!(wt.join("src/lib.rs").exists());
 }
 
 /// A7: another repository below the target's root is refused.
@@ -411,9 +379,9 @@ fn nested_repository_refused() {
     let plan = s.plan(PlanKind::ReclaimDir, &control.join("node_modules"));
     assert_eq!(
         s.act(&plan.id, &arbiter()).unwrap().status,
-        ActStatus::Executed
+        ActStatus::DryRun
     );
-    assert!(!control.join("node_modules").exists());
+    assert!(control.join("node_modules/pkg/index.js").exists());
 }
 
 /// A7: a target that is a symbolic link is refused, and what it points to is untouched.
@@ -507,7 +475,7 @@ fn plain_target_checks(
 }
 
 /// A7 end to end: `act` refuses a regenerable directory that is a mount point (a disk image
-/// attached there), and deletes nothing on it.
+/// attached there), and what is on it stays.
 #[cfg(target_os = "macos")]
 #[test]
 fn mount_point_refused() {
@@ -578,9 +546,9 @@ fn managed_worktree_refused() {
     let plan = s.plan(PlanKind::ReclaimWorktree, &control);
     assert_eq!(
         s.act(&plan.id, &arbiter()).unwrap().status,
-        ActStatus::Executed
+        ActStatus::DryRun
     );
-    assert!(!control.exists());
+    assert!(control.join("src/lib.rs").exists());
 }
 
 #[cfg(unix)]
@@ -606,9 +574,9 @@ fn managed_reclaim_dir_refused() {
     let plan = s.plan(PlanKind::ReclaimDir, &control.join("node_modules"));
     assert_eq!(
         s.act(&plan.id, &arbiter()).unwrap().status,
-        ActStatus::Executed
+        ActStatus::DryRun
     );
-    assert!(!control.join("node_modules").exists());
+    assert!(control.join("node_modules/pkg/index.js").exists());
 }
 
 /// `plan` with no target plans every candidate worktree and the regenerable entries of

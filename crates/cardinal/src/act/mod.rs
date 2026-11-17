@@ -1,11 +1,11 @@
-//! Plan execution: claim, snapshot, checks, and descriptor-relative deletion
-//! (`docs/architecture.md` sections 9.5 and 9.6).
+//! Plan evaluation (`docs/architecture.md` sections 9.5 and 9.6).
 //!
-//! Data safety rests on the order snapshot, checks, deletion of unchanged entries: a change
-//! made before the checks is seen by them, and an entry created, rewritten, or replaced after
-//! the snapshot does not match it and survives. The in-use lock only keeps running commands
-//! from losing files under them. `act` writes nothing inside the repository. On Windows it
-//! always takes the dry-run path; handle-relative deletion is phase 3.
+//! Phase 0 `act` is report-only on every platform: it loads the plan, inspects a snapshot of
+//! the target, re-observes identity, evaluates the checks, and reports `expired`, `rejected`,
+//! or `dry_run`. It claims nothing, deletes or renames nothing, and writes nothing inside the
+//! repository, whatever the caller, approval, or unit configuration. The snapshot and the
+//! identity checks describe observed state; they do not exclude concurrent modification,
+//! which is why deletion waits for phase 1.
 
 #[cfg(unix)]
 mod unix;
@@ -16,14 +16,15 @@ use std::time::{Duration, Instant};
 use crate::config::Config;
 use crate::contract::{
     ActResult, ActResultSchema, ActStatus, Approval, Caller, Check, CheckResult, CheckRole,
-    ConfigKey, Error, ErrorCode, InUse, Plan, PlanClaim, PlanKind, Provenance, RecordKind, RootId,
+    ConfigKey, Error, InUse, Plan, PlanKind, Provenance, RecordKind, RootId,
 };
 use crate::observe::WorktreeObservation;
 use crate::plan::{self, DataLists, InUseFacts, Inspection, Real, Sources, Walk};
-use crate::state::{self, Durability, LockMode, StateDir};
+use crate::state::{self, LockMode, Probe, StateDir};
 use crate::testpoint;
 
-/// `cardinal act` flags.
+/// `cardinal act` flags. In phase 0 neither `dry_run` nor `owner_approved` enables
+/// deletion: every run reports.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ActOptions {
     pub dry_run: bool,
@@ -49,51 +50,23 @@ pub fn execute_with(
     plan_id: &str,
     options: &ActOptions,
 ) -> Result<ActResult, Error> {
-    // Step 1: load the plan.
     let plan = plan::load(state, plan_id)?;
-    // A unit whose `act` is off only reports (C16); Windows only dry-runs in phase 0.
-    let gated = matches!(&options.caller, Caller::Unit(name) if !config.host.unit_may_act(name));
-    let dry_run = options.dry_run || gated || cfg!(not(unix));
     let run = Run {
         config,
         state,
         sources,
         plan: &plan,
         options,
-        check_only: dry_run,
     };
-    if plan.host_id != state.host_id() {
-        let outcome = Outcome::refused(ActStatus::Expired, vec!["identity_changed:host_id".into()]);
-        return Ok(run.finish(outcome, false, gated));
-    }
-    // Step 2: claim, so the plan runs at most once, even across a crash.
-    if !dry_run {
-        let claim = PlanClaim {
-            pid: std::process::id(),
-            claimed_ms: state::now_ms(),
-        };
-        let bytes = serde_json::to_vec(&claim)
-            .map_err(|err| Error::new(ErrorCode::Internal, err.to_string()))?;
-        let path = state.plan_claim(&plan.id);
-        match state::create_new_durable(&path, &bytes) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                let outcome = Outcome::refused(ActStatus::AlreadyExecuted, Vec::new());
-                return Ok(run.finish(outcome, false, gated));
-            }
-            Err(err) => {
-                return Err(Error::new(
-                    ErrorCode::StateUnavailable,
-                    format!("{}: {err}", path.display()),
-                ));
-            }
-        }
-    }
-    let outcome = run.steps();
-    Ok(run.finish(outcome, !dry_run, gated))
+    let outcome = if plan.host_id == state.host_id() {
+        run.evaluate()
+    } else {
+        Outcome::refused(ActStatus::Expired, vec!["identity_changed:host_id".into()])
+    };
+    Ok(run.report(outcome))
 }
 
-/// What steps 3–7 decided.
+/// What an evaluation decided.
 #[derive(Clone, Debug, Default)]
 struct Outcome {
     status: Option<ActStatus>,
@@ -101,7 +74,6 @@ struct Outcome {
     checks: Vec<Check>,
     provenance: Provenance,
     freed_bytes: Option<u64>,
-    skipped_changed: Vec<String>,
     error: Option<String>,
 }
 
@@ -113,15 +85,6 @@ impl Outcome {
             ..Self::default()
         }
     }
-
-    /// A failure before anything was deleted.
-    fn failed(error: impl Into<String>) -> Self {
-        Self {
-            status: Some(ActStatus::Rejected),
-            error: Some(error.into()),
-            ..Self::default()
-        }
-    }
 }
 
 struct Run<'a> {
@@ -130,8 +93,6 @@ struct Run<'a> {
     sources: &'a dyn Sources,
     plan: &'a Plan,
     options: &'a ActOptions,
-    /// Steps 1 and 3–5 only: nothing is claimed or deleted.
-    check_only: bool,
 }
 
 impl Run<'_> {
@@ -143,31 +104,27 @@ impl Run<'_> {
         PathBuf::from(&self.plan.target.path)
     }
 
-    /// Steps 3–7. The in-use lock is held from step 3 until this returns.
-    fn steps(&self) -> Outcome {
+    /// The in-use facts, the snapshot, a new observation with its identity comparison, and
+    /// every check of section 9.2.
+    fn evaluate(&self) -> Outcome {
         let worktree = self.worktree();
         let target = self.target();
-        // Step 3: the exclusive in-use lock (no waiting), then reservations under the
-        // admission lock.
+        // The in-use lock is probed, not taken: a report never makes a command wait.
         let key = state::worktree_key(&worktree);
-        let (lock_held, _lock) =
-            match state::try_lock(&self.state.worktree_lock(&key), LockMode::Exclusive) {
-                Ok(Some(lock)) => (Ok(false), Some(lock)),
-                Ok(None) => (Ok(true), None),
-                Err(err) => (Err(err.to_string()), None),
-            };
-        if let Err(err) = testpoint::hit(testpoint::ACT_LOCKED) {
-            return Outcome::failed(err.to_string());
-        }
+        let lock_held = state::probe(&self.state.worktree_lock(&key))
+            .map(|probe| probe == Probe::Held)
+            .map_err(|err| err.to_string());
         let reservations = self.reservations(&key);
 
-        // Step 4: the snapshot.
         let snapshot = Snapshot::take(&worktree, &target);
         if let Err(err) = testpoint::hit(testpoint::ACT_SNAPSHOTTED) {
-            return Outcome::failed(err.to_string());
+            return Outcome {
+                status: Some(ActStatus::Rejected),
+                error: Some(err.to_string()),
+                ..Outcome::default()
+            };
         }
 
-        // Step 5: observe from scratch, compare identity, evaluate every check.
         let observation = self.sources.observe_worktree(&worktree);
         let changed = self.identity_changes(observation.as_ref().ok(), &snapshot);
         if !changed.is_empty() {
@@ -198,7 +155,6 @@ impl Run<'_> {
             .filter(|c| c.role == CheckRole::Invariant && c.result != CheckResult::Pass)
             .map(|c| c.name.clone())
             .collect();
-        let would_free = snapshot.walk.as_ref().ok().map(Walk::allocated);
         let mut outcome = Outcome {
             checks,
             provenance: plan::provenance(self.config, &inspection),
@@ -207,26 +163,14 @@ impl Run<'_> {
         if !failed.is_empty() {
             outcome.status = Some(ActStatus::Rejected);
             outcome.reasons = failed;
-            return outcome;
-        }
-        if plan::approval(&outcome.checks) == Approval::Owner && !self.options.owner_approved {
+        } else if plan::approval(&outcome.checks) == Approval::Owner && !self.options.owner_approved
+        {
             outcome.status = Some(ActStatus::Rejected);
             outcome.reasons = vec!["owner_approval_required".into()];
-            return outcome;
-        }
-        // Windows only dry-runs in phase 0.
-        if self.check_only || cfg!(not(unix)) {
+        } else {
             outcome.status = Some(ActStatus::DryRun);
-            outcome.freed_bytes = would_free;
-            return outcome;
+            outcome.freed_bytes = snapshot.walk.as_ref().ok().map(Walk::allocated);
         }
-        if let Err(err) = testpoint::hit(testpoint::ACT_CHECKED) {
-            outcome.status = Some(ActStatus::Rejected);
-            outcome.error = Some(err.to_string());
-            return outcome;
-        }
-        #[cfg(unix)]
-        let outcome = self.delete(&snapshot, observation.as_ref().ok(), outcome);
         outcome
     }
 
@@ -294,111 +238,11 @@ impl Run<'_> {
             && opened.is_none_or(|opened| Some(opened) == expected.root_id)
     }
 
-    /// Step 6 re-read: root identity, HEAD, and branch.
-    #[cfg(unix)]
-    fn head_unchanged(&self, head: &Result<plan::Head, Error>) -> Vec<String> {
-        let mut changed = Vec::new();
-        match head {
-            Ok(head) => {
-                if head.head != self.plan.target.head {
-                    changed.push("identity_changed:head".to_owned());
-                }
-                if head.branch != self.plan.target.branch {
-                    changed.push("identity_changed:branch".to_owned());
-                }
-            }
-            Err(err) => changed.push(format!("identity_changed:head ({})", err.message)),
-        }
-        changed
-    }
-
-    /// Steps 6 and 7 (Unix).
-    #[cfg(unix)]
-    fn delete(
-        &self,
-        snapshot: &Snapshot,
-        observation: Option<&WorktreeObservation>,
-        mut outcome: Outcome,
-    ) -> Outcome {
-        let Ok(walk) = &snapshot.walk else {
-            // The checks passed, so the snapshot exists.
-            outcome.status = Some(ActStatus::Rejected);
-            return outcome;
-        };
-        let main = observation.map_or_else(PathBuf::new, |o| PathBuf::from(&o.repo.main_worktree));
-        let main = main.as_path();
-        // Step 6: identity once more, then delete bottom-up.
-        let mut changed = self.head_unchanged(&self.sources.head(&self.worktree()));
-        if !self.root_unchanged(snapshot.root_id) {
-            changed.push("identity_changed:root_id".into());
-        }
-        if !changed.is_empty() {
-            outcome.status = Some(ActStatus::Expired);
-            outcome.reasons = changed;
-            return outcome;
-        }
-        let target = match unix::Target::open(&self.worktree(), &self.target()) {
-            Ok(target) if Some(target.root_id()) == self.plan.target.root_id => target,
-            Ok(_) => {
-                outcome.status = Some(ActStatus::Expired);
-                outcome.reasons = vec!["identity_changed:root_id".into()];
-                return outcome;
-            }
-            Err(err) => {
-                outcome.status = Some(ActStatus::Rejected);
-                outcome.error = Some(format!("{}: {err}", self.plan.target.path));
-                return outcome;
-            }
-        };
-        let worktree = self.plan.kind == PlanKind::ReclaimWorktree;
-        let mut deletion = target.delete(walk, worktree);
-        let mut status = ActStatus::Executed;
-        if worktree {
-            // Step 7: `.git` goes last, and only when nothing else is left.
-            status = ActStatus::Partial;
-            if deletion.skipped.is_empty() && deletion.failed.is_empty() {
-                let changed = self.head_unchanged(&self.sources.head(&self.worktree()));
-                if changed.is_empty() {
-                    match target.finish_worktree(walk, &mut deletion) {
-                        Ok(true) => match self.sources.remove_worktree(main, &self.worktree()) {
-                            Ok(()) => status = ActStatus::Executed,
-                            Err(err) => deletion.failed.push(format!(
-                                "git worktree remove {}: {}",
-                                self.plan.target.worktree, err.message
-                            )),
-                        },
-                        Ok(false) => {}
-                        Err(err) => deletion
-                            .failed
-                            .push(format!("{}: {err}", self.plan.target.worktree)),
-                    }
-                } else {
-                    status = ActStatus::Expired;
-                    outcome.reasons = changed;
-                }
-            }
-        } else if !deletion.root_removed {
-            status = ActStatus::Partial;
-        }
-        if !deletion.failed.is_empty() && status == ActStatus::Executed {
-            status = ActStatus::Partial;
-        }
-        outcome.status = Some(status);
-        outcome.freed_bytes = Some(deletion.freed);
-        outcome.skipped_changed = deletion
-            .skipped
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect();
-        if !deletion.failed.is_empty() {
-            outcome.error = Some(deletion.failed.join("; "));
-        }
-        outcome
-    }
-
-    /// Step 8: writes `result.json` when the plan was claimed, appends the record (`planned`
-    /// for a unit that may not act), and builds the result.
-    fn finish(&self, outcome: Outcome, claimed: bool, gated: bool) -> ActResult {
+    /// Appends the record (`planned` for a unit whose `act` is off, `act` otherwise) and
+    /// builds the result.
+    fn report(&self, outcome: Outcome) -> ActResult {
+        let gated = matches!(&self.options.caller, Caller::Unit(name)
+            if !self.config.host.unit_may_act(name));
         let mut provenance = outcome.provenance;
         if let (true, Caller::Unit(unit)) = (gated, &self.options.caller) {
             provenance.config.push(ConfigKey {
@@ -407,7 +251,7 @@ impl Run<'_> {
                 value: false.into(),
             });
         }
-        let mut result = ActResult {
+        let result = ActResult {
             schema: ActResultSchema,
             plan_id: self.plan.id.clone(),
             caller: self.options.caller.to_string(),
@@ -415,27 +259,10 @@ impl Run<'_> {
             reasons: outcome.reasons,
             checks: outcome.checks,
             freed_bytes: outcome.freed_bytes,
-            skipped_changed: outcome.skipped_changed,
+            skipped_changed: Vec::new(),
             error: outcome.error,
             finished_ms: state::now_ms(),
         };
-        if claimed {
-            let path = self.state.plan_result(&self.plan.id);
-            let written = serde_json::to_vec(&result)
-                .map_err(|err| err.to_string())
-                .and_then(|bytes| {
-                    self.state
-                        .write_atomic(&path, &bytes, Durability::Durable)
-                        .map_err(|err| err.to_string())
-                });
-            if let Err(err) = written {
-                let note = format!("cannot write {}: {err}", path.display());
-                result.error = Some(match result.error.take() {
-                    Some(error) => format!("{error}; {note}"),
-                    None => note,
-                });
-            }
-        }
         let recorder = plan::recorder(self.config, self.state);
         let mut record = recorder.record(if gated {
             RecordKind::Planned
@@ -450,7 +277,6 @@ impl Run<'_> {
             "status": result.status,
             "reasons": result.reasons,
             "freed_bytes": result.freed_bytes,
-            "skipped_changed": result.skipped_changed.len(),
             "error": result.error,
             "checks": result.checks,
             "provenance": provenance,
@@ -461,7 +287,7 @@ impl Run<'_> {
     }
 }
 
-/// Step 4: the target's entries and the worktree root as the snapshot opened it.
+/// The target's entries and the worktree root as the snapshot opened it.
 struct Snapshot {
     walk: Result<Walk, String>,
     root_id: Option<RootId>,

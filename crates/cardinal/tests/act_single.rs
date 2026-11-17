@@ -1,84 +1,18 @@
-//! A plan runs at most once (C14, `docs/architecture.md` sections 4.9 and 9.5): `act` claims
-//! it before touching the target, also across processes, and a dry run claims nothing.
-
-#![cfg_attr(
-    not(unix),
-    allow(
-        dead_code,
-        unused_imports,
-        reason = "deletion is Unix-only in phase 0, and so are the tests that delete"
-    )
-)]
+//! A plan is evaluated, never claimed (C14, `docs/architecture.md` section 9.5): `act`
+//! requires a plan ID, reports on every call, and leaves the plan unclaimed, so repeating it
+//! reports again.
 
 mod fakes;
 mod support;
 
-use std::time::Duration;
-
 use cardinal::act::ActOptions;
 use cardinal::contract::{ActStatus, ErrorCode, IgnoredClass, PlanKind};
-use cardinal::testpoint::ACT_LOCKED;
 use fakes::{Setup, arbiter, write};
-use support::helper::ChildGuard;
-use support::testpoints::TestPoints;
 
+/// With or without `--dry-run`, `act` evaluates every check, reports what it would free, and
+/// neither claims, records a result for, nor deletes anything; a repeated call reports again.
 #[test]
-fn helper() {
-    fakes::run_act_if_requested();
-}
-
-const WAIT: Duration = Duration::from_secs(20);
-
-/// The first `act` holds its claim while paused at `act.locked`; a second `act` of the same
-/// plan returns `already_executed` without touching anything, and the first then executes.
-#[cfg(unix)]
-#[test]
-fn concurrent_second_act_is_already_executed() {
-    let s = Setup::new();
-    let wt = s.worktree("twice", &[("target", IgnoredClass::Regenerable)]);
-    write(&wt, "target/debug/app", "bin");
-    let plan = s.plan(PlanKind::ReclaimDir, &wt.join("target"));
-
-    let points = TestPoints::new();
-    let out = points.dir().join("first.json");
-    let mut command = s.act_command(&plan.id, &arbiter(), &out);
-    points.apply(&mut command, &[ACT_LOCKED], None);
-    let mut first = ChildGuard::new(command.spawn().unwrap());
-    points.wait_reached(ACT_LOCKED, first.id(), WAIT);
-
-    let second = s.act(&plan.id, &arbiter()).unwrap();
-    assert_eq!(second.status, ActStatus::AlreadyExecuted);
-    assert!(
-        wt.join("target/debug/app").exists(),
-        "the second act touched nothing"
-    );
-
-    points.release(ACT_LOCKED);
-    assert!(first.child().wait().unwrap().success());
-    let first = fakes::read_result(&out);
-    assert_eq!(first.status, ActStatus::Executed, "{first:#?}");
-    assert!(!wt.join("target").exists());
-}
-
-/// A claim without a result (an interrupted run) is never retried.
-#[cfg(unix)]
-#[test]
-fn interrupted_plan_is_not_retried() {
-    let s = Setup::new();
-    let wt = s.worktree("interrupted", &[("target", IgnoredClass::Regenerable)]);
-    write(&wt, "target/x", "x");
-    let plan = s.plan(PlanKind::ReclaimDir, &wt.join("target"));
-    std::fs::write(s.state.plan_claim(&plan.id), br#"{"pid":1,"claimed_ms":1}"#).unwrap();
-    let result = s.act(&plan.id, &arbiter()).unwrap();
-    assert_eq!(result.status, ActStatus::AlreadyExecuted);
-    assert!(wt.join("target/x").exists());
-}
-
-/// A dry run evaluates every check without claiming or deleting, so the plan can still be
-/// executed afterwards.
-#[cfg(unix)]
-#[test]
-fn dry_run_neither_claims_nor_deletes() {
+fn act_neither_claims_nor_deletes() {
     let s = Setup::new();
     let wt = s.worktree("dry", &[("target", IgnoredClass::Regenerable)]);
     write(&wt, "target/debug/app", "bin");
@@ -87,19 +21,17 @@ fn dry_run_neither_claims_nor_deletes() {
         dry_run: true,
         ..arbiter()
     };
-    let result = s.act(&plan.id, &dry).unwrap();
-    assert_eq!(result.status, ActStatus::DryRun, "{result:#?}");
-    assert!(
-        result.freed_bytes.unwrap() > 0,
-        "reports what it would free"
-    );
-    assert!(!s.state.plan_claim(&plan.id).exists());
-    assert!(wt.join("target/debug/app").exists());
-    let result = s.act(&plan.id, &arbiter()).unwrap();
-    assert_eq!(result.status, ActStatus::Executed);
-    let stored: cardinal::contract::ActResult =
-        serde_json::from_slice(&std::fs::read(s.state.plan_result(&plan.id)).unwrap()).unwrap();
-    assert_eq!(stored, result, "result.json holds the result");
+    for options in [dry, arbiter(), arbiter()] {
+        let result = s.act(&plan.id, &options).unwrap();
+        assert_eq!(result.status, ActStatus::DryRun, "{result:#?}");
+        assert!(
+            result.freed_bytes.unwrap() > 0,
+            "reports what it would free"
+        );
+        assert!(!s.state.plan_claim(&plan.id).exists());
+        assert!(!s.state.plan_result(&plan.id).exists());
+        assert!(wt.join("target/debug/app").exists());
+    }
 }
 
 #[test]

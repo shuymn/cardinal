@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use crate::classify;
 use crate::config::{self, Config, Selection};
 use crate::contract::{
-    ActResult, CheckResult, ClassifyDecision, ClassifyRepo, ClassifyRequest, ClassifyRequestSchema,
+    CheckResult, ClassifyDecision, ClassifyRepo, ClassifyRequest, ClassifyRequestSchema,
     ClassifyResponse, ClassifyTool, Error, ErrorCode, Explain, ExplainKind, ExplainSchema,
     ExplainSource, ExplainSubject, Plan, Record, RecordKind, Reservation, ToolName,
 };
@@ -316,10 +316,6 @@ fn plan_sources(plan: &Plan) -> Vec<ExplainSource> {
 /// `[unit.<name>] act` key of a unit whose `act` was turned into a dry run.
 fn plan(config: &Config, state: &StateDir, prefix: &str) -> Result<Explain, Error> {
     let plan: Plan = plan::load(state, prefix)?;
-    let result: Option<ActResult> = std::fs::read(state.plan_result(&plan.id))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
-    let claimed = state.plan_claim(&plan.id).exists();
     let records = records(state)?;
     let own: Vec<&Record> = records
         .iter()
@@ -358,25 +354,16 @@ fn plan(config: &Config, state: &StateDir, prefix: &str) -> Result<Explain, Erro
             failing.join(", ")
         );
     }
-    // Without a claim (a dry run, a unit's run, a refusal before the claim), the latest run's
-    // record tells the outcome.
-    let unclaimed = own
+    // `act` reports without claiming; its latest record tells the outcome.
+    let latest = own
         .iter()
         .rev()
         .find(|r| matches!(r.kind, RecordKind::Act | RecordKind::Planned));
-    let outcome = match (&result, claimed, unclaimed) {
-        (Some(result), _, _) => {
-            let _ = write!(summary, "; act by {}", result.caller);
-            Some(name(result.status))
-        }
-        (None, true, _) => Some("interrupted".to_owned()),
-        (None, false, Some(record)) => {
-            let status = text(record, "status");
-            let _ = write!(summary, "; {status} by {}", text(record, "caller"));
-            Some(status)
-        }
-        (None, false, None) => None,
-    };
+    let outcome = latest.map(|record| {
+        let status = text(record, "status");
+        let _ = write!(summary, "; {status} by {}", text(record, "caller"));
+        status
+    });
     Ok(document(
         ExplainKind::Plan,
         plan.id,

@@ -31,15 +31,7 @@ use crate::state::{self, Durability, Probe, StateDir};
 /// Plan directories older than this are removed by `plan` runs.
 const PLAN_MAX_AGE: Duration = Duration::from_hours(30 * 24);
 
-/// HEAD and branch of a worktree.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Head {
-    pub head: Option<String>,
-    pub branch: Option<String>,
-}
-
-/// What plans and `act` read from observation and admission, and the one git operation
-/// `act` performs.
+/// What plans and `act` read from observation and admission.
 pub trait Sources {
     /// Observes the worktree containing `path` from scratch.
     fn observe_worktree(&self, path: &Path) -> Result<WorktreeObservation, Error>;
@@ -47,12 +39,6 @@ pub trait Sources {
     fn inventory(&self, repos: &[PathBuf]) -> Result<Inventory, Error>;
     /// Live and recovery-needed reservations naming the worktree with key `worktree_key`.
     fn in_use(&self, worktree_key: &str) -> Result<InUse, Error>;
-    /// HEAD and branch of the worktree rooted at `worktree`, read right before deletion: a
-    /// local read of the two, not a new observation.
-    fn head(&self, worktree: &Path) -> Result<Head, Error>;
-    /// `git -C <main> worktree remove <worktree>`: drops the administrative entry of a
-    /// worktree whose directory `act` has removed.
-    fn remove_worktree(&self, main: &Path, worktree: &Path) -> Result<(), Error>;
 }
 
 /// [`Sources`] backed by the `observe` and `admission` modules.
@@ -77,18 +63,6 @@ impl Sources for Real<'_> {
 
     fn in_use(&self, worktree_key: &str) -> Result<InUse, Error> {
         admission::in_use(self.state, worktree_key)
-    }
-
-    /// `git rev-parse HEAD` and `git symbolic-ref -q HEAD` in `worktree` through `observe::git`
-    /// (constructed environment, deadline), once that runner is wired in.
-    fn head(&self, worktree: &Path) -> Result<Head, Error> {
-        let _ = worktree;
-        Err(Error::not_implemented("observe::git"))
-    }
-
-    fn remove_worktree(&self, main: &Path, worktree: &Path) -> Result<(), Error> {
-        let _ = (main, worktree);
-        Err(Error::not_implemented("observe::git"))
     }
 }
 

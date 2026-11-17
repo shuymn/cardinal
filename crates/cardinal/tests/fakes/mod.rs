@@ -29,7 +29,7 @@ use cardinal::contract::{
     Inventory, InventorySchema, MergeEvidence, Os, Plan, ReclaimSummary, Repo, Tri, Worktree,
 };
 use cardinal::observe::WorktreeObservation;
-use cardinal::plan::{Head, Sources};
+use cardinal::plan::Sources;
 use cardinal::state::StateDir;
 use serde::{Deserialize, Serialize};
 
@@ -88,19 +88,6 @@ impl FakeSources {
             .expect("an observed worktree");
         change(&mut observed.worktree);
         self.write(&world);
-    }
-
-    /// `git worktree remove` calls, as `main<TAB>worktree` lines.
-    pub fn removed(&self) -> Vec<String> {
-        std::fs::read_to_string(self.removed_log())
-            .unwrap_or_default()
-            .lines()
-            .map(str::to_owned)
-            .collect()
-    }
-
-    fn removed_log(&self) -> PathBuf {
-        self.file.with_extension("removed")
     }
 }
 
@@ -176,21 +163,13 @@ impl Sources for FakeSources {
             .cloned()
             .unwrap_or_default())
     }
+}
 
-    fn head(&self, worktree: &Path) -> Result<Head, Error> {
-        Ok(read_head(worktree))
-    }
-
-    fn remove_worktree(&self, main: &Path, worktree: &Path) -> Result<(), Error> {
-        use std::io::Write;
-        let mut log = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.removed_log())
-            .expect("open the removal log");
-        writeln!(log, "{}\t{}", main.display(), worktree.display()).unwrap();
-        Ok(())
-    }
+/// HEAD and branch of a worktree.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Head {
+    pub head: Option<String>,
+    pub branch: Option<String>,
 }
 
 /// HEAD and branch from the git files of the worktree at `root`, as git resolves them for a

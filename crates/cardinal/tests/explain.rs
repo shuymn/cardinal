@@ -99,7 +99,7 @@ fn job_outcomes_come_from_records() {
     assert_eq!(missing.code, ErrorCode::NotFound);
 }
 
-#[cfg(unix)]
+/// The latest run is the plan's outcome.
 #[test]
 fn plan_shows_its_result_and_records() {
     let s = Setup::new();
@@ -111,9 +111,19 @@ fn plan_shows_its_result_and_records() {
     s.act(&plan.id, &arbiter()).unwrap();
     let doc = explain(&s.config, &s.state, &Subject::Plan(plan.id[..5].into())).unwrap();
     assert_eq!(doc.subject.id, plan.id);
-    assert_eq!(doc.outcome.as_deref(), Some("executed"));
-    assert!(doc.summary.contains("act by arbiter"), "{}", doc.summary);
+    assert_eq!(doc.outcome.as_deref(), Some("dry_run"));
+    assert!(
+        doc.summary.contains("dry_run by arbiter"),
+        "{}",
+        doc.summary
+    );
     assert_eq!(records_in(&doc), ["plan_created", "act"]);
+
+    write(&wt, "target/proptest-regressions/x.txt", "keep");
+    s.act(&plan.id, &arbiter()).unwrap();
+    let doc = explain(&s.config, &s.state, &Subject::Plan(plan.id.clone())).unwrap();
+    assert_eq!(doc.outcome.as_deref(), Some("rejected"));
+    assert_eq!(records_in(&doc), ["plan_created", "act", "act"]);
 }
 
 /// A unit's dry run names the configuration key that turned it into one (C16).
@@ -139,38 +149,6 @@ fn gated_plan_names_the_unit_key() {
         doc.sources
     );
     assert_eq!(records_in(&doc), ["plan_created", "planned"]);
-}
-
-/// A run that claims nothing (a dry run, also every run on Windows) is the plan's outcome.
-#[test]
-fn dry_run_is_reported() {
-    let s = Setup::new();
-    let wt = s.worktree("dry", &[("target", IgnoredClass::Regenerable)]);
-    write(&wt, "target/x", "x");
-    let plan = s.plan(PlanKind::ReclaimDir, &wt.join("target"));
-    let dry_run = ActOptions {
-        dry_run: true,
-        ..arbiter()
-    };
-    s.act(&plan.id, &dry_run).unwrap();
-    let doc = explain(&s.config, &s.state, &Subject::Plan(plan.id.clone())).unwrap();
-    assert_eq!(doc.outcome.as_deref(), Some("dry_run"));
-    assert!(
-        doc.summary.contains("dry_run by arbiter"),
-        "{}",
-        doc.summary
-    );
-}
-
-#[test]
-fn interrupted_plan_is_reported() {
-    let s = Setup::new();
-    let wt = s.worktree("interrupted", &[("target", IgnoredClass::Regenerable)]);
-    write(&wt, "target/x", "x");
-    let plan = s.plan(PlanKind::ReclaimDir, &wt.join("target"));
-    std::fs::write(s.state.plan_claim(&plan.id), br#"{"pid":1,"claimed_ms":1}"#).unwrap();
-    let doc = explain(&s.config, &s.state, &Subject::Plan(plan.id.clone())).unwrap();
-    assert_eq!(doc.outcome.as_deref(), Some("interrupted"));
 }
 
 #[test]
