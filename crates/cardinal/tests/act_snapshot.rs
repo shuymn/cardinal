@@ -245,14 +245,15 @@ fn walk_command(s: &Setup, worktree: &Path, target: &Path, out: &Path) -> std::p
     walk
 }
 
-/// The mount and the entries a walk helper wrote to `out`.
+/// The mount and the entries a walk helper wrote to `out`, with `/` between path components
+/// on every platform.
 fn read_walk(out: &Path) -> (String, Vec<String>) {
     let doc: serde_json::Value = serde_json::from_slice(&std::fs::read(out).unwrap()).unwrap();
     let entries = doc["entries"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|e| e.as_str().unwrap().to_owned())
+        .map(|e| e.as_str().unwrap().replace('\\', "/"))
         .collect();
     (doc["mount"].as_str().unwrap().to_owned(), entries)
 }
