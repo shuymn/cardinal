@@ -280,13 +280,14 @@ impl Runner {
         Ok(())
     }
 
+    /// A signal that arrived, or the parent's exit, before now.
     fn pending_cancel(&self) -> Option<Cancel> {
         while let Some(event) = self.watch.poll() {
             if let Some(cancel) = cancel_of(event) {
                 return Some(cancel);
             }
         }
-        None
+        self.watch.parent_exited().then_some(Cancel::ParentExited)
     }
 
     /// Step 4: the worktree in-use lock, shared, waiting until `deadline`. When it cannot be
@@ -448,6 +449,10 @@ impl Runner {
 
     /// Step 7 onward on the admitted path.
     fn start_admitted(mut self) -> ExitCode {
+        // Every wait before the spawn may have outlasted the caller.
+        if let Some(cancel) = self.pending_cancel() {
+            return self.cancel(cancel);
+        }
         let inv = Invocation {
             argv: self.argv.clone(),
         };
@@ -514,6 +519,9 @@ impl Runner {
     /// that cannot be executed ends as a shell reports it: `<command>: <OS error>` and 127
     /// when it is not found, 126 otherwise.
     fn run_in_caller_group(mut self, path: &'static str) -> ExitCode {
+        if let Some(cancel) = self.pending_cancel() {
+            return self.cancel(cancel);
+        }
         let inv = Invocation {
             argv: self.argv.clone(),
         };

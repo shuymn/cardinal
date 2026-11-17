@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use cardinal::admission::{list_reservations, recovery_pass};
 use cardinal::config::HostConfig;
 use cardinal::contract::{DerivedState, RecordKind};
-use cardinal::testpoint::{ADMISSION_WAITING, RUN_AFTER_SPAWN};
+use cardinal::testpoint::{ADMISSION_WAITING, RUN_AFTER_SPAWN, RUN_BEFORE_STARTING};
 use runner_support::{Env, GroupGuard, WAIT, wait_gone};
 use support::helper::{ChildGuard, wait_for, wait_for_file};
 
@@ -46,6 +46,36 @@ fn parent_exit_before_the_spawn_leaves_nothing() {
     let finished = env.records_of(RecordKind::JobFinished);
     assert_eq!(finished.len(), 1);
     assert_eq!(finished[0].data["cancelled"], "parent_exited");
+}
+
+/// The parent exits while the runner is paused right before the spawn, on the admitted path
+/// and on the fail-open path: the runner looks again at the start boundary and does not start
+/// the stage.
+#[test]
+fn parent_exit_at_the_start_boundary_cancels() {
+    for fail in [None, Some(RUN_BEFORE_STARTING)] {
+        let env = Env::with_budget(1);
+        let script = format!("echo run >> '{}'", env.file("counter").display());
+        let runner = env.run_at(None, &["sh", "-c", &script], &[RUN_BEFORE_STARTING], fail);
+        let mut parent = ChildGuard::new(env.in_shell(&runner, "; exit $?").spawn().unwrap());
+        let runner_pid = env.wait_any_reached(RUN_BEFORE_STARTING);
+        let runner_start = cardinal::os::start_time_s(runner_pid).unwrap();
+
+        let parent_pid = parent.id();
+        parent.kill();
+        wait_orphaned(runner_pid, parent_pid);
+        env.points.release(RUN_BEFORE_STARTING);
+        wait_gone(runner_pid, runner_start);
+
+        assert_eq!(env.records_of(RecordKind::JobStarted), [], "{fail:?}");
+        assert_eq!(env.lines("counter"), Vec::<String>::new(), "{fail:?}");
+        assert_eq!(env.reservations(), [], "{fail:?}");
+        assert_eq!(env.live_locks(), Vec::<String>::new(), "{fail:?}");
+        assert!(env.worktree_lock_free());
+        let finished = env.records_of(RecordKind::JobFinished);
+        assert_eq!(finished.len(), 1, "{fail:?}");
+        assert_eq!(finished[0].data["cancelled"], "parent_exited", "{fail:?}");
+    }
 }
 
 /// Waits until the runner is no longer `parent`'s child.
