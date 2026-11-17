@@ -141,6 +141,27 @@ fn gated_plan_names_the_unit_key() {
     assert_eq!(records_in(&doc), ["plan_created", "planned"]);
 }
 
+/// A run that claims nothing (a dry run, also every run on Windows) is the plan's outcome.
+#[test]
+fn dry_run_is_reported() {
+    let s = Setup::new();
+    let wt = s.worktree("dry", &[("target", IgnoredClass::Regenerable)]);
+    write(&wt, "target/x", "x");
+    let plan = s.plan(PlanKind::ReclaimDir, &wt.join("target"));
+    let dry_run = ActOptions {
+        dry_run: true,
+        ..arbiter()
+    };
+    s.act(&plan.id, &dry_run).unwrap();
+    let doc = explain(&s.config, &s.state, &Subject::Plan(plan.id.clone())).unwrap();
+    assert_eq!(doc.outcome.as_deref(), Some("dry_run"));
+    assert!(
+        doc.summary.contains("dry_run by arbiter"),
+        "{}",
+        doc.summary
+    );
+}
+
 #[test]
 fn interrupted_plan_is_reported() {
     let s = Setup::new();

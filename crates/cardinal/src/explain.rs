@@ -358,13 +358,24 @@ fn plan(config: &Config, state: &StateDir, prefix: &str) -> Result<Explain, Erro
             failing.join(", ")
         );
     }
-    let outcome = match (&result, claimed) {
-        (Some(result), _) => {
+    // Without a claim (a dry run, a unit's run, a refusal before the claim), the latest run's
+    // record tells the outcome.
+    let unclaimed = own
+        .iter()
+        .rev()
+        .find(|r| matches!(r.kind, RecordKind::Act | RecordKind::Planned));
+    let outcome = match (&result, claimed, unclaimed) {
+        (Some(result), _, _) => {
             let _ = write!(summary, "; act by {}", result.caller);
             Some(name(result.status))
         }
-        (None, true) => Some("interrupted".to_owned()),
-        (None, false) => None,
+        (None, true, _) => Some("interrupted".to_owned()),
+        (None, false, Some(record)) => {
+            let status = text(record, "status");
+            let _ = write!(summary, "; {status} by {}", text(record, "caller"));
+            Some(status)
+        }
+        (None, false, None) => None,
     };
     Ok(document(
         ExplainKind::Plan,
