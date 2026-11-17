@@ -142,7 +142,11 @@ fn parent_exit_after_the_spawn_stops_the_group() {
         "SIGKILL comes 5 s after SIGTERM: {stopped_after:?}"
     );
     wait_gone(runner_pid, runner_start);
-    assert!(!cardinal::os::unix::group_exists(runner_pid));
+    // A killed member stays in the group as a zombie until its new parent reaps it, and
+    // `kill(-pgid, 0)` reads such a group as existing (macOS answers EPERM).
+    wait_for("the group to empty", WAIT, || {
+        (!cardinal::os::unix::group_exists(runner_pid)).then_some(())
+    });
     assert!(env.worktree_lock_free());
     let finished = env.records_of(RecordKind::JobFinished);
     assert_eq!(finished.len(), 1, "recorded before SIGKILL");
