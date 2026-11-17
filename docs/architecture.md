@@ -708,9 +708,9 @@ A plan stores the target identity: `host_id`, repository common dir, worktree pa
 3. Take the worktree's in-use lock exclusively (`try_lock`), check reservations under the admission lock, and hold the lock until step 7 ends.
 4. **Snapshot:** walk the target without following symbolic links or crossing devices and record each entry's `(dev, ino, type, size, mtime)`.
 5. **Checks, after the snapshot:** re-observe the target from scratch (section 8), comparing identity (`expired` on a difference), and evaluate every check of section 9.2: the git and gh facts (`clean`, HEAD, branch, `no_unpushed`, …) and, on the snapshot's entries, `plain_target`, `no_protected`, `no_unclassifiable`, `no_nested_repository`, and the process part of `not_in_use`. An invariant not `pass`, or a failed condition without `--owner-approved` (`owner_approval_required`): `rejected`, nothing touched.
-6. **Delete bottom-up** after re-reading the identity of section 9.4 (root identity, HEAD, branch) once more; any difference gives `expired` with nothing touched, for every plan kind. Use directory descriptors: open the target root relative to its parent and each directory relative to its own parent, never following links (`openat` with `O_DIRECTORY | O_NOFOLLOW`), and compare each directory's `(dev, ino)` with the snapshot as it is opened; a mismatch skips that subtree. Unlink (`unlinkat`) an entry only if its metadata equals the snapshot, remove a directory only once empty, and list everything left in `skipped_changed`. A worktree's `.git` file is left for step 7.
+6. **Delete bottom-up** after re-reading the identity of section 9.4 (root identity, HEAD, branch) once more; any difference gives `expired` with nothing touched, for every plan kind. Use directory descriptors: open the target root relative to its parent and each directory relative to its own parent, never following links (`openat` with `O_DIRECTORY | O_NOFOLLOW`), and compare each directory's `(dev, ino)` with the snapshot as it is opened; a mismatch skips that subtree, and a symbolic link on the way to the target skips the whole target. Unlink (`unlinkat`) an entry only if its metadata equals the snapshot, remove a directory only once empty, and list everything left in `skipped_changed`. A worktree's `.git` file is left for step 7.
 7. For a worktree, only if nothing was skipped or failed and only `.git` remains: re-read HEAD and branch, and if they equal the plan, unlink `.git`, remove the directory, and run `git -C <main> worktree remove <path>`. Otherwise `.git` stays and the worktree stays connected to git (`partial`, or `expired` on a HEAD or branch change).
-8. Write `result.json` (`executed`, or `partial`; fsync), append an `act` record, drop the lock.
+8. Write `result.json` with the result, whatever its status once the plan is claimed (fsync), so a claim without it always means an interrupted run; append an `act` record, drop the lock. Every `act` run appends that record, refusals and dry runs included.
 
 On Windows, phase 0 `act` always takes the dry-run path of section 9.6 (no claim, nothing deleted), so repeating it keeps reporting `dry_run`; handle-relative deletion is phase 3.
 
@@ -730,13 +730,20 @@ In phase 0 items are raised only by the refresh that `cardinal inbox` runs first
 | Kind | Key | Raised when | Cleared (resolved by `cardinal`) when |
 | --- | --- | --- | --- |
 | `recovery_needed` | `recovery_needed:<job>` | A reservation is `recovery_needed` (evidence: group members, verified or not) | The reservation is gone |
-| `outlived_processes` | `outlived:<session>` | A session snapshot has live processes after its agent process ended | None of them is alive |
+| `outlived_processes` | `outlived:<session>` | A session snapshot has live processes after its agent process ended | None of them is alive; the session snapshot is then deleted |
 
-Statuses are `open`, `escalated` (waiting for the owner), `resolved`, and `dismissed`. Raising a key that exists updates `seen` and evidence of an open or escalated item and leaves resolved and dismissed items alone (C19).
+Statuses are `open`, `escalated` (waiting for the owner), `resolved`, and `dismissed`. Raising a key that exists updates `seen` and evidence of an open or escalated item and leaves resolved and dismissed items alone (C19). Without `--status`, `cardinal inbox` lists open and escalated items. `cardinal inbox resolve` records the resolution with `by: "cli"`, the refresh with `by: "cardinal"`.
 
 ### 10.2 explain
 
-`explain` shows where a decision came from: configuration files and keys, the rule, observations (the exact command and its result), and records. Subjects: `job <id>`, `plan <id>`, `inbox <key>`, and `command [--cwd DIR] -- <string>` (a classification and rewrite trace without running anything).
+`explain` shows where a decision came from: configuration files and keys, the rule, observations (the exact command and its result), and records. Subjects: `job <id>`, `plan <id>`, `inbox <key>`, and `command [--cwd DIR] -- <string>` (a classification and rewrite trace without running anything). Job and plan IDs resolve by unique prefix.
+
+| Subject | `outcome` |
+| --- | --- |
+| `job` | `exited:<code>` or `signaled:<signal>` (from `job_finished`), `infra_failure:<reason>`, `running`, `waiting` (reserved, not started), `runner_died` (started or reserved, live lock free), or `fail_open:<reason>` |
+| `plan` | The `act` result's status; `interrupted` for a claim without `result.json`; null before any `act`. A unit's dry run also lists `unit.<name>.act` as a configuration source |
+| `inbox` | `<status> by <by>: <note>` (without `: <note>` when empty) once resolved, escalated, or dismissed; null while open |
+| `command` | null. `rewritten` is the command the hook would produce, or null with the reasons it stays unrewritten in `summary` |
 
 ## 11. CLI and JSON contracts
 
