@@ -4,9 +4,18 @@
 //!
 //! The environment is always the caller's choice. [`git_env`] and [`gh_env`] build the
 //! constructed environments of section 8.1 from separate allowlists.
+//!
+//! No process cardinal starts here outlives what started it: the child's process group
+//! (Unix) or Job Object (Windows) is killed before the child is reaped, after a normal exit
+//! too. The first [`run`] in a process also makes a terminated process take its live
+//! children along (see `guard_termination`): on Unix it installs handlers for SIGTERM,
+//! SIGINT, and SIGHUP that end the process by the same signal, so a process that handles
+//! those signals itself must not use [`run`].
 
 #[cfg(unix)]
 mod unix;
+#[cfg(windows)]
+mod windows;
 
 use std::ffi::{OsStr, OsString};
 use std::io::Read;
@@ -14,7 +23,9 @@ use std::path::Path;
 #[cfg(unix)]
 use std::process::Child;
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::mpsc;
+#[cfg(unix)]
+use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Once, mpsc};
 use std::time::{Duration, Instant};
 
 /// Variables git children copy from the caller's environment (section 8.1). `LC_*` is
@@ -253,6 +264,43 @@ fn take_output(child: &mut Handle) -> [Option<Box<dyn Read + Send>>; 2] {
     ]
 }
 
+/// The process groups of the children alive now (Unix). Held while a child is spawned and
+/// added, while one is killed, reaped, and removed, and by the signal handler while it kills
+/// them, so every group it names is pinned by an unreaped leader.
+#[cfg(unix)]
+static LIVE: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+#[cfg(unix)]
+fn live() -> MutexGuard<'static, Vec<u32>> {
+    LIVE.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Makes this process take its children along when it is terminated, once per process. On
+/// Unix, SIGTERM, SIGINT, and SIGHUP (unless ignored) kill every live child's process group,
+/// then end the process by the same signal with its default action. On Windows the process
+/// joins a job that kills its members when the process ends. Best effort: a failure leaves
+/// the default behaviour.
+fn guard_termination() {
+    static GUARD: Once = Once::new();
+    GUARD.call_once(|| {
+        #[cfg(unix)]
+        {
+            use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
+
+            let _ = unix::watch_signals(&[SIGTERM, SIGINT, SIGHUP], |sig| {
+                // Held until the process ends: no child starts or is reaped after this.
+                let live = live();
+                for &pgid in live.iter() {
+                    crate::os::kill_process_group(pgid);
+                }
+                unix::die_by_signal(sig)
+            });
+        }
+        #[cfg(windows)]
+        windows::contain_self();
+    });
+}
+
 /// Owns the child until it is reaped. On every exit from [`run`], complete or early
 /// (deadline, output over the limit, read error, a reader thread that could not start), it
 /// kills whatever is left of the child's process group (Unix) or Job Object (Windows)
@@ -282,11 +330,15 @@ impl Reaper {
         self.complete = true;
         #[cfg(unix)]
         {
+            let mut live = live();
+            let id = self.child.id();
             // The group is the child's own (`process_group(0)`), and its ID is pinned until
             // the child is reaped below.
-            crate::os::kill_process_group(self.child.id());
+            crate::os::kill_process_group(id);
             let _ = self.child.kill();
-            self.child.wait()
+            let status = self.child.wait();
+            live.retain(|&pgid| pgid != id);
+            status
         }
         #[cfg(windows)]
         {
@@ -364,6 +416,9 @@ pub fn run(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .current_dir(cwd);
+    guard_termination();
+    #[cfg(unix)]
+    let mut live = live();
     let mut child = Reaper {
         child: spawn(command).map_err(|source| ChildError::Spawn {
             program: name(),
@@ -371,6 +426,11 @@ pub fn run(
         })?,
         complete: false,
     };
+    #[cfg(unix)]
+    {
+        live.push(child.child.id());
+        drop(live);
+    }
 
     let (receiver, mut pending) = read_streams(take_output(&mut child.child), limits.max_output)
         .map_err(|source| ChildError::Io {
