@@ -9,8 +9,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 pub use fs::{
-    Durability, append_line, create_new_durable, parse_jsonl, read_jsonl, remove_older_than,
-    sync_parent, write_atomic,
+    Durability, append_line, create_new_durable, open_append, parse_jsonl, read_jsonl,
+    remove_older_than, sync_parent, write_atomic,
 };
 pub use id::{
     PrefixError, find_worktree_root, fnv1a64, is_id, key, new_id, now_ms, resolve_prefix,
@@ -243,10 +243,11 @@ impl StateDir {
         self.records_dir().join(format!("records.{n}.jsonl"))
     }
 
-    /// `records/.rotate.lock`: serializes rotation. Never deleted.
+    /// `records/.lock`: appenders hold it shared from opening the current file until their
+    /// write is done; rotation takes it exclusively. Never deleted.
     #[must_use]
-    pub fn rotate_lock(&self) -> PathBuf {
-        self.records_dir().join(".rotate.lock")
+    pub fn records_lock(&self) -> PathBuf {
+        self.records_dir().join(".lock")
     }
 
     /// `jobs/`: reserved for phase 2 accepted jobs; not created in phase 0.

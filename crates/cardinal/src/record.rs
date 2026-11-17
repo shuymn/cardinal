@@ -1,15 +1,28 @@
 //! Records: appending, rotation, and reading (`docs/architecture.md` section 4.7).
 //!
-//! One `cardinal.record.v1` object per line, appended with a single `write`. When the current
-//! file exceeds the size limit, the appender that notices rotates it unless another process
-//! is already rotating. Readers skip lines that do not parse. A record failure is never
-//! surfaced to a command and never causes a rerun: callers ignore the returned error.
+//! One `cardinal.record.v1` object per line, appended with a single `write`. An appender
+//! holds `records/.lock` shared from opening the current file until its write is done, and
+//! rotation takes it exclusively, so no rename or removal happens while a descriptor is open:
+//! a delayed appender cannot write into a file a later rotation has replaced. When the
+//! current file exceeds the size limit, the appender that notices rotates it, or leaves it to
+//! the next append when the lock stays busy. Readers skip lines that do not parse. A record
+//! failure is never surfaced to a command and never causes a rerun: callers ignore the
+//! returned error.
 
 use std::io;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use crate::contract::{Record, RecordKind};
-use crate::state::{self, LockMode, StateDir, now_ms};
+use crate::state::{self, LockError, LockMode, StateDir, now_ms};
+use crate::testpoint;
+
+/// How long an appender waits for a rotation to finish before giving up on its record.
+const APPEND_WAIT: Duration = Duration::from_secs(1);
+
+/// How long a rotation waits for appenders to finish their writes before leaving the
+/// rotation to the next append.
+const ROTATE_WAIT: Duration = Duration::from_millis(100);
 
 /// Where and how records are written.
 #[derive(Clone, Debug)]
@@ -52,10 +65,21 @@ impl Recorder {
     pub fn append(&self, record: &Record) -> Result<(), RecordError> {
         let line = serde_json::to_vec(record)?;
         let path = self.state.records_file();
-        state::append_line(&path, &line).map_err(|source| RecordError::Append {
+        let append_error = |source| RecordError::Append {
             path: path.clone(),
             source,
-        })?;
+        };
+        let shared = state::lock(
+            &self.state.records_lock(),
+            LockMode::Shared,
+            Instant::now() + APPEND_WAIT,
+        )
+        .map_err(|err| append_error(io::Error::other(err)))?;
+        let file = state::open_append(&path).map_err(append_error)?;
+        testpoint::hit(testpoint::RECORD_OPENED)
+            .map_err(|err| append_error(io::Error::other(err)))?;
+        state::append_line(&file, &line).map_err(append_error)?;
+        drop((file, shared));
         self.rotate_if_needed().map_err(RecordError::Rotate)
     }
 
@@ -64,10 +88,15 @@ impl Recorder {
         if !self.over_limit()? {
             return Ok(());
         }
-        let lock = match state::try_lock(&self.state.rotate_lock(), LockMode::Exclusive) {
-            Ok(Some(lock)) => lock,
-            // Another appender is rotating; skip.
-            Ok(None) => return Ok(()),
+        let lock = match state::lock(
+            &self.state.records_lock(),
+            LockMode::Exclusive,
+            Instant::now() + ROTATE_WAIT,
+        ) {
+            Ok(lock) => lock,
+            // Appenders are still writing or another appender is rotating; the next append
+            // rotates.
+            Err(LockError::TimedOut(_)) => return Ok(()),
             Err(err) => return Err(io::Error::other(err)),
         };
         // Someone may have rotated between the size check and the lock.

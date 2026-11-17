@@ -30,6 +30,9 @@ pub const ACT_SNAPSHOTTED: &str = "act.snapshotted";
 pub const ACT_CHECKED: &str = "act.checked";
 /// The hook classified the command.
 pub const HOOK_CLASSIFIED: &str = "hook.classified";
+/// A record appender holds the shared records lock and the open current file, and has not
+/// written its line.
+pub const RECORD_OPENED: &str = "record.opened";
 
 /// Every pause point.
 pub const POINTS: &[&str] = &[
@@ -42,6 +45,7 @@ pub const POINTS: &[&str] = &[
     ACT_SNAPSHOTTED,
     ACT_CHECKED,
     HOOK_CLASSIFIED,
+    RECORD_OPENED,
 ];
 
 /// How long a paused process waits for its release file before aborting.

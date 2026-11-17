@@ -37,6 +37,14 @@ pub enum Mode {
     },
     /// Call `cardinal::testpoint::hit(point)` and exit 0, or exit 3 on an injected failure.
     Testpoint { point: String },
+    /// Append one record with `data.seq = seq` to the state dir `state` through a
+    /// `Recorder` with `max_bytes` and `keep`; exit 3 if the append fails.
+    Append {
+        state: PathBuf,
+        seq: u64,
+        max_bytes: u64,
+        keep: u32,
+    },
 }
 
 /// Runs the helper mode requested through the environment, then exits; returns at once in a
@@ -76,6 +84,21 @@ pub fn run_if_requested() {
                 std::process::exit(3);
             }
         }
+        "append" => {
+            let state =
+                cardinal::state::StateDir::open(Path::new(&args[0])).expect("open the state dir");
+            let recorder = cardinal::record::Recorder::new(
+                &state,
+                args[2].parse().expect("max_bytes"),
+                args[3].parse().expect("keep"),
+            );
+            let mut record = recorder.record(cardinal::contract::RecordKind::JobFinished);
+            let seq: u64 = args[1].parse().expect("seq");
+            record.data.insert("seq".into(), seq.into());
+            if recorder.append(&record).is_err() {
+                std::process::exit(3);
+            }
+        }
         other => panic!("unknown helper mode {other}"),
     }
     std::process::exit(0);
@@ -106,6 +129,20 @@ pub fn command(mode: &Mode) -> Command {
             ],
         ),
         Mode::Testpoint { point } => ("testpoint", vec![point.clone()]),
+        Mode::Append {
+            state,
+            seq,
+            max_bytes,
+            keep,
+        } => (
+            "append",
+            vec![
+                state.to_string_lossy().into_owned(),
+                seq.to_string(),
+                max_bytes.to_string(),
+                keep.to_string(),
+            ],
+        ),
     };
     command.env(MODE, name).env(ARGS, args.join("\n"));
     command

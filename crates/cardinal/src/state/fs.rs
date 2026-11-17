@@ -102,26 +102,30 @@ pub fn remove_older_than(dir: &Path, max_age: Duration) -> io::Result<usize> {
     Ok(removed)
 }
 
-/// Appends one line with a single `write` on a file opened in append mode, so concurrent
-/// appenders do not interleave. `line` must not contain a newline; one is added.
-///
-/// If the file does not end with a newline (a crash tore the last append), the line is
-/// written after a newline so it starts a line of its own and only the torn line is lost.
-pub fn append_line(path: &Path, line: &[u8]) -> io::Result<()> {
-    debug_assert!(!line.contains(&b'\n'));
-    let file = OpenOptions::new()
+/// Opens `path` in append mode for [`append_line`], creating it if needed.
+pub fn open_append(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
         .append(true)
         .read(true)
         .create(true)
-        .open(path)?;
-    let torn = !ends_with_newline(&file)?;
+        .open(path)
+}
+
+/// Appends one line with a single `write` on `file`, opened with [`open_append`], so
+/// concurrent appenders do not interleave. `line` must not contain a newline; one is added.
+///
+/// If the file does not end with a newline (a crash tore the last append), the line is
+/// written after a newline so it starts a line of its own and only the torn line is lost.
+pub fn append_line(file: &File, line: &[u8]) -> io::Result<()> {
+    debug_assert!(!line.contains(&b'\n'));
+    let torn = !ends_with_newline(file)?;
     let mut buf = Vec::with_capacity(line.len() + 2);
     if torn {
         buf.push(b'\n');
     }
     buf.extend_from_slice(line);
     buf.push(b'\n');
-    let written = (&file).write(&buf)?;
+    let written = (&*file).write(&buf)?;
     if written == buf.len() {
         Ok(())
     } else {
@@ -184,7 +188,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        Durability, append_line, create_new_durable, read_jsonl, remove_older_than, write_atomic,
+        Durability, append_line, create_new_durable, open_append, read_jsonl, remove_older_than,
+        write_atomic,
     };
 
     #[test]
@@ -222,9 +227,9 @@ mod tests {
     fn append_after_a_torn_tail_starts_a_new_line() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("r.jsonl");
-        append_line(&path, b"1").unwrap();
+        append_line(&open_append(&path).unwrap(), b"1").unwrap();
         std::fs::write(&path, b"1\n{\"torn\":").unwrap();
-        append_line(&path, b"2").unwrap();
+        append_line(&open_append(&path).unwrap(), b"2").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"1\n{\"torn\":\n2\n");
         assert_eq!(read_jsonl::<u32>(&path).unwrap(), [1, 2]);
         assert_eq!(

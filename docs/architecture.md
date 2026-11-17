@@ -217,7 +217,7 @@ protected = ["fuzz/corpus", "fuzz/artifacts", "proptest-regressions"]
   plans/<plan>/result.json    # act result
   records/records.jsonl       # current record file
   records/records.<n>.jsonl   # rotated files, n = 1..keep-1
-  records/.rotate.lock        # empty; serializes rotation
+  records/.lock               # empty; appenders shared, rotation exclusive
   tmp/                        # temporary files for atomic writes (same file system)
   jobs/                       # reserved for phase 2 accepted jobs
   tickets/                    # reserved for phase 2 queue tickets
@@ -251,8 +251,8 @@ Locks use `std::fs::File::{lock, lock_shared, try_lock, try_lock_shared}` (stabl
 - Lock files are always empty and separate from data files, because Windows locks are mandatory: a locked byte range cannot be read by other processes.
 - std opens files close-on-exec and non-inheritable, so a child never inherits the runner's locks. A surviving child therefore cannot keep a dead runner looking alive.
 - Waiting with a deadline is a `try_lock` loop with backoff (5 ms doubling to 50 ms). Every acquisition has a deadline; there is no unbounded `lock()`.
-- Lock order is always: worktree in-use lock, then admission lock, then inbox or rotate lock. Nothing takes them in another order.
-- `admission.lock`, `worktrees/*.lock`, `inbox/.lock`, and `records/.rotate.lock` are never deleted, so no process can lock a file another process has already unlinked. `worktrees/*.lock` grows by one empty file per worktree ever used; phase 1 may prune them under the admission lock.
+- Lock order is always: worktree in-use lock, then admission lock, then inbox or records lock. Nothing takes them in another order.
+- `admission.lock`, `worktrees/*.lock`, `inbox/.lock`, and `records/.lock` are never deleted, so no process can lock a file another process has already unlinked. `worktrees/*.lock` grows by one empty file per worktree ever used; phase 1 may prune them under the admission lock.
 
 ### 4.4 Admission protocol
 
@@ -293,7 +293,8 @@ A `recovery_needed` group is **verified** when the recorded child (PID and start
 ### 4.7 Records
 
 - One JSON object per line, appended with a single `write` on a file opened in append mode (`O_APPEND`; `FILE_APPEND_DATA` on Windows), so concurrent appenders do not interleave.
-- When `records.jsonl` exceeds `max_bytes`, the appender that notices takes `.rotate.lock` with `try_lock` (skips rotation if busy), renames `records.<keep-2>` → `records.<keep-1>` … `records.jsonl` → `records.1.jsonl`. An appender that still holds the old file writes into the rotated file; nothing is lost.
+- An appender holds `records/.lock` **shared** from opening `records.jsonl` until its write is done (waiting at most 1 s for a rotation to finish, else the record is dropped). Rotation and removal take it **exclusively**, so no file is renamed or removed while an appender has it open, and a delayed appender never writes into a file a later rotation has replaced.
+- When `records.jsonl` exceeds `max_bytes`, the appender that notices takes the lock exclusively with a 100 ms deadline (on timeout the next append rotates), checks the size again, and renames `records.<keep-2>` → `records.<keep-1>` … `records.jsonl` → `records.1.jsonl`; with `keep = 1` it removes `records.jsonl`.
 - Readers skip lines that do not parse. A crash mid-write costs at most the torn line and the line appended after it.
 - A record failure is never surfaced to a command and never causes a rerun (C5, C11).
 
@@ -907,12 +908,13 @@ Tests do not rely on starting processes at the same time. The `testpoint` module
 - `CARDINAL_TEST_PAUSE=<point>[,<point>]`: at a point the process creates `<dir>/<point>.<pid>.reached` and polls for `<dir>/<point>.release`; after 30 s it aborts so a broken test fails instead of hanging.
 - `CARDINAL_TEST_FAIL=<point>`: the process returns an injected error at that point.
 
-Points: `admission.reserved` (reservation committed, admission lock released), `admission.waiting` (budget full, about to sleep), `inuse.waiting`, `run.before_starting`, `run.after_spawn`, `act.locked` (exclusive in-use lock taken), `act.snapshotted` (snapshot recorded, checks not run), `act.checked` (checks passed, nothing deleted), `hook.classified`. **Every contended test waits for the second actor's `.reached` file before releasing the first**, so it proves the second actor actually hit the contended point. Examples:
+Points: `admission.reserved` (reservation committed, admission lock released), `admission.waiting` (budget full, about to sleep), `inuse.waiting`, `run.before_starting`, `run.after_spawn`, `act.locked` (exclusive in-use lock taken), `act.snapshotted` (snapshot recorded, checks not run), `act.checked` (checks passed, nothing deleted), `hook.classified`, `record.opened` (shared records lock held, current file open, line not written). **Every contended test waits for the second actor's `.reached` file before releasing the first**, so it proves the second actor actually hit the contended point. Examples:
 
 - Two runners and a budget of one job: pause the first at `admission.reserved`; start the second and wait for its `admission.waiting`; release; assert the second starts only after the first's reservation is gone.
 - `act` and a runner: pause `act` at `act.locked`; start a runner in the worktree and wait for its `inuse.waiting`; release; the stage starts after `act` ends, or, with a shorter wait cap, runs and records `in_use_unprotected`. A runner paused at `run.after_spawn` makes `act` `rejected` with `not_in_use`.
 - Snapshot deletion of a worktree: editing a tracked file at `act.snapshotted` gives `rejected` (`clean`) with nothing touched. At `act.checked`, edit a tracked file, create a file, and create `fuzz/corpus/seed`: all survive with their directories, are listed in `skipped_changed`, and the worktree keeps its `.git` (`git status` in it still works). At `act.checked`, replace an inspected subdirectory with a symbolic link to protected data: the protected data is intact and the subtree is listed as skipped. At `act.checked`, switch the worktree to another branch with the same tree: `expired` with nothing deleted, both for a worktree plan and for a `reclaim_dir` plan inside it (`act_snapshot::head_change_stops_deletion`). On Windows, `act` twice on the same plan reports `dry_run` both times.
 - Two `act` runs on one plan: pause the first at `act.locked`; the second returns `already_executed`.
+- Records: pause an appender at `record.opened`; two appends that would each rotate leave `records.jsonl` in place, and after the release the paused record is read back with the others.
 - Start boundary: a runner killed at `run.before_starting` runs the stage zero times and the Bash-level status is 137; an injected failure at `run.before_starting` or a failed spawn runs it once; a runner killed at `run.after_spawn` never reruns it.
 - Parent death: killing the runner's parent at `admission.waiting` leaves the stage unstarted and no reservation behind; killing it after `run.after_spawn`, with a grandchild that ignores SIGTERM, keeps the reservation until SIGKILL has emptied the group.
 - Signals: a stage killed by SIGTERM gives `bash -c` the same status and message with and without cardinal.

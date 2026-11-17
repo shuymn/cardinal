@@ -1,13 +1,25 @@
 //! Records (`docs/architecture.md` section 4.7): torn tails cost at most the torn line, and
-//! rotation keeps the newest records in order without losing or splitting lines.
+//! rotation keeps the newest records in order without losing or splitting lines, even with
+//! an appender paused between opening the file and writing.
+
+mod support;
 
 use std::io::Write;
 use std::sync::{Arc, Barrier};
+use std::time::{Duration, Instant};
 
 use cardinal::contract::{Record, RecordKind};
 use cardinal::record::{Recorder, read_all};
-use cardinal::state::{LockMode, StateDir, try_lock};
+use cardinal::state::{self, LockMode, StateDir, try_lock};
+use cardinal::testpoint::RECORD_OPENED;
 use proptest::prelude::*;
+use support::helper::{self, ChildGuard, Mode};
+use support::testpoints::TestPoints;
+
+#[test]
+fn helper() {
+    helper::run_if_requested();
+}
 
 fn state() -> (tempfile::TempDir, StateDir) {
     let dir = tempfile::tempdir().unwrap();
@@ -146,17 +158,18 @@ fn keep_one_drops_the_full_file() {
 }
 
 #[test]
-fn busy_rotation_lock_skips_rotation() {
+fn rotation_waits_for_open_appenders() {
     let (_dir, state) = state();
     let recorder = Recorder::new(&state, 10, 4);
-    let held = try_lock(&state.rotate_lock(), LockMode::Exclusive)
+    // An appender between opening the file and writing.
+    let held = try_lock(&state.records_lock(), LockMode::Shared)
         .unwrap()
         .unwrap();
     recorder.append(&numbered(&recorder, 0, 0)).unwrap();
     recorder.append(&numbered(&recorder, 1, 0)).unwrap();
     assert!(
         !state.rotated_records(1).exists(),
-        "another appender is rotating"
+        "rotation is left to a later append"
     );
     drop(held);
     recorder.append(&numbered(&recorder, 2, 0)).unwrap();
@@ -173,6 +186,74 @@ fn busy_rotation_lock_skips_rotation() {
 }
 
 #[test]
+fn append_gives_up_while_a_rotation_holds_the_lock() {
+    let (_dir, state) = state();
+    let recorder = Recorder::new(&state, 1 << 20, 4);
+    let held = try_lock(&state.records_lock(), LockMode::Exclusive)
+        .unwrap()
+        .unwrap();
+    let start = Instant::now();
+    assert!(recorder.append(&numbered(&recorder, 0, 0)).is_err());
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "the append waits a bounded time"
+    );
+    assert!(!state.records_file().exists(), "nothing is written");
+    drop(held);
+    recorder.append(&numbered(&recorder, 1, 0)).unwrap();
+    assert_eq!(
+        read_all(&state)
+            .unwrap()
+            .iter()
+            .map(seq)
+            .collect::<Vec<_>>(),
+        [1]
+    );
+}
+
+#[test]
+fn a_paused_appender_loses_nothing_across_two_rotations() {
+    let (dir, state) = state();
+    // Every append exceeds the limit, and with keep = 2 a second rotation replaces
+    // records.1.jsonl: an appender writing through a descriptor opened before both would
+    // write into a removed file.
+    let (max_bytes, keep) = (1, 2);
+    let recorder = Recorder::new(&state, max_bytes, keep);
+    recorder.append(&numbered(&recorder, 0, 0)).unwrap();
+    assert!(state.rotated_records(1).exists());
+
+    let points = TestPoints::new();
+    let mut command = helper::command(&Mode::Append {
+        state: dir.path().to_path_buf(),
+        seq: 1,
+        max_bytes,
+        keep,
+    });
+    points.apply(&mut command, &[RECORD_OPENED], None);
+    let mut paused = ChildGuard::new(command.spawn().unwrap());
+    points.wait_reached(RECORD_OPENED, paused.id(), Duration::from_secs(30));
+
+    // Two appends that would each rotate.
+    recorder.append(&numbered(&recorder, 2, 0)).unwrap();
+    recorder.append(&numbered(&recorder, 3, 0)).unwrap();
+    assert_eq!(
+        state::read_jsonl::<Record>(&state.records_file())
+            .unwrap()
+            .iter()
+            .map(seq)
+            .collect::<Vec<_>>(),
+        [2, 3],
+        "no rotation while the paused appender holds the file"
+    );
+
+    points.release(RECORD_OPENED);
+    let status = paused.child().wait().unwrap();
+    assert!(status.success(), "the paused append failed: {status}");
+    let seqs: Vec<u64> = read_all(&state).unwrap().iter().map(seq).collect();
+    assert_eq!(seqs, [2, 3, 1], "the paused record survives");
+}
+
+#[test]
 fn concurrent_appenders_with_rotation_never_split_lines() {
     let (_dir, state) = state();
     let writers: u64 = 8;
@@ -186,9 +267,7 @@ fn concurrent_appenders_with_rotation_never_split_lines() {
                 let recorder = Recorder::new(&state, 16 * 1024, 64);
                 barrier.wait();
                 for n in 0..per_writer {
-                    // A failed rotation (a rename racing another appender) is reported
-                    // after the line is written; records only must not be lost or torn.
-                    let _ = recorder.append(&numbered(&recorder, n, writer));
+                    recorder.append(&numbered(&recorder, n, writer)).unwrap();
                 }
             })
         })
