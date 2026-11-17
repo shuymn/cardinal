@@ -52,6 +52,12 @@ fn named_operations_work_inside_the_fixture() {
         Some("x")
     );
     assert_eq!(fixture.config_get(&repo, "branch.main.missing"), None);
+    let url = "https://github.com/acme/app.git";
+    fixture.remote_add_url(&repo, "github", url);
+    assert_eq!(
+        fixture.config_get(&repo, "remote.github.url").as_deref(),
+        Some(url)
+    );
 }
 
 #[test]
@@ -110,6 +116,14 @@ fn names_that_read_as_options_or_paths_are_refused() {
     });
     refuses("a space in a tag", || fixture.tag(&repo, "a b"));
     refuses("an option as a path", || fixture.add(&repo, "--all"));
+    for url in [
+        "/tmp/remote.git",
+        "file:///tmp/remote.git",
+        "ext::sh -c x",
+        "https://",
+    ] {
+        refuses(url, || fixture.remote_add_url(&repo, "origin", url));
+    }
 }
 
 #[test]
