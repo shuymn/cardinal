@@ -174,8 +174,8 @@ act = false        # report only until set to true
 4. From acceptance until completion or cancellation, the runner holds the worktree's in-use lock. The worktree is not reclaimed while the job waits.
 5. The runner decides on a reservation inside the admission lock.
    - If resources are free, it reserves them and starts the child process.
-   - If not, it waits inside the runner. The maximum synchronous wait is kept shorter than the Bash tool timeout minus the expected run time. When the child starts after a wait, the runner appends one line such as `[cardinal] Ran after waiting 40 s` to the end of the output.
-   - If the wait is expected to exceed the maximum synchronous wait, or the actual wait reaches it, the runner registers the command as an accepted job and returns the job ID and how to collect the result **as normal output**. The job runs as soon as resources free up. A retry with the same tool call ID binds to the same job, so it never runs twice.
+   - If not, it waits inside the runner. The maximum synchronous wait is kept shorter than the Bash tool timeout minus the expected run time. The wait is recorded and shown by `explain`; nothing is added to the command's output.
+   - If the wait is expected to exceed the maximum synchronous wait, or the actual wait reaches it, the runner registers the command as an accepted job and returns the job ID and how to collect the result **as normal output**. Apart from reporting its own failure (G4), this reply is the only output `cardinal` adds to a command. The job runs as soon as resources free up. A retry with the same tool call ID binds to the same job, so it never runs twice.
 6. The runner supervises the child process group. When it exits, the runner releases the reservation and the in-use lock and records measurements (duration, peak memory, disk growth).
 7. Pushing to the control plane happens after execution, and failures are ignored.
 
