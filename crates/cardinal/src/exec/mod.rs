@@ -301,7 +301,13 @@ impl LocalExecutor {
                 .name("cardinal-child".into())
                 .spawn(move || {
                     loop {
-                        let exited = os::unix::wait_unreaped(pid, stops).unwrap_or(true);
+                        let until = if stops {
+                            os::unix::Until::EndedOrStopped
+                        } else {
+                            os::unix::Until::Ended
+                        };
+                        let exited = os::unix::wait_unreaped(pid, until)
+                            .map_or(true, |state| state == os::unix::ChildState::Ended);
                         let _ = tx.send(Event::ChildChanged);
                         if exited {
                             return;
@@ -425,8 +431,8 @@ impl LocalRunning {
         let mut killed = false;
         loop {
             if !exited {
-                match os::unix::child_exited(pid) {
-                    Ok(found) => exited = found,
+                match os::unix::wait_unreaped(pid, os::unix::Until::Now) {
+                    Ok(state) => exited = state == os::unix::ChildState::Ended,
                     Err(err) => {
                         return ExecOutcome::InfraFailure(format!(
                             "cannot wait for the command: {err}"
@@ -436,7 +442,7 @@ impl LocalRunning {
             }
             if !exited
                 && self.group.is_none()
-                && let Ok(Some(sig)) = os::unix::child_stopped(pid)
+                && let Ok(Some(sig)) = os::unix::take_stop(pid)
             {
                 // Once the parent is gone nobody would continue the runner; the child only
                 // goes on.

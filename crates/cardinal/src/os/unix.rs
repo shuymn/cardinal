@@ -1,16 +1,30 @@
-//! Process groups and signals on Unix (`docs/architecture.md` sections 4.5 and 5.5).
+//! Process groups, children, and signals on Unix (`docs/architecture.md` sections 4.5 and
+//! 5.5): the one implementation of these primitives in the product.
 //!
-//! The runner leads its job's process group, so the group ID is the runner's PID and is known
-//! before any reservation names it. A group is empty when `kill(-pgid, 0)` fails with `ESRCH`.
+//! - **Process groups:** [`lead_group`] and [`rejoin_group`] move this process; [`group_exists`]
+//!   (`kill(-pgid, 0)`; only `ESRCH` means empty), [`pgid_of`], [`group_members`], and
+//!   [`other_group_members`] read; [`signal_group`] signals a whole group.
+//! - **Children:** [`wait_unreaped`] reports a child's [`ChildState`] without reaping it, and
+//!   never takes a stopped child for an ended one (macOS reports a stop even to a wait for
+//!   exits alone); [`take_stop`] takes a stop report; [`reap`] reaps an ended child.
+//! - **Signals:** [`signal_process`]; [`watch_signals`] and [`ignored`] for handlers;
+//!   [`stop_self`] and [`die_by_signal`] for this process.
+//!
+//! **Signal an ID only while it is pinned.** A child's PID is not reused while the child is
+//! unreaped, which [`wait_unreaped`] keeps it; a group's ID is not reused while the group has a
+//! member, and only the process with that PID can create a group with that ID, so it is pinned
+//! while its leader is this process or an unreaped child of it. Checking an ID and then
+//! signalling it is no substitute: the process can end and its ID pass to another in between.
+//!
 //! Signal handlers are installed through `signal-hook`; a handler is reset to the default
-//! action by `exec`, so the stage starts with default dispositions for the handled signals. A
-//! signal the caller ignores gets no handler and stays ignored for the stage.
+//! action by `exec`, so a child starts with default dispositions for the handled signals. A
+//! signal this process ignores gets no handler and stays ignored for its children.
 
 use std::io::{self, Read as _};
 use std::sync::Arc;
 use std::time::Duration;
 
-use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, WaitIdStatus, WaitOptions};
+use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, WaitOptions};
 
 use super::{Detail, ProcessInfo, ProcessTable};
 
@@ -91,12 +105,13 @@ pub fn pgid_of(raw_pid: u32) -> Option<u32> {
         .map(raw)
 }
 
-/// Sends `sig` to every member of group `pgid`, this process included if it is a member.
+/// Sends `sig` to every member of group `pgid`, this process included if it is a member. The
+/// ID must be pinned (see the module documentation).
 pub fn signal_group(pgid: u32, sig: i32) -> io::Result<()> {
     rustix::process::kill_process_group(pid(pgid)?, signal(sig)?).map_err(Into::into)
 }
 
-/// Sends `sig` to process `pid`.
+/// Sends `sig` to process `pid`. The PID must be pinned (see the module documentation).
 pub fn signal_process(raw_pid: u32, sig: i32) -> io::Result<()> {
     rustix::process::kill_process(pid(raw_pid)?, signal(sig)?).map_err(Into::into)
 }
@@ -126,55 +141,67 @@ pub fn other_group_members(pgid: u32) -> io::Result<Vec<ProcessInfo>> {
     Ok(members)
 }
 
-/// Whether a `waitid` report is the end of the child. macOS also reports a stopped child to
-/// a wait for `WEXITED` alone.
-fn ended(status: &WaitIdStatus) -> bool {
-    status.exited() || status.killed() || status.dumped()
+/// A child's state as [`wait_unreaped`] reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChildState {
+    /// Neither ended nor stopped with a report pending.
+    Running,
+    /// Stopped by this signal, and the report not taken yet ([`take_stop`]).
+    Stopped(i32),
+    /// Exited or killed by a signal; [`reap`] it.
+    Ended,
 }
 
-/// Whether child `pid` has exited, without waiting and without reaping it, so its PID stays
-/// reserved while the caller may still signal it. Fails when the child cannot be waited for,
-/// for example because the parent ignores SIGCHLD and the system reaped the child already.
-pub fn child_exited(raw_pid: u32) -> io::Result<bool> {
-    let id = pid(raw_pid)?;
-    loop {
-        match rustix::process::waitid(
-            WaitId::Pid(id),
-            WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG,
-        ) {
-            Ok(status) => return Ok(status.is_some_and(|s| ended(&s))),
-            Err(rustix::io::Errno::INTR) => {}
-            Err(err) => return Err(err.into()),
-        }
-    }
+/// How long [`wait_unreaped`] waits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Until {
+    /// Not at all.
+    Now,
+    /// Until the child has ended; stops do not count.
+    Ended,
+    /// Until the child has ended or a stop report is pending.
+    EndedOrStopped,
 }
 
-/// Blocks until child `pid` has exited, or, with `stops`, stopped, without reaping it or
-/// taking the report, so no PID is reused while the caller may signal it. Returns whether the
-/// child exited. Fails when the child cannot be waited for, for example because the parent
-/// ignores SIGCHLD and the system reaped the child already.
-pub fn wait_unreaped(raw_pid: u32, stops: bool) -> io::Result<bool> {
+/// The state of child `pid`, waiting as `until` says, without reaping the child or taking a
+/// report, so the child's PID, and a group it leads, stay pinned. A stopped child is never
+/// reported as ended. Fails when the child cannot be waited for, for example because this
+/// process ignores SIGCHLD and the system reaped the child already.
+pub fn wait_unreaped(raw_pid: u32, until: Until) -> io::Result<ChildState> {
     let id = pid(raw_pid)?;
-    let mut options = WaitIdOptions::EXITED | WaitIdOptions::NOWAIT;
-    if stops {
-        options |= WaitIdOptions::STOPPED;
-    }
+    let options = WaitIdOptions::EXITED
+        | WaitIdOptions::NOWAIT
+        | match until {
+            Until::Now => WaitIdOptions::STOPPED | WaitIdOptions::NOHANG,
+            Until::Ended => WaitIdOptions::empty(),
+            Until::EndedOrStopped => WaitIdOptions::STOPPED,
+        };
     loop {
-        match rustix::process::waitid(WaitId::Pid(id), options) {
-            Ok(Some(status)) if ended(&status) => return Ok(true),
-            Ok(Some(status)) if stops && status.stopped() => return Ok(false),
-            // A report that was not asked for stays until the child changes again; look again
-            // later instead of spinning on it.
-            Ok(_) => std::thread::sleep(Duration::from_millis(100)),
-            Err(rustix::io::Errno::INTR) => {}
+        let state = match rustix::process::waitid(WaitId::Pid(id), options) {
+            Ok(Some(status)) if status.exited() || status.killed() || status.dumped() => {
+                ChildState::Ended
+            }
+            Ok(Some(status)) => status
+                .stopping_signal()
+                .map_or(ChildState::Running, ChildState::Stopped),
+            Ok(None) => ChildState::Running,
+            Err(rustix::io::Errno::INTR) => continue,
             Err(err) => return Err(err.into()),
+        };
+        match (until, state) {
+            (Until::Now, _)
+            | (_, ChildState::Ended)
+            | (Until::EndedOrStopped, ChildState::Stopped(_)) => return Ok(state),
+            // A pending stop report stays until the child changes again; look again later
+            // instead of spinning on it.
+            _ => std::thread::sleep(Duration::from_millis(100)),
         }
     }
 }
 
 /// The signal that stopped child `pid`, if it stopped and that was not reported yet; takes
-/// the report. Never waits.
-pub fn child_stopped(raw_pid: u32) -> io::Result<Option<i32>> {
+/// the report, so the stop is reported once. Never waits.
+pub fn take_stop(raw_pid: u32) -> io::Result<Option<i32>> {
     let id = pid(raw_pid)?;
     loop {
         match rustix::process::waitid(
@@ -212,7 +239,7 @@ pub enum ChildEnd {
     Signaled(i32),
 }
 
-/// Waits for child `pid` to end and reaps it.
+/// Waits for child `pid` to end and reaps it; its PID is free for reuse afterwards.
 pub fn reap(raw_pid: u32) -> io::Result<ChildEnd> {
     let id = pid(raw_pid)?;
     loop {
