@@ -15,6 +15,8 @@ use std::ffi::{OsStr, OsString};
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 use std::process::{ChildStderr, ChildStdin, ChildStdout, ExitStatus, Output, Stdio};
+#[cfg(unix)]
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
@@ -175,11 +177,29 @@ impl Scope {
         )]
         let mut inner = std::process::Command::new(program);
         inner.env_clear().envs(self.env()).current_dir(cwd);
+        #[cfg(unix)]
+        let highest = Arc::new(AtomicI32::new(2));
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            let highest = Arc::clone(&highest);
+            // SAFETY: the closure runs in the child between fork and exec. It loads an integer
+            // and makes system calls that only read and set descriptor flags, all
+            // async-signal-safe, and allocates nothing.
+            unsafe {
+                inner.pre_exec(move || {
+                    unix::close_others_on_exec(highest.load(Ordering::Relaxed));
+                    Ok(())
+                });
+            }
+        }
         Command {
             inner,
             registry: Arc::clone(&self.registry),
             #[cfg(unix)]
             group: Group::New,
+            #[cfg(unix)]
+            highest,
             stdin_set: false,
             stdout_set: false,
             stderr_set: false,
@@ -238,6 +258,10 @@ pub struct Command {
     registry: Arc<Registry>,
     #[cfg(unix)]
     group: Group,
+    /// The highest descriptor this process held when the child last started, for the child's
+    /// `pre_exec` (see `unix::close_others_on_exec`).
+    #[cfg(unix)]
+    highest: Arc<AtomicI32>,
     stdin_set: bool,
     stdout_set: bool,
     stderr_set: bool,
@@ -417,7 +441,8 @@ impl Command {
             }
             Group::Session => {}
         }
-        unix::close_others_on_exec();
+        self.highest
+            .store(unix::highest_descriptor(), Ordering::Relaxed);
         #[expect(
             clippy::disallowed_methods,
             reason = "the spawn API: the one place tests start a process"
@@ -893,19 +918,43 @@ mod unix {
         let _ = rustix::process::kill_process_group(pid(raw), Signal::KILL);
     }
 
-    /// Marks every descriptor of this process past the standard streams close-on-exec, so a
-    /// child gets only the streams the test gives it: none that whatever started the test run
-    /// left open, which the child would otherwise hold as its own. The standard library opens
-    /// its descriptors close-on-exec, and a child's streams are set up after the fork.
-    pub(super) fn close_others_on_exec() {
-        let fds: Vec<i32> = std::fs::read_dir("/dev/fd")
+    /// The highest descriptor this process holds, listed from `/dev/fd`; no flag changes.
+    pub(super) fn highest_descriptor() -> i32 {
+        std::fs::read_dir("/dev/fd")
             .expect("list this process's descriptors")
             .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
-            .filter(|&fd| fd > 2)
-            .collect();
-        for raw in fds {
-            // SAFETY: only the descriptor flags of `raw` are read and set; one closed since the
-            // listing (such as the listing's own) fails with EBADF.
+            .max()
+            .unwrap_or(2)
+    }
+
+    /// Run in a child between fork and exec: marks every descriptor from 3 up close-on-exec,
+    /// so the child keeps only the standard streams set up for it, never a descriptor that
+    /// whatever started the test run left open. The test process's own flags never change.
+    /// With `close_range` (Linux 5.11 and later) one call covers every descriptor; otherwise
+    /// each one up to `highest`, the highest the test process held when the child started:
+    /// the descriptors it inherited are among those, and the ones it opened since are
+    /// close-on-exec already, as the standard library opens them. Async-signal-safe: system
+    /// calls only, nothing allocated.
+    pub(super) fn close_others_on_exec(highest: i32) {
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: `close_range` with `CLOSE_RANGE_CLOEXEC` closes nothing; it only sets the
+            // close-on-exec flag of the descriptors in the range.
+            let set = unsafe {
+                libc::syscall(
+                    libc::SYS_close_range,
+                    3_u32,
+                    u32::MAX,
+                    libc::CLOSE_RANGE_CLOEXEC,
+                )
+            };
+            if set == 0 {
+                return;
+            }
+        }
+        for raw in 3..=highest {
+            // SAFETY: only the descriptor flags of `raw` are read and set; a number that is
+            // not open fails with EBADF.
             let fd = unsafe { rustix::fd::BorrowedFd::borrow_raw(raw) };
             if let Ok(flags) = rustix::io::fcntl_getfd(fd) {
                 let _ = rustix::io::fcntl_setfd(fd, flags | rustix::io::FdFlags::CLOEXEC);
@@ -991,6 +1040,31 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::Scope;
+
+    /// A child does not get a descriptor of this process that is not close-on-exec, and
+    /// starting it leaves that descriptor's flags as they were.
+    #[cfg(unix)]
+    #[test]
+    fn a_child_starts_without_the_parents_descriptors_and_leaves_their_flags() {
+        use std::os::fd::{AsFd as _, AsRawFd as _};
+
+        use rustix::io::{FdFlags, fcntl_getfd, fcntl_setfd};
+
+        let scope = Scope::new();
+        let file = std::fs::File::open(scope.root()).expect("open the root");
+        let fd = file.as_fd();
+        fcntl_setfd(fd, fcntl_getfd(fd).unwrap() - FdFlags::CLOEXEC).unwrap();
+        let raw = fd.as_raw_fd();
+        let status = scope
+            .shell(&format!("[ ! -e /dev/fd/{raw} ]"), scope.root())
+            .status()
+            .expect("run the shell");
+        assert!(status.success(), "the child holds descriptor {raw}");
+        assert!(
+            !fcntl_getfd(fd).unwrap().contains(FdFlags::CLOEXEC),
+            "the parent's descriptor flags changed"
+        );
+    }
 
     /// A child that has not exited by the deadline is killed, and the result says so.
     #[cfg(unix)]
