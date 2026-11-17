@@ -31,6 +31,9 @@ const LIFETIME: Duration = Duration::from_secs(60);
 pub enum Mode {
     /// Sleep, then exit.
     Sleep,
+    /// Write this process's PID to `out`, then sleep: once `out` holds the PID, this process
+    /// is past its `execve`.
+    Pid { out: PathBuf },
     /// Exit with status 0 after half a second, long enough to be seen running.
     Exit,
     /// Optionally take an exclusive lock on `lock`, start a sleeping grandchild in a process
@@ -69,6 +72,10 @@ pub fn run_if_requested() {
     let args: Vec<String> = request.collect();
     match mode.as_str() {
         "sleep" => std::thread::sleep(LIFETIME),
+        "pid" => {
+            std::fs::write(&args[0], std::process::id().to_string()).expect("write the pid");
+            std::thread::sleep(LIFETIME);
+        }
         "exit" => std::thread::sleep(Duration::from_millis(500)),
         "spawn" => {
             let lock = (!args[2].is_empty()).then(|| {
@@ -147,6 +154,7 @@ pub fn command(scope: &Scope, mode: &Mode, cwd: &Path) -> Command {
     let exe = std::env::current_exe().expect("current test binary");
     let (name, args): (&str, Vec<String>) = match mode {
         Mode::Sleep => ("sleep", vec![]),
+        Mode::Pid { out } => ("pid", vec![out.to_string_lossy().into_owned()]),
         Mode::Exit => ("exit", vec![]),
         Mode::Spawn {
             ready,

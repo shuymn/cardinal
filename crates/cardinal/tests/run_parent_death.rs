@@ -7,18 +7,24 @@
 mod runner_support;
 mod support;
 
+#[test]
+fn helper() {
+    support::helper::run_if_requested();
+}
+
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use cardinal::admission::{list_reservations, recovery_pass};
 use cardinal::config::HostConfig;
 use cardinal::contract::{DerivedState, RecordKind};
-use cardinal::os::unix::{SIGCONT, signal_process};
+use cardinal::os::unix::{SIGCONT, SIGSTOP, signal_process};
 use cardinal::testpoint::{ADMISSION_WAITING, RUN_AFTER_SPAWN, RUN_BEFORE_STARTING};
 use cardinal_test_support::Child;
 use cardinal_test_support::process::{GroupGuard, PidGuard, is_stopped, wait_for, wait_for_file};
 use cardinal_test_support::pty::Pty;
 use runner_support::{Env, WAIT, wait_gone};
+use support::helper::{self, Mode};
 
 #[test]
 fn parent_exit_before_the_spawn_leaves_nothing() {
@@ -199,9 +205,6 @@ fn a_stopped_runner_cancels_once_continued_and_leaves_its_group_alone() {
         let env = Env::with_budget(1);
         let job = StoppedJob::start(&env, path, Caller::Anchored, "");
         let sibling = job.member.expect("an anchored group has a stopped member");
-        wait_for("the sibling to stop", WAIT, || {
-            is_stopped(sibling).then_some(())
-        });
 
         PidGuard::new(job.parent).kill();
         wait_orphaned(job.runner, job.parent);
@@ -247,11 +250,11 @@ fn orphaning_a_stopped_runner_cancels_its_stage() {
 /// shell leads the session and gives the parent a group of its own, as it gives a job.
 #[derive(Clone, Copy)]
 enum Caller {
-    /// The job is a pipeline whose second command, a stopped `sleep`, stays in the parent's
-    /// group. That member's parent, the session leader, is in another group of the session, so
-    /// the group does not become orphaned when the parent exits. A member whose parent is this
-    /// test would not do on every host: when this test runs in launchd's session, macOS
-    /// orphans the group once the runner, adopted by launchd, exits.
+    /// The job is a pipeline whose second command, a helper this test stops, stays in the
+    /// parent's group. That member's parent, the session leader, is in another group of the
+    /// session, so the group does not become orphaned when the parent exits. A member whose
+    /// parent is this test would not do on every host: when this test runs in launchd's
+    /// session, macOS orphans the group once the runner, adopted by launchd, exits.
     Anchored,
     /// Once the parent exits, no member of the group has a parent in another group of the
     /// session, so the group becomes orphaned wherever the runner is adopted (a container's
@@ -292,11 +295,18 @@ impl StoppedJob {
         // background so the shell never hands it a terminal, a group of its own. The parent's
         // stdout is /dev/null, as is the leader's.
         let job = match caller {
-            Caller::Anchored => format!(
-                "set -m; \"$0\" \"$@\" >/dev/null | sleep 60 & \
-                 kill -STOP $!; echo $! > '{}'; exec sleep 60",
-                member_file.display()
-            ),
+            Caller::Anchored => {
+                let out = member_file.clone();
+                let member = helper::command(env.scope(), &Mode::Pid { out }, &env.worktree());
+                let words: Vec<String> = std::iter::once(member.get_program())
+                    .chain(member.get_args())
+                    .map(quoted)
+                    .collect();
+                format!(
+                    "set -m; \"$0\" \"$@\" >/dev/null | {} & exec sleep 60",
+                    words.join(" ")
+                )
+            }
             Caller::Session => "set -m; \"$0\" \"$@\" >/dev/null & wait $!".to_owned(),
         };
         let mut leader = env.in_worktree("bash");
@@ -324,14 +334,22 @@ impl StoppedJob {
             Some(leader.id()),
             "{path}"
         );
+        // The member writes its PID once it runs the helper. Stopping it sooner could miss:
+        // macOS drops a stop signal that arrives while the process is in `execve`.
         let member = matches!(caller, Caller::Anchored).then(|| {
-            wait_for("the member PID", WAIT, || {
+            let member = wait_for("the member PID", WAIT, || {
                 std::fs::read_to_string(&member_file)
                     .ok()?
                     .trim()
                     .parse()
                     .ok()
-            })
+            });
+            // The leader, `sleep` by now, never reaps it, so the PID is still the member's.
+            signal_process(member, SIGSTOP).unwrap();
+            wait_for("the member to stop", WAIT, || {
+                is_stopped(member).then_some(())
+            });
+            member
         });
         wait_for("the runner to stop", WAIT, || {
             is_stopped(runner).then_some(())
@@ -390,6 +408,12 @@ impl StoppedJob {
         let finished = env.records_of(RecordKind::JobFinished);
         assert_eq!(finished[0].data["signal"], 15, "{path}: SIGTERM");
     }
+}
+
+/// `word` quoted for a POSIX shell.
+fn quoted(word: &std::ffi::OsStr) -> String {
+    let word = word.to_str().expect("a UTF-8 word");
+    format!("'{}'", word.replace('\'', r"'\''"))
 }
 
 /// `pid`'s state, for a failure message.
