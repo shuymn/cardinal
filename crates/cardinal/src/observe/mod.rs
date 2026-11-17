@@ -2,14 +2,38 @@
 //! worktree facts, merge evidence, ignored data, disk usage, and outlived processes
 //! (`docs/architecture.md` section 8).
 //!
-//! Owned by the observation work unit. The bodies are not written yet; every declared
-//! function returns `not_implemented`.
+//! Every fact is read fresh. A git or gh call that fails to start, exits with a status that
+//! carries no meaning for the fact, prints output that does not parse, or misses its
+//! deadline makes the fact `unknown`, never "safe". Observation writes nothing: git runs
+//! with `--no-optional-locks` and `GIT_OPTIONAL_LOCKS=0`, never `fetch`, and `inventory`
+//! never deletes reservations or signals processes.
 
+mod child;
+mod data;
+mod gh;
+mod git;
+
+use std::collections::BTreeMap;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
-use crate::config::Config;
-use crate::contract::{Error, Inventory, Repo, Worktree};
-use crate::state::StateDir;
+pub use child::{ChildError, Output, constructed_env};
+
+use crate::admission;
+use crate::config::{Config, Selection};
+use crate::contract::{
+    BaseRef, CheckResult, DerivedState, Error, ErrorCode, Facts, GhStatus, HostInfo, IgnoredClass,
+    IgnoredEntry, InUse, Inventory, InventorySchema, MergeEvidence, Os, Outlived, PrRef,
+    ReclaimSummary, Repo, ReservationView, Resources, ScopedError, SessionSnapshot, Tri, Worktree,
+};
+use crate::os::{Detail, ProcessTable};
+use crate::state::{Probe, StateDir, find_worktree_root, now_ms, probe, worktree_key};
+
+use data::DataPatterns;
+use git::ListedWorktree;
 
 /// `cardinal inventory` arguments.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -33,8 +57,7 @@ pub fn inventory(
     state: &StateDir,
     options: &InventoryOptions,
 ) -> Result<Inventory, Error> {
-    let _ = (config, state, options);
-    Err(Error::not_implemented("cardinal inventory"))
+    Observer::new(config).inventory(state, options)
 }
 
 /// Observes the worktree containing `path` from scratch; `plan` and `act` use it.
@@ -43,6 +66,928 @@ pub fn observe_worktree(
     state: &StateDir,
     path: &Path,
 ) -> Result<WorktreeObservation, Error> {
-    let _ = (config, state, path);
-    Err(Error::not_implemented("observe::observe_worktree"))
+    Observer::new(config).observe_worktree(state, path)
+}
+
+/// Runs `git --no-optional-locks -C <dir> <args>` with the constructed environment of
+/// section 8.1 and `[observe] git_timeout_ms`. This is the one way cardinal runs git.
+pub fn git<S: AsRef<OsStr>>(config: &Config, dir: &Path, args: &[S]) -> Result<Output, ChildError> {
+    Observer::new(config).git(dir, args)
+}
+
+/// Where observation reads reservations: `admission` in the product, a fake in tests of
+/// observation alone.
+pub trait Reservations: Sync {
+    /// Every reservation with its derived state. Read-only.
+    fn list(&self, state: &StateDir) -> Result<Vec<ReservationView>, Error>;
+}
+
+/// [`Reservations`] from `admission::list_reservations`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AdmissionReservations;
+
+impl Reservations for AdmissionReservations {
+    fn list(&self, state: &StateDir) -> Result<Vec<ReservationView>, Error> {
+        admission::list_reservations(state)
+    }
+}
+
+/// Observation with its inputs: the configuration, the environment git and gh children are
+/// built from, and the reservation source.
+pub struct Observer<'a> {
+    config: &'a Config,
+    env: Vec<(OsString, OsString)>,
+    reservations: &'a dyn Reservations,
+}
+
+/// Facts shared by every worktree of one inventory.
+struct Shared<'a> {
+    state: &'a StateDir,
+    /// `None` when the reservations could not be read.
+    reservations: Option<Vec<ReservationView>>,
+    /// `None` when the process table could not be read.
+    processes: Option<ProcessTable>,
+    sizes: bool,
+}
+
+/// Repository-level facts every worktree of the repository uses.
+struct RepoContext {
+    repo: Repo,
+    listed: Vec<ListedWorktree>,
+    patterns: DataPatterns,
+    /// `Err` when the open pull requests are unknown.
+    open_prs: Result<Vec<gh::OpenPr>, String>,
+}
+
+/// The history facts of one worktree.
+struct History {
+    merge_evidence: MergeEvidence,
+    merged_pr: Option<PrRef>,
+    unpushed: Tri,
+    open_pr: Tri,
+    gh_error: Option<String>,
+}
+
+/// What one worktree observation found, besides the worktree itself.
+struct WorktreeResult {
+    worktree: Worktree,
+    errors: Vec<ScopedError>,
+    gh_error: Option<String>,
+}
+
+impl<'a> Observer<'a> {
+    /// Observation with this process's environment and the admission reservations.
+    #[must_use]
+    pub fn new(config: &'a Config) -> Self {
+        Self {
+            config,
+            env: constructed_env(std::env::vars_os()),
+            reservations: &AdmissionReservations,
+        }
+    }
+
+    /// Builds the child environment from `inherited` instead of this process's environment.
+    #[must_use]
+    pub fn with_env(mut self, inherited: impl IntoIterator<Item = (OsString, OsString)>) -> Self {
+        self.env = constructed_env(inherited);
+        self
+    }
+
+    /// Reads reservations from `reservations`.
+    #[must_use]
+    pub fn with_reservations(mut self, reservations: &'a dyn Reservations) -> Self {
+        self.reservations = reservations;
+        self
+    }
+
+    /// See [`git`](fn@git).
+    pub fn git<S: AsRef<OsStr>>(&self, dir: &Path, args: &[S]) -> Result<Output, ChildError> {
+        let observe = &self.config.host.observe;
+        let mut command: Vec<OsString> =
+            vec!["--no-optional-locks".into(), "-C".into(), dir.into()];
+        command.extend(args.iter().map(|a| a.as_ref().to_os_string()));
+        child::run(
+            &observe.git,
+            &command,
+            &self.env,
+            None,
+            Duration::from_millis(observe.git_timeout_ms),
+        )
+    }
+
+    /// git that must exit 0; anything else is an error message.
+    fn git_ok<S: AsRef<OsStr>>(&self, dir: &Path, args: &[S]) -> Result<Output, String> {
+        let what = args.first().map_or("git".to_owned(), |a| {
+            format!("git {}", a.as_ref().to_string_lossy())
+        });
+        self.git(dir, args)
+            .map_err(|err| err.to_string())?
+            .success(&what)
+    }
+
+    fn gh(&self, args: &[String]) -> Result<Output, String> {
+        let observe = &self.config.host.observe;
+        let command: Vec<OsString> = args.iter().map(OsString::from).collect();
+        let out = child::run(
+            &observe.gh,
+            &command,
+            &self.env,
+            None,
+            Duration::from_millis(observe.gh_timeout_ms),
+        )
+        .map_err(|err| err.to_string())?;
+        out.success("gh")
+    }
+
+    /// `cardinal inventory`.
+    pub fn inventory(
+        &self,
+        state: &StateDir,
+        options: &InventoryOptions,
+    ) -> Result<Inventory, Error> {
+        let mut errors = Vec::new();
+        let shared = self.shared(state, options.sizes, &mut errors);
+        let host = Self::host_info(state, &mut errors);
+
+        let mut repos: Vec<Repo> = Vec::new();
+        for path in self.repo_paths(options) {
+            match self.repo_context(&path) {
+                Ok(ctx) => {
+                    if repos.iter().any(|r| r.common_dir == ctx.repo.common_dir) {
+                        continue;
+                    }
+                    let (repo, repo_errors) = self.observe_repo(ctx, &shared);
+                    errors.extend(repo_errors);
+                    repos.push(repo);
+                }
+                Err(message) => errors.push(scoped(&format!("repo:{}", path.display()), message)),
+            }
+        }
+
+        let (budget, reserved, reservations) =
+            budget_view(self.config, shared.reservations.as_deref());
+        let outlived = outlived(state, shared.processes.as_ref(), &mut errors);
+        Ok(Inventory {
+            schema: InventorySchema,
+            observed_ms: now_ms(),
+            host,
+            budget,
+            reserved,
+            reservations,
+            repos,
+            outlived,
+            errors,
+        })
+    }
+
+    /// Observes the worktree containing `path` from scratch.
+    pub fn observe_worktree(
+        &self,
+        state: &StateDir,
+        path: &Path,
+    ) -> Result<WorktreeObservation, Error> {
+        let root = find_worktree_root(path).ok_or_else(|| {
+            Error::new(
+                ErrorCode::NotFound,
+                format!("{} is not inside a git worktree", path.display()),
+            )
+        })?;
+        let ctx = self
+            .repo_context(&root)
+            .map_err(|message| Error::new(ErrorCode::Internal, message))?;
+        let index = ctx
+            .listed
+            .iter()
+            .position(|w| !w.bare && canonical(&w.path) == root)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorCode::NotFound,
+                    format!("git does not list {} as a worktree", root.display()),
+                )
+            })?;
+        let shared = self.shared(state, false, &mut Vec::new());
+        let result = self.observe_one(&ctx, index, &shared);
+        let mut repo = ctx.repo;
+        if let Some(message) = result.gh_error {
+            repo.gh = GhStatus::Unknown;
+            repo.gh_error.get_or_insert(message);
+        }
+        Ok(WorktreeObservation {
+            repo,
+            worktree: result.worktree,
+        })
+    }
+
+    fn shared<'s>(
+        &self,
+        state: &'s StateDir,
+        sizes: bool,
+        errors: &mut Vec<ScopedError>,
+    ) -> Shared<'s> {
+        // The process table is read before any git or gh child starts, so none of them can
+        // be mistaken for a process working inside a worktree.
+        let processes = ProcessTable::snapshot(Detail::all())
+            .map_err(|err| errors.push(scoped("processes", err.to_string())))
+            .ok();
+        let reservations = self
+            .reservations
+            .list(state)
+            .map_err(|err| errors.push(scoped("reservations", err.message)))
+            .ok();
+        Shared {
+            state,
+            reservations,
+            processes,
+            sizes,
+        }
+    }
+
+    fn host_info(state: &StateDir, errors: &mut Vec<ScopedError>) -> HostInfo {
+        let boot_s = crate::os::boot_time_s()
+            .map_err(|err| errors.push(scoped("host", err.to_string())))
+            .unwrap_or(0);
+        let os = if cfg!(target_os = "macos") {
+            Os::Macos
+        } else if cfg!(windows) {
+            Os::Windows
+        } else {
+            Os::Linux
+        };
+        HostInfo {
+            id: state.host_id().to_owned(),
+            hostname: crate::os::hostname().unwrap_or_default(),
+            os,
+            arch: std::env::consts::ARCH.to_owned(),
+            boot_s,
+        }
+    }
+
+    /// The main worktrees of profiles with `match.paths`, `[observe] repos`, and `--repo`, in
+    /// that order.
+    fn repo_paths(&self, options: &InventoryOptions) -> Vec<PathBuf> {
+        let profiles = self
+            .config
+            .profiles
+            .iter()
+            .filter_map(|p| p.matcher.as_ref())
+            .flat_map(|m| m.paths.iter().cloned());
+        let mut paths: Vec<PathBuf> = Vec::new();
+        for path in profiles
+            .chain(self.config.host.observe.repos.iter().cloned())
+            .chain(options.repos.iter().cloned())
+        {
+            let path = std::path::absolute(&path).unwrap_or(path);
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+        paths
+    }
+
+    /// Repository facts, read through the worktree at or containing `path`.
+    fn repo_context(&self, path: &Path) -> Result<RepoContext, String> {
+        let dir = dunce::canonicalize(path).map_err(|err| format!("{}: {err}", path.display()))?;
+        let out = self.git_ok(
+            &dir,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )?;
+        let common = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        let common_dir = canonical(Path::new(&common));
+        let out = self.git_ok(&dir, &["worktree", "list", "--porcelain", "-z"])?;
+        let listed = git::parse_worktree_list(&out.stdout)?;
+        let main_worktree = canonical(&listed[0].path);
+
+        // Exit 2 is "no such remote"; any other failure leaves the remote unknown.
+        let remote = match self.git(&dir, &["remote", "get-url", "origin"]) {
+            Ok(out) if out.code == Some(0) => {
+                Ok(Some(String::from_utf8_lossy(&out.stdout).trim().to_owned()))
+            }
+            Ok(out) if out.code == Some(2) => Ok(None),
+            Ok(out) => Err(format!(
+                "git remote get-url origin failed: {}",
+                out.stderr_line()
+            )),
+            Err(err) => Err(err.to_string()),
+        };
+        let remote_url = remote.as_ref().ok().and_then(Option::as_deref);
+        let selection: Selection<'_> = self.config.select(|profile| {
+            profile.matches_common_dir(&common_dir)
+                || remote_url.is_some_and(|url| profile.matches_remote(url))
+        });
+        let patterns = DataPatterns {
+            regenerable: selection
+                .regenerable()
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            protected: selection
+                .protected()
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        };
+        let base = self.base(&dir, selection.base());
+
+        let gh_host = child::lookup(&self.env, "GH_HOST").and_then(OsStr::to_str);
+        let github = remote_url.and_then(|url| gh::github_repo(url, gh_host));
+        let (gh_status, gh_error, open_prs) = match (&remote, &github) {
+            (_, Some(name)) => match self
+                .gh(&gh::open_args(name))
+                .and_then(|out| gh::parse_open(&out.stdout))
+            {
+                Ok(prs) => (GhStatus::Ok, None, Ok(prs)),
+                Err(message) => (GhStatus::Unknown, Some(message.clone()), Err(message)),
+            },
+            (Err(message), None) => (
+                GhStatus::Unknown,
+                Some(message.clone()),
+                Err(message.clone()),
+            ),
+            (Ok(_), None) => (
+                GhStatus::NotApplicable,
+                None,
+                Err("the origin remote is not a GitHub repository".to_owned()),
+            ),
+        };
+
+        Ok(RepoContext {
+            repo: Repo {
+                common_dir: display(&common_dir),
+                main_worktree: display(&main_worktree),
+                profiles: selection.names().into_iter().map(str::to_owned).collect(),
+                github,
+                base,
+                gh: gh_status,
+                gh_error,
+                worktrees: Vec::new(),
+            },
+            listed,
+            patterns,
+            open_prs,
+        })
+    }
+
+    /// `[git] base`, else the target of `refs/remotes/origin/HEAD`, with its commit.
+    fn base(&self, dir: &Path, configured: Option<&str>) -> Option<BaseRef> {
+        let name = if let Some(name) = configured {
+            name.to_owned()
+        } else {
+            let out = self
+                .git_ok(
+                    dir,
+                    &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+                )
+                .ok()?;
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        };
+        if name.is_empty() || name.starts_with('-') {
+            return None;
+        }
+        let spec = format!("{name}^{{commit}}");
+        let out = self
+            .git_ok(dir, &["rev-parse", "--verify", "--quiet", &spec])
+            .ok()?;
+        let oid = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        git::is_oid(&oid).then_some(BaseRef {
+            ref_name: name,
+            oid,
+        })
+    }
+
+    /// Observes every worktree of a repository, several at a time.
+    fn observe_repo(&self, ctx: RepoContext, shared: &Shared<'_>) -> (Repo, Vec<ScopedError>) {
+        let indexes: Vec<usize> = (0..ctx.listed.len())
+            .filter(|&i| !ctx.listed[i].bare)
+            .collect();
+        let results: Mutex<Vec<(usize, WorktreeResult)>> = Mutex::new(Vec::new());
+        let next = AtomicUsize::new(0);
+        let workers = std::thread::available_parallelism()
+            .map_or(1, std::num::NonZero::get)
+            .clamp(1, 8)
+            .min(indexes.len().max(1));
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| {
+                    loop {
+                        let n = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(&index) = indexes.get(n) else { break };
+                        let result = self.observe_one(&ctx, index, shared);
+                        results
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push((index, result));
+                    }
+                });
+            }
+        });
+        let mut results = results
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        results.sort_by_key(|(index, _)| *index);
+
+        let mut repo = ctx.repo;
+        let mut errors = Vec::new();
+        for (_, result) in results {
+            if let Some(message) = result.gh_error {
+                repo.gh = GhStatus::Unknown;
+                repo.gh_error.get_or_insert(message);
+            }
+            errors.extend(result.errors);
+            repo.worktrees.push(result.worktree);
+        }
+        (repo, errors)
+    }
+
+    /// Observes the worktree `ctx.listed[index]`.
+    fn observe_one(&self, ctx: &RepoContext, index: usize, shared: &Shared<'_>) -> WorktreeResult {
+        let listed = &ctx.listed[index];
+        let path = canonical(&listed.path);
+        let scope = format!("worktree:{}", path.display());
+        let mut errors = Vec::new();
+        let mut note = |message: String| errors.push(scoped(&scope, message));
+        let main = index == 0;
+
+        let managed_by = self
+            .config
+            .host
+            .observe
+            .managed
+            .iter()
+            .find(|m| path.starts_with(canonical(&m.root)))
+            .map(|m| m.app.clone())
+            .or_else(|| listed.locked.then(|| "git-lock".to_owned()));
+
+        let status = self
+            .git_ok(
+                &path,
+                &[
+                    "status",
+                    "--porcelain=v2",
+                    "-z",
+                    "--branch",
+                    "--untracked-files=all",
+                    "--ignored=matching",
+                ],
+            )
+            .and_then(|out| git::parse_status(&out.stdout))
+            .map_err(&mut note)
+            .ok();
+        let (head, branch, upstream) = match &status {
+            Some(s) => (s.head.clone(), s.branch.clone(), s.upstream.clone()),
+            None => (listed.head.clone(), listed.branch.clone(), None),
+        };
+        let head = head.filter(|h| git::is_oid(h));
+        let dirty = status.as_ref().map_or(Tri::Unknown, |s| tri(s.dirty));
+        let has_upstream = status
+            .as_ref()
+            .map_or(Tri::Unknown, |s| tri(s.upstream.is_some()));
+
+        let history = self.history(ctx, &path, head.as_deref(), branch.as_deref(), &mut note);
+
+        let (in_use, in_use_known) = in_use(&path, shared);
+
+        let ignored = status.as_ref().map_or_else(Vec::new, |s| {
+            ignored_entries(&path, &s.ignored, &ctx.patterns, shared.sizes)
+        });
+        let submodules = self
+            .tracked_nested_repository(&path)
+            .unwrap_or_else(|message| {
+                note(message);
+                Tri::Unknown
+            });
+
+        let facts = Facts {
+            dirty,
+            has_upstream,
+            unpushed: history.unpushed,
+            open_pr: history.open_pr,
+            merge_evidence: history.merge_evidence,
+            merged_pr: history.merged_pr,
+            in_use,
+        };
+        let worktree = Worktree {
+            path: display(&path),
+            main,
+            head,
+            branch,
+            upstream,
+            managed_by,
+            reclaim: ReclaimSummary::default(),
+            allocated_bytes: shared.sizes.then(|| data::allocated_bytes(&path)).flatten(),
+            facts,
+            ignored,
+        };
+        let checks = ReclaimInputs {
+            status_known: status.is_some(),
+            in_use_known,
+            tracked_nested: submodules,
+            plain_target: plain_target(&path),
+        };
+        let reclaim = reclaim_summary(&worktree, &checks);
+        WorktreeResult {
+            worktree: Worktree {
+                reclaim,
+                ..worktree
+            },
+            errors,
+            gh_error: history.gh_error,
+        }
+    }
+
+    /// Merge evidence, unpushed commits, and the open pull request of a worktree at `head`.
+    fn history(
+        &self,
+        ctx: &RepoContext,
+        path: &Path,
+        head: Option<&str>,
+        branch: Option<&str>,
+        note: &mut dyn FnMut(String),
+    ) -> History {
+        let base_ancestor = match (head, &ctx.repo.base) {
+            (Some(head), Some(base)) => {
+                match self.git(path, &["merge-base", "--is-ancestor", head, &base.oid]) {
+                    Ok(out) if out.code == Some(0) => Tri::Yes,
+                    Ok(out) if out.code == Some(1) => Tri::No,
+                    Ok(out) => {
+                        note(format!("git merge-base failed: {}", out.stderr_line()));
+                        Tri::Unknown
+                    }
+                    Err(err) => {
+                        note(err.to_string());
+                        Tri::Unknown
+                    }
+                }
+            }
+            _ => Tri::Unknown,
+        };
+
+        let mut gh_error = None;
+        // Looked up only without base ancestry; `None` when the answer is unknown.
+        let merged: Option<Option<PrRef>> = match (&ctx.repo.github, head) {
+            _ if base_ancestor == Tri::Yes => None,
+            (Some(repo), Some(head)) => match self
+                .gh(&gh::merged_args(repo, head))
+                .and_then(|out| gh::parse_merged(&out.stdout))
+            {
+                Ok(prs) => Some(gh::merged_pr_for(&prs, head).map(|pr| PrRef {
+                    number: pr.number,
+                    url: pr.url.clone(),
+                })),
+                Err(message) => {
+                    gh_error = Some(message);
+                    None
+                }
+            },
+            _ => None,
+        };
+        let (merge_evidence, merged_pr) = match (base_ancestor, merged) {
+            (Tri::Yes, _) => (MergeEvidence::BaseAncestor, None),
+            (_, Some(Some(pr))) => (MergeEvidence::MergedPr, Some(pr)),
+            (Tri::No, Some(None)) => (MergeEvidence::None, None),
+            _ => (MergeEvidence::Unknown, None),
+        };
+
+        let unpushed = match head {
+            Some(head) => match self
+                .git_ok(path, &["rev-list", "--count", head, "--not", "--remotes"])
+                .and_then(|out| {
+                    String::from_utf8_lossy(&out.stdout)
+                        .trim()
+                        .parse::<u64>()
+                        .map_err(|err| format!("unexpected git rev-list output: {err}"))
+                }) {
+                Ok(0) => Tri::No,
+                // The commits of a merged pull request's head exist on GitHub.
+                Ok(_) if merge_evidence == MergeEvidence::MergedPr => Tri::No,
+                Ok(_) => Tri::Yes,
+                Err(message) => {
+                    note(message);
+                    Tri::Unknown
+                }
+            },
+            None => Tri::Unknown,
+        };
+
+        let open_pr = match &ctx.open_prs {
+            Ok(prs) => tri(gh::open_pr_for(prs, branch, head).is_some()),
+            Err(_) => Tri::Unknown,
+        };
+        History {
+            merge_evidence,
+            merged_pr,
+            unpushed,
+            open_pr,
+            gh_error,
+        }
+    }
+
+    /// Whether a tracked submodule below the worktree has its own `.git` entry. Read only
+    /// when `.gitmodules` exists.
+    fn tracked_nested_repository(&self, path: &Path) -> Result<Tri, String> {
+        if std::fs::symlink_metadata(path.join(".gitmodules")).is_err() {
+            return Ok(Tri::No);
+        }
+        let out = self.git_ok(path, &["ls-files", "-z", "--stage"])?;
+        let nested = out
+            .stdout
+            .split(|&b| b == 0)
+            .filter_map(|entry| {
+                let text = std::str::from_utf8(entry).ok()?;
+                let (meta, file) = text.split_once('\t')?;
+                meta.starts_with("160000 ").then_some(file)
+            })
+            .any(|sub| std::fs::symlink_metadata(path.join(sub).join(".git")).is_ok());
+        Ok(tri(nested))
+    }
+}
+
+/// The ignored entries of the worktree at `root`, classified, with sizes of regenerable ones
+/// when `sizes` is set.
+fn ignored_entries(
+    root: &Path,
+    ignored: &[PathBuf],
+    patterns: &DataPatterns,
+    sizes: bool,
+) -> Vec<IgnoredEntry> {
+    ignored
+        .iter()
+        .map(|rel| {
+            let class = data::classify(root, rel, patterns);
+            let entry = root.join(rel);
+            let allocated_bytes = (sizes && class == IgnoredClass::Regenerable)
+                .then(|| data::allocated_bytes(&entry))
+                .flatten();
+            IgnoredEntry {
+                path: display(&entry),
+                class,
+                allocated_bytes,
+            }
+        })
+        .collect()
+}
+
+/// Whether a worktree is in use, and whether every source of that answer could be read: its
+/// in-use lock is held, a live or recovery-needed reservation names it, or a process other
+/// than this one works inside it.
+fn in_use(path: &Path, shared: &Shared<'_>) -> (InUse, bool) {
+    let key = worktree_key(path);
+    let mut known = true;
+    let lock_held = match probe(&shared.state.worktree_lock(&key)) {
+        Ok(Probe::Held) => true,
+        Ok(Probe::Free | Probe::Missing) => false,
+        Err(_) => {
+            known = false;
+            false
+        }
+    };
+    let jobs: Vec<String> = if let Some(list) = &shared.reservations {
+        list.iter()
+            .filter(|view| view.derived != DerivedState::Stale)
+            .filter(|view| {
+                view.reservation
+                    .worktree
+                    .as_ref()
+                    .is_some_and(|w| w.key == key)
+            })
+            .map(|view| view.reservation.job_id.clone())
+            .collect()
+    } else {
+        known = false;
+        Vec::new()
+    };
+    let me = crate::os::current_pid();
+    let process_inside = if let Some(table) = &shared.processes {
+        table.iter().any(|p| {
+            p.pid != me && !p.zombie && p.cwd.as_ref().is_some_and(|cwd| cwd.starts_with(path))
+        })
+    } else {
+        known = false;
+        false
+    };
+    let value = lock_held || !jobs.is_empty() || process_inside;
+    (InUse { value, jobs }, known)
+}
+
+/// What the reclaim summary needs beyond the worktree's facts.
+struct ReclaimInputs {
+    status_known: bool,
+    in_use_known: bool,
+    tracked_nested: Tri,
+    plain_target: CheckResult,
+}
+
+/// The whole-worktree checks of section 9.2 as observation sees them. A main worktree is
+/// never a candidate.
+fn reclaim_summary(worktree: &Worktree, inputs: &ReclaimInputs) -> ReclaimSummary {
+    let f = &worktree.facts;
+    let from_tri = |fact: Tri, pass_when: Tri| match fact {
+        Tri::Unknown => CheckResult::Unknown,
+        value if value == pass_when => CheckResult::Pass,
+        _ => CheckResult::Fail,
+    };
+    let any_class = |class: IgnoredClass| worktree.ignored.iter().any(|e| e.class == class);
+    let ignored_check = |class: IgnoredClass| {
+        if !inputs.status_known {
+            CheckResult::Unknown
+        } else if any_class(class) {
+            CheckResult::Fail
+        } else {
+            CheckResult::Pass
+        }
+    };
+    let observed = inputs.status_known
+        && [f.dirty, f.has_upstream, f.unpushed, f.open_pr]
+            .iter()
+            .all(|t| *t != Tri::Unknown)
+        && f.merge_evidence != MergeEvidence::Unknown;
+    let nested = match (
+        ignored_check(IgnoredClass::NestedRepository),
+        inputs.tracked_nested,
+    ) {
+        (CheckResult::Fail, _) | (_, Tri::Yes) => CheckResult::Fail,
+        (CheckResult::Unknown, _) | (_, Tri::Unknown) => CheckResult::Unknown,
+        _ => CheckResult::Pass,
+    };
+    let checks = [
+        (
+            "observed",
+            if observed {
+                CheckResult::Pass
+            } else {
+                CheckResult::Fail
+            },
+        ),
+        (
+            "not_in_use",
+            if f.in_use.value {
+                CheckResult::Fail
+            } else if inputs.in_use_known {
+                CheckResult::Pass
+            } else {
+                CheckResult::Unknown
+            },
+        ),
+        (
+            "not_managed",
+            if worktree.managed_by.is_some() {
+                CheckResult::Fail
+            } else {
+                CheckResult::Pass
+            },
+        ),
+        ("clean", from_tri(f.dirty, Tri::No)),
+        ("no_unpushed", from_tri(f.unpushed, Tri::No)),
+        ("no_open_pr", from_tri(f.open_pr, Tri::No)),
+        ("has_upstream", from_tri(f.has_upstream, Tri::Yes)),
+        ("plain_target", inputs.plain_target),
+        ("no_protected", ignored_check(IgnoredClass::Protected)),
+        (
+            "no_unclassifiable",
+            ignored_check(IgnoredClass::Unclassifiable),
+        ),
+        ("no_nested_repository", nested),
+        (
+            "merge_evidence",
+            match f.merge_evidence {
+                MergeEvidence::BaseAncestor | MergeEvidence::MergedPr => CheckResult::Pass,
+                MergeEvidence::None => CheckResult::Fail,
+                MergeEvidence::Unknown => CheckResult::Unknown,
+            },
+        ),
+    ];
+    let names = |want: CheckResult| -> Vec<String> {
+        checks
+            .iter()
+            .filter(|(_, result)| *result == want)
+            .map(|(name, _)| (*name).to_owned())
+            .collect()
+    };
+    let failed = names(CheckResult::Fail);
+    let unknown = names(CheckResult::Unknown);
+    ReclaimSummary {
+        candidate: !worktree.main && failed.is_empty() && unknown.is_empty(),
+        failed,
+        unknown,
+    }
+}
+
+/// `plain_target` for a worktree root: not a symbolic link, and on the same device as its
+/// parent (which also rules out a mount point). Windows has no device number in std, so the
+/// check is `unknown` there.
+fn plain_target(path: &Path) -> CheckResult {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return CheckResult::Unknown;
+    };
+    if meta.file_type().is_symlink() {
+        return CheckResult::Fail;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let Some(parent) = path.parent() else {
+            return CheckResult::Fail;
+        };
+        match std::fs::metadata(parent) {
+            Ok(parent) if parent.dev() == meta.dev() => CheckResult::Pass,
+            Ok(_) => CheckResult::Fail,
+            Err(_) => CheckResult::Unknown,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        CheckResult::Unknown
+    }
+}
+
+/// The budgets, the resources of live and recovery-needed reservations, and the reservations.
+fn budget_view(
+    config: &Config,
+    reservations: Option<&[ReservationView]>,
+) -> (Resources, Resources, Vec<ReservationView>) {
+    let mut reserved = Resources::new();
+    let list = reservations.unwrap_or_default().to_vec();
+    for view in list.iter().filter(|v| v.derived != DerivedState::Stale) {
+        for (name, amount) in &view.reservation.resources {
+            reserved
+                .entry(name.clone())
+                .and_modify(|sum| *sum = sum.saturating_add(amount.get()))
+                .or_insert(*amount);
+        }
+    }
+    (config.host.budget.clone(), reserved, list)
+}
+
+/// Processes of session snapshots that are still alive after their agent process ended.
+fn outlived(
+    state: &StateDir,
+    processes: Option<&ProcessTable>,
+    errors: &mut Vec<ScopedError>,
+) -> Vec<Outlived> {
+    let Some(table) = processes else {
+        return Vec::new();
+    };
+    let dir = state.sessions_dir();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(err) => {
+            errors.push(scoped("sessions", format!("{}: {err}", dir.display())));
+            return Vec::new();
+        }
+    };
+    let mut snapshots: BTreeMap<String, SessionSnapshot> = BTreeMap::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
+        match std::fs::read(&path)
+            .map_err(|err| err.to_string())
+            .and_then(|bytes| {
+                serde_json::from_slice::<SessionSnapshot>(&bytes).map_err(|err| err.to_string())
+            }) {
+            Ok(snapshot) => {
+                snapshots.insert(snapshot.session_id.clone(), snapshot);
+            }
+            // A snapshot removed meanwhile is simply gone.
+            Err(_) if !path.exists() => {}
+            Err(message) => errors.push(scoped(&format!("session:{}", path.display()), message)),
+        }
+    }
+    snapshots
+        .into_values()
+        .filter(|s| !table.is_alive(s.agent.pid, s.agent.start_s))
+        .filter_map(|s| {
+            let alive: Vec<_> = s
+                .processes
+                .into_iter()
+                .filter(|p| table.is_alive(p.pid, p.start_s))
+                .collect();
+            (!alive.is_empty()).then_some(Outlived {
+                session_id: s.session_id,
+                ended_ms: s.ended_ms,
+                processes: alive,
+            })
+        })
+        .collect()
+}
+
+fn tri(value: bool) -> Tri {
+    if value { Tri::Yes } else { Tri::No }
+}
+
+fn scoped(scope: &str, message: impl Into<String>) -> ScopedError {
+    ScopedError {
+        scope: scope.to_owned(),
+        message: message.into(),
+    }
+}
+
+/// The canonical form of `path` (without `\\?\` on Windows), or `path` itself when it does
+/// not exist.
+fn canonical(path: &Path) -> PathBuf {
+    dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn display(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
 }
