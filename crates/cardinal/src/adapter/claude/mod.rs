@@ -234,12 +234,17 @@ mod tests {
 
     use super::run_pre_tool_use;
 
+    /// On Windows the hook returns before it reads its input or configuration: input that
+    /// fails everywhere else passes there with empty output.
     #[test]
     fn windows_never_rewrites() {
-        let input = br#"{"tool_name":"Bash","tool_input":{"command":"make"}}"#;
-        let mut output = Vec::new();
+        let input = b"not json";
         let none = |_: &str| None;
+        let mut output = Vec::new();
         run_pre_tool_use(&mut &input[..], &mut output, true, &none, Instant::now()).unwrap();
+        assert_eq!(output, b"");
+        let mut output = Vec::new();
+        run_pre_tool_use(&mut &input[..], &mut output, false, &none, Instant::now()).unwrap_err();
         assert_eq!(output, b"");
     }
 
