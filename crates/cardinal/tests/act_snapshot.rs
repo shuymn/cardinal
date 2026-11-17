@@ -13,7 +13,6 @@ mod support;
 
 #[cfg(target_os = "linux")]
 use std::fmt::Write as _;
-#[cfg(unix)]
 use std::path::Path;
 use std::time::Duration;
 
@@ -232,7 +231,6 @@ fn act_with_binds(s: &Setup, flags: &[&str], plan: &str, binds: &[(&Path, &Path)
 
 /// A helper process (this test binary, see [`walk_if_requested`]) that runs `plan::walk` of
 /// `target` and writes what it found to `out`, a fresh file.
-#[cfg(unix)]
 fn walk_command(s: &Setup, worktree: &Path, target: &Path, out: &Path) -> std::process::Command {
     match std::fs::remove_file(out) {
         Err(err) if err.kind() != std::io::ErrorKind::NotFound => panic!("{err}"),
@@ -248,7 +246,6 @@ fn walk_command(s: &Setup, worktree: &Path, target: &Path, out: &Path) -> std::p
 }
 
 /// The mount and the entries a walk helper wrote to `out`.
-#[cfg(unix)]
 fn read_walk(out: &Path) -> (String, Vec<String>) {
     let doc: serde_json::Value = serde_json::from_slice(&std::fs::read(out).unwrap()).unwrap();
     let entries = doc["entries"]
@@ -277,7 +274,6 @@ fn walk_with_binds(
 
 /// Runs `plan::walk` of `target` in a helper paused at `point`, calls `change` once the
 /// helper has reached it, releases it, and returns the mount and the entries it found.
-#[cfg(unix)]
 fn walk_with_change_at(
     s: &Setup,
     worktree: &Path,
@@ -563,9 +559,36 @@ fn walk_lists_only_the_directories_it_recorded() {
     assert!(failed.is_empty(), "{failed:#?}");
 }
 
+/// A directory removed after `plan`'s walk checked it and before the walk lists it: the walk
+/// records it as it saw it and goes on to the next one.
+#[test]
+fn walk_records_a_directory_removed_before_it_is_listed() {
+    let s = Setup::new();
+    let wt = s.fx.path("removed-first");
+    write(&wt, "node_modules/a/index.js", "x");
+    write(&wt, "node_modules/b/index.js", "x");
+    let target = wt.join("node_modules");
+    // The walk pauses at its first directory below the target, `a`, before it opens it.
+    let (mount, entries) = walk_with_change_at(
+        &s,
+        &wt,
+        &target,
+        cardinal::testpoint::WALK_DIR_CHECKED,
+        || std::fs::remove_dir_all(target.join("a")).unwrap(),
+    );
+    assert_eq!(mount, "Same");
+    assert_eq!(
+        entries,
+        [
+            "node_modules/a",
+            "node_modules/b",
+            "node_modules/b/index.js"
+        ]
+    );
+}
+
 /// A directory removed after `plan`'s walk listed its parent, while the walk is below an
 /// earlier one: the walk records it as it saw it and goes on.
-#[cfg(unix)]
 #[test]
 fn walk_records_a_directory_removed_after_it_was_listed() {
     let s = Setup::new();

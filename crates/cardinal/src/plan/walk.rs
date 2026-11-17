@@ -285,8 +285,10 @@ fn walk_dir(
             };
         if enter {
             testpoint::hit(testpoint::WALK_DIR_CHECKED).map_err(io::Error::other)?;
-            match Listing::open(&path, &entry, on_mount) {
-                Ok(Some(below)) => pending.push(below.entries(&entry.rel)?.into_iter()),
+            let listed = Listing::open(&path, &entry, on_mount)
+                .and_then(|below| below.map(|below| below.entries(&entry.rel)).transpose());
+            match listed {
+                Ok(Some(below)) => pending.push(below.into_iter()),
                 // Replaced or removed since its entry was read: the entry stays as it was seen.
                 Ok(None) => {}
                 Err(err) if err.kind() == io::ErrorKind::NotFound => {}
