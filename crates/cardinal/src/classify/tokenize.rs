@@ -10,7 +10,7 @@ use std::ops::Range;
 use super::Stage;
 use super::words::{
     assigns_unsafe_name, changes_caller, is_assignment, is_precommand, is_refused_keyword,
-    names_table_element,
+    is_shell_command, names_table_element,
 };
 
 /// Why a command is left unrewritten as a whole.
@@ -674,14 +674,22 @@ fn finish(
     {
         return Err(Refusal::ChangesShell(word.to_owned()));
     }
-    // Arithmetic evaluates words such as zsh's `printf %d` and `shift` arguments, and an
-    // element assignment there defines a function or an alias as well.
-    if let Some(word) = builder.words.iter().find(|w| names_table_element(&w.bare)) {
-        return Err(Refusal::ChangesShell(command[word.span.clone()].to_owned()));
-    }
     let command_word = (assignments < builder.words.len()).then_some(assignments);
-    if let Some(i) = command_word {
-        check_command_position(command, &builder.words[i..])?;
+    let runs = match command_word {
+        Some(i) => check_command_position(command, &builder.words[i..])?,
+        None => None,
+    };
+    // The calling shell reads assignment words, and the arguments of its builtins, as names
+    // or arithmetic (an integer variable's value, zsh's `printf %d`, `shift`, `[ … -eq … ]`),
+    // where an element assignment defines a function or an alias. It reads the arguments of
+    // other commands as text only.
+    let read_words = if runs.is_some_and(is_shell_command) {
+        &builder.words[..]
+    } else {
+        &builder.words[..assignments]
+    };
+    if let Some(word) = read_words.iter().find(|w| names_table_element(&w.bare)) {
+        return Err(Refusal::ChangesShell(command[word.span.clone()].to_owned()));
     }
     Ok(Stage {
         index,
@@ -709,8 +717,12 @@ fn finish(
 /// Refuses keywords in command position, a command word that is not a literal (an expansion,
 /// a pattern, or a leading `~` can name any command, `eval` included), and builtins that can
 /// change what a later stage means or trace it (`eval`, `.`, `alias`, `trap`, `set -x`, …);
-/// each after quote removal and behind precommand modifiers (`command "eval" …`).
-fn check_command_position(command: &str, words: &[Word]) -> Result<(), Refusal> {
+/// each after quote removal and behind precommand modifiers (`command "eval" …`). Returns
+/// the command the stage runs behind its precommand modifiers, if it names one.
+fn check_command_position<'w>(
+    command: &str,
+    words: &'w [Word],
+) -> Result<Option<&'w str>, Refusal> {
     let first = &command[words[0].span.clone()];
     if is_refused_keyword(first) {
         return Err(Refusal::Keyword(first.to_owned()));
@@ -729,7 +741,7 @@ fn check_command_position(command: &str, words: &[Word]) -> Result<(), Refusal> 
             return Err(Refusal::ChangesShell(value.to_owned()));
         }
         if !is_precommand(value) {
-            break;
+            return Ok(Some(value));
         }
         // Skip the modifier's options, then look at the word it runs.
         i += 1;
@@ -741,5 +753,5 @@ fn check_command_position(command: &str, words: &[Word]) -> Result<(), Refusal> 
             i += 1;
         }
     }
-    Ok(())
+    Ok(None)
 }

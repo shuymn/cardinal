@@ -658,6 +658,14 @@ const CASES: &[Case] = &[
         0,
         0,
     ),
+    // Arguments of other commands are text, not assignments.
+    case(
+        "table_element_text",
+        "",
+        "probe -F 'functions[probe]=0' x",
+        1,
+        1,
+    ),
     // A leading `~` expands to `$HOME`, here `eval`.
     case(
         "tilde_command_word",

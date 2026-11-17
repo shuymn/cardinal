@@ -1119,6 +1119,19 @@ fn trace_of_another_classifier_has_no_profile_rule() {
     assert_eq!(found[0].skip, None);
 }
 
+/// The name of a table element in an argument of a command other than a builtin is text, so
+/// the stage is classified and wrapped as any other.
+#[test]
+fn table_element_text_in_arguments_still_wraps() {
+    let profiles = [profile(
+        "generic",
+        "[[rule]]\nid = \"g\"\ncommands = [\"grep\"]\nclass = \"c\"\n",
+    )];
+    let found = outcomes("grep -F 'functions[' code.txt", &profiles);
+    assert_eq!(found.len(), 1);
+    assert!(found[0].wrap(), "{found:?}");
+}
+
 /// Pattern characters that are quoted or escaped leave the command word a literal.
 #[test]
 fn quoted_pattern_characters_still_wrap() {
@@ -1260,6 +1273,16 @@ fn table_writers_refuse_the_command() {
         "shift 'functions[probe]=0'",
         "integer n=\"aliases[x]\"",
         "echo a && return BASH_ALIASES[x]=1",
+        // An integer variable's value is arithmetic.
+        "x='functions[probe]=0'",
+        "n='functions[probe]=0' make",
+        "typeset -i n='functions[probe]=0'",
+        // So are numeric arguments of zsh's builtins, behind modifiers too.
+        "[ 'functions[probe]=0' -eq 0 ]",
+        "exit 'functions[probe]=0'",
+        "ulimit 'functions[probe]=0'",
+        "command printf %d 'functions[probe]=0'",
+        "builtin shift 'aliases[x]=0'",
     ] {
         assert!(
             matches!(tokenize(command), Err(Refusal::ChangesShell(_))),
@@ -1283,6 +1306,11 @@ fn table_writers_refuse_the_command() {
         "export -n FOO",
         "let i++",
         "echo functions commands my_options[1] subcommands[2]",
+        // Other commands get their arguments as text.
+        "grep -F 'functions[' code.txt",
+        "make 'functions[probe]=0' && rg 'BASH_CMDS[x]'",
+        "command grep 'aliases[x]' f",
+        "nice -n 5 make CFLAGS='functions[x]'",
     ] {
         assert!(
             tokenize(command).is_ok(),
