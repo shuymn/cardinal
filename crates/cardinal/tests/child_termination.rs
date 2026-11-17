@@ -8,12 +8,19 @@ mod support;
 
 #[cfg(unix)]
 use std::path::Path;
-use std::process::{Child, ExitStatus, Stdio};
+#[cfg(unix)]
+use std::process::ExitStatus;
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
+use cardinal_test_support::Child;
 use observe_common::Scene;
+
 #[cfg(windows)]
-use support::helper::ChildGuard;
+#[test]
+fn helper() {
+    support::helper::run_if_requested();
+}
 
 /// Polls `check` every 20 ms until it returns `Some` or `limit` passes.
 fn poll<T>(limit: Duration, mut check: impl FnMut() -> Option<T>) -> Option<T> {
@@ -42,28 +49,13 @@ fn start_inventory(scene: &Scene) -> Child {
 }
 
 /// Waits for `child` to end; kills it and fails the test if it does not within 20 s.
+#[cfg(unix)]
 fn wait_or_kill(child: &mut Child) -> ExitStatus {
     if let Some(status) = poll(Duration::from_secs(20), || child.try_wait().unwrap()) {
         return status;
     }
-    let _ = child.kill();
-    let _ = child.wait();
+    child.kill();
     panic!("cardinal did not end after the signal");
-}
-
-/// Kills the git wrapper's process group if a failing test left it running.
-#[cfg(unix)]
-struct StopGroup(Option<(u32, u64)>);
-
-#[cfg(unix)]
-impl Drop for StopGroup {
-    fn drop(&mut self) {
-        if let Some((pid, start_s)) = self.0
-            && cardinal::os::is_alive(pid, start_s)
-        {
-            cardinal::os::kill_process_group(pid);
-        }
-    }
 }
 
 /// Whether this process ignores `sig`; cardinal inherits that and leaves the signal ignored.
@@ -117,6 +109,7 @@ fn read_pids(file: &Path) -> Vec<u32> {
 fn a_terminated_cardinal_kills_its_children_and_dies_by_the_signal() {
     use std::os::unix::process::ExitStatusExt;
 
+    use cardinal_test_support::process::GroupGuard;
     use rustix::process::{Pid, Signal};
 
     for sig in [Signal::TERM, Signal::INT, Signal::HUP] {
@@ -129,10 +122,13 @@ fn a_terminated_cardinal_kills_its_children_and_dies_by_the_signal() {
         let mut cardinal = start_inventory(&scene);
         let pids = read_pids(&pids_file);
         assert_eq!(pids.len(), 2, "{pids:?}");
-        let wrapper = pids[0];
-        let _stop = StopGroup(cardinal::os::start_time_s(wrapper).map(|s| (wrapper, s)));
+        // The wrapper leads the group `os::child` made for it, which `sleep` shares; the guard
+        // kills what a failing test leaves of it.
+        let _group = GroupGuard::new(scene.fx.scope(), pids[0]);
 
-        rustix::process::kill_process(Pid::from_child(&cardinal), sig).unwrap();
+        let id = i32::try_from(cardinal.id()).unwrap();
+        // The child is unreaped until `wait_or_kill`, so its PID is still its own.
+        rustix::process::kill_process(Pid::from_raw(id).unwrap(), sig).unwrap();
         let status = wait_or_kill(&mut cardinal);
         assert_eq!(status.signal(), Some(sig.as_raw()), "{status:?}");
         for pid in pids {
@@ -149,7 +145,9 @@ fn a_terminated_cardinal_kills_its_children_and_dies_by_the_signal() {
 }
 
 /// On Windows a terminated cardinal runs no code; its children go with it because each runs
-/// in a job that is killed when its only handle, which cardinal holds, closes.
+/// in a job that is killed when its only handle, which cardinal holds, closes. Cardinal alone
+/// is killed: the job of the test's scope, which holds every process cardinal started, is
+/// left running until the check.
 #[cfg(windows)]
 #[test]
 fn a_terminated_cardinal_kills_its_children() {
@@ -167,21 +165,16 @@ fn a_terminated_cardinal_kills_its_children() {
         cmd: true,
         cwd: false,
     };
-    let ping = poll(Duration::from_secs(30), || {
+    let (pid, start_s) = poll(Duration::from_secs(30), || {
         let table = ProcessTable::snapshot(detail).ok()?;
         table
             .iter()
             .find(|p| p.name.to_ascii_lowercase().starts_with("ping") && p.cmd.contains(&target))
             .map(|p| (p.pid, p.start_s))
-    });
-    let Some((pid, start_s)) = ping else {
-        let _ = cardinal.kill();
-        let _ = cardinal.wait();
-        panic!("the git wrapper's ping started");
-    };
+    })
+    .expect("the git wrapper's ping started");
 
-    cardinal.kill().unwrap();
-    wait_or_kill(&mut cardinal);
+    cardinal.kill_leader();
     assert!(
         poll(Duration::from_secs(5), || (!cardinal::os::is_alive(
             pid, start_s
@@ -192,102 +185,30 @@ fn a_terminated_cardinal_kills_its_children() {
     );
 }
 
-/// The file `outside_os_child_helper` writes its `ping`'s PID to.
-#[cfg(windows)]
-const HELPER_PID_FILE: &str = "CARDINAL_TEST_HELPER_PID_FILE";
-
-/// Kills the helper's `ping` by PID, if it still runs with its start time.
-#[cfg(windows)]
-struct KillProcess(u32, u64);
-
-#[cfg(windows)]
-impl Drop for KillProcess {
-    fn drop(&mut self) {
-        use windows_sys::Win32::Foundation::CloseHandle;
-        use windows_sys::Win32::System::Threading::{
-            OpenProcess, PROCESS_TERMINATE, TerminateProcess,
-        };
-
-        if !cardinal::os::is_alive(self.0, self.1) {
-            return;
-        }
-        // SAFETY: `OpenProcess` takes no pointers and returns a null handle on failure.
-        let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, self.0) };
-        if handle.is_null() {
-            return;
-        }
-        // SAFETY: `handle` was opened above with `PROCESS_TERMINATE` and is closed once, here.
-        unsafe {
-            TerminateProcess(handle, 1);
-            CloseHandle(handle);
-        }
-    }
-}
-
-/// Started by `a_process_started_outside_os_child_outlives_cardinal`, it stands in for a
-/// cardinal process: it runs a child through `os::child`, starts `ping` directly, writes the
-/// `ping`'s PID to the file `HELPER_PID_FILE` names, and waits to be killed.
-#[cfg(windows)]
-#[test]
-#[ignore = "started by a_process_started_outside_os_child_outlives_cardinal"]
-fn outside_os_child_helper() {
-    use cardinal::os::child::{Limits, git_env, run};
-
-    let Some(pid_file) = std::env::var_os(HELPER_PID_FILE).map(std::path::PathBuf::from) else {
-        return;
-    };
-    let dir = pid_file.parent().unwrap();
-    let limits = Limits {
-        deadline: Instant::now() + Duration::from_secs(30),
-        max_output: 1024,
-    };
-    let args = ["/D".into(), "/C".into(), "exit 0".into()];
-    let out = run("cmd", &args, &git_env(std::env::vars_os()), dir, limits).unwrap();
-    assert_eq!(out.code, Some(0), "{}", out.stderr_line());
-
-    let mut ping = std::process::Command::new("ping")
-        .args(["-n", "31", "127.0.0.1"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let written = dir.join("ping.pid.tmp");
-    std::fs::write(&written, ping.id().to_string()).unwrap();
-    std::fs::rename(&written, &pid_file).unwrap();
-    std::thread::sleep(Duration::from_secs(60));
-    let _ = ping.wait();
-}
-
 /// Only the children cardinal runs through `os::child` go with it: a process it starts
-/// otherwise is in none of their jobs, so it outlives a terminated cardinal.
+/// otherwise is in none of their jobs, so it outlives a terminated cardinal. A helper stands
+/// in for cardinal: it runs a child through `os::child`, then starts a sleeper through a scope
+/// of its own. The helper alone is killed; the job of the test's scope ends the sleeper when
+/// the helper's `Child` is dropped.
 #[cfg(windows)]
 #[test]
 fn a_process_started_outside_os_child_outlives_cardinal() {
-    let dir = tempfile::tempdir().unwrap();
-    let pid_file = dir.path().join("ping.pid");
-    let mut helper = ChildGuard::new(
-        std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["outside_os_child_helper", "--exact", "--ignored"])
-            .env(HELPER_PID_FILE, &pid_file)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
-    );
-    let pid: u32 = poll(Duration::from_secs(30), || {
-        std::fs::read_to_string(&pid_file).ok()?.trim().parse().ok()
-    })
-    .expect("the helper started ping");
-    let start_s = cardinal::os::start_time_s(pid).expect("ping runs");
-    let _ping = KillProcess(pid, start_s);
+    use support::helper::{self, Mode};
 
-    helper.child().kill().unwrap();
-    wait_or_kill(helper.child());
+    let scene = Scene::new();
+    let scope = scene.fx.scope();
+    let out = scene.fx.path("sleeper.pid");
+    let mut helper = helper::spawn(scope, &Mode::Outside { out: out.clone() }, scope.root());
+    let pid: u32 = poll(Duration::from_secs(30), || {
+        std::fs::read_to_string(&out).ok()?.trim().parse().ok()
+    })
+    .expect("the helper started its sleeper");
+    let start_s = cardinal::os::start_time_s(pid).expect("the sleeper runs");
+
+    helper.kill_leader();
     let survived = (0..50).all(|_| {
         std::thread::sleep(Duration::from_millis(20));
         cardinal::os::is_alive(pid, start_s)
     });
-    assert!(survived, "ping {pid} was killed with the helper");
+    assert!(survived, "sleeper {pid} was killed with the helper");
 }

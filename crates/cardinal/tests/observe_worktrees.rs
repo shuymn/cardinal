@@ -3,7 +3,6 @@
 //! upstream, and observation failures as `unknown`. gh is a fake answering from files.
 
 mod observe_common;
-mod support;
 
 use std::time::Instant;
 
@@ -70,9 +69,7 @@ fn merged_pull_request_head_is_evidence_and_its_commits_count_as_pushed() {
     let wt = scene.worktree("feat", "feat");
     let head = scene.commit(&wt, "feature.txt");
     // The branch was pushed, merged by squash, and deleted; only the pull request knows.
-    scene
-        .fx
-        .git(&wt, &["branch", "--set-upstream-to=origin/main", "feat"]);
+    scene.fx.set_upstream(&wt, "feat", "origin/main");
     scene.set_merged(&head, &merged_json(42, &head));
     let inv = scene.inventory();
     let w = worktree(&inv, &wt);
@@ -193,9 +190,7 @@ fn missing_upstream_and_detached_head_have_no_upstream() {
     let local = scene.worktree("local", "local");
     let detached = scene.worktree("detached", "detached");
     let head = scene.head(&detached);
-    scene
-        .fx
-        .git(&detached, &["checkout", "-q", "--detach", &head]);
+    scene.fx.detach(&detached);
     let inv = scene.inventory();
     let w = worktree(&inv, &local);
     assert_eq!(w.upstream, None);
@@ -269,10 +264,9 @@ fn a_failed_merged_lookup_makes_merge_evidence_unknown() {
 #[test]
 fn a_missing_base_makes_merge_evidence_unknown() {
     let scene = Scene::new();
-    scene.fx.git(
-        &scene.repo,
-        &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
-    );
+    scene
+        .fx
+        .symbolic_ref_delete(&scene.repo, "refs/remotes/origin/HEAD");
     let wt = scene.worktree("feat", "feat");
     scene.commit(&wt, "feature.txt");
     scene.push(&wt, "feat");
@@ -286,10 +280,10 @@ fn a_missing_base_makes_merge_evidence_unknown() {
 #[test]
 fn a_configured_base_wins() {
     let (scene, wt, _) = merged_scene();
-    scene.fx.git(
-        &scene.repo,
-        &["update-ref", "refs/remotes/origin/develop", "HEAD~0"],
-    );
+    let main = scene.head(&scene.repo);
+    scene
+        .fx
+        .update_ref(&scene.repo, "refs/remotes/origin/develop", &main);
     scene.profile(
         "app",
         &format!(
@@ -313,15 +307,9 @@ fn a_configured_base_wins() {
 #[test]
 fn a_remote_outside_github_makes_pull_request_facts_unknown() {
     let (scene, wt, _) = merged_scene();
-    scene.fx.git(
-        &scene.repo,
-        &[
-            "remote",
-            "set-url",
-            "origin",
-            "https://example.com/acme/app.git",
-        ],
-    );
+    scene
+        .fx
+        .remote_set_url(&scene.repo, "origin", "https://example.com/acme/app.git");
     let inv = scene.inventory();
     assert_eq!(inv.repos[0].github, None);
     assert_eq!(inv.repos[0].gh, GhStatus::NotApplicable);
@@ -369,10 +357,7 @@ fn a_git_that_cannot_start_is_reported_not_trusted() {
 fn managed_and_git_locked_worktrees_are_marked() {
     let (mut scene, wt, _) = merged_scene();
     let locked = scene.worktree("locked", "locked");
-    scene.fx.git(
-        &scene.repo,
-        &["worktree", "lock", &locked.to_string_lossy()],
-    );
+    scene.fx.worktree_lock(&scene.repo, &locked);
     let root = scene.fx.path("feat");
     scene.observe_config(&format!(
         "managed = [{{ app = 't3code', root = '{}' }}]",
@@ -428,8 +413,8 @@ fn a_gitlink_without_gitmodules_is_a_nested_repository() {
     let wt = scene.worktree("feat", "feat");
     let dep = scene.fx.init("feat/dep");
     scene.fx.commit_file(&dep, "lib.txt", "lib\n", "dep");
-    scene.fx.git(&wt, &["add", "dep"]);
-    scene.fx.git(&wt, &["commit", "-q", "-m", "add dep"]);
+    scene.fx.add(&wt, "dep");
+    scene.fx.commit(&wt, "add dep");
     assert!(!wt.join(".gitmodules").exists());
     let head = scene.head(&wt);
     scene.push(&wt, "feat");

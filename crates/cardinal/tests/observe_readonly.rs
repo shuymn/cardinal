@@ -2,12 +2,12 @@
 //! (`docs/architecture.md` sections 8.1 and 17, item 8).
 
 mod observe_common;
-mod support;
 
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
+use cardinal_test_support::process::LeftoverGuard;
 use observe_common::{Scene, merged_json};
 
 /// Every entry below `dir` with its type, length, modification time, and file contents.
@@ -51,18 +51,6 @@ fn age(path: &Path) {
         .unwrap();
 }
 
-/// Stops a filesystem monitor daemon a failing run would have started, on every exit path.
-struct StopMonitor<'a>(&'a Scene);
-
-impl Drop for StopMonitor<'_> {
-    fn drop(&mut self) {
-        let _ = self
-            .0
-            .fx
-            .git_output(&self.0.repo, &["fsmonitor--daemon", "stop"]);
-    }
-}
-
 #[test]
 fn index_and_refs_unchanged() {
     let scene = Scene::new();
@@ -80,11 +68,10 @@ fn index_and_refs_unchanged() {
     }
     scene.profile("data", "[data]\nregenerable = ['target']\n");
     // A filesystem monitor configured for the repository must not start: its daemon writes
-    // inside `.git`.
-    scene
-        .fx
-        .git(&scene.repo, &["config", "core.fsmonitor", "true"]);
-    let _daemon = StopMonitor(&scene);
+    // inside `.git`. Should one start, dropping `monitor` stops it, and `_leftovers`, dropped
+    // after it, kills whatever of the scope still runs, the daemon included, and fails the test.
+    let _leftovers = LeftoverGuard::new(scene.fx.scope());
+    let monitor = scene.fx.fsmonitor(&scene.repo);
 
     let roots = [scene.repo.clone(), wt.clone(), other.clone()];
     let before: Vec<Listing> = roots.iter().map(|r| listing(r)).collect();
@@ -115,26 +102,13 @@ fn index_and_refs_unchanged() {
         );
     }
 
-    // Stop a daemon if one started, and prove none is left running for the repository.
-    scene
-        .fx
-        .git_output(&scene.repo, &["fsmonitor--daemon", "stop"]);
-    assert!(
-        !scene
-            .fx
-            .git_output(&scene.repo, &["fsmonitor--daemon", "status"])
-            .status
-            .success(),
-        "no filesystem monitor daemon remains"
-    );
+    assert_no_monitor(&scene, &scene.repo);
     // Turn the monitor off for the control below.
-    scene
-        .fx
-        .git(&scene.repo, &["config", "--unset", "core.fsmonitor"]);
+    drop(monitor);
 
     // Control: the same status without disabling optional locks rewrites the index, so the
     // comparison above would have seen it.
-    scene.fx.git(&wt, &["status", "--porcelain"]);
+    scene.fx.status(&wt);
     let index_after_git = listing(&scene.repo.join(".git"));
     let before_git = &before[0];
     assert!(
@@ -155,7 +129,7 @@ fn split_index_is_left_unread() {
     let head = scene.commit(&wt, "feature.txt");
     scene.push(&wt, "feat");
     scene.merge_into_base(&head);
-    scene.fx.git(&wt, &["update-index", "--split-index"]);
+    scene.fx.split_index(&wt);
     let shared = aged_shared_indexes(&scene.repo.join(".git"));
 
     let before = listing(&scene.repo);
@@ -177,7 +151,7 @@ fn split_index_is_left_unread() {
 
     // Control: a plain status freshens the shared index, so the comparison above would have
     // seen it.
-    scene.fx.git(&wt, &["status", "--porcelain"]);
+    scene.fx.status(&wt);
     let control = listing(&scene.repo);
     assert!(
         shared.iter().any(|file| {
@@ -225,11 +199,7 @@ fn observe_all(scene: &Scene) -> cardinal::contract::Inventory {
 /// No filesystem monitor daemon runs for the repository at `dir`.
 fn assert_no_monitor(scene: &Scene, dir: &Path) {
     assert!(
-        !scene
-            .fx
-            .git_output(dir, &["fsmonitor--daemon", "status"])
-            .status
-            .success(),
+        !scene.fx.fsmonitor_running(dir),
         "a filesystem monitor daemon runs for {}",
         dir.display()
     );
@@ -250,9 +220,7 @@ fn assert_unchanged(before: &Listing, after: &Listing) {
 fn a_configured_base_is_only_a_ref_name() {
     let scene = Scene::new();
     let wt = scene.worktree("feat", "feat");
-    scene
-        .fx
-        .git(&scene.repo, &["update-index", "--split-index"]);
+    scene.fx.split_index(&scene.repo);
     aged_shared_indexes(&scene.repo.join(".git"));
     scene.profile("base", "[git]\nbase = ':missing'\n");
 
@@ -280,12 +248,12 @@ fn a_submodule_split_index_is_left_unread() {
     let wt = scene.worktree("feat", "feat");
     let dep = scene.fx.init("feat/dep");
     scene.fx.commit_file(&dep, "lib.txt", "lib\n", "dep");
-    scene.fx.git(&wt, &["add", "dep"]);
-    scene.fx.git(&wt, &["commit", "-q", "-m", "add dep"]);
+    scene.fx.add(&wt, "dep");
+    scene.fx.commit(&wt, "add dep");
     let head = scene.head(&wt);
     scene.push(&wt, "feat");
     scene.merge_into_base(&head);
-    scene.fx.git(&dep, &["update-index", "--split-index"]);
+    scene.fx.split_index(&dep);
     let shared = aged_shared_indexes(&dep.join(".git"));
     age(&dep.join("lib.txt"));
 
@@ -304,7 +272,7 @@ fn a_submodule_split_index_is_left_unread() {
     assert_no_monitor(&scene, &dep);
 
     // Control: a status that enters submodules freshens the submodule's shared index.
-    scene.fx.git(&wt, &["status", "--porcelain"]);
+    scene.fx.status(&wt);
     let control = listing(&wt);
     assert!(
         shared.iter().any(|file| {

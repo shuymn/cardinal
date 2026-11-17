@@ -60,6 +60,17 @@ pub enum Mode {
     /// Write this process's process group ID to `out`.
     #[cfg(unix)]
     Group { out: PathBuf },
+    /// Run `cmd /D /C exit 0` through `cardinal::os::child`, start a sleeping helper through a
+    /// scope of this process, write its PID to `out`, then sleep: the sleeper is a process
+    /// started outside `os::child`.
+    #[cfg(windows)]
+    Outside { out: PathBuf },
+    /// Write this process's PID and start time to `dir/helper`, start a sleeping helper
+    /// through a scope of this process, write its PID and start time to `dir/sleeper`, and
+    /// exit, leaving the sleeper running. The sleeper gets this process's stdout and stderr
+    /// with `keep_output`; otherwise it holds no handle of them.
+    #[cfg(windows)]
+    Leave { dir: PathBuf, keep_output: bool },
 }
 
 /// Runs the helper mode named on the command line, then exits; returns at once in a normal
@@ -128,9 +139,82 @@ pub fn run_if_requested() {
             let group = unsafe { libc::getpgrp() };
             std::fs::write(&args[0], group.to_string()).expect("write the group");
         }
+        #[cfg(windows)]
+        "outside" => {
+            let limits = cardinal::os::child::Limits {
+                deadline: Instant::now() + Duration::from_secs(30),
+                max_output: 1024,
+            };
+            let env = cardinal::os::child::git_env(std::env::vars_os());
+            let cwd = std::env::current_dir().expect("the working directory");
+            let exit = ["/D".into(), "/C".into(), "exit 0".into()];
+            let out = cardinal::os::child::run("cmd", &exit, &env, &cwd, limits)
+                .expect("run a child through os::child");
+            assert_eq!(out.code, Some(0), "{}", out.stderr_line());
+            let scope = Scope::new();
+            let sleeper = spawn(&scope, &Mode::Sleep, scope.root());
+            std::fs::write(&args[0], sleeper.id().to_string()).expect("write the pid");
+            std::thread::sleep(LIFETIME);
+            drop((sleeper, scope));
+        }
+        #[cfg(windows)]
+        "leave" => leave(Path::new(&args[0]), args[1] == "keep-output"),
         other => panic!("unknown helper mode {other}"),
     }
     std::process::exit(0);
+}
+
+/// The `leave` mode: see [`Mode::Leave`].
+#[cfg(windows)]
+fn leave(dir: &Path, keep_output: bool) {
+    use std::os::windows::io::AsRawHandle as _;
+    use std::process::Stdio;
+
+    use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+
+    report(dir, "helper", std::process::id());
+    if !keep_output {
+        // A child started to inherit handles gets every inheritable one, not only its own
+        // standard streams, so stdout and stderr stop being inheritable first.
+        for handle in [
+            std::io::stdout().as_raw_handle(),
+            std::io::stderr().as_raw_handle(),
+        ] {
+            // SAFETY: the handle is this process's stdout or stderr, open while it runs.
+            let set = unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) };
+            assert_ne!(set, 0, "{}", std::io::Error::last_os_error());
+        }
+    }
+    let scope = Scope::new();
+    let mut sleeper = command(&scope, &Mode::Sleep, scope.root());
+    if keep_output {
+        sleeper.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+    } else {
+        sleeper.stderr(Stdio::null());
+    }
+    let sleeper = sleeper.spawn().expect("start the sleeper");
+    report(dir, "sleeper", sleeper.id());
+    // Left running on purpose: the scope's job does not kill its processes when its handle
+    // closes, so the sleeper outlives this process, in the job of whatever started it.
+    std::mem::forget(sleeper);
+    std::mem::forget(scope);
+}
+
+/// Writes `pid`'s ID and start time to `dir/name`, atomically.
+#[cfg(windows)]
+fn report(dir: &Path, name: &str, pid: u32) {
+    let start_s = cardinal::os::start_time_s(pid).expect("the process is listed");
+    let written = dir.join(format!("{name}.tmp"));
+    std::fs::write(&written, format!("{pid} {start_s}")).expect("write the report");
+    std::fs::rename(&written, dir.join(name)).expect("publish the report");
+}
+
+/// The process ID and start time [`Mode::Leave`] wrote to `dir/name`, once written.
+#[cfg(windows)]
+pub fn reported(dir: &Path, name: &str) -> Option<(u32, u64)> {
+    let text = std::fs::read_to_string(dir.join(name)).ok()?;
+    let (pid, start_s) = text.split_once(' ')?;
+    Some((pid.parse().ok()?, start_s.parse().ok()?))
 }
 
 /// SIGCHLD's disposition in this process, read without changing it.
@@ -149,9 +233,8 @@ fn child_signal() -> &'static str {
     }
 }
 
-/// A command that runs this test binary in `mode`, in `cwd` inside `scope`.
-pub fn command(scope: &Scope, mode: &Mode, cwd: &Path) -> Command {
-    let exe = std::env::current_exe().expect("current test binary");
+/// The arguments that make this test binary run `mode`, after the program.
+pub fn args(mode: &Mode) -> Vec<String> {
     let (name, args): (&str, Vec<String>) = match mode {
         Mode::Sleep => ("sleep", vec![]),
         Mode::Pid { out } => ("pid", vec![out.to_string_lossy().into_owned()]),
@@ -188,12 +271,31 @@ pub fn command(scope: &Scope, mode: &Mode, cwd: &Path) -> Command {
         Mode::ChildSignal { out } => ("child-signal", vec![out.to_string_lossy().into_owned()]),
         #[cfg(unix)]
         Mode::Group { out } => ("group", vec![out.to_string_lossy().into_owned()]),
+        #[cfg(windows)]
+        Mode::Outside { out } => ("outside", vec![out.to_string_lossy().into_owned()]),
+        #[cfg(windows)]
+        Mode::Leave { dir, keep_output } => (
+            "leave",
+            vec![
+                dir.to_string_lossy().into_owned(),
+                if *keep_output { "keep-output" } else { "" }.to_owned(),
+            ],
+        ),
     };
+    ["helper", "--exact", "--nocapture", "--test-threads=1", "--"]
+        .into_iter()
+        .map(str::to_owned)
+        .chain(std::iter::once(format!("{TAG}{name}")))
+        .chain(args.iter().map(|arg| format!("{TAG}{arg}")))
+        .collect()
+}
+
+/// A command that runs this test binary in `mode`, in `cwd` inside `scope`.
+pub fn command(scope: &Scope, mode: &Mode, cwd: &Path) -> Command {
+    let exe = std::env::current_exe().expect("current test binary");
     let mut command = scope.command(exe, cwd);
     command
-        .args(["helper", "--exact", "--nocapture", "--test-threads=1", "--"])
-        .arg(format!("{TAG}{name}"))
-        .args(args.iter().map(|arg| format!("{TAG}{arg}")))
+        .args(args(mode))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null());
     command

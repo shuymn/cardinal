@@ -2,7 +2,6 @@
 //! repository-location variables are absent (`docs/architecture.md` section 8.1).
 
 mod observe_common;
-mod support;
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -44,9 +43,8 @@ fn inherited_git_vars_ignored() {
     let decoy_head = scene
         .fx
         .commit_file(&decoy, "decoy.txt", "decoy\n", "decoy");
-    scene
-        .fx
-        .git(&decoy, &["checkout", "-q", "-b", "decoy-branch"]);
+    scene.fx.branch(&decoy, "decoy-branch");
+    scene.fx.switch(&decoy, "decoy-branch");
     let before = contents(&decoy.join(".git"));
 
     let output = scene

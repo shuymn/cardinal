@@ -17,7 +17,8 @@ use cardinal::contract::{Error, Inventory, ReservationView, Worktree};
 use cardinal::observe::{InventoryOptions, Observer, Reservations, WorktreeObservation};
 use cardinal::state::StateDir;
 
-use crate::support::fixture::Fixture;
+use cardinal_test_support::Command;
+use cardinal_test_support::fixture::Fixture;
 
 pub const GITHUB: &str = "acme/app";
 
@@ -55,15 +56,7 @@ impl Scene {
         let fx = Fixture::new();
         let repo = fx.init("repo");
         fx.commit_file(&repo, "README.md", "hello\n", "initial");
-        fx.git(
-            &repo,
-            &[
-                "remote",
-                "add",
-                "origin",
-                &format!("https://github.com/{GITHUB}.git"),
-            ],
-        );
+        fx.remote_add_url(&repo, "origin", &format!("https://github.com/{GITHUB}.git"));
         let gh_dir = fx.path("gh");
         let config_dir = fx.path("config");
         let state_dir = fx.path("state");
@@ -80,13 +73,10 @@ impl Scene {
             gh_timeout_ms: 15_000,
         };
         scene.push(&scene.repo, "main");
-        scene.fx.git(
+        scene.fx.symbolic_ref(
             &scene.repo,
-            &[
-                "symbolic-ref",
-                "refs/remotes/origin/HEAD",
-                "refs/remotes/origin/main",
-            ],
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
         );
         scene.write_gh();
         scene.set_open("[]");
@@ -96,7 +86,7 @@ impl Scene {
 
     /// The HEAD object ID of `dir`.
     pub fn head(&self, dir: &Path) -> String {
-        self.fx.git(dir, &["rev-parse", "HEAD"]).trim().to_owned()
+        self.fx.rev_parse(dir, "HEAD")
     }
 
     /// A linked worktree `name` on a new branch `branch` from the main worktree's HEAD.
@@ -113,28 +103,16 @@ impl Scene {
     /// its upstream (what a push and fetch would leave behind).
     pub fn push(&self, dir: &Path, branch: &str) {
         let head = self.head(dir);
-        self.fx.git(
-            dir,
-            &[
-                "update-ref",
-                &format!("refs/remotes/origin/{branch}"),
-                &head,
-            ],
-        );
-        self.fx.git(
-            dir,
-            &[
-                "branch",
-                &format!("--set-upstream-to=origin/{branch}"),
-                branch,
-            ],
-        );
+        self.fx
+            .update_ref(dir, &format!("refs/remotes/origin/{branch}"), &head);
+        self.fx
+            .set_upstream(dir, branch, &format!("origin/{branch}"));
     }
 
     /// Moves `origin/main` to `oid`, as a merge on GitHub followed by a fetch would.
     pub fn merge_into_base(&self, oid: &str) {
         self.fx
-            .git(&self.repo, &["update-ref", "refs/remotes/origin/main", oid]);
+            .update_ref(&self.repo, "refs/remotes/origin/main", oid);
     }
 
     /// The open pull request list gh returns.
@@ -285,6 +263,7 @@ exit "$code"
         let isolation = self.isolation();
         let mut env: Vec<(OsString, OsString)> = self
             .fx
+            .scope()
             .env()
             .into_iter()
             .filter(|(k, _)| !isolation.iter().any(|(name, _)| name == k))
@@ -327,13 +306,15 @@ exit "$code"
     /// The `cardinal` binary with this scene's state and config directories, the scene's
     /// environment (`env_clear` first), and the fixture root as its working directory. Every
     /// caller passes `--repo <fixture repository>`.
-    pub fn cardinal(&self) -> std::process::Command {
+    pub fn cardinal(&self) -> Command {
         self.config();
         let mut command = self
             .fx
             .command(env!("CARGO_BIN_EXE_cardinal"), self.fx.root());
+        for (name, value) in self.isolation() {
+            command.env(name, value);
+        }
         command
-            .envs(self.isolation())
             .env("CARDINAL_STATE_DIR", &self.state_dir)
             .env("CARDINAL_CONFIG_DIR", &self.config_dir);
         command

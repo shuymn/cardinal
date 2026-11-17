@@ -14,26 +14,14 @@ use cardinal::contract::{
     ReservationWorktree, SessionProcess, SessionSnapshot, SessionSnapshotSchema, SnapshotAgent,
 };
 use cardinal::state::{LockMode, try_lock, worktree_key};
+use cardinal_test_support::Child;
+use cardinal_test_support::process::wait_for;
 use observe_common::{FakeReservations, Scene, worktree};
 use support::helper::{self, Mode};
 
-/// A sleeping helper in `cwd` (inside the fixture), without the caller's `GIT_*` and
-/// `GH_*`, and with `HOME` and `XDG_CONFIG_HOME` inside the fixture.
-fn spawn_helper(scene: &Scene, cwd: &Path) -> helper::ChildGuard {
-    let mut command = helper::command(&Mode::Sleep);
-    for (name, _) in std::env::vars_os() {
-        let text = name.to_string_lossy();
-        if text.starts_with("GIT_") || text.starts_with("GH_") {
-            command.env_remove(&name);
-        }
-    }
-    let home = scene.fx.path("home");
-    command
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
-        .env("XDG_CONFIG_HOME", home.join(".config"))
-        .current_dir(cwd);
-    helper::ChildGuard::new(command.spawn().expect("start a helper process"))
+/// A sleeping helper in `cwd`, inside the fixture.
+fn spawn_helper(scene: &Scene, cwd: &Path) -> Child {
+    helper::spawn(scene.fx.scope(), &Mode::Sleep, cwd)
 }
 
 #[test]
@@ -167,7 +155,7 @@ fn reservations_lock_and_processes_make_a_worktree_in_use() {
     let mut child = cfg!(unix).then(|| spawn_helper(&scene, &by_process));
     if let Some(child) = &child {
         let pid = child.id();
-        helper::wait_for("the helper's cwd", Duration::from_secs(10), || {
+        wait_for("the helper's cwd", Duration::from_secs(10), || {
             (cardinal::os::cwd(pid).as_deref() == Some(by_process.as_path())).then_some(())
         });
     }
@@ -228,8 +216,8 @@ fn ignored_entries_are_classified_and_sized() {
     let scene = Scene::new();
     let wt = scene.worktree("feat", "feat");
     std::fs::write(wt.join(".gitignore"), "node_modules/\ntarget/\nnotes.log\n").unwrap();
-    scene.fx.git(&wt, &["add", ".gitignore"]);
-    scene.fx.git(&wt, &["commit", "-q", "-m", "ignore"]);
+    scene.fx.add(&wt, ".gitignore");
+    scene.fx.commit(&wt, "ignore");
     for (rel, bytes) in [
         ("node_modules/pkg/index.js", 5000),
         ("target/a/b/fuzz/corpus/seed", 10),
@@ -286,8 +274,8 @@ fn a_nested_repository_in_ignored_data_is_reported() {
     let scene = Scene::new();
     let wt = scene.worktree("feat", "feat");
     std::fs::write(wt.join(".gitignore"), "vendor/\n").unwrap();
-    scene.fx.git(&wt, &["add", ".gitignore"]);
-    scene.fx.git(&wt, &["commit", "-q", "-m", "ignore"]);
+    scene.fx.add(&wt, ".gitignore");
+    scene.fx.commit(&wt, "ignore");
     std::fs::create_dir_all(wt.join("vendor/dep/.git")).unwrap();
     scene.profile("data", "[data]\nregenerable = ['vendor']\n");
     let inv = scene.inventory();
@@ -326,7 +314,7 @@ fn processes_that_outlived_their_session_are_listed() {
     let state = scene.state();
     let mut child = spawn_helper(&scene, scene.fx.root());
     let pid = child.id();
-    let start_s = helper::wait_for("the helper", Duration::from_secs(10), || {
+    let start_s = wait_for("the helper", Duration::from_secs(10), || {
         cardinal::os::start_time_s(pid)
     });
     let me = cardinal::os::current_pid();
