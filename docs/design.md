@@ -169,8 +169,8 @@ act = false        # report only until set to true
 ### The flow of one command
 
 1. A worker agent tries to run a command with Bash.
-2. The `PreToolUse` hook classifies it. If the command is out of scope, or classification does not respond within its deadline, the command runs unchanged.
-3. If it is in scope, the hook rewrites the command to run through `cardinal run` (`updatedInput`). The rewrite keeps every Bash tool input field other than `command` unchanged, and passes `command` as a shell string whose meaning, including cwd and environment variables, does not change (the only change is injecting parallelism settings, section 7). The rewritten command carries a shell prefix that runs the original command if the runner cannot start.
+2. The `PreToolUse` hook classifies each stage of it (each simple command in its pipelines and lists). If no stage is in scope, or classification does not respond within its deadline, the command runs unchanged.
+3. For each stage in scope, the hook rewrites that stage, in place, to run through `cardinal run` (`updatedInput`). The rest of the command stays in the calling shell, so its meaning, including cwd, environment variables, and shell state, does not change (the only change is injecting parallelism settings, section 7). The rewrite keeps every Bash tool input field other than `command` unchanged. Each rewritten stage carries a shell fallback that runs the original stage if the runner cannot start.
 4. From acceptance until completion or cancellation, the runner holds the worktree's in-use lock. The worktree is not reclaimed while the job waits.
 5. The runner decides on a reservation inside the admission lock.
    - If resources are free, it reserves them and starts the child process.
@@ -187,7 +187,7 @@ Do not rerun the same command. Continue with other work while you wait.
 
 ### Failures and lifetimes
 
-- **Failure before the child starts**: if the runner cannot start, the shell prefix runs the original command unchanged. If the runner fails to reserve or record, the runner runs the original command unchanged (fail-open).
+- **Failure before the child starts**: if the runner cannot start, the shell fallback runs the original stage unchanged. If the runner fails to reserve or record, the runner runs the original stage unchanged (fail-open).
 - **Failure after the child starts**: a command that may already have run is not rerun; the failure is returned as an infrastructure failure. A recording failure is never a reason to rerun either.
 - **Runner crash**: the reservation and in-use lock become recovery-needed. Admission and reclamation keep counting them as reserved and in use until the recorded process group is confirmed stopped. On Windows, the Job Object's `KILL_ON_JOB_CLOSE` stops the children immediately. On Unix, admission or a reconciler stops the leftover process group before releasing the reservation.
 - **Session end**: `SubagentStop` and `SessionEnd` do not stop processes; they record that the session ended, because background processes (such as a dev server) may have been left running on purpose. Processes that outlive their session go to the inbox, and the arbiter handles them.
@@ -195,7 +195,7 @@ Do not rerun the same command. Continue with other work while you wait.
 
 ### Command capture
 
-Capture is based on the hook rewriting the outer command, and the whole command is reserved as one job. Executions launched inside a script (for example, a test script that runs vitest four times) are not controlled individually; they are learned as part of the whole command's weight. There are no shims on `PATH`. The resolution order of mise, rustup, and pnpm and `node_modules/.bin` easily bypass them, and reserving both the outer and inner command can make a job wait on itself. Finer control is added later, and only for tools where measurements show it is needed. Classification treats variant spellings (`pnpm exec vitest`, `npx vitest`, `env X=1 cargo test`, `bash -c '…'`) as the same command.
+Capture is based on the hook rewriting each classified stage of the command in place, and each such stage is reserved as one job; the rest of the command stays in the calling shell. Executions launched inside a script that a stage starts (for example, a test script that runs vitest four times) are not controlled individually; they are learned as part of that stage's weight. There are no shims on `PATH`. The resolution order of mise, rustup, and pnpm and `node_modules/.bin` easily bypass them, and reserving both the outer and inner command can make a job wait on itself. Finer control is added later, and only for tools where measurements show it is needed. Classification treats variant spellings (`pnpm exec vitest`, `npx vitest`, `env X=1 cargo test`, `bash -c '…'`) as the same command.
 
 ## 7. Per-resource handling
 
@@ -224,7 +224,7 @@ Reservations are per command. Adapters inject each tool's parallelism settings.
 | --- | --- | --- | --- |
 | jobserver | Supported (Cargo is a client). Sharing requires passing the jobserver connection; `CARGO_BUILD_JOBS` alone does not share | Not supported | Not supported |
 | Injected settings | `CARGO_BUILD_JOBS`, `NEXTEST_TEST_THREADS` | `--maxWorkers`, `NODE_OPTIONS` | `GOMAXPROCS`, `GOFLAGS=-p=N` |
-| When injection does not reach | — | If a script runs the tool several times internally, the whole command is treated as a heavy job | — |
+| When injection does not reach | — | If a script runs the tool several times internally, the whole stage is treated as a heavy job | — |
 
 ### Memory measurement
 
@@ -281,7 +281,7 @@ v1 does not implement offloading to other machines. It fixes only the seams that
 
 | Fixed in v1 | Shape in v1 |
 | --- | --- |
-| Two representations | A local invocation (shell string, cwd, and environment as they are) is kept separate from a portable job spec (argv, repository identity, cwd relative to the repository, allowed environment variables, input tree hash, required resources, wanted outputs). Only portable invocations are converted from local ones. Whether the input includes uncommitted or untracked files is explicit, never silently replaced by HEAD |
+| Two representations | A local invocation (the stage's argv as expanded by the calling shell, cwd, and environment as they are) is kept separate from a portable job spec (argv, repository identity, cwd relative to the repository, allowed environment variables, input tree hash, required resources, wanted outputs). Only portable invocations are converted from local ones. Whether the input includes uncommitted or untracked files is explicit, never silently replaced by HEAD |
 | Execution flow | placement → admission and reservation on the chosen host → executor. The executing host holds the reservation. placement always returns local |
 | Asynchronous jobs | Job ID, `wait`, `cancel`, log subscription. Local jobs use the same shape |
 | Result shape | Exit code, logs, list of outputs, and whether the failure came from infrastructure or the command |
@@ -398,7 +398,7 @@ Hypotheses derived from the purpose layer. Test names are filled in during imple
 | C3 | While memory pressure is at or above the warning line, the runner admits no new `normal` or `idle` jobs, and resumes only after it drops below the release line. If a sensor read fails, it decides from reservations alone. | G1 | Replace raw sensor values and check admission per class, release, and read failure |
 | C4 | When the wait is expected to exceed the maximum synchronous wait, or the actual wait reaches it, the runner registers the command as an accepted job and returns the job ID as normal output. A retry with the same tool call ID binds to the same job. | G13 | No double execution across run-after-free, cancellation, and retry. A job ID is returned by the maximum synchronous wait even when the estimate is unknown or wrong and the wait drags on |
 | C5 | On a failure before the child starts, the shell prefix runs the original command unchanged if the runner cannot start, and the runner runs it unchanged if reservation or recording fails. On a failure after the child starts, the command is not rerun and is returned as an infrastructure failure. When the hook does not respond within its deadline, the command is not rewritten. | G4 | Compare execution count and results with a missing runner binary, reservation failure, recording failure, runner crash right after the child starts, and a delayed hook |
-| C6 | When the hook rewrites a command, Bash tool input fields other than `command` do not change, and `command` runs as a shell string with the same meaning, including cwd and environment variables. The only exception is injecting parallelism settings (section 7). | G4 | Compare inputs containing redirects, `cd &&`, environment variable prefixes, and timeouts. Environment variables other than the injected settings do not change |
+| C6 | When the hook rewrites a command, Bash tool input fields other than `command` do not change, only classified stages are wrapped, and the command keeps its meaning, including cwd, environment variables, and shell state. The only exception is injecting parallelism settings (section 7). | G4 | Compare inputs containing redirects, `cd &&`, `&&`/`\|\|` lists, pipelines with `pipefail`, environment variable prefixes, and timeouts. Environment variables other than the injected settings do not change |
 | C7 | Commands inside WSL go through Windows-side admission. If the request fails, they fail open and record that the reservation is not shared. | G1 | Submit from Windows and WSL at once; the combined total stays within the budget. The record on request failure |
 | C8 | When a runner crashes, its reservation and in-use lock become recovery-needed and count as reserved and in use until the recorded process group is confirmed stopped. On Windows the Job Object stops the process group; on Unix, admission or a reconciler stops it. | G14 | Right after killing the runner (before a reconciler runs), new admissions and reclamations are held. Afterwards no children remain and the reservation is released |
 | C9 | On `SubagentStop` and `SessionEnd`, `cardinal` does not stop processes and records that the session ended. Processes that outlive their session go to the inbox. | G8 | A background dev server remains and appears in the inbox |
