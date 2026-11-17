@@ -253,10 +253,13 @@ fn walk_dir(
             Err(err) if vanished(&err) => continue,
             Err(err) => return Err(err.into()),
         };
-        let meta = match dent.metadata() {
+        // `lstat` of the entry itself, not `dent.metadata()`: on Windows that is the copy of
+        // the entry's attributes in its parent directory's index (`FindNextFileW`), which NTFS
+        // updates lazily, so a directory's mtime there can predate an entry created below it.
+        let meta = match std::fs::symlink_metadata(dent.path()) {
             Ok(meta) => meta,
-            Err(err) if vanished(&err) => continue,
-            Err(err) => return Err(err.into()),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err),
         };
         let below = dent.path().strip_prefix(dir).map_err(io::Error::other)?;
         let entry = Entry::from_metadata(rel.join(below), &meta);
