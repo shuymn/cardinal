@@ -16,16 +16,11 @@ concurrency:
 permissions: {}
 
 jobs:
-  test:
-    name: Test (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os:
-          - macos-latest
-          - ubuntu-latest
-          - windows-latest
-    runs-on: ${{ matrix.os }}
+  # One job per OS instead of a matrix: a matrix leg cancelled before it gets
+  # a runner can still leave the matrix's aggregate result as `success`.
+  test-macos:
+    name: Test (macos-latest)
+    runs-on: macos-latest
     timeout-minutes: 30
     permissions:
       contents: read
@@ -34,6 +29,8 @@ jobs:
         shell: bash
     env:
       CARGO_TERM_COLOR: always
+      # Only rust is installed; `mise exec` must not install the other tools.
+      MISE_EXEC_AUTO_INSTALL: "false"
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -43,6 +40,7 @@ jobs:
       - name: Set up mise
         uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5.2.9
         with:
+          version: 2026.11.8
           install_args: rust
 
       # The toolchain is part of the key through mise.lock, so a toolchain
@@ -50,13 +48,14 @@ jobs:
       - name: Compute cache key
         id: cache-key
         env:
-          LOCK_HASH: ${{ hashFiles('Cargo.lock', 'mise.lock') }}
+          CARGO_LOCK_HASH: ${{ hashFiles('Cargo.lock') }}
+          MISE_LOCK_HASH: ${{ hashFiles('mise.lock') }}
         run: |
-          if [ -z "$LOCK_HASH" ]; then
+          if [ -z "$CARGO_LOCK_HASH" ] || [ -z "$MISE_LOCK_HASH" ]; then
             echo "Cargo.lock or mise.lock is missing" >&2
             exit 1
           fi
-          echo "key=cargo-$RUNNER_OS-$RUNNER_ARCH-$LOCK_HASH" >>"$GITHUB_OUTPUT"
+          echo "key=cargo-$RUNNER_OS-$RUNNER_ARCH-$CARGO_LOCK_HASH-$MISE_LOCK_HASH" >>"$GITHUB_OUTPUT"
 
       - name: Cache cargo
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -77,18 +76,140 @@ jobs:
       - name: Run tests
         run: mise exec -- cargo test --locked
 
-  # The required status check: passes only when every matrix leg passed.
+  test-linux:
+    name: Test (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_TERM_COLOR: always
+      # Only rust is installed; `mise exec` must not install the other tools.
+      MISE_EXEC_AUTO_INSTALL: "false"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up mise
+        uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5.2.9
+        with:
+          version: 2026.11.8
+          install_args: rust
+
+      # The toolchain is part of the key through mise.lock, so a toolchain
+      # update starts a fresh target directory.
+      - name: Compute cache key
+        id: cache-key
+        env:
+          CARGO_LOCK_HASH: ${{ hashFiles('Cargo.lock') }}
+          MISE_LOCK_HASH: ${{ hashFiles('mise.lock') }}
+        run: |
+          if [ -z "$CARGO_LOCK_HASH" ] || [ -z "$MISE_LOCK_HASH" ]; then
+            echo "Cargo.lock or mise.lock is missing" >&2
+            exit 1
+          fi
+          echo "key=cargo-$RUNNER_OS-$RUNNER_ARCH-$CARGO_LOCK_HASH-$MISE_LOCK_HASH" >>"$GITHUB_OUTPUT"
+
+      - name: Cache cargo
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ steps.cache-key.outputs.key }}
+
+      - name: Check formatting
+        run: mise exec -- cargo fmt --all --check
+
+      - name: Run clippy
+        run: mise exec -- cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Run tests
+        run: mise exec -- cargo test --locked
+
+  test-windows:
+    name: Test (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_TERM_COLOR: always
+      # Only rust is installed; `mise exec` must not install the other tools.
+      MISE_EXEC_AUTO_INSTALL: "false"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up mise
+        uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5.2.9
+        with:
+          version: 2026.11.8
+          install_args: rust
+
+      # The toolchain is part of the key through mise.lock, so a toolchain
+      # update starts a fresh target directory.
+      - name: Compute cache key
+        id: cache-key
+        env:
+          CARGO_LOCK_HASH: ${{ hashFiles('Cargo.lock') }}
+          MISE_LOCK_HASH: ${{ hashFiles('mise.lock') }}
+        run: |
+          if [ -z "$CARGO_LOCK_HASH" ] || [ -z "$MISE_LOCK_HASH" ]; then
+            echo "Cargo.lock or mise.lock is missing" >&2
+            exit 1
+          fi
+          echo "key=cargo-$RUNNER_OS-$RUNNER_ARCH-$CARGO_LOCK_HASH-$MISE_LOCK_HASH" >>"$GITHUB_OUTPUT"
+
+      - name: Cache cargo
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ steps.cache-key.outputs.key }}
+
+      - name: Check formatting
+        run: mise exec -- cargo fmt --all --check
+
+      - name: Run clippy
+        run: mise exec -- cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Run tests
+        run: mise exec -- cargo test --locked
+
+  # The required status check: passes only when every test job succeeded; a
+  # failed, cancelled or skipped job, or a missing result, fails it.
   check:
     name: Check
     if: always()
-    needs: test
+    needs: [test-macos, test-linux, test-windows]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions: {}
     steps:
-      - name: Check matrix result
+      - name: Check the test jobs
         env:
-          RESULT: ${{ needs.test.result }}
+          RESULTS: ${{ needs.test-macos.result }} ${{ needs.test-linux.result }} ${{ needs.test-windows.result }}
         run: |
-          echo "test: $RESULT"
-          test "$RESULT" = success
+          echo "test-macos, test-linux, test-windows: $RESULTS"
+          # shellcheck disable=SC2086 # one word per job
+          set -- $RESULTS
+          test "$#" -eq 3
+          for result in "$@"; do
+            test "$result" = success
+          done
