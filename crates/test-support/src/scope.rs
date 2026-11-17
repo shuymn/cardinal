@@ -25,6 +25,9 @@ use tempfile::TempDir;
 #[cfg(unix)]
 use crate::marker::Marker;
 
+#[cfg(target_os = "linux")]
+mod mount;
+
 /// The variable the test harness sets to a value unique to each harness run. A scope passes
 /// it to every child, so the harness can find what a test left running.
 pub const RUN_MARKER: &str = "CARDINAL_TEST_RUN";
