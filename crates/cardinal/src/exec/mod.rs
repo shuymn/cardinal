@@ -101,6 +101,12 @@ const HANDLED: [i32; 4] = [
 ];
 
 struct WatchInner {
+    /// Kept on every platform: an open channel makes waits time out instead of returning at
+    /// once.
+    #[cfg_attr(
+        not(unix),
+        allow(dead_code, reason = "nothing reports events on this platform")
+    )]
     tx: Sender<Event>,
     rx: Mutex<Receiver<Event>>,
     parent_exited: std::sync::atomic::AtomicBool,
@@ -184,6 +190,7 @@ impl Watch {
         self.next(Duration::ZERO)
     }
 
+    #[cfg(unix)]
     fn sender(&self) -> Sender<Event> {
         self.inner.tx.clone()
     }
