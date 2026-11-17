@@ -2,7 +2,8 @@
 //! snapshot (`docs/architecture.md` section 6).
 //!
 //! Owned by the hook work unit. The bodies are not written yet; every declared function
-//! returns `not_implemented`. The CLI exits 0 for every hook, whatever these return.
+//! returns `not_implemented`. The CLI exits 0 for every hook, whatever these return, and
+//! writes the output of `pre_tool_use` to stdout only when it returns `Ok`.
 
 use std::io::{Read, Write};
 

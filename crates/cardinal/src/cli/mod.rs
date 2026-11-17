@@ -311,24 +311,24 @@ fn dispatch(command: Command) -> ExitCode {
     }
 }
 
-/// Runs a hook handler. Always exits 0: panics and errors leave stdout empty, except that a
-/// handler that is not implemented yet says so with `cardinal.error.v1`.
+/// Runs a hook handler. Always exits 0. The handler's output is buffered and written only
+/// when it succeeds, so an error or a panic, `not_implemented` included, leaves stdout empty
+/// and the agent's tool call proceeds unchanged.
 fn hook(args: &HookArgs) -> ExitCode {
     let HookAgent::Claude { event } = args.agent;
-    let result = std::panic::catch_unwind(|| {
+    let mut output = Vec::new();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut stdin = std::io::stdin().lock();
         match event {
-            ClaudeEvent::PreToolUse => {
-                claude::pre_tool_use(&mut stdin, &mut std::io::stdout().lock())
-            }
+            ClaudeEvent::PreToolUse => claude::pre_tool_use(&mut stdin, &mut output),
             ClaudeEvent::SubagentStop => claude::subagent_stop(&mut stdin),
             ClaudeEvent::SessionEnd => claude::session_end(&mut stdin),
         }
-    });
-    if let Ok(Err(err)) = result
-        && err.code == ErrorCode::NotImplemented
-    {
-        print_json(&err.to_doc());
+    }));
+    if let Ok(Ok(())) = result {
+        let mut stdout = std::io::stdout().lock();
+        let _ = stdout.write_all(&output);
+        let _ = stdout.flush();
     }
     ExitCode::SUCCESS
 }
