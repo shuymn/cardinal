@@ -681,7 +681,7 @@ Each plan carries a list of checks. An **invariant** failing or being `unknown` 
 | `no_open_pr` | `reclaim_worktree` | invariant | `open_pr` is `no` |
 | `has_upstream` | `reclaim_worktree` | invariant | The branch has an upstream (G6). This also keeps freshly created worktrees, which start clean at the base, from being reclaimed before their first push |
 | `regenerable` | `reclaim_dir` | invariant | The target is a `regenerable` ignored entry of a worktree that observation listed |
-| `plain_target` | both | invariant | The target is not a symbolic link, not a mount point, and on the same device and mount as its parent. A bind mount on the same device counts as a mount point: the mount is told by its mount ID (`statx`) on Linux and by the path it is mounted on (`statfs`) on macOS; a mount that cannot be read is `unknown`. `plan` reads mount points from `/proc/self/mountinfo` on Linux and compares devices elsewhere; `act` checks mounts on every platform |
+| `plain_target` | both | invariant | The target is not a symbolic link, not a mount point, and on the same device and mount as its parent. A bind mount on the same device counts as a mount point: the mount is told by its mount ID (`statx`) on Linux and by the path it is mounted on (`statfs`) on macOS; a mount that cannot be read is `unknown`. `plan`'s walk by path and `act`'s snapshot read mounts the same way (`os::mount`), for the target and every directory they would enter. On Windows a folder a volume is mounted on is a reparse point, which both treat as a symbolic link |
 | `no_protected` | both | invariant | Nothing in the target, descendants included, is protected |
 | `no_unclassifiable` | both | invariant | Nothing in the target is unclassifiable ignored data |
 | `no_nested_repository` | both | invariant | No directory below the target's root has its own `.git` entry (another worktree, a submodule, a nested clone) |
@@ -932,7 +932,8 @@ These names are reserved and not registered in phase 0 (an unregistered command 
 | `anyhow` | Skip | Typed errors are needed for JSON error codes anyway |
 | `rand`, `uuid`, `getrandom` | Skip | `RandomState` plus exclusive creation gives unique IDs |
 | `chrono`, `time`, `jiff` | Skip | All times are integer milliseconds |
-| `walkdir`, `ignore` | Skip | `read_dir` recursion is enough; git reports ignored entries |
+| `walkdir` | Use | `plan`'s walk by path: iterative with a bounded number of open directories, in name order, never following links; the mount check of section 9.2 prunes it |
+| `ignore` | Skip | git reports ignored entries |
 | `shlex`, `conch-parser`, `brush-parser` | Skip | `shlex` only splits words, and a parser such as `brush-parser` gives stage spans but not the safe-to-wrap policy, the caller-state analysis, zsh handling, or fail-open refusal, so a parser plus a whitelist would still need everything the subset tokenizer does |
 | `wait-timeout`, `duct` | Skip | `os::child`, polling for the exit status (`waitid` with `WNOWAIT` on Unix, `try_wait` on Windows) with reader threads, covers deadlines and output caps |
 | `tracing`, `log` | Skip | Records and `explain` are the diagnostics; hooks must not write to stderr |
