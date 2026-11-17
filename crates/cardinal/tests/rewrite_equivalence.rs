@@ -229,7 +229,7 @@ const CASES: &[Case] = &[
     case(
         "short_circuit",
         "",
-        "cd missing && probe one || printf 'fallback\\n'",
+        "cd missing && probe one 2>&1 | cat || printf 'fallback\\n'",
         1,
         0,
     ),
@@ -268,19 +268,72 @@ const CASES: &[Case] = &[
         1,
         1,
     ),
+    // zsh ignores errexit for the rest of an and-or list after an `if` that ran in the
+    // calling shell, so a stage the list goes on after stays unwrapped (section 7.2).
+    case(
+        "errexit_after_and",
+        "set -e",
+        "probe --exit 0 'x y' && false",
+        0,
+        0,
+    ),
+    case(
+        "errexit_after_or",
+        "set -e",
+        "probe --exit 3 || false; echo unreachable",
+        0,
+        0,
+    ),
+    case(
+        "errexit_after_last_in_pipeline",
+        "set -e",
+        "printf 'x\\n' | probe --stdin && false",
+        0,
+        0,
+    ),
+    // A stage that feeds a pipe runs in a subshell, which keeps the flag to itself.
+    case(
+        "errexit_after_piped_stage",
+        "set -e",
+        "probe --exit 0 | cat && false; echo unreachable",
+        1,
+        1,
+    ),
+    // With `pipefail`, an earlier stage's status decides `errexit` for the last stage's
+    // pipeline, which zsh no longer applies after the `if`.
+    Case {
+        pipefail: true,
+        ..case(
+            "errexit_pipefail_last_in_pipeline",
+            "set -eo pipefail",
+            "cat absent.log 2>&1 | probe --stdin; echo unreachable",
+            0,
+            0,
+        )
+    },
+    Case {
+        pipefail: true,
+        ..case(
+            "errexit_pipefail",
+            "set -eo pipefail",
+            "probe --exit 3 | cat || false; echo unreachable",
+            1,
+            1,
+        )
+    },
     case(
         "errexit_and_list",
         "set -e",
         "probe --exit 2 && echo yes; echo after",
-        1,
-        1,
+        0,
+        0,
     ),
     case(
         "errexit_or_list",
         "set -e",
         "probe --exit 2 || echo recovered; probe --exit 5; echo unreachable",
-        2,
-        2,
+        1,
+        1,
     ),
     case("exit_status", "", "probe --exit 7", 1, 1),
     case(
@@ -341,7 +394,7 @@ const CASES: &[Case] = &[
     case(
         "several_stages",
         "",
-        "probe one && probe two; probe three | cat",
+        "probe one | cat && probe two; probe three | cat",
         3,
         3,
     ),
@@ -596,6 +649,8 @@ fn head() -> impl Strategy<Value = &'static str> {
         Just("probe --err e 2>&1"),
         Just("probe out >> out.log"),
         Just("cat out.log 2>&1"),
+        Just("set -e"),
+        Just("strict"),
     ]
 }
 
@@ -623,12 +678,17 @@ fn separator() -> impl Strategy<Value = &'static str> {
     prop_oneof![Just(" && "), Just(" || "), Just("; "), Just("\n")]
 }
 
+/// The owner's rc: `strict`, a function that turns `errexit` on, is defined in each setup
+/// except the first.
 fn setup() -> impl Strategy<Value = &'static str> {
     prop_oneof![
         Just(""),
-        Just("set -e"),
-        Just("set -o pipefail"),
-        Just("X=outer")
+        Just("strict() { set -e; }"),
+        Just("strict() { set -e; }\nset -e"),
+        Just("strict() { set -e; }\nset -o errexit"),
+        Just("strict() { set -e; }\nset -o pipefail"),
+        Just("strict() { set -e; }\nset -eo pipefail"),
+        Just("strict() { set -e; }\nX=outer")
     ]
 }
 

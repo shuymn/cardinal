@@ -593,6 +593,13 @@ pub(super) fn stages(command: &str) -> Result<Vec<Stage>, Refusal> {
                 match op {
                     Op::Pipe => expect_stage = Some(op),
                     Op::AndIf | Op::OrIf => {
+                        for stage in stages
+                            .iter_mut()
+                            .rev()
+                            .take_while(|s| s.pipeline == pipeline)
+                        {
+                            stage.continued = true;
+                        }
                         expect_stage = Some(op);
                         pipeline += 1;
                     }
@@ -662,6 +669,7 @@ fn finish(
         piped_out: false,
         redirected: builder.redirected,
         background: false,
+        continued: false,
         shell_state: builder.state,
         multiline: builder.newline || command[span].contains('\n'),
     })

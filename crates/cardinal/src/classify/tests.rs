@@ -157,6 +157,15 @@ fn background_covers_the_whole_and_or_list() {
 }
 
 #[test]
+fn continued_marks_each_stage_of_a_pipeline_before_and_or() {
+    let found = stages("a && b | c ||\n d; e | f & g");
+    assert_eq!(
+        found.iter().map(|s| s.continued).collect::<Vec<_>>(),
+        [true, true, true, false, false, false, false]
+    );
+}
+
+#[test]
 fn shell_state_and_newlines_are_flagged() {
     for command in [
         "t $?",
@@ -454,8 +463,8 @@ fn rule_matching_and_precedence() {
 #[test]
 fn unwrapped_stages() {
     use Skip::{
-        Assignments, Background, Multiline, NoCommand, PipedRedirect, SharedPipeline, ShellCommand,
-        ShellState, Skipped, Sleep, Unclassified,
+        Assignments, Background, Errexit, Multiline, NoCommand, PipedRedirect, SharedPipeline,
+        ShellCommand, ShellState, Skipped, Sleep, Unclassified,
     };
     let cases: &[(&str, &[Option<Skip>])] = &[
         ("pnpm test", &[None]),
@@ -480,10 +489,7 @@ fn unwrapped_stages() {
             &[Some(Background), Some(Background), Some(ShellCommand)],
         ),
         ("make 'a\nb'", &[Some(Multiline)]),
-        (
-            "make | vitest",
-            &[Some(SharedPipeline), Some(SharedPipeline)],
-        ),
+        ("make | vitest", &[Some(SharedPipeline), Some(Errexit)]),
         (
             "make | CI=1 vitest",
             &[Some(SharedPipeline), Some(Assignments)],
@@ -517,8 +523,26 @@ fn unwrapped_stages() {
         ),
         ("make 2>&1 3>f | tail", &[None, Some(Unclassified)]),
         ("make < f | tail", &[None, Some(Unclassified)]),
-        ("tail | make > f", &[Some(Unclassified), None]),
-        ("make > f && tail", &[None, Some(Unclassified)]),
+        ("tail | make > f", &[Some(Unclassified), Some(Errexit)]),
+        ("tail && make > f", &[Some(Unclassified), None]),
+        // Once an `if` has run in the calling shell, zsh ignores `errexit` for the rest of its
+        // and-or list and for the status `pipefail` takes from earlier stages; a stage that
+        // feeds a pipe runs in a subshell.
+        ("make && echo ok", &[Some(Errexit), Some(ShellCommand)]),
+        (
+            "make ||\n echo failed",
+            &[Some(Errexit), Some(ShellCommand)],
+        ),
+        (
+            "tail | make && echo ok",
+            &[Some(Unclassified), Some(Errexit), Some(ShellCommand)],
+        ),
+        ("tail | make", &[Some(Unclassified), Some(Errexit)]),
+        (
+            "make | tail || echo failed",
+            &[None, Some(Unclassified), Some(ShellCommand)],
+        ),
+        ("echo a && make; make", &[Some(ShellCommand), None, None]),
     ];
     for (command, expected) in cases {
         assert_eq!(skips(command), *expected, "{command}");

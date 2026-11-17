@@ -63,6 +63,8 @@ pub struct Stage {
     pub redirected: Vec<u32>,
     /// The stage's and-or list is followed by `&`.
     pub background: bool,
+    /// The stage's pipeline is followed by `&&` or `||`: its and-or list goes on after it.
+    pub continued: bool,
     /// The stage expands shell state (`$?`, `$_`, `$!`, `$-`, `$$`, `PIPESTATUS`, …).
     pub shell_state: bool,
     /// The span contains a newline (inside quotes).
@@ -209,6 +211,11 @@ pub enum Skip {
     /// send the output, or read the input, both ways for the stage as written, but not for
     /// the wrapped stage, whose pipe belongs to the surrounding `if`.
     PipedRedirect,
+    /// It runs in the calling shell (alone or last in its pipeline), and a status it does not
+    /// produce can decide `errexit`: a later command of its and-or list, or with `pipefail`
+    /// an earlier stage of its pipeline. Once an `if` has run in the calling shell, zsh
+    /// ignores `errexit` for both.
+    Errexit,
 }
 
 impl Skip {
@@ -228,6 +235,7 @@ impl Skip {
             Self::Multiline => "multiline",
             Self::SharedPipeline => "shared_pipeline",
             Self::PipedRedirect => "piped_redirect",
+            Self::Errexit => "errexit",
         }
     }
 }
@@ -355,6 +363,8 @@ pub fn decide(
                 || (stage.piped_in && stage.redirected.contains(&0))
             {
                 Some(Skip::PipedRedirect)
+            } else if !stage.piped_out && (stage.continued || stage.piped_in) {
+                Some(Skip::Errexit)
             } else {
                 None
             };
