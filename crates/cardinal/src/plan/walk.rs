@@ -6,8 +6,6 @@ use std::fs::Metadata;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use walkdir::WalkDir;
-
 use crate::contract::RootId;
 
 /// The type of an entry, as `lstat` reports it.
@@ -224,9 +222,10 @@ fn mount_id(_path: &Path) -> Result<MountKey, String> {
 }
 
 /// Records the entries below `dir`, parents before children in name order, without following
-/// symbolic links, with a bounded number of directories open (`walkdir`). A directory on
-/// another device or mount than `dev` and `on_mount` is recorded but not entered; a mount that
-/// cannot be read fails the walk.
+/// symbolic links. A directory is listed only after its device and mount are found to be
+/// `dev` and `on_mount`: one on another device or mount is recorded but never listed, and a
+/// mount that cannot be read fails the walk. Each directory is listed in full and closed
+/// before anything below it is listed, so one directory is open at a time.
 fn walk_dir(
     dir: &Path,
     rel: &Path,
@@ -234,46 +233,51 @@ fn walk_dir(
     on_mount: &MountKey,
     out: &mut Vec<Entry>,
 ) -> io::Result<()> {
-    // Removed while walking: nothing to record. The walk's own root is not removed under it.
-    let vanished = |err: &walkdir::Error| {
-        err.depth() > 0
-            && err
-                .io_error()
-                .is_some_and(|e| e.kind() == io::ErrorKind::NotFound)
-    };
-    let mut found = WalkDir::new(dir)
-        .follow_links(false)
-        .follow_root_links(false)
-        .min_depth(1)
-        .sort_by_file_name()
-        .into_iter();
-    while let Some(next) = found.next() {
-        let dent = match next {
-            Ok(dent) => dent,
-            Err(err) if vanished(&err) => continue,
-            Err(err) => return Err(err.into()),
+    // The remaining children of each directory being walked, innermost last.
+    let mut pending = vec![children(dir, rel)?.into_iter()];
+    while let Some(level) = pending.last_mut() {
+        let Some((path, rel)) = level.next() else {
+            pending.pop();
+            continue;
         };
-        // `lstat` of the entry itself, not `dent.metadata()`: on Windows that is the copy of
-        // the entry's attributes in its parent directory's index (`FindNextFileW`), which NTFS
-        // updates lazily, so a directory's mtime there can predate an entry created below it.
-        let meta = match std::fs::symlink_metadata(dent.path()) {
+        // `lstat` of the entry itself, not `DirEntry::metadata`: on Windows that is the copy
+        // of the entry's attributes in its parent directory's index (`FindNextFileW`), which
+        // NTFS updates lazily, so a directory's mtime there can predate an entry created below
+        // it.
+        let meta = match std::fs::symlink_metadata(&path) {
             Ok(meta) => meta,
+            // Removed while walking: nothing to record.
             Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
             Err(err) => return Err(err),
         };
-        let below = dent.path().strip_prefix(dir).map_err(io::Error::other)?;
-        let entry = Entry::from_metadata(rel.join(below), &meta);
-        let descend = entry.kind == EntryKind::Dir
+        let entry = Entry::from_metadata(rel, &meta);
+        let enter = entry.kind == EntryKind::Dir
             && entry.dev == dev
-            && mount_id(dent.path()).map_err(io::Error::other)? == *on_mount;
-        // `walkdir` has opened every directory it yields (and only those, so this skips
-        // nothing else); one not to enter is left before anything below it is yielded.
-        if dent.file_type().is_dir() && !descend {
-            found.skip_current_dir();
+            && mount_id(&path).map_err(io::Error::other)? == *on_mount;
+        if enter {
+            match children(&path, &entry.rel) {
+                Ok(below) => pending.push(below.into_iter()),
+                // Removed since its `lstat`: the entry stays as it was seen.
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err),
+            }
         }
         out.push(entry);
     }
     Ok(())
+}
+
+/// The entries of the directory `dir`, as their paths and their worktree-relative paths below
+/// `rel`, in name order.
+fn children(dir: &Path, rel: &Path) -> io::Result<Vec<(PathBuf, PathBuf)>> {
+    let mut names = std::fs::read_dir(dir)?
+        .map(|entry| entry.map(|e| e.file_name()))
+        .collect::<io::Result<Vec<_>>>()?;
+    names.sort();
+    Ok(names
+        .into_iter()
+        .map(|name| (dir.join(&name), rel.join(name)))
+        .collect())
 }
 
 /// The identity of a worktree root: `dev` and `ino` on Unix, and its creation time where

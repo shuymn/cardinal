@@ -270,3 +270,78 @@ fn bind_mounts_are_not_entered() {
         "the bind mount is listed, not entered: {entries:?}"
     );
 }
+
+/// Whether a directory was opened and whether its entries were read since [`Watch::new`],
+/// from inotify, which reports both however the directory is reached (through a bind mount
+/// in another mount namespace included).
+#[cfg(target_os = "linux")]
+struct Watch {
+    inotify: std::os::fd::OwnedFd,
+}
+
+#[cfg(target_os = "linux")]
+impl Watch {
+    fn new(dir: &Path) -> Self {
+        use rustix::fs::inotify::{self, CreateFlags, WatchFlags};
+        let inotify = inotify::init(CreateFlags::NONBLOCK | CreateFlags::CLOEXEC).unwrap();
+        inotify::add_watch(&inotify, dir, WatchFlags::OPEN | WatchFlags::ACCESS).unwrap();
+        Self { inotify }
+    }
+
+    /// `(opened, listed)` for the directory itself, from the events queued so far.
+    fn seen(&self) -> (bool, bool) {
+        use rustix::fs::inotify::{ReadFlags, Reader};
+        let mut buf = [std::mem::MaybeUninit::uninit(); 4096];
+        let mut events = Reader::new(&self.inotify, &mut buf);
+        let (mut opened, mut listed) = (false, false);
+        loop {
+            match events.next() {
+                // An event on an entry inside carries its name; one on the directory does not.
+                Ok(event) if event.file_name().is_none() => {
+                    opened |= event.events().contains(ReadFlags::OPEN);
+                    listed |= event.events().contains(ReadFlags::ACCESS);
+                }
+                Ok(_) => {}
+                Err(rustix::io::Errno::AGAIN) => return (opened, listed),
+                Err(err) => panic!("read the inotify events: {err}"),
+            }
+        }
+    }
+}
+
+/// A7 on Linux: a bind mount below the target is told by its mount before it is read. `plan`'s
+/// walk neither opens nor lists it; `act`'s snapshot opens it to read its mount and does not
+/// list it.
+#[cfg(target_os = "linux")]
+#[test]
+fn bind_mounts_are_not_listed() {
+    let s = Setup::new();
+    let Some(flags) = mount_namespace(&s) else {
+        return;
+    };
+    let data = s.fx.path("owner/data");
+    write(&data, "keep", "x");
+    let wt = s.worktree("bound", &[("node_modules", IgnoredClass::Regenerable)]);
+    write(&wt, "node_modules/pkg/index.js", "x");
+    let cache = wt.join("node_modules").join("cache");
+    std::fs::create_dir_all(&cache).unwrap();
+    let target = wt.join("node_modules");
+    let plan = s.plan(PlanKind::ReclaimDir, &target);
+
+    let watch = Watch::new(&data);
+    let (mount, entries) = walk_with_binds(&s, flags, &wt, &target, &[(&data, &cache)]);
+    assert_eq!(mount, "Same");
+    assert!(
+        entries.contains(&"node_modules/cache".to_owned()),
+        "{entries:?}"
+    );
+    assert_eq!(
+        watch.seen(),
+        (false, false),
+        "the walk neither opens nor lists the bind mount"
+    );
+
+    let result = act_with_binds(&s, flags, &plan.id, &[(&data, &cache)]);
+    assert_eq!(result.status, ActStatus::DryRun, "{result:#?}");
+    assert!(!watch.seen().1, "the snapshot does not list the bind mount");
+}
