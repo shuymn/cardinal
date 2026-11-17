@@ -452,7 +452,7 @@ The explicit `timeout` keeps a stuck hook from stalling Bash calls for the 600 s
 
 ### 6.3 `hook claude pre-tool-use`
 
-1. Read stdin (bounded at 1 MiB) as JSON. Exit 0 with empty stdout, rewriting nothing, if the platform is Windows (section 5.5), `tool_name` is not `Bash`, `tool_input.command` is not a string, `hook.enabled` is false, `permission_mode` is `auto` (section 6.5), or anything fails.
+1. On Windows (section 5.5), exit 0 with empty stdout at once, before reading the input or the configuration, so the hook records nothing there. Elsewhere, read stdin (bounded at 1 MiB) as JSON. Exit 0 with empty stdout, rewriting nothing, if `tool_name` is not `Bash`, `tool_input.command` is not a string, `hook.enabled` is false, `permission_mode` is `auto` (section 6.5), or anything fails.
 2. Find and classify stages (section 7) within `hook.deadline_ms`, measured from process start. Past the deadline: no rewrite.
 3. If at least one stage is classified, rewrite each classified stage (section 6.4) and print:
 
