@@ -103,7 +103,7 @@ fn descendants_and_ancestors_cover_grandchildren() {
     );
     wait_for_file(&ready, WAIT);
     let grandchild: u32 = std::fs::read_to_string(&pid_file).unwrap().parse().unwrap();
-    let _grandchild = PidGuard::new(grandchild);
+    let _grandchild = PidGuard::new(&scope, grandchild);
 
     let table = wait_for("both helpers in the table", WAIT, || {
         let table = ProcessTable::snapshot(Detail::default()).unwrap();

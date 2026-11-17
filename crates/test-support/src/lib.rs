@@ -10,6 +10,8 @@
 //! - [`pty`]: pseudo-terminals for a child's stdin (Unix).
 
 pub mod fixture;
+#[cfg(unix)]
+mod marker;
 pub mod process;
 #[cfg(unix)]
 pub mod pty;

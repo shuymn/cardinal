@@ -103,7 +103,7 @@ fn runner_killed_before_starting_runs_the_stage_zero_times() {
     let after = format!("; echo $? > '{}'", status_file.display());
     let mut shell = env.in_shell(&runner, &after).spawn().unwrap();
     let runner = env.wait_any_reached(cardinal::testpoint::RUN_BEFORE_STARTING);
-    PidGuard::new(runner).kill();
+    PidGuard::new(env.scope(), runner).kill();
     assert_eq!(shell.wait().unwrap().code(), Some(0));
     assert_eq!(
         std::fs::read_to_string(&status_file).unwrap().trim(),

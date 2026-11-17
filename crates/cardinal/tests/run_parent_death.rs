@@ -206,7 +206,7 @@ fn a_stopped_runner_cancels_once_continued_and_leaves_its_group_alone() {
         let job = StoppedJob::start(&env, path, Caller::Anchored, "");
         let sibling = job.member.expect("an anchored group has a stopped member");
 
-        PidGuard::new(job.parent).kill();
+        PidGuard::new(env.scope(), job.parent).kill();
         wait_orphaned(job.runner, job.parent);
         // Long enough for anything that watches the parent to act.
         std::thread::sleep(Duration::from_secs(1));
@@ -241,7 +241,7 @@ fn orphaning_a_stopped_runner_cancels_its_stage() {
     for path in ["fail_open", "tty"] {
         let env = Env::with_budget(1);
         let job = StoppedJob::start(&env, path, Caller::Session, "trap '' HUP; ");
-        PidGuard::new(job.parent).kill();
+        PidGuard::new(env.scope(), job.parent).kill();
         job.wait_cancelled(&env, path);
     }
 }

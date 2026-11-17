@@ -3,9 +3,9 @@
 //! Every child starts with `env_clear()` and the scope's constructed environment, in a working
 //! directory inside the root, in a process group of its own (Unix) or a job object of its own
 //! (Windows). On Unix it holds no descriptor of the test process but the standard streams it is
-//! given. Its cleanup slot is registered before it starts. When the child exits, is
-//! killed, or its [`Child`] or the [`Scope`] is dropped, whatever is left of its group or job
-//! is killed. A group is signalled only while its leader is unreaped, so its ID cannot have
+//! given and the scope's marker (`crate::marker`), which the guards of `crate::process` go by.
+//! Its cleanup slot is registered before it starts. When the child exits, is killed, or its
+//! [`Child`] or the [`Scope`] is dropped, whatever is left of its group or job is killed. A group is signalled only while its leader is unreaped, so its ID cannot have
 //! been reused; a job holds only processes started inside it. On Unix a child can instead
 //! lead a new session ([`Command::new_session`]), whose group it leads too, or join the group
 //! another child leads ([`Command::join_group`]); a child that joined a group is cleaned up
@@ -21,6 +21,9 @@ use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
+
+#[cfg(unix)]
+use crate::marker::{FileId, Marker};
 
 /// The variable the test harness sets to a value unique to each harness run. A scope passes
 /// it to every child, so the harness can find what a test left running.
@@ -45,6 +48,8 @@ const MAX_LINKS: u32 = 40;
 pub struct Scope {
     registry: Arc<Registry>,
     root: PathBuf,
+    #[cfg(unix)]
+    marker: Arc<Marker>,
     // Removed after the registry's children are gone (see `Drop`).
     _dir: TempDir,
 }
@@ -95,6 +100,8 @@ impl Scope {
         .expect("write the scope git config");
         Self {
             registry: Arc::default(),
+            #[cfg(unix)]
+            marker: Arc::new(Marker::create(&root)),
             root,
             _dir: dir,
         }
@@ -104,6 +111,12 @@ impl Scope {
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The file every child of this scope holds open (see [`Marker`]).
+    #[cfg(unix)]
+    pub(crate) fn marker(&self) -> FileId {
+        self.marker.id()
     }
 
     /// `root/rel`; panics if `rel` leaves the root.
@@ -183,12 +196,14 @@ impl Scope {
         {
             use std::os::unix::process::CommandExt as _;
             let highest = Arc::clone(&highest);
-            // SAFETY: the closure runs in the child between fork and exec. It loads an integer
+            let marker = Arc::clone(&self.marker);
+            // SAFETY: the closure runs in the child between fork and exec. It reads integers
             // and makes system calls that only read and set descriptor flags, all
             // async-signal-safe, and allocates nothing.
             unsafe {
                 inner.pre_exec(move || {
-                    unix::close_others_on_exec(highest.load(Ordering::Relaxed));
+                    unix::close_others_on_exec(highest.load(Ordering::Relaxed), marker.keep());
+                    unix::inherit(marker.raw());
                     Ok(())
                 });
             }
@@ -927,38 +942,67 @@ mod unix {
             .unwrap_or(2)
     }
 
-    /// Run in a child between fork and exec: marks every descriptor from 3 up close-on-exec,
-    /// so the child keeps only the standard streams set up for it, never a descriptor that
-    /// whatever started the test run left open. The test process's own flags never change.
-    /// With `close_range` (Linux 5.11 and later) one call covers every descriptor; otherwise
-    /// each one up to `highest`, the highest the test process held when the child started:
-    /// the descriptors it inherited are among those, and the ones it opened since are
-    /// close-on-exec already, as the standard library opens them. Async-signal-safe: system
-    /// calls only, nothing allocated.
-    pub(super) fn close_others_on_exec(highest: i32) {
+    /// Run in a child between fork and exec: marks every descriptor from 3 up but those in
+    /// `keep` (sorted) close-on-exec, so the child keeps only the standard streams set up for
+    /// it and the scope's markers, never a descriptor that whatever started the test run left
+    /// open. The test process's own flags never change. With `close_range` (Linux 5.11 and
+    /// later) one call covers each run between kept descriptors; otherwise each descriptor up to
+    /// `highest`, the highest the test process held when the child started: the descriptors it
+    /// inherited are among those, and the ones it opened since are close-on-exec already, as the
+    /// standard library opens them. Async-signal-safe: system calls only, nothing allocated.
+    pub(super) fn close_others_on_exec(highest: i32, keep: &[i32]) {
         #[cfg(target_os = "linux")]
         {
-            // SAFETY: `close_range` with `CLOSE_RANGE_CLOEXEC` closes nothing; it only sets the
-            // close-on-exec flag of the descriptors in the range.
-            let set = unsafe {
-                libc::syscall(
-                    libc::SYS_close_range,
-                    3_u32,
-                    u32::MAX,
-                    libc::CLOSE_RANGE_CLOEXEC,
-                )
-            };
-            if set == 0 {
+            let mut first = 3_u32;
+            let mut set = true;
+            for &kept in keep {
+                let kept = kept.cast_unsigned();
+                if kept > first {
+                    set &= cloexec_range(first, kept - 1);
+                }
+                first = first.max(kept + 1);
+            }
+            if set && cloexec_range(first, u32::MAX) {
                 return;
             }
         }
         for raw in 3..=highest {
+            if keep.contains(&raw) {
+                continue;
+            }
             // SAFETY: only the descriptor flags of `raw` are read and set; a number that is
             // not open fails with EBADF.
             let fd = unsafe { rustix::fd::BorrowedFd::borrow_raw(raw) };
             if let Ok(flags) = rustix::io::fcntl_getfd(fd) {
                 let _ = rustix::io::fcntl_setfd(fd, flags | rustix::io::FdFlags::CLOEXEC);
             }
+        }
+    }
+
+    /// `close_range(first, last, CLOSE_RANGE_CLOEXEC)`: whether it set the flag.
+    #[cfg(target_os = "linux")]
+    fn cloexec_range(first: u32, last: u32) -> bool {
+        // SAFETY: with `CLOSE_RANGE_CLOEXEC` the call closes nothing; it only sets the
+        // close-on-exec flag of the descriptors in the range.
+        let set = unsafe {
+            libc::syscall(
+                libc::SYS_close_range,
+                first,
+                last,
+                libc::CLOSE_RANGE_CLOEXEC,
+            )
+        };
+        set == 0
+    }
+
+    /// Run in a child between fork and exec: clears close-on-exec on `raw`, the scope's marker,
+    /// so the program the child runs holds it. Async-signal-safe.
+    pub(super) fn inherit(raw: i32) {
+        // SAFETY: only the descriptor flags of `raw` are read and set; the marker is open in
+        // the test process, and so in the child.
+        let fd = unsafe { rustix::fd::BorrowedFd::borrow_raw(raw) };
+        if let Ok(flags) = rustix::io::fcntl_getfd(fd) {
+            let _ = rustix::io::fcntl_setfd(fd, flags - rustix::io::FdFlags::CLOEXEC);
         }
     }
 }
