@@ -470,7 +470,7 @@ impl LocalRunning {
             }
             if stopping.is_none() && self.watch.parent_exited() {
                 stopping = Some(Instant::now());
-                self.forward_stop(os::unix::SIGTERM, !exited);
+                self.forward(os::unix::SIGTERM, !exited);
             }
             let Some(since) = stopping else {
                 if exited {
@@ -544,17 +544,6 @@ impl LocalRunning {
         match self.group {
             Some(pgid) => self.watch.signal_own_group(pgid, sig),
             None if child_unreaped && (sig == os::unix::SIGTERM || sig == os::unix::SIGHUP) => {
-                let _ = os::unix::signal_process(self.pid, sig);
-            }
-            None => {}
-        }
-    }
-
-    #[cfg(unix)]
-    fn forward_stop(&self, sig: i32, child_unreaped: bool) {
-        match self.group {
-            Some(pgid) => self.watch.signal_own_group(pgid, sig),
-            None if child_unreaped => {
                 let _ = os::unix::signal_process(self.pid, sig);
             }
             None => {}

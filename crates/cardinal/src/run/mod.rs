@@ -81,10 +81,10 @@ pub fn truncate_argv(argv: &[OsString]) -> Vec<String> {
         if left == 0 {
             break;
         }
-        let mut arg = arg.to_string_lossy().into_owned();
-        arg.truncate(arg.floor_char_boundary(left));
-        left -= arg.len();
-        out.push(arg);
+        let arg = arg.to_string_lossy();
+        let kept = &arg[..arg.floor_char_boundary(left)];
+        left -= kept.len();
+        out.push(kept.to_owned());
     }
     out
 }
@@ -200,7 +200,7 @@ struct Context {
 
 struct Runner {
     started: Instant,
-    argv: Vec<OsString>,
+    inv: Invocation,
     watch: Watch,
     /// Why the signals are not watched (step 1), which makes the run fail open.
     unwatched: Option<FailOpen>,
@@ -227,7 +227,9 @@ impl Runner {
     ) -> Self {
         Self {
             started,
-            argv: command.to_vec(),
+            inv: Invocation {
+                argv: command.to_vec(),
+            },
             executor: LocalExecutor::new(watch.clone()),
             watch,
             unwatched,
@@ -470,7 +472,7 @@ impl Runner {
             worktree: self.worktree.clone(),
             session,
             cwd: cwd_string(),
-            argv: truncate_argv(&self.argv),
+            argv: truncate_argv(&self.inv.argv),
         })
     }
 
@@ -542,10 +544,7 @@ impl Runner {
         if let Err(err) = testpoint::hit(testpoint::RUN_SPAWNING) {
             return self.fail_open(&FailOpen::new("injected", &err));
         }
-        let inv = Invocation {
-            argv: self.argv.clone(),
-        };
-        let running = match self.executor.start(&inv) {
+        let running = match self.executor.start(&self.inv) {
             Ok(running) => running,
             // The OS guarantees that no child ran.
             Err(err) => return self.fail_open(&FailOpen::new("spawn_failed", &err)),
@@ -637,10 +636,7 @@ impl Runner {
         if let Some(cancel) = self.pending_cancel() {
             return self.cancel(cancel);
         }
-        let inv = Invocation {
-            argv: self.argv.clone(),
-        };
-        match self.executor.spawn(&inv) {
+        match self.executor.spawn(&self.inv) {
             Ok(running) => {
                 let child = self.begin(Box::new(running), path);
                 self.record(
@@ -656,6 +652,7 @@ impl Runner {
                     126
                 };
                 let command = self
+                    .inv
                     .argv
                     .first()
                     .map_or_default(|c| c.to_string_lossy().into_owned());

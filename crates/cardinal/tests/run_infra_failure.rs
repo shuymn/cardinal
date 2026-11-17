@@ -121,9 +121,9 @@ fn panic_after_the_spawn_returns_the_stage_status() {
     }
 }
 
-/// A panic in a record append once the stage has started, and the same panic again while the
-/// runner recovers from it: the reservation stays while the stage runs, the runner waits for
-/// the stage and returns its status, and only the records are lost (section 4.7).
+/// A panic in every record append from the first one after the spawn: each is caught where it
+/// happens, the reservation stays while the stage runs, the runner waits for the stage and
+/// returns its status, and only the records are lost (section 4.7).
 #[cfg(unix)]
 #[test]
 fn a_panic_while_recording_after_the_spawn_keeps_the_reservation() {

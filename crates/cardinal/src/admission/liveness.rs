@@ -29,8 +29,8 @@ pub trait ProcessFacts {
 }
 
 /// The derived state of one reservation and, for `recovery_needed`, whether its group is
-/// verified: the recorded child is alive and still in the recorded group. Only a verified
-/// group is ever signalled.
+/// verified: the recorded child is alive and still in the recorded group. Verification is
+/// reported for inspection; recovery never signals.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Derived {
     pub state: DerivedState,
