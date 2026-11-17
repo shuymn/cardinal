@@ -5,12 +5,15 @@
 //! The environment is always the caller's choice. [`git_env`] and [`gh_env`] build the
 //! constructed environments of section 8.1 from separate allowlists.
 
+#[cfg(unix)]
+mod unix;
+
 use std::ffi::{OsStr, OsString};
 use std::io::Read;
 use std::path::Path;
 #[cfg(unix)]
 use std::process::Child;
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -250,30 +253,40 @@ fn take_output(child: &mut Handle) -> [Option<Box<dyn Read + Send>>; 2] {
     ]
 }
 
-/// Owns the child until its output is complete. Dropped before that (deadline, output over
-/// the limit, read error, a reader thread that could not start), it kills the child and
-/// every descendant still in its process group (Unix) or Job Object (Windows), so none holds
-/// the output open, and reaps the child.
+/// Owns the child until it is reaped. On every exit from [`run`], complete or early
+/// (deadline, output over the limit, read error, a reader thread that could not start), it
+/// kills whatever is left of the child's process group (Unix) or Job Object (Windows)
+/// before it reaps the child, so no process cardinal started outlives the run.
 struct Reaper {
     child: Handle,
     complete: bool,
 }
 
-impl Drop for Reaper {
-    fn drop(&mut self) {
-        if self.complete {
-            return;
-        }
+impl Reaper {
+    /// Whether the child has ended. On Unix the child stays unreaped, so the ID of the
+    /// process group it leads cannot pass to another group.
+    fn ended(&mut self) -> std::io::Result<bool> {
         #[cfg(unix)]
         {
-            // The group is the child's own (`process_group(0)`); while the child is unreaped
-            // or a member still holds the output open, its ID cannot belong to another group.
+            unix::ended(self.child.id())
+        }
+        #[cfg(windows)]
+        {
+            Ok(self.child.try_wait()?.is_some())
+        }
+    }
+
+    /// Kills the child and everything left in its process group or job, then reaps the
+    /// child. A child that had already exited keeps its own status.
+    fn finish(&mut self) -> std::io::Result<ExitStatus> {
+        self.complete = true;
+        #[cfg(unix)]
+        {
+            // The group is the child's own (`process_group(0)`), and its ID is pinned until
+            // the child is reaped below.
             crate::os::kill_process_group(self.child.id());
-            if matches!(self.child.try_wait(), Ok(Some(_))) {
-                return;
-            }
             let _ = self.child.kill();
-            let _ = self.child.wait();
+            self.child.wait()
         }
         #[cfg(windows)]
         {
@@ -281,7 +294,15 @@ impl Drop for Reaper {
             // own `wait` also waits for a job notification, which may already have been
             // consumed.
             let _ = self.child.start_kill();
-            let _ = self.child.inner_mut().wait();
+            self.child.inner_mut().wait()
+        }
+    }
+}
+
+impl Drop for Reaper {
+    fn drop(&mut self) {
+        if !self.complete {
+            let _ = self.finish();
         }
     }
 }
@@ -317,8 +338,10 @@ fn read_streams(
 /// Runs `program` with `args` and exactly `env` in `cwd`, stdin closed, within `limits`.
 ///
 /// Output is read on two threads, each stopping one byte past `limits.max_output`. On Unix
-/// the child leads its own process group; on Windows it runs in its own Job Object. On the
-/// deadline the group or job is killed and the child reaped, and the result is
+/// the child leads its own process group; on Windows it runs in its own Job Object. The run
+/// completes once the child has exited and both streams are at end of file; whatever is
+/// left in the group or job is then killed before the child is reaped. On the deadline the
+/// group or job is killed and the child reaped, and the result is
 /// [`ChildError::Timeout`]; that includes a child that exited while a descendant still
 /// holds its output open. A stream over the limit ends the same way at once, with
 /// [`ChildError::OutputTooLarge`]. Once the group or job is gone the reader threads see end
@@ -360,16 +383,14 @@ pub fn run(
         source,
     };
     let mut streams = [Vec::new(), Vec::new()];
-    let mut status = None;
+    let mut ended = false;
     let mut delay = Duration::from_millis(1);
     loop {
-        if status.is_none() {
-            status = child.child.try_wait().map_err(io_err)?;
+        if !ended {
+            ended = child.ended().map_err(io_err)?;
         }
-        if let Some(status) = status
-            && pending == 0
-        {
-            child.complete = true;
+        if ended && pending == 0 {
+            let status = child.finish().map_err(io_err)?;
             let [stdout, stderr] = streams;
             return Ok(Output {
                 code: status.code(),
@@ -650,32 +671,58 @@ mod tests {
         );
     }
 
-    /// On the deadline the whole job goes on Windows: `cmd` waits for `ping`, which holds
-    /// the output open; killing `cmd` alone would leave `ping` running.
-    #[cfg(windows)]
+    /// A descendant that let go of the output and outlives a normal exit is killed with the
+    /// group before the child is reaped.
+    #[cfg(unix)]
     #[test]
-    fn the_deadline_kills_the_whole_tree_on_windows() {
+    fn a_descendant_left_after_a_normal_exit_is_killed() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let script = format!(
+            "sleep 30 >/dev/null 2>&1 & echo $! > '{}'; exit 0",
+            pid_file.display()
+        );
+        let out = sh(dir.path(), &script, limits(Duration::from_secs(10), 1024)).unwrap();
+        assert_eq!(out.code, Some(0));
+        let pid: u32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let gone = (0..250).any(|_| {
+            std::thread::sleep(Duration::from_millis(20));
+            crate::os::start_time_s(pid).is_none()
+        });
+        assert!(gone, "the descendant {pid} was killed with the group");
+    }
+
+    /// A loopback address unique to this test process, for finding its `ping`.
+    #[cfg(windows)]
+    fn ping_target(n: u32) -> String {
+        let id = std::process::id();
+        format!("127.{}.{}.{n}", (id >> 8) & 0xff, id & 0xff)
+    }
+
+    /// The constructed git environment from this process, which carries the variables `cmd`
+    /// and `powershell` need.
+    #[cfg(windows)]
+    fn windows_env() -> Vec<(OsString, OsString)> {
+        git_env(std::env::vars_os())
+    }
+
+    /// Finds the `ping` of `target` while it runs, so a later "gone" check cannot pass for a
+    /// `ping` that never started.
+    #[cfg(windows)]
+    fn watch_ping(target: &str) -> std::thread::JoinHandle<Option<(u32, u64)>> {
         use crate::os::{Detail, ProcessTable};
 
-        let dir = tempfile::tempdir().unwrap();
-        let id = std::process::id();
-        let target = format!("127.{}.{}.37", (id >> 8) & 0xff, id & 0xff);
-        let inherited = std::env::vars_os().filter(|(k, _)| {
-            ["PATH", "SystemRoot", "ComSpec", "PATHEXT"]
-                .iter()
-                .any(|keep| k.eq_ignore_ascii_case(keep))
-        });
-        let env = git_env(inherited);
-
-        // Finds the `ping` while it runs, so the check below cannot pass for a `ping` that
-        // never started.
-        let wanted = target.clone();
-        let watcher = std::thread::spawn(move || {
+        let wanted = target.to_owned();
+        std::thread::spawn(move || {
             let detail = Detail {
                 cmd: true,
                 cwd: false,
             };
-            for _ in 0..200 {
+            for _ in 0..600 {
                 if let Ok(table) = ProcessTable::snapshot(detail) {
                     let found = table.iter().find(|p| {
                         p.name.to_ascii_lowercase().starts_with("ping")
@@ -688,7 +735,27 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(50));
             }
             None
+        })
+    }
+
+    #[cfg(windows)]
+    fn assert_gone(found: Option<(u32, u64)>) {
+        let (pid, start_s) = found.expect("ping started");
+        let gone = (0..250).any(|_| {
+            std::thread::sleep(Duration::from_millis(20));
+            !crate::os::is_alive(pid, start_s)
         });
+        assert!(gone, "ping {pid} was killed with the job");
+    }
+
+    /// On the deadline the whole job goes on Windows: `cmd` waits for `ping`, which holds
+    /// the output open; killing `cmd` alone would leave `ping` running.
+    #[cfg(windows)]
+    #[test]
+    fn the_deadline_kills_the_whole_tree_on_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = ping_target(37);
+        let watcher = watch_ping(&target);
         let err = run(
             "cmd",
             &[
@@ -699,17 +766,40 @@ mod tests {
                 "31".into(),
                 target.clone().into(),
             ],
-            &env,
+            &windows_env(),
             dir.path(),
             limits(Duration::from_secs(5), 1024 * 1024),
         )
         .unwrap_err();
         assert!(matches!(err, ChildError::Timeout { .. }), "{err}");
-        let (pid, start_s) = watcher.join().unwrap().expect("ping started");
-        let gone = (0..250).any(|_| {
-            std::thread::sleep(Duration::from_millis(20));
-            !crate::os::is_alive(pid, start_s)
-        });
-        assert!(gone, "ping {pid} was killed with the job");
+        assert_gone(watcher.join().unwrap());
+    }
+
+    /// After a normal exit the rest of the job goes on Windows: `Start-Process` leaves a
+    /// `ping` that inherits no handle, so the run completes while it still runs.
+    #[cfg(windows)]
+    #[test]
+    fn a_process_left_after_a_normal_exit_is_killed_on_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = ping_target(38);
+        let watcher = watch_ping(&target);
+        let script = format!(
+            "Start-Process -FilePath ping -ArgumentList '-n','31','{target}' -WindowStyle Hidden"
+        );
+        let out = run(
+            "powershell",
+            &[
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-Command".into(),
+                script.into(),
+            ],
+            &windows_env(),
+            dir.path(),
+            limits(Duration::from_secs(60), 1024 * 1024),
+        )
+        .unwrap();
+        assert_eq!(out.code, Some(0), "{}", out.stderr_line());
+        assert_gone(watcher.join().unwrap());
     }
 }
