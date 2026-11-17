@@ -8,7 +8,7 @@
 use std::ffi::{OsStr, OsString};
 use std::io::Read;
 use std::path::Path;
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -174,6 +174,8 @@ pub enum ChildError {
     },
     #[error("{program} did not finish by its deadline")]
     Timeout { program: String },
+    #[error("{program} wrote more than {limit} bytes to stdout or stderr")]
+    OutputTooLarge { program: String, limit: u64 },
     #[error("{program}: {source}")]
     Io {
         program: String,
@@ -181,30 +183,29 @@ pub enum ChildError {
     },
 }
 
-/// Owns the child until its output is complete. Dropped before that (deadline, read error,
-/// a reader thread that could not start), it kills the child's process group on Unix, so
-/// descendants holding the output open go too, then kills and reaps the child. On Windows
-/// only the child is killed; a descendant can outlive it until it closes the pipe.
+/// The bounds of one [`run`]: the absolute deadline every wait ends at, and the most bytes
+/// read from each of stdout and stderr.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits {
+    pub deadline: Instant,
+    pub max_output: u64,
+}
+
+/// What a reader thread read from one stream.
+enum Stream {
+    Read(Vec<u8>),
+    TooLarge,
+    Failed(std::io::Error),
+}
+
+/// Owns the child until its output is complete. Dropped before that (deadline, output over
+/// the limit, read error, a reader thread that could not start), it kills the child's
+/// process group on Unix, so descendants holding the output open go too, then kills and
+/// reaps the child. On Windows only the child is killed; a descendant can outlive it until
+/// it closes the pipe.
 struct Reaper {
     child: Child,
     complete: bool,
-}
-
-impl Reaper {
-    fn wait_until(&mut self, deadline: Instant) -> std::io::Result<Option<ExitStatus>> {
-        let mut delay = Duration::from_millis(1);
-        loop {
-            if let Some(status) = self.child.try_wait()? {
-                return Ok(Some(status));
-            }
-            let now = Instant::now();
-            if now >= deadline {
-                return Ok(None);
-            }
-            std::thread::sleep(delay.min(deadline - now));
-            delay = (delay * 2).min(Duration::from_millis(20));
-        }
-    }
 }
 
 impl Drop for Reaper {
@@ -224,19 +225,48 @@ impl Drop for Reaper {
     }
 }
 
-/// Runs `program` with `args` and exactly `env` in `cwd`, stdin closed, until `deadline`.
+/// Reads each present stream to its end on its own thread, stopping one byte past `max`.
+/// Each thread sends its stream's index and what it read; returns the receiver and the
+/// number of threads started.
+fn read_streams(
+    streams: [Option<Box<dyn Read + Send>>; 2],
+    max: u64,
+) -> std::io::Result<(mpsc::Receiver<(usize, Stream)>, usize)> {
+    let (sender, receiver) = mpsc::channel();
+    let mut started = 0;
+    for (index, stream) in streams.into_iter().enumerate() {
+        let Some(stream) = stream else { continue };
+        let sender = sender.clone();
+        std::thread::Builder::new()
+            .name("child-output".into())
+            .spawn(move || {
+                let mut bytes = Vec::new();
+                let read = match stream.take(max.saturating_add(1)).read_to_end(&mut bytes) {
+                    Ok(_) if bytes.len() as u64 > max => Stream::TooLarge,
+                    Ok(_) => Stream::Read(bytes),
+                    Err(err) => Stream::Failed(err),
+                };
+                let _ = sender.send((index, read));
+            })?;
+        started += 1;
+    }
+    Ok((receiver, started))
+}
+
+/// Runs `program` with `args` and exactly `env` in `cwd`, stdin closed, within `limits`.
 ///
-/// Output is read on two threads. On Unix the child leads its own process group. On the
-/// deadline the group is killed and the child reaped, and the result is
-/// [`ChildError::Timeout`]; that includes a child that exited while a descendant still
-/// holds its output open. Once the group is gone the reader threads see end of file and
-/// end; nothing waits for them.
+/// Output is read on two threads, each stopping one byte past `limits.max_output`. On Unix
+/// the child leads its own process group. On the deadline the group is killed and the child
+/// reaped, and the result is [`ChildError::Timeout`]; that includes a child that exited
+/// while a descendant still holds its output open. A stream over the limit ends the same
+/// way at once, with [`ChildError::OutputTooLarge`]. Once the group is gone the reader
+/// threads see end of file and end; nothing waits for them.
 pub fn run(
     program: impl AsRef<OsStr>,
     args: &[OsString],
     env: &[(OsString, OsString)],
     cwd: &Path,
-    deadline: Instant,
+    limits: Limits,
 ) -> Result<Output, ChildError> {
     let program = program.as_ref();
     let name = || program.to_string_lossy().into_owned();
@@ -259,7 +289,6 @@ pub fn run(
         complete: false,
     };
 
-    let (sender, receiver) = mpsc::channel();
     let stdout = child
         .child
         .stdout
@@ -270,47 +299,64 @@ pub fn run(
         .stderr
         .take()
         .map(|s| Box::new(s) as Box<dyn Read + Send>);
-    for (index, stream) in [stdout, stderr].into_iter().enumerate() {
-        let Some(mut stream) = stream else { continue };
-        let sender = sender.clone();
-        std::thread::Builder::new()
-            .name("child-output".into())
-            .spawn(move || {
-                let mut bytes = Vec::new();
-                let result = stream.read_to_end(&mut bytes).map(|_| bytes);
-                let _ = sender.send((index, result));
-            })
-            .map_err(|source| ChildError::Io {
-                program: name(),
-                source,
-            })?;
-    }
-    drop(sender);
+    let (receiver, mut pending) =
+        read_streams([stdout, stderr], limits.max_output).map_err(|source| ChildError::Io {
+            program: name(),
+            source,
+        })?;
 
     let io_err = |source| ChildError::Io {
         program: name(),
         source,
     };
-    let timed_out = || ChildError::Timeout { program: name() };
-    let Some(status) = child.wait_until(deadline).map_err(io_err)? else {
-        return Err(timed_out());
-    };
     let mut streams = [Vec::new(), Vec::new()];
-    for _ in 0..2 {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        match receiver.recv_timeout(remaining) {
-            Ok((index, result)) => streams[index] = result.map_err(io_err)?,
-            Err(mpsc::RecvTimeoutError::Timeout) => return Err(timed_out()),
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+    let mut status = None;
+    let mut delay = Duration::from_millis(1);
+    loop {
+        if status.is_none() {
+            status = child.child.try_wait().map_err(io_err)?;
+        }
+        if let Some(status) = status
+            && pending == 0
+        {
+            child.complete = true;
+            let [stdout, stderr] = streams;
+            return Ok(Output {
+                code: status.code(),
+                stdout,
+                stderr,
+            });
+        }
+        let now = Instant::now();
+        if now >= limits.deadline {
+            return Err(ChildError::Timeout { program: name() });
+        }
+        let wait = delay.min(limits.deadline - now);
+        delay = (delay * 2).min(Duration::from_millis(20));
+        if pending == 0 {
+            std::thread::sleep(wait);
+            continue;
+        }
+        match receiver.recv_timeout(wait) {
+            Ok((index, Stream::Read(bytes))) => {
+                streams[index] = bytes;
+                pending -= 1;
+            }
+            Ok((_, Stream::TooLarge)) => {
+                return Err(ChildError::OutputTooLarge {
+                    program: name(),
+                    limit: limits.max_output,
+                });
+            }
+            Ok((_, Stream::Failed(err))) => return Err(io_err(err)),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(io_err(std::io::Error::other(
+                    "an output reader ended without a result",
+                )));
+            }
         }
     }
-    child.complete = true;
-    let [stdout, stderr] = streams;
-    Ok(Output {
-        code: status.code(),
-        stdout,
-        stderr,
-    })
 }
 
 #[cfg(test)]
@@ -318,7 +364,7 @@ mod tests {
     use std::ffi::OsString;
     use std::time::{Duration, Instant};
 
-    use super::{ChildError, git_env, lookup, run};
+    use super::{ChildError, Limits, git_env, lookup, run};
 
     fn pairs(items: &[(&str, &str)]) -> Vec<(OsString, OsString)> {
         items
@@ -396,10 +442,17 @@ mod tests {
             &[],
             &[],
             dir.path(),
-            Instant::now() + Duration::from_secs(5),
+            limits(Duration::from_secs(5), 1024),
         )
         .unwrap_err();
         assert!(matches!(err, ChildError::Spawn { .. }), "{err}");
+    }
+
+    fn limits(timeout: Duration, max_output: u64) -> Limits {
+        Limits {
+            deadline: Instant::now() + timeout,
+            max_output,
+        }
     }
 
     /// `sh -c script` in `dir`, with only `PATH` from this process and `HOME` in `dir`.
@@ -407,19 +460,13 @@ mod tests {
     fn sh(
         dir: &std::path::Path,
         script: &str,
-        timeout: Duration,
+        limits: Limits,
     ) -> Result<super::Output, ChildError> {
         let mut inherited: Vec<(OsString, OsString)> =
             std::env::vars_os().filter(|(k, _)| k == "PATH").collect();
         inherited.push(("HOME".into(), dir.into()));
         let env = git_env(inherited);
-        run(
-            "sh",
-            &["-c".into(), script.into()],
-            &env,
-            dir,
-            Instant::now() + timeout,
-        )
+        run("sh", &["-c".into(), script.into()], &env, dir, limits)
     }
 
     #[cfg(unix)]
@@ -429,7 +476,7 @@ mod tests {
         let out = sh(
             dir.path(),
             "printf out; printf err >&2; exit 3",
-            Duration::from_secs(10),
+            limits(Duration::from_secs(10), 1024),
         )
         .unwrap();
         assert_eq!(out.code, Some(3));
@@ -444,7 +491,12 @@ mod tests {
         let pid_file = dir.path().join("pid");
         let script = format!("echo $$ > '{}'; exec sleep 30", pid_file.display());
         let start = Instant::now();
-        let err = sh(dir.path(), &script, Duration::from_millis(300)).unwrap_err();
+        let err = sh(
+            dir.path(),
+            &script,
+            limits(Duration::from_millis(300), 1024),
+        )
+        .unwrap_err();
         assert!(matches!(err, ChildError::Timeout { .. }), "{err}");
         assert!(start.elapsed() < Duration::from_secs(5));
         let pid: u32 = std::fs::read_to_string(&pid_file)
@@ -468,7 +520,12 @@ mod tests {
             pid_file.display()
         );
         let start = Instant::now();
-        let err = sh(dir.path(), &script, Duration::from_millis(300)).unwrap_err();
+        let err = sh(
+            dir.path(),
+            &script,
+            limits(Duration::from_millis(300), 1024),
+        )
+        .unwrap_err();
         assert!(matches!(err, ChildError::Timeout { .. }), "{err}");
         assert!(
             start.elapsed() < Duration::from_secs(5),
@@ -485,5 +542,61 @@ mod tests {
             crate::os::start_time_s(pid).is_none()
         });
         assert!(gone, "the descendant {pid} was killed with the group");
+    }
+
+    /// A stream exactly at the limit is read; one byte more is refused, on stderr too.
+    #[cfg(unix)]
+    #[test]
+    fn output_at_the_limit_passes_and_one_byte_more_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = sh(
+            dir.path(),
+            "printf abcd",
+            limits(Duration::from_secs(10), 4),
+        )
+        .unwrap();
+        assert_eq!(out.stdout, b"abcd");
+        for script in ["printf abcd", "printf abcd >&2"] {
+            let err = sh(dir.path(), script, limits(Duration::from_secs(10), 3)).unwrap_err();
+            assert!(
+                matches!(err, ChildError::OutputTooLarge { limit: 3, .. }),
+                "{script}: {err}"
+            );
+        }
+    }
+
+    /// A child that writes past the limit and keeps its output open ends as soon as a stream
+    /// passes the limit, long before the deadline, and is killed and reaped.
+    #[cfg(unix)]
+    #[test]
+    fn output_past_the_limit_ends_the_run_at_once_and_kills_the_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let script = format!(
+            "echo $$ > '{}'; head -c 4000000 /dev/zero; exec sleep 30",
+            pid_file.display()
+        );
+        let start = Instant::now();
+        let err = sh(
+            dir.path(),
+            &script,
+            limits(Duration::from_secs(20), 64 * 1024),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChildError::OutputTooLarge { .. }), "{err}");
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            start.elapsed()
+        );
+        let pid: u32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(
+            crate::os::start_time_s(pid).is_none(),
+            "the child was killed and reaped"
+        );
     }
 }

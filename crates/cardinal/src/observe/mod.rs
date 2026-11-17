@@ -60,6 +60,18 @@ pub fn inventory(
     Observer::new(config).inventory(state, options)
 }
 
+/// The most bytes read from each of a git or gh child's stdout and stderr. A repository
+/// whose status or file list is larger makes those facts `unknown`.
+const MAX_OUTPUT: u64 = 256 * 1024 * 1024;
+
+/// The bounds of a git or gh child: `timeout_ms` from now and [`MAX_OUTPUT`].
+fn limits(timeout_ms: u64) -> child::Limits {
+    child::Limits {
+        deadline: Instant::now() + Duration::from_millis(timeout_ms),
+        max_output: MAX_OUTPUT,
+    }
+}
+
 /// Observes the worktree containing `path` from scratch; `plan` and `act` use it.
 pub fn observe_worktree(
     config: &Config,
@@ -194,7 +206,7 @@ impl<'a> Observer<'a> {
             &command,
             &self.env,
             dir,
-            Instant::now() + Duration::from_millis(observe.git_timeout_ms),
+            limits(observe.git_timeout_ms),
         )
     }
 
@@ -217,7 +229,7 @@ impl<'a> Observer<'a> {
             args,
             &self.gh_env,
             dir,
-            Instant::now() + Duration::from_millis(observe.gh_timeout_ms),
+            limits(observe.gh_timeout_ms),
         )
         .map_err(|err| err.to_string())?;
         out.success("gh")
