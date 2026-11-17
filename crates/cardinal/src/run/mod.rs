@@ -96,13 +96,9 @@ pub fn run(spec_b64: Option<&str>, command: &[OsString]) -> ExitCode {
     let watch = Watch::start();
     let tty = std::io::stdin().is_terminal();
     let mut runner = Runner::new(started, command, watch);
-    let next = catch_unwind(AssertUnwindSafe(|| runner.prepare(spec_b64, tty)))
-        .unwrap_or_else(|_| Next::FailOpen(FailOpen::new("panic", &panic_message())));
-    match next {
-        Next::Admitted => runner.start_admitted(),
-        Next::FailOpen(reason) => runner.fail_open(&reason),
-        Next::Passthrough => runner.run_in_caller_group("tty"),
-        Next::Cancelled(cancel) => runner.cancel(cancel),
+    match catch_unwind(AssertUnwindSafe(|| runner.drive(spec_b64, tty))) {
+        Ok(code) => code,
+        Err(_) => runner.after_panic(&panic_message()),
     }
 }
 
@@ -165,6 +161,18 @@ enum Next {
     Cancelled(Cancel),
 }
 
+/// The stage once `spawn()` has returned a child: it is never run again (section 5.3).
+struct Stage {
+    path: &'static str,
+    spawned: Instant,
+    /// Until the wait takes it.
+    running: Option<Box<dyn Running>>,
+    /// Read right after the spawn.
+    child: Option<ProcessIdentity>,
+    /// How the stage ended, once known.
+    outcome: Option<ExecOutcome>,
+}
+
 /// The state directory, `host.toml`, and the recorder.
 struct Context {
     state: StateDir,
@@ -186,6 +194,8 @@ struct Runner {
     job: Option<Job>,
     waited: Option<Duration>,
     admission: Option<AdmissionResult>,
+    stage: Option<Stage>,
+    cancelled: Option<Cancel>,
 }
 
 impl Runner {
@@ -203,6 +213,54 @@ impl Runner {
             job: None,
             waited: None,
             admission: None,
+            stage: None,
+            cancelled: None,
+        }
+    }
+
+    /// Everything after the watch has started, inside the panic boundary of section 5.3.
+    fn drive(&mut self, spec_b64: Option<&str>, tty: bool) -> ExitCode {
+        match self.prepare(spec_b64, tty) {
+            Next::Admitted => self.start_admitted(),
+            Next::FailOpen(reason) => self.fail_open(&reason),
+            Next::Passthrough => self.run_in_caller_group("tty"),
+            Next::Cancelled(cancel) => self.cancel(cancel),
+        }
+    }
+
+    /// After a panic anywhere in [`Runner::drive`]: before the spawn the runner fails open and
+    /// runs the stage once; after it, the runner waits for the child (again) and exits with
+    /// its status, or with 125 when the status is unknown.
+    fn after_panic(&mut self, message: &str) -> ExitCode {
+        if let Some(cancel) = self.cancelled {
+            return cancel_exit(cancel);
+        }
+        let Some(stage) = self.stage.as_mut() else {
+            return self.fail_open(&FailOpen::new("panic", &message));
+        };
+        if let Some(outcome) = stage.outcome.take() {
+            // The panic came while finishing: a reservation still there stays for recovery.
+            if let Some(job) = self.job.take() {
+                job.abandon();
+            }
+            drop(self.inuse.take());
+            return exit_with(&outcome);
+        }
+        let running = stage.running.take();
+        let child = stage.child;
+        self.record(RecordKind::JobInfraFailure, json!({ "reason": message }));
+        let outcome = catch_unwind(AssertUnwindSafe(|| match (running, child) {
+            (Some(running), _) => running.wait(),
+            (None, Some(child)) => match self.executor.adopt(child.pid) {
+                Some(running) => Box::new(running).wait(),
+                None => ExecOutcome::InfraFailure(message.to_owned()),
+            },
+            (None, None) => ExecOutcome::InfraFailure(message.to_owned()),
+        }))
+        .unwrap_or_else(|_| ExecOutcome::InfraFailure(panic_message()));
+        match catch_unwind(AssertUnwindSafe(|| self.finish(&outcome))) {
+            Ok(code) => code,
+            Err(_) => exit_with(&outcome),
         }
     }
 
@@ -447,10 +505,13 @@ impl Runner {
     }
 
     /// Step 7 onward on the admitted path.
-    fn start_admitted(mut self) -> ExitCode {
+    fn start_admitted(&mut self) -> ExitCode {
         // Every wait before the spawn may have outlasted the caller.
         if let Some(cancel) = self.pending_cancel() {
             return self.cancel(cancel);
+        }
+        if let Err(err) = testpoint::hit(testpoint::RUN_SPAWNING) {
+            return self.fail_open(&FailOpen::new("injected", &err));
         }
         let inv = Invocation {
             argv: self.argv.clone(),
@@ -460,19 +521,45 @@ impl Runner {
             // The OS guarantees that no child ran.
             Err(err) => return self.fail_open(&FailOpen::new("spawn_failed", &err)),
         };
-        // The stage has started: from here on it is never run again.
-        let spawned = Instant::now();
-        let child = running.child();
-        let after = catch_unwind(AssertUnwindSafe(|| self.after_spawn(child)));
-        if after.is_err() {
+        let child = self.begin(running, "admitted");
+        self.after_spawn(child);
+        self.wait_and_finish()
+    }
+
+    /// The spawn returned a child: the stage has started. This is marked before anything else
+    /// happens, so that from here on a panic ends in waiting for the child, never in running
+    /// the stage again.
+    fn begin(&mut self, running: Box<dyn Running>, path: &'static str) -> ProcessIdentity {
+        let stage = self.stage.insert(Stage {
+            path,
+            spawned: Instant::now(),
+            running: Some(running),
+            child: None,
+            outcome: None,
+        });
+        let injected = testpoint::hit(testpoint::RUN_SPAWNED);
+        let child = stage
+            .running
+            .as_ref()
+            .map_or(ProcessIdentity { pid: 0, start_s: 0 }, |r| r.child());
+        stage.child = Some(child);
+        if let Err(err) = injected {
             self.record(
                 RecordKind::JobInfraFailure,
-                json!({ "reason": panic_message() }),
+                json!({ "reason": err.to_string() }),
             );
         }
-        let outcome = catch_unwind(AssertUnwindSafe(move || running.wait()))
-            .unwrap_or_else(|_| ExecOutcome::InfraFailure(panic_message()));
-        self.finish(&outcome, spawned, "admitted")
+        child
+    }
+
+    /// Step 8 and 9: waits for the child, then finishes.
+    fn wait_and_finish(&mut self) -> ExitCode {
+        let running = self.stage.as_mut().and_then(|stage| stage.running.take());
+        let outcome = running.map_or_else(
+            || ExecOutcome::InfraFailure("the command was already waited for".into()),
+            Running::wait,
+        );
+        self.finish(&outcome)
     }
 
     fn after_spawn(&mut self, child: ProcessIdentity) {
@@ -502,7 +589,7 @@ impl Runner {
 
     /// Fail-open: drop the reservation and live lock if taken, restore the original process
     /// group, and run the stage in it, still holding the in-use lock until it exits.
-    fn fail_open(mut self, fail: &FailOpen) -> ExitCode {
+    fn fail_open(&mut self, fail: &FailOpen) -> ExitCode {
         self.record(
             RecordKind::JobFailOpen,
             json!({ "reason": fail.reason, "detail": fail.detail }),
@@ -517,7 +604,7 @@ impl Runner {
     /// Runs the stage in the caller's process group (fail-open and TTY passthrough). A stage
     /// that cannot be executed ends as a shell reports it: `<command>: <OS error>` and 127
     /// when it is not found, 126 otherwise.
-    fn run_in_caller_group(mut self, path: &'static str) -> ExitCode {
+    fn run_in_caller_group(&mut self, path: &'static str) -> ExitCode {
         if let Some(cancel) = self.pending_cancel() {
             return self.cancel(cancel);
         }
@@ -526,15 +613,12 @@ impl Runner {
         };
         match self.executor.spawn(&inv) {
             Ok(running) => {
-                let spawned = Instant::now();
-                let child = running.child();
+                let child = self.begin(Box::new(running), path);
                 self.record(
                     RecordKind::JobStarted,
                     json!({ "path": path, "pid": child.pid, "start_s": child.start_s }),
                 );
-                let outcome = catch_unwind(AssertUnwindSafe(move || Box::new(running).wait()))
-                    .unwrap_or_else(|_| ExecOutcome::InfraFailure(panic_message()));
-                self.finish(&outcome, spawned, path)
+                self.wait_and_finish()
             }
             Err(err) => {
                 let code: u8 = if err.kind() == std::io::ErrorKind::NotFound {
@@ -564,12 +648,19 @@ impl Runner {
     /// Step 9: release, record, and exit as the stage did. The reservation is released only
     /// when no member of the stage's group is left; otherwise it stays for the recovery pass,
     /// which releases it once the group is empty (section 4.5).
-    fn finish(mut self, outcome: &ExecOutcome, spawned: Instant, path: &'static str) -> ExitCode {
-        let wall_ms = u64::try_from(spawned.elapsed().as_millis()).unwrap_or(u64::MAX);
+    fn finish(&mut self, outcome: &ExecOutcome) -> ExitCode {
+        let Some(stage) = self.stage.as_mut() else {
+            return exit_with(outcome);
+        };
+        stage.outcome = Some(outcome.clone());
+        let path = stage.path;
+        let wall_ms = u64::try_from(stage.spawned.elapsed().as_millis()).unwrap_or(u64::MAX);
         // The group that outlived the SIGTERM sent when the parent exited.
         let mut kill = None;
-        if let Some(job) = self.job.take() {
-            if self.group_is_empty(&job) {
+        if let Some(empty) = self.job.as_ref().map(|job| self.group_is_empty(job))
+            && let Some(job) = self.job.take()
+        {
+            if empty {
                 let _ = job.release();
             } else {
                 let GroupIdentity::Pgid { pgid, .. } = job.reservation().group;
@@ -597,23 +688,13 @@ impl Runner {
         if let Some(pgid) = kill {
             kill_group(pgid);
         }
-        match outcome {
-            ExecOutcome::Exited(code) => exit_code(*code),
-            ExecOutcome::Signaled(sig) => die_by_signal(*sig),
-            ExecOutcome::InfraFailure(reason) => {
-                let _ = writeln!(
-                    std::io::stderr(),
-                    "[cardinal] Infrastructure failure after the command started: {reason}. \
-                     The command was not rerun."
-                );
-                ExitCode::from(EXIT_INFRA_FAILURE)
-            }
-        }
+        exit_with(outcome)
     }
 
     /// The parent exited or a signal arrived before the spawn: release everything and stop
     /// without starting the stage.
-    fn cancel(mut self, cancel: Cancel) -> ExitCode {
+    fn cancel(&mut self, cancel: Cancel) -> ExitCode {
+        self.cancelled = Some(cancel);
         let reason = match cancel {
             Cancel::Signal(sig) => format!("signal {sig}"),
             Cancel::ParentExited => "parent_exited".into(),
@@ -629,10 +710,7 @@ impl Runner {
             let _ = job.release();
         }
         drop(self.inuse.take());
-        match cancel {
-            Cancel::Signal(sig) => die_by_signal(sig),
-            Cancel::ParentExited => ExitCode::from(EXIT_CANCELLED),
-        }
+        cancel_exit(cancel)
     }
 
     /// Whether the job's group has no member left besides the runner. The runner first moves
@@ -674,6 +752,30 @@ impl Runner {
             record.data = map;
         }
         let _ = ctx.recorder.append(&record);
+    }
+}
+
+/// Exits as the stage did (section 5.6).
+fn exit_with(outcome: &ExecOutcome) -> ExitCode {
+    match outcome {
+        ExecOutcome::Exited(code) => exit_code(*code),
+        ExecOutcome::Signaled(sig) => die_by_signal(*sig),
+        ExecOutcome::InfraFailure(reason) => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "[cardinal] Infrastructure failure after the command started: {reason}. \
+                 The command was not rerun."
+            );
+            ExitCode::from(EXIT_INFRA_FAILURE)
+        }
+    }
+}
+
+/// Exits as a cancelled run does: by the signal, or with 129 when the parent exited.
+fn cancel_exit(cancel: Cancel) -> ExitCode {
+    match cancel {
+        Cancel::Signal(sig) => die_by_signal(sig),
+        Cancel::ParentExited => ExitCode::from(EXIT_CANCELLED),
     }
 }
 

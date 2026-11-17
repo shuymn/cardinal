@@ -10,7 +10,7 @@ use std::io::{self, Read as _};
 use std::sync::Arc;
 use std::time::Duration;
 
-use rustix::process::{Pid, Signal, WaitId, WaitIdOptions};
+use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, WaitOptions};
 
 use super::{Detail, ProcessInfo, ProcessTable};
 
@@ -169,6 +169,32 @@ pub fn ignored(sig: i32) -> bool {
     let read = unsafe { libc::sigaction(sig, std::ptr::null(), current.as_mut_ptr()) };
     // SAFETY: `current` is zero-initialized, a valid `sigaction`, and filled on success.
     read == 0 && unsafe { current.assume_init() }.sa_sigaction == libc::SIG_IGN
+}
+
+/// How a reaped child ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChildEnd {
+    Exited(i32),
+    Signaled(i32),
+}
+
+/// Waits for child `pid` to end and reaps it.
+pub fn reap(raw_pid: u32) -> io::Result<ChildEnd> {
+    let id = pid(raw_pid)?;
+    loop {
+        match rustix::process::waitpid(Some(id), WaitOptions::empty()) {
+            Ok(Some((_, status))) => {
+                if let Some(code) = status.exit_status() {
+                    return Ok(ChildEnd::Exited(code));
+                }
+                if let Some(sig) = status.terminating_signal() {
+                    return Ok(ChildEnd::Signaled(sig));
+                }
+            }
+            Ok(None) | Err(rustix::io::Errno::INTR) => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
 }
 
 /// Calls `on_signal` on a background thread for every delivery of one of `signals`. The

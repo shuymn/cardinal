@@ -8,6 +8,8 @@ mod support;
 #[cfg(unix)]
 use cardinal::contract::RecordKind;
 #[cfg(unix)]
+use cardinal::testpoint::{RUN_AFTER_SPAWN, RUN_SPAWNED, RUN_SPAWNING};
+#[cfg(unix)]
 use runner_support::{Env, output};
 
 #[test]
@@ -54,6 +56,62 @@ fn failure_after_spawn_keeps_the_stage_status_and_never_reruns() {
     assert_eq!(infra_reasons(&env), ["injected failure at run.after_spawn"]);
     assert_eq!(env.records_of(RecordKind::JobFailOpen), []);
     assert_eq!(env.reservations(), []);
+}
+
+/// A panic before the spawn ends in fail-open: the stage runs once, with nothing added to its
+/// output (section 5.3).
+#[cfg(unix)]
+#[test]
+fn panic_before_the_spawn_runs_the_stage_once() {
+    let env = Env::with_budget(4);
+    let stage = stage(&env, 7);
+    let args: Vec<&str> = stage.iter().map(String::as_str).collect();
+    let out = output(
+        env.run_at(None, &args, &[], None)
+            .env("CARDINAL_TEST_PANIC", RUN_SPAWNING),
+    );
+    assert_eq!(out.status.code(), Some(7));
+    assert_eq!(out.stdout, b"out");
+    assert_eq!(out.stderr, b"err");
+    assert_eq!(env.lines("counter"), ["run"]);
+    let fail_open = env.records_of(RecordKind::JobFailOpen);
+    assert_eq!(fail_open.len(), 1);
+    assert_eq!(fail_open[0].data["reason"], "panic");
+    let detail = fail_open[0].data["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("injected panic at run.spawning"),
+        "{detail}"
+    );
+    assert_eq!(env.reservations(), []);
+}
+
+/// A panic once the spawn returned, before anything about the child is read or later: the
+/// stage is not run again, and the runner waits for it and returns its status.
+#[cfg(unix)]
+#[test]
+fn panic_after_the_spawn_returns_the_stage_status() {
+    for point in [RUN_SPAWNED, RUN_AFTER_SPAWN] {
+        let env = Env::with_budget(4);
+        let stage = stage(&env, 7);
+        let args: Vec<&str> = stage.iter().map(String::as_str).collect();
+        let out = output(
+            env.run_at(None, &args, &[], None)
+                .env("CARDINAL_TEST_PANIC", point),
+        );
+        assert_eq!(out.status.code(), Some(7), "{point}");
+        assert_eq!(out.stdout, b"out", "{point}");
+        assert_eq!(out.stderr, b"err", "{point}: the status is known");
+        assert_eq!(env.lines("counter"), ["run"], "{point}");
+        assert_eq!(env.records_of(RecordKind::JobFailOpen), [], "{point}");
+        let reasons = infra_reasons(&env);
+        assert_eq!(reasons.len(), 1, "{point}: {reasons:?}");
+        assert!(
+            reasons[0].contains(&format!("injected panic at {point}")),
+            "{reasons:?}"
+        );
+        assert_eq!(env.records_of(RecordKind::JobFinished)[0].data["exit"], 7);
+        assert_eq!(env.reservations(), [], "{point}");
+    }
 }
 
 /// When the runner cannot learn the stage's status, it exits 125 with one line on stderr and

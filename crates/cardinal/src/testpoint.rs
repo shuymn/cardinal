@@ -7,6 +7,7 @@
 //!   `<dir>/<point>.<pid>.reached` and polls for `<dir>/<point>.release`. After 30 s it aborts,
 //!   so a broken test fails instead of hanging.
 //! - `CARDINAL_TEST_FAIL=<point>`: the process returns an injected error at that point.
+//! - `CARDINAL_TEST_PANIC=<point>`: the process panics at that point.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -20,6 +21,10 @@ pub const ADMISSION_WAITING: &str = "admission.waiting";
 pub const INUSE_WAITING: &str = "inuse.waiting";
 /// Immediately before the `starting` record and the spawn.
 pub const RUN_BEFORE_STARTING: &str = "run.before_starting";
+/// The admitted path is about to spawn the stage, after its last cancellation check.
+pub const RUN_SPAWNING: &str = "run.spawning";
+/// The spawn returned a child, before anything about the child is read.
+pub const RUN_SPAWNED: &str = "run.spawned";
 /// The child has been spawned.
 pub const RUN_AFTER_SPAWN: &str = "run.after_spawn";
 /// `act` holds the exclusive in-use lock.
@@ -40,6 +45,8 @@ pub const POINTS: &[&str] = &[
     ADMISSION_WAITING,
     INUSE_WAITING,
     RUN_BEFORE_STARTING,
+    RUN_SPAWNING,
+    RUN_SPAWNED,
     RUN_AFTER_SPAWN,
     ACT_LOCKED,
     ACT_SNAPSHOTTED,
@@ -63,6 +70,7 @@ struct Settings {
     dir: PathBuf,
     pause: Vec<String>,
     fail: Option<String>,
+    panic: Option<String>,
 }
 
 fn settings() -> Option<&'static Settings> {
@@ -79,13 +87,14 @@ fn settings() -> Option<&'static Settings> {
                     .map(str::to_owned)
                     .collect(),
                 fail: Some(list("CARDINAL_TEST_FAIL")).filter(|p| !p.is_empty()),
+                panic: Some(list("CARDINAL_TEST_PANIC")).filter(|p| !p.is_empty()),
             })
         })
         .as_ref()
 }
 
-/// Marks that the process reached `point`: pauses there or returns an injected failure when
-/// the test environment asks for it. A no-op outside tests.
+/// Marks that the process reached `point`: pauses there, returns an injected failure, or
+/// panics when the test environment asks for it. A no-op outside tests.
 pub fn hit(point: &'static str) -> Result<(), Injected> {
     let Some(settings) = settings() else {
         return Ok(());
@@ -93,6 +102,10 @@ pub fn hit(point: &'static str) -> Result<(), Injected> {
     if settings.pause.iter().any(|p| p == point) {
         pause(&settings.dir, point);
     }
+    assert!(
+        settings.panic.as_deref() != Some(point),
+        "injected panic at {point}"
+    );
     if settings.fail.as_deref() == Some(point) {
         return Err(Injected { point });
     }

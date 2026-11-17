@@ -7,7 +7,9 @@
 //! can cancel before the spawn and supervise the child after it.
 
 use std::ffi::OsString;
-use std::process::{Child, Command};
+#[cfg(not(unix))]
+use std::process::Child;
+use std::process::Command;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -277,7 +279,8 @@ impl LocalExecutor {
         false
     }
 
-    /// Starts `inv`. The error is the spawn's own: the OS guarantees that no child ran.
+    /// Starts `inv`. The error is the spawn's own: the OS guarantees that no child ran. Returns
+    /// as soon as the spawn did; nothing about the child is read yet.
     pub fn spawn(&self, inv: &Invocation) -> std::io::Result<LocalRunning> {
         let (program, args) = inv
             .argv
@@ -285,11 +288,11 @@ impl LocalExecutor {
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "empty command"))?;
         let child = Command::new(program).args(args).spawn()?;
         let pid = child.id();
-        // A zombie keeps its start time on Linux; macOS drops an exited child from the table,
-        // and 0 then never matches a live process, so such a child is never verified.
-        let start_s = os::process(pid, os::Detail::default()).map_or(0, |p| p.start_s);
         #[cfg(unix)]
         {
+            // The supervisor waits for the child by its PID; dropping `Child` neither waits
+            // nor kills.
+            drop(child);
             let tx = self.watch.sender();
             // Without the waiter thread the supervisor still polls the child.
             let _ = std::thread::Builder::new()
@@ -300,12 +303,31 @@ impl LocalExecutor {
                 });
         }
         Ok(LocalRunning {
+            #[cfg(not(unix))]
             child,
-            identity: ProcessIdentity { pid, start_s },
+            pid,
             watch: self.watch.clone(),
             #[cfg(unix)]
             group: self.group.get().map(|g| g.pgid),
         })
+    }
+
+    /// Supervises child `pid` again after the wait for it panicked. A child that the failed
+    /// wait already reaped ends in an infrastructure failure. `None` where a child can only be
+    /// waited for through the handle the spawn returned.
+    #[must_use]
+    pub fn adopt(&self, pid: u32) -> Option<LocalRunning> {
+        #[cfg(unix)]
+        return Some(LocalRunning {
+            pid,
+            watch: self.watch.clone(),
+            group: self.group.get().map(|g| g.pgid),
+        });
+        #[cfg(not(unix))]
+        {
+            let _ = pid;
+            None
+        }
     }
 }
 
@@ -340,8 +362,9 @@ impl Executor for LocalExecutor {
 /// A child started by the local executor. The supervisor that waits for it is the only code
 /// that reaps it, so its PID cannot be reused while the supervisor signals it.
 pub struct LocalRunning {
+    #[cfg(not(unix))]
     child: Child,
-    identity: ProcessIdentity,
+    pid: u32,
     watch: Watch,
     /// The group the runner leads and the child runs in; `None` when the child shares the
     /// caller's group.
@@ -351,7 +374,13 @@ pub struct LocalRunning {
 
 impl Running for LocalRunning {
     fn child(&self) -> ProcessIdentity {
-        self.identity
+        // A zombie keeps its start time on Linux; macOS drops an exited child from the table,
+        // and 0 then never matches a live process, so such a child is never verified.
+        let start_s = os::process(self.pid, os::Detail::default()).map_or(0, |p| p.start_s);
+        ProcessIdentity {
+            pid: self.pid,
+            start_s,
+        }
     }
 
     fn wait(self: Box<Self>) -> ExecOutcome {
@@ -377,8 +406,8 @@ impl LocalRunning {
     /// child in the caller's group gets SIGKILL instead and is waited for up to
     /// [`PARENT_EXIT_GIVE_UP`].
     #[cfg(unix)]
-    fn supervise(mut self) -> ExecOutcome {
-        let pid = self.identity.pid;
+    fn supervise(self) -> ExecOutcome {
+        let pid = self.pid;
         let mut exited = false;
         // When the runner's parent exited: the time SIGTERM went out.
         let mut stopping: Option<Instant> = None;
@@ -453,17 +482,10 @@ impl LocalRunning {
 
     /// Reaps the exited child.
     #[cfg(unix)]
-    fn reap(&mut self) -> ExecOutcome {
-        use std::os::unix::process::ExitStatusExt as _;
-
-        match self.child.wait() {
-            Ok(exit) => match (exit.code(), exit.signal()) {
-                (Some(code), _) => ExecOutcome::Exited(code),
-                (None, Some(sig)) => ExecOutcome::Signaled(sig),
-                (None, None) => ExecOutcome::InfraFailure(format!(
-                    "the command ended without an exit status: {exit}"
-                )),
-            },
+    fn reap(&self) -> ExecOutcome {
+        match os::unix::reap(self.pid) {
+            Ok(os::unix::ChildEnd::Exited(code)) => ExecOutcome::Exited(code),
+            Ok(os::unix::ChildEnd::Signaled(sig)) => ExecOutcome::Signaled(sig),
             Err(err) => ExecOutcome::InfraFailure(format!("cannot wait for the command: {err}")),
         }
     }
@@ -473,7 +495,7 @@ impl LocalRunning {
         match self.group {
             Some(pgid) => self.watch.signal_own_group(pgid, sig),
             None if child_unreaped && (sig == os::unix::SIGTERM || sig == os::unix::SIGHUP) => {
-                let _ = os::unix::signal_process(self.identity.pid, sig);
+                let _ = os::unix::signal_process(self.pid, sig);
             }
             None => {}
         }
@@ -484,7 +506,7 @@ impl LocalRunning {
         match self.group {
             Some(pgid) => self.watch.signal_own_group(pgid, sig),
             None if child_unreaped => {
-                let _ = os::unix::signal_process(self.identity.pid, sig);
+                let _ = os::unix::signal_process(self.pid, sig);
             }
             None => {}
         }
