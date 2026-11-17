@@ -42,7 +42,8 @@ fn lock_is_released_when_the_holder_dies_and_its_child_does_not_hold_it() {
     assert_eq!(probe(&lock).unwrap(), Probe::Held);
     assert!(try_lock(&lock, LockMode::Shared).unwrap().is_none());
 
-    holder.kill();
+    // The holder alone: its child must outlive it.
+    holder.kill_leader();
 
     assert!(
         os::is_alive(child, child_start),

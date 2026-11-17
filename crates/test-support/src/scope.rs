@@ -453,6 +453,16 @@ impl Child {
         lock(&self.slot).kill();
     }
 
+    /// Kills the child alone (SIGKILL on Unix, `TerminateProcess` on Windows) and waits until
+    /// it has exited, leaving the rest of its group or job running and the child unreaped. On
+    /// Windows a job a descendant joined is nested in the child's job, so [`Child::kill`]
+    /// would end it too. What is left is killed when the child is waited for or dropped.
+    pub fn kill_leader(&mut self) {
+        if let Slot::Running(process) = &mut *lock(&self.slot) {
+            process.kill_leader();
+        }
+    }
+
     /// Waits as [`Child::wait`] and collects the piped stdout and stderr.
     pub fn wait_with_output(mut self) -> io::Result<Output> {
         drop(self.stdin.take());
@@ -570,6 +580,21 @@ impl Process {
         }
     }
 
+    fn kill_leader(&mut self) {
+        #[cfg(unix)]
+        {
+            unix::kill_leader(self.child.id());
+            let _ = unix::wait_exited(self.child.id(), true);
+        }
+        #[cfg(windows)]
+        {
+            let leader = windows::leader(&mut *self.child);
+            let _ = leader.kill();
+            // The handle std holds keeps the exited process listed; `wait` only waits.
+            let _ = leader.wait();
+        }
+    }
+
     fn kill(mut self) -> io::Result<ExitStatus> {
         #[cfg(unix)]
         {
@@ -638,6 +663,11 @@ mod unix {
                 Err(err) => return Err(err.into()),
             }
         }
+    }
+
+    /// SIGKILL to unreaped child `raw` alone.
+    pub(super) fn kill_leader(raw: u32) {
+        let _ = rustix::process::kill_process(pid(raw), Signal::KILL);
     }
 
     /// SIGKILL to the process group led by unreaped child `raw`. The group may be empty.
