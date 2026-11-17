@@ -150,6 +150,17 @@ pub fn parse_status(bytes: &[u8]) -> Result<Status, String> {
     Ok(status)
 }
 
+/// Splits one `git ls-files -z --stage` entry into `"<mode> <object> <stage>"` and its
+/// path.
+pub fn parse_stage_entry(entry: &[u8]) -> Result<(String, PathBuf), String> {
+    let tab = entry
+        .iter()
+        .position(|&b| b == b'\t')
+        .ok_or("ls-files entry without a path")?;
+    let meta = std::str::from_utf8(&entry[..tab]).map_err(|_| "ls-files entry is not UTF-8")?;
+    Ok((meta.to_owned(), path_from_bytes(&entry[tab + 1..])?))
+}
+
 /// Whether `oid` looks like a full object ID (SHA-1 or SHA-256).
 #[must_use]
 pub fn is_oid(oid: &str) -> bool {

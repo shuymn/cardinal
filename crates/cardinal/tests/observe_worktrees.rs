@@ -231,7 +231,8 @@ fn gh_failures_make_pull_request_facts_unknown() {
         ("timeout", |s| s.gh_hangs("open")),
     ];
     for (name, break_gh) in cases {
-        let (scene, wt, _) = merged_scene();
+        let (mut scene, wt, _) = merged_scene();
+        scene.gh_timeout_ms = 2000;
         break_gh(&scene);
         let start = Instant::now();
         let inv = scene.inventory();
@@ -404,4 +405,94 @@ fn observe_worktree_finds_the_worktree_of_a_path_inside_it() {
     std::fs::create_dir_all(&outside).unwrap();
     let err = scene.observe(&outside).unwrap_err();
     assert_eq!(err.code, cardinal::contract::ErrorCode::NotFound);
+}
+
+#[test]
+fn tracked_protected_data_is_not_a_candidate() {
+    let scene = Scene::new();
+    let wt = scene.worktree("feat", "feat");
+    scene.commit(&wt, "crate/proptest-regressions/case.txt");
+    let head = scene.commit(&wt, "feature.txt");
+    scene.push(&wt, "feat");
+    scene.merge_into_base(&head);
+    scene.profile("data", "[data]\nprotected = ['proptest-regressions']\n");
+    let inv = scene.inventory();
+    let w = worktree(&inv, &wt);
+    assert_eq!(w.facts.dirty, Tri::No);
+    assert_eq!(reclaim(w), (false, vec!["no_protected"], vec![]));
+}
+
+#[test]
+fn a_gitlink_without_gitmodules_is_a_nested_repository() {
+    let scene = Scene::new();
+    let wt = scene.worktree("feat", "feat");
+    let dep = scene.fx.init("feat/dep");
+    scene.fx.commit_file(&dep, "lib.txt", "lib\n", "dep");
+    scene.fx.git(&wt, &["add", "dep"]);
+    scene.fx.git(&wt, &["commit", "-q", "-m", "add dep"]);
+    assert!(!wt.join(".gitmodules").exists());
+    let head = scene.head(&wt);
+    scene.push(&wt, "feat");
+    scene.merge_into_base(&head);
+    let inv = scene.inventory();
+    let w = worktree(&inv, &wt);
+    assert_eq!(w.facts.dirty, Tri::No);
+    assert_eq!(reclaim(w), (false, vec!["no_nested_repository"], vec![]));
+}
+
+#[test]
+fn a_full_merged_page_without_the_head_is_unknown() {
+    let scene = Scene::new();
+    let wt = scene.worktree("feat", "feat");
+    let head = scene.commit(&wt, "feature.txt");
+    scene.push(&wt, "feat");
+    let other = "0123456789abcdef0123456789abcdef01234567";
+    let entries: Vec<String> = (0..20)
+        .map(|n| format!(r#"{{"number":{n},"headRefOid":"{other}","mergedAt":null,"url":"u{n}"}}"#))
+        .collect();
+    scene.set_merged(&head, &format!("[{}]", entries.join(",")));
+    let inv = scene.inventory();
+    let w = worktree(&inv, &wt);
+    assert_eq!(w.facts.merge_evidence, MergeEvidence::Unknown);
+    assert_eq!(inv.repos[0].gh, GhStatus::Unknown);
+    assert!(!w.reclaim.candidate);
+}
+
+/// A git step that fails makes `observed` fail even when other evidence would do: here
+/// `merge-base` fails while gh reports the head merged.
+#[cfg(unix)]
+#[test]
+fn a_failed_git_step_fails_observed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut scene = Scene::new();
+    let wt = scene.worktree("feat", "feat");
+    let head = scene.commit(&wt, "feature.txt");
+    scene.push(&wt, "feat");
+    scene.set_merged(&head, &merged_json(42, &head));
+    let real_git = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|dir| dir.join("git"))
+        .find(|path| path.is_file())
+        .expect("git on PATH");
+    let wrapper = scene.fx.path("git-wrapper");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\ncase \" $* \" in *\" merge-base \"*) echo broken >&2; exit 2;; esac\nexec '{}' \"$@\"\n",
+            real_git.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    scene.observe_config(&format!("git = '{}'", wrapper.display()));
+
+    let inv = scene.inventory();
+    let w = worktree(&inv, &wt);
+    assert_eq!(w.facts.merge_evidence, MergeEvidence::MergedPr);
+    assert!(
+        inv.errors.iter().any(|e| e.message.contains("merge-base")),
+        "{:?}",
+        inv.errors
+    );
+    assert_eq!(reclaim(w), (false, vec!["observed"], vec![]));
 }

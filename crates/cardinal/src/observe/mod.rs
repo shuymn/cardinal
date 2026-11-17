@@ -23,7 +23,7 @@ use std::time::Duration;
 pub use child::{ChildError, Output, constructed_env};
 
 use crate::admission;
-use crate::config::{Config, Selection};
+use crate::config::{Config, DataList, Selection};
 use crate::contract::{
     BaseRef, CheckResult, DerivedState, Error, ErrorCode, Facts, GhStatus, HostInfo, IgnoredClass,
     IgnoredEntry, InUse, Inventory, InventorySchema, MergeEvidence, Os, Outlived, PrRef,
@@ -96,7 +96,12 @@ impl Reservations for AdmissionReservations {
 /// built from, and the reservation source.
 pub struct Observer<'a> {
     config: &'a Config,
+    /// The environment of git children.
     env: Vec<(OsString, OsString)>,
+    /// The environment of gh children.
+    gh_env: Vec<(OsString, OsString)>,
+    /// The caller's `GH_HOST`: a host besides `github.com` whose remotes are GitHub.
+    gh_host: Option<String>,
     reservations: &'a dyn Reservations,
 }
 
@@ -113,6 +118,9 @@ struct Shared<'a> {
 /// Repository-level facts every worktree of the repository uses.
 struct RepoContext {
     repo: Repo,
+    github: Option<gh::GithubRepo>,
+    /// A repository-level step that failed (the base could not be read).
+    failure: Option<String>,
     listed: Vec<ListedWorktree>,
     patterns: DataPatterns,
     /// `Err` when the open pull requests are unknown.
@@ -141,15 +149,23 @@ impl<'a> Observer<'a> {
     pub fn new(config: &'a Config) -> Self {
         Self {
             config,
-            env: constructed_env(std::env::vars_os()),
+            env: Vec::new(),
+            gh_env: Vec::new(),
+            gh_host: None,
             reservations: &AdmissionReservations,
         }
+        .with_env(std::env::vars_os())
     }
 
-    /// Builds the child environment from `inherited` instead of this process's environment.
+    /// Builds the child environments from `inherited` instead of this process's environment.
     #[must_use]
     pub fn with_env(mut self, inherited: impl IntoIterator<Item = (OsString, OsString)>) -> Self {
-        self.env = constructed_env(inherited);
+        let inherited: Vec<(OsString, OsString)> = inherited.into_iter().collect();
+        self.gh_host = child::lookup(&inherited, "GH_HOST")
+            .and_then(OsStr::to_str)
+            .map(str::to_owned);
+        self.env = constructed_env(inherited.iter().cloned());
+        self.gh_env = child::gh_env(inherited);
         self
     }
 
@@ -163,8 +179,15 @@ impl<'a> Observer<'a> {
     /// See [`git`](fn@git).
     pub fn git<S: AsRef<OsStr>>(&self, dir: &Path, args: &[S]) -> Result<Output, ChildError> {
         let observe = &self.config.host.observe;
-        let mut command: Vec<OsString> =
-            vec!["--no-optional-locks".into(), "-C".into(), dir.into()];
+        // No optional locks, and no filesystem monitor: a configured fsmonitor would start a
+        // daemon that writes inside `.git`.
+        let mut command: Vec<OsString> = vec![
+            "--no-optional-locks".into(),
+            "-c".into(),
+            "core.fsmonitor=false".into(),
+            "-C".into(),
+            dir.into(),
+        ];
         command.extend(args.iter().map(|a| a.as_ref().to_os_string()));
         child::run(
             &observe.git,
@@ -191,7 +214,7 @@ impl<'a> Observer<'a> {
         let out = child::run(
             &observe.gh,
             &command,
-            &self.env,
+            &self.gh_env,
             None,
             Duration::from_millis(observe.gh_timeout_ms),
         )
@@ -386,13 +409,15 @@ impl<'a> Observer<'a> {
                 .map(str::to_owned)
                 .collect(),
         };
-        let base = self.base(&dir, selection.base());
+        let (base, failure) = match self.base(&dir, selection.base()) {
+            Ok(base) => (base, None),
+            Err(message) => (None, Some(message)),
+        };
 
-        let gh_host = child::lookup(&self.env, "GH_HOST").and_then(OsStr::to_str);
-        let github = remote_url.and_then(|url| gh::github_repo(url, gh_host));
+        let github = remote_url.and_then(|url| gh::github_repo(url, self.gh_host.as_deref()));
         let (gh_status, gh_error, open_prs) = match (&remote, &github) {
-            (_, Some(name)) => match self
-                .gh(&gh::open_args(name))
+            (_, Some(repo)) => match self
+                .gh(&gh::open_args(&repo.spec()))
                 .and_then(|out| gh::parse_open(&out.stdout))
             {
                 Ok(prs) => (GhStatus::Ok, None, Ok(prs)),
@@ -415,43 +440,46 @@ impl<'a> Observer<'a> {
                 common_dir: display(&common_dir),
                 main_worktree: display(&main_worktree),
                 profiles: selection.names().into_iter().map(str::to_owned).collect(),
-                github,
+                github: github.as_ref().map(|r| r.name.clone()),
                 base,
                 gh: gh_status,
                 gh_error,
                 worktrees: Vec::new(),
             },
+            github,
+            failure,
             listed,
             patterns,
             open_prs,
         })
     }
 
-    /// `[git] base`, else the target of `refs/remotes/origin/HEAD`, with its commit.
-    fn base(&self, dir: &Path, configured: Option<&str>) -> Option<BaseRef> {
-        let name = if let Some(name) = configured {
-            name.to_owned()
-        } else {
-            let out = self
-                .git_ok(
-                    dir,
-                    &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
-                )
-                .ok()?;
-            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    /// `[git] base`, else the target of `refs/remotes/origin/HEAD`, with its commit. A base
+    /// that git reports missing is `None`; git failing to answer is an error.
+    fn base(&self, dir: &Path, configured: Option<&str>) -> Result<Option<BaseRef>, String> {
+        let answered = |args: &[&str]| -> Result<Option<String>, String> {
+            let out = self.git(dir, args).map_err(|err| err.to_string())?;
+            Ok((out.code == Some(0))
+                .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned()))
+        };
+        let name = match configured {
+            Some(name) => name.to_owned(),
+            None => match answered(&["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])? {
+                Some(name) => name,
+                None => return Ok(None),
+            },
         };
         if name.is_empty() || name.starts_with('-') {
-            return None;
+            return Ok(None);
         }
         let spec = format!("{name}^{{commit}}");
-        let out = self
-            .git_ok(dir, &["rev-parse", "--verify", "--quiet", &spec])
-            .ok()?;
-        let oid = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-        git::is_oid(&oid).then_some(BaseRef {
+        let Some(oid) = answered(&["rev-parse", "--verify", "--quiet", &spec])? else {
+            return Ok(None);
+        };
+        Ok(git::is_oid(&oid).then_some(BaseRef {
             ref_name: name,
             oid,
-        })
+        }))
     }
 
     /// Observes every worktree of a repository, several at a time.
@@ -549,12 +577,8 @@ impl<'a> Observer<'a> {
         let ignored = status.as_ref().map_or_else(Vec::new, |s| {
             ignored_entries(&path, &s.ignored, &ctx.patterns, shared.sizes)
         });
-        let submodules = self
-            .tracked_nested_repository(&path)
-            .unwrap_or_else(|message| {
-                note(message);
-                Tri::Unknown
-            });
+        let tracked = self.tracked(&path, &ctx.patterns).map_err(&mut note).ok();
+        let step_failed = !errors.is_empty() || history.gh_error.is_some() || ctx.failure.is_some();
 
         let facts = Facts {
             dirty,
@@ -579,8 +603,9 @@ impl<'a> Observer<'a> {
         };
         let checks = ReclaimInputs {
             status_known: status.is_some(),
+            step_failed,
             in_use_known,
-            tracked_nested: submodules,
+            tracked,
             plain_target: plain_target(&path),
         };
         let reclaim = reclaim_summary(&worktree, &checks);
@@ -623,16 +648,18 @@ impl<'a> Observer<'a> {
 
         let mut gh_error = None;
         // Looked up only without base ancestry; `None` when the answer is unknown.
-        let merged: Option<Option<PrRef>> = match (&ctx.repo.github, head) {
+        let merged: Option<Option<PrRef>> = match (&ctx.github, head) {
             _ if base_ancestor == Tri::Yes => None,
             (Some(repo), Some(head)) => match self
-                .gh(&gh::merged_args(repo, head))
+                .gh(&gh::merged_args(&repo.spec(), head))
                 .and_then(|out| gh::parse_merged(&out.stdout))
-            {
-                Ok(prs) => Some(gh::merged_pr_for(&prs, head).map(|pr| PrRef {
-                    number: pr.number,
-                    url: pr.url.clone(),
-                })),
+                .and_then(|prs| {
+                    Ok(gh::merged_pr_for(&prs, head)?.map(|pr| PrRef {
+                        number: pr.number,
+                        url: pr.url.clone(),
+                    }))
+                }) {
+                Ok(found) => Some(found),
                 Err(message) => {
                     gh_error = Some(message);
                     None
@@ -681,24 +708,32 @@ impl<'a> Observer<'a> {
         }
     }
 
-    /// Whether a tracked submodule below the worktree has its own `.git` entry. Read only
-    /// when `.gitmodules` exists.
-    fn tracked_nested_repository(&self, path: &Path) -> Result<Tri, String> {
-        if std::fs::symlink_metadata(path.join(".gitmodules")).is_err() {
-            return Ok(Tri::No);
-        }
+    /// What the index of the worktree at `path` holds that `act` would refuse: a tracked path
+    /// covered by a protected pattern, and a gitlink (mode 160000) whose directory has its
+    /// own `.git` entry.
+    fn tracked(&self, path: &Path, patterns: &DataPatterns) -> Result<Tracked, String> {
         let out = self.git_ok(path, &["ls-files", "-z", "--stage"])?;
-        let nested = out
-            .stdout
-            .split(|&b| b == 0)
-            .filter_map(|entry| {
-                let text = std::str::from_utf8(entry).ok()?;
-                let (meta, file) = text.split_once('\t')?;
-                meta.starts_with("160000 ").then_some(file)
-            })
-            .any(|sub| std::fs::symlink_metadata(path.join(sub).join(".git")).is_ok());
-        Ok(tri(nested))
+        let mut tracked = Tracked::default();
+        for entry in out.stdout.split(|&b| b == 0).filter(|e| !e.is_empty()) {
+            let (meta, file) = git::parse_stage_entry(entry)?;
+            if !tracked.protected && patterns.covers(DataList::Protected, &file) {
+                tracked.protected = true;
+            }
+            if meta.starts_with("160000 ")
+                && std::fs::symlink_metadata(path.join(&file).join(".git")).is_ok()
+            {
+                tracked.nested = true;
+            }
+        }
+        Ok(tracked)
     }
+}
+
+/// Tracked content `act` would refuse.
+#[derive(Clone, Copy, Debug, Default)]
+struct Tracked {
+    protected: bool,
+    nested: bool,
 }
 
 /// The ignored entries of the worktree at `root`, classified, with sizes of regenerable ones
@@ -771,8 +806,11 @@ fn in_use(path: &Path, shared: &Shared<'_>) -> (InUse, bool) {
 /// What the reclaim summary needs beyond the worktree's facts.
 struct ReclaimInputs {
     status_known: bool,
+    /// A git or gh step of this worktree or its repository failed.
+    step_failed: bool,
     in_use_known: bool,
-    tracked_nested: Tri,
+    /// `None` when the index could not be read.
+    tracked: Option<Tracked>,
     plain_target: CheckResult,
 }
 
@@ -796,18 +834,26 @@ fn reclaim_summary(worktree: &Worktree, inputs: &ReclaimInputs) -> ReclaimSummar
         }
     };
     let observed = inputs.status_known
+        && !inputs.step_failed
         && [f.dirty, f.has_upstream, f.unpushed, f.open_pr]
             .iter()
             .all(|t| *t != Tri::Unknown)
         && f.merge_evidence != MergeEvidence::Unknown;
-    let nested = match (
-        ignored_check(IgnoredClass::NestedRepository),
-        inputs.tracked_nested,
-    ) {
-        (CheckResult::Fail, _) | (_, Tri::Yes) => CheckResult::Fail,
-        (CheckResult::Unknown, _) | (_, Tri::Unknown) => CheckResult::Unknown,
+    // A check fails on the ignored entries or the tracked ones, and is unknown when either
+    // could not be read.
+    let with_tracked = |ignored: CheckResult, tracked: Option<bool>| match (ignored, tracked) {
+        (CheckResult::Fail, _) | (_, Some(true)) => CheckResult::Fail,
+        (CheckResult::Unknown, _) | (_, None) => CheckResult::Unknown,
         _ => CheckResult::Pass,
     };
+    let nested = with_tracked(
+        ignored_check(IgnoredClass::NestedRepository),
+        inputs.tracked.map(|t| t.nested),
+    );
+    let protected = with_tracked(
+        ignored_check(IgnoredClass::Protected),
+        inputs.tracked.map(|t| t.protected),
+    );
     let checks = [
         (
             "observed",
@@ -840,7 +886,7 @@ fn reclaim_summary(worktree: &Worktree, inputs: &ReclaimInputs) -> ReclaimSummar
         ("no_open_pr", from_tri(f.open_pr, Tri::No)),
         ("has_upstream", from_tri(f.has_upstream, Tri::Yes)),
         ("plain_target", inputs.plain_target),
-        ("no_protected", ignored_check(IgnoredClass::Protected)),
+        ("no_protected", protected),
         (
             "no_unclassifiable",
             ignored_check(IgnoredClass::Unclassifiable),

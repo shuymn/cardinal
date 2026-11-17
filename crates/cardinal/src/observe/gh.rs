@@ -11,14 +11,34 @@ pub const OPEN_LIMIT: usize = 500;
 /// `gh pr list` limit for merged pull requests found by a head object ID.
 pub const MERGED_LIMIT: usize = 20;
 
-/// `owner/name` of a GitHub remote: `github.com`, or `gh_host` when set. `None` for any
-/// other remote.
+/// A GitHub repository: its host and `owner/name`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GithubRepo {
+    pub host: String,
+    /// `owner/name`
+    pub name: String,
+}
+
+impl GithubRepo {
+    /// The `--repo` value: `HOST/OWNER/NAME`, so gh asks the origin's host whatever its
+    /// configuration says.
+    #[must_use]
+    pub fn spec(&self) -> String {
+        format!("{}/{}", self.host, self.name)
+    }
+}
+
+/// The GitHub repository of a remote on `github.com`, or on `gh_host` (the caller's
+/// `GH_HOST`) when set. `None` for any other remote.
 #[must_use]
-pub fn github_repo(remote: &str, gh_host: Option<&str>) -> Option<String> {
+pub fn github_repo(remote: &str, gh_host: Option<&str>) -> Option<GithubRepo> {
     let normalized = normalize_remote(remote)?;
-    let (host, repo) = normalized.split_once('/')?;
+    let (host, name) = normalized.split_once('/')?;
     let gh_host = gh_host.map(|h| h.trim().to_ascii_lowercase());
-    (host == "github.com" || gh_host.as_deref() == Some(host)).then(|| repo.to_owned())
+    (host == "github.com" || gh_host.as_deref() == Some(host)).then(|| GithubRepo {
+        host: host.to_owned(),
+        name: name.to_owned(),
+    })
 }
 
 /// One open pull request.
@@ -115,11 +135,19 @@ pub fn open_pr_for<'a>(
     })
 }
 
-/// The merged pull request whose head commit is exactly `head`.
-#[must_use]
-pub fn merged_pr_for<'a>(prs: &'a [MergedPr], head: &str) -> Option<&'a MergedPr> {
-    prs.iter()
+/// The merged pull request whose head commit is exactly `head`. Without a match, a full
+/// page cannot tell "none" from "beyond the limit" and is an error.
+pub fn merged_pr_for<'a>(prs: &'a [MergedPr], head: &str) -> Result<Option<&'a MergedPr>, String> {
+    match prs
+        .iter()
         .find(|pr| pr.head_ref_oid.eq_ignore_ascii_case(head))
+    {
+        Some(pr) => Ok(Some(pr)),
+        None if prs.len() >= MERGED_LIMIT => Err(format!(
+            "gh returned {MERGED_LIMIT} merged pull requests for {head}, the query limit, none with that head"
+        )),
+        None => Ok(None),
+    }
 }
 
 #[cfg(test)]
@@ -128,18 +156,19 @@ mod tests {
 
     #[test]
     fn github_remotes() {
+        let spec = |remote, host| github_repo(remote, host).map(|r| r.spec());
         assert_eq!(
-            github_repo("git@github.com:Owner/App.git", None).as_deref(),
-            Some("owner/app")
+            spec("git@github.com:Owner/App.git", None).as_deref(),
+            Some("github.com/owner/app")
         );
         assert_eq!(
-            github_repo("https://github.com/o/n", None).as_deref(),
-            Some("o/n")
+            github_repo("https://github.com/o/n", None).unwrap().name,
+            "o/n"
         );
         assert_eq!(github_repo("https://gitlab.com/o/n", None), None);
         assert_eq!(
-            github_repo("https://ghe.example.com/o/n", Some("GHE.example.com")).as_deref(),
-            Some("o/n")
+            spec("https://ghe.example.com/o/n", Some("GHE.example.com")).as_deref(),
+            Some("ghe.example.com/o/n")
         );
         assert_eq!(github_repo("/local/path", None), None);
     }
@@ -180,7 +209,13 @@ mod tests {
             br#"[{"number":7,"headRefOid":"abc","mergedAt":"2026-01-01T00:00:00Z","url":"u"}]"#,
         )
         .unwrap();
-        assert_eq!(merged_pr_for(&prs, "abc").unwrap().number, 7);
-        assert!(merged_pr_for(&prs, "abd").is_none());
+        assert_eq!(merged_pr_for(&prs, "abc").unwrap().unwrap().number, 7);
+        assert!(merged_pr_for(&prs, "abd").unwrap().is_none());
+        let full: Vec<_> = (0..20).map(|_| prs[0].clone()).collect();
+        assert!(
+            merged_pr_for(&full, "abd").is_err(),
+            "a full page without a match"
+        );
+        assert_eq!(merged_pr_for(&full, "abc").unwrap().unwrap().number, 7);
     }
 }

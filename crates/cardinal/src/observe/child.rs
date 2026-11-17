@@ -8,8 +8,9 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-/// Variables copied from the caller's environment. `LC_*` is copied too.
-const INHERITED: &[&str] = &[
+/// Variables git children copy from the caller's environment (section 8.1). `LC_*` is
+/// copied too.
+const GIT_INHERITED: &[&str] = &[
     "PATH",
     "HOME",
     "USER",
@@ -25,6 +26,24 @@ const INHERITED: &[&str] = &[
     "GH_HOST",
     "GH_CONFIG_DIR",
     "SSH_AUTH_SOCK",
+];
+
+/// Variables gh children copy: where gh keeps its configuration and the tokens it
+/// authenticates with. `GH_HOST` and `GH_REPO` are left out, because they would point gh at
+/// another host or repository than the `--repo HOST/OWNER/NAME` observation passes.
+const GH_INHERITED: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "LANG",
+    "TMPDIR",
+    "XDG_CONFIG_HOME",
+    "GH_CONFIG_DIR",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
 ];
 
 /// Variables Windows programs need, copied on Windows only.
@@ -50,26 +69,41 @@ const ADDED: &[(&str, &str)] = &[
     ("NO_COLOR", "1"),
 ];
 
-/// The environment of a git or gh child, built from `inherited`: only the allowlisted
-/// variables pass, so `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, and every other
+/// The environment of a git child, built from `inherited`: only the allowlisted variables
+/// pass, so `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, and every other
 /// repository-location variable of the caller never reach git.
 pub fn constructed_env(
     inherited: impl IntoIterator<Item = (OsString, OsString)>,
 ) -> Vec<(OsString, OsString)> {
+    build_env(inherited, GIT_INHERITED)
+}
+
+/// The environment of a gh child, built from `inherited` like [`constructed_env`] with the
+/// gh allowlist.
+pub fn gh_env(
+    inherited: impl IntoIterator<Item = (OsString, OsString)>,
+) -> Vec<(OsString, OsString)> {
+    build_env(inherited, GH_INHERITED)
+}
+
+fn build_env(
+    inherited: impl IntoIterator<Item = (OsString, OsString)>,
+    allowed: &[&str],
+) -> Vec<(OsString, OsString)> {
     let mut env: Vec<(OsString, OsString)> = inherited
         .into_iter()
-        .filter(|(name, _)| passes(name))
+        .filter(|(name, _)| passes(name, allowed))
         .collect();
     env.retain(|(name, _)| !ADDED.iter().any(|(added, _)| same_name(name, added)));
     env.extend(ADDED.iter().map(|(k, v)| ((*k).into(), (*v).into())));
     env
 }
 
-fn passes(name: &OsStr) -> bool {
+fn passes(name: &OsStr, allowed: &[&str]) -> bool {
     let Some(name) = name.to_str() else {
         return false;
     };
-    INHERITED.iter().any(|keep| same_name(name, keep))
+    allowed.iter().any(|keep| same_name(name, keep))
         || (cfg!(windows) && INHERITED_WINDOWS.iter().any(|keep| same_name(name, keep)))
         || name.starts_with("LC_")
 }
@@ -142,14 +176,20 @@ pub enum ChildError {
     },
 }
 
-/// Kills and reaps the child when dropped, so no exit path leaves it running or unreaped.
-struct Reaper(Child);
+/// Owns the child until its output is complete. Dropped before that (deadline, read error,
+/// a reader thread that could not start), it kills the child's process group on Unix, so
+/// descendants holding the output open go too, then kills and reaps the child. On Windows
+/// only the child is killed; a descendant can outlive it until it closes the pipe.
+struct Reaper {
+    child: Child,
+    complete: bool,
+}
 
 impl Reaper {
     fn wait_until(&mut self, deadline: Instant) -> std::io::Result<Option<ExitStatus>> {
         let mut delay = Duration::from_millis(1);
         loop {
-            if let Some(status) = self.0.try_wait()? {
+            if let Some(status) = self.child.try_wait()? {
                 return Ok(Some(status));
             }
             let now = Instant::now();
@@ -164,20 +204,28 @@ impl Reaper {
 
 impl Drop for Reaper {
     fn drop(&mut self) {
-        if matches!(self.0.try_wait(), Ok(Some(_))) {
+        if self.complete {
             return;
         }
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        // The group is the child's own (`process_group(0)`); while the child is unreaped or a
+        // member still holds the output open, its ID cannot belong to another group.
+        #[cfg(unix)]
+        crate::os::kill_process_group(self.child.id());
+        if matches!(self.child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
 /// Runs `program` with `args` and exactly `env`, stdin closed, until `timeout`.
 ///
-/// Output is read on two threads. On the deadline the child is killed and reaped and the
-/// result is [`ChildError::Timeout`]; that includes a child that exited while a descendant
-/// still holds its output open. A reader thread blocked on such a descendant is left to end
-/// when the descendant closes the pipe; nothing waits for it.
+/// Output is read on two threads. On Unix the child leads its own process group. On the
+/// deadline the group is killed and the child reaped, and the result is
+/// [`ChildError::Timeout`]; that includes a child that exited while a descendant still
+/// holds its output open. Once the group is gone the reader threads see end of file and
+/// end; nothing waits for them.
 pub fn run(
     program: &str,
     args: &[OsString],
@@ -195,22 +243,27 @@ pub fn run(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
-    let mut child = Reaper(command.spawn().map_err(|source| ChildError::Spawn {
-        program: name(),
-        source,
-    })?);
+    let mut child = Reaper {
+        child: command.spawn().map_err(|source| ChildError::Spawn {
+            program: name(),
+            source,
+        })?,
+        complete: false,
+    };
 
     let (sender, receiver) = mpsc::channel();
     let stdout = child
-        .0
+        .child
         .stdout
         .take()
         .map(|s| Box::new(s) as Box<dyn Read + Send>);
     let stderr = child
-        .0
+        .child
         .stderr
         .take()
         .map(|s| Box::new(s) as Box<dyn Read + Send>);
@@ -251,6 +304,7 @@ pub fn run(
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
+    child.complete = true;
     let [stdout, stderr] = streams;
     Ok(Output {
         code: status.code(),
@@ -311,6 +365,30 @@ mod tests {
     }
 
     #[test]
+    fn gh_gets_its_own_allowlist() {
+        let env = super::gh_env(pairs(&[
+            ("PATH", "/bin"),
+            ("GH_TOKEN", "t"),
+            ("GH_ENTERPRISE_TOKEN", "e"),
+            ("GH_HOST", "evil.example.com"),
+            ("GH_REPO", "evil/repo"),
+            ("GIT_DIR", "/decoy/.git"),
+        ]));
+        let names: Vec<_> = env.iter().map(|(k, _)| k.to_str().unwrap()).collect();
+        for absent in ["GH_HOST", "GH_REPO", "GIT_DIR"] {
+            assert!(!names.contains(&absent), "{absent} passed: {names:?}");
+        }
+        for present in [
+            "PATH",
+            "GH_TOKEN",
+            "GH_ENTERPRISE_TOKEN",
+            "GH_PROMPT_DISABLED",
+        ] {
+            assert!(names.contains(&present), "{present} missing: {names:?}");
+        }
+    }
+
+    #[test]
     fn a_missing_program_is_a_spawn_error() {
         let err = run(
             "cardinal-no-such-program",
@@ -365,7 +443,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_descendant_holding_the_output_open_ends_in_a_timeout() {
+    fn a_descendant_holding_the_output_open_ends_in_a_timeout_and_is_killed() {
         let dir = tempfile::tempdir().unwrap();
         let pid_file = dir.path().join("pid");
         let script = format!(
@@ -373,16 +451,22 @@ mod tests {
             pid_file.display()
         );
         let start = Instant::now();
-        let result = sh(&script, Duration::from_millis(300));
-        let elapsed = start.elapsed();
-        if let Ok(pid) = std::fs::read_to_string(&pid_file) {
-            let pid = pid.trim().to_owned();
-            let _ = std::process::Command::new("kill")
-                .args(["-9", &pid])
-                .status();
-        }
-        let err = result.unwrap_err();
+        let err = sh(&script, Duration::from_millis(300)).unwrap_err();
         assert!(matches!(err, ChildError::Timeout { .. }), "{err}");
-        assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            start.elapsed()
+        );
+        let pid: u32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let gone = (0..250).any(|_| {
+            std::thread::sleep(Duration::from_millis(20));
+            crate::os::start_time_s(pid).is_none()
+        });
+        assert!(gone, "the descendant {pid} was killed with the group");
     }
 }

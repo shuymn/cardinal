@@ -51,6 +51,18 @@ fn age(path: &Path) {
         .unwrap();
 }
 
+/// Stops a filesystem monitor daemon a failing run would have started, on every exit path.
+struct StopMonitor<'a>(&'a Scene);
+
+impl Drop for StopMonitor<'_> {
+    fn drop(&mut self) {
+        let _ = self
+            .0
+            .fx
+            .git_output(&self.0.repo, &["fsmonitor--daemon", "stop"]);
+    }
+}
+
 #[test]
 fn index_and_refs_unchanged() {
     let scene = Scene::new();
@@ -67,6 +79,12 @@ fn index_and_refs_unchanged() {
         age(&dir.join("README.md"));
     }
     scene.profile("data", "[data]\nregenerable = ['target']\n");
+    // A filesystem monitor configured for the repository must not start: its daemon writes
+    // inside `.git`.
+    scene
+        .fx
+        .git(&scene.repo, &["config", "core.fsmonitor", "true"]);
+    let _daemon = StopMonitor(&scene);
 
     let roots = [scene.repo.clone(), wt.clone(), other.clone()];
     let before: Vec<Listing> = roots.iter().map(|r| listing(r)).collect();
@@ -96,6 +114,11 @@ fn index_and_refs_unchanged() {
             root.display()
         );
     }
+
+    // Turn the monitor off for the control below.
+    scene
+        .fx
+        .git(&scene.repo, &["config", "--unset", "core.fsmonitor"]);
 
     // Control: the same status without disabling optional locks rewrites the index, so the
     // comparison above would have seen it.

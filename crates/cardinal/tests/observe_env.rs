@@ -171,3 +171,46 @@ fn children_get_the_constructed_environment() {
         }
     }
 }
+
+/// gh is asked about the origin's host, whatever `GH_HOST` or `GH_REPO` the caller exports,
+/// and neither reaches gh.
+#[test]
+fn gh_asks_the_origin_host() {
+    let scene = Scene::new();
+    let wt = scene.worktree("feat", "feat");
+    scene.commit(&wt, "feature.txt");
+    scene.push(&wt, "feat");
+    let config = scene.config();
+    let mut env = scene.env();
+    env.push(("GH_HOST".into(), "evil.example.com".into()));
+    env.push(("GH_REPO".into(), "evil/repo".into()));
+    env.push(("GH_TOKEN".into(), "token".into()));
+    let reservations = observe_common::FakeReservations::none();
+    let inv = cardinal::observe::Observer::new(&config)
+        .with_env(env)
+        .with_reservations(&reservations)
+        .inventory(
+            &scene.state(),
+            &cardinal::observe::InventoryOptions {
+                repos: vec![scene.repo.clone()],
+                sizes: false,
+            },
+        )
+        .unwrap();
+    assert_eq!(inv.repos[0].github.as_deref(), Some(observe_common::GITHUB));
+    let calls = scene.gh_calls();
+    assert!(calls.len() >= 2, "{calls:?}");
+    for call in &calls {
+        assert!(
+            call.contains(&format!("--repo github.com/{}", observe_common::GITHUB)),
+            "{call}"
+        );
+    }
+    if cfg!(unix) {
+        let env = std::fs::read_to_string(scene.gh_dir.join("env.log")).unwrap();
+        let names: Vec<&str> = env.lines().filter_map(|l| l.split('=').next()).collect();
+        assert!(!names.contains(&"GH_HOST"), "{names:?}");
+        assert!(!names.contains(&"GH_REPO"), "{names:?}");
+        assert!(names.contains(&"GH_TOKEN"), "gh keeps its authentication");
+    }
+}

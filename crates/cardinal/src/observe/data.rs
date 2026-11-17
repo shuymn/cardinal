@@ -17,7 +17,8 @@ pub struct DataPatterns {
 }
 
 impl DataPatterns {
-    fn covers(&self, list: DataList, rel: &Path) -> bool {
+    /// Whether `rel` (worktree-relative) is, or is inside, a match of `list`.
+    pub fn covers(&self, list: DataList, rel: &Path) -> bool {
         let patterns = match list {
             DataList::Regenerable => &self.regenerable,
             DataList::Protected => &self.protected,

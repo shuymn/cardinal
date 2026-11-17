@@ -44,6 +44,8 @@ pub struct Scene {
     pub state_dir: PathBuf,
     /// Extra `host.toml` lines appended to the generated `[observe]` table.
     observe_extra: String,
+    /// `[observe] gh_timeout_ms`: long enough for a loaded machine by default.
+    pub gh_timeout_ms: u64,
 }
 
 impl Scene {
@@ -74,6 +76,7 @@ impl Scene {
             config_dir,
             state_dir,
             observe_extra: String::new(),
+            gh_timeout_ms: 15_000,
         };
         scene.push(&scene.repo, "main");
         scene.fx.git(
@@ -245,8 +248,9 @@ exit "$code"
     /// Writes `host.toml` and loads the configuration.
     pub fn config(&self) -> Config {
         let host = format!(
-            "[observe]\ngh = '{}'\ngh_timeout_ms = 3000\ngit_timeout_ms = 10000\n{}",
+            "[observe]\ngh = '{}'\ngh_timeout_ms = {}\ngit_timeout_ms = 15000\n{}",
             self.gh_program().display(),
+            self.gh_timeout_ms,
             self.observe_extra
         );
         std::fs::write(self.config_dir.join("host.toml"), host).unwrap();
