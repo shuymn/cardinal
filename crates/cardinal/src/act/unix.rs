@@ -66,9 +66,10 @@ fn open_dir_at(dir: impl AsFd, name: &OsStr) -> io::Result<OwnedFd> {
 fn names(dir: impl AsFd) -> io::Result<Vec<OsString>> {
     let mut names = Vec::new();
     for entry in Dir::read_from(dir)? {
-        let name = entry?.file_name().to_bytes().to_vec();
+        let entry = entry?;
+        let name = entry.file_name().to_bytes();
         if name != b"." && name != b".." {
-            names.push(OsStr::from_bytes(&name).to_os_string());
+            names.push(OsStr::from_bytes(name).to_os_string());
         }
     }
     names.sort();
