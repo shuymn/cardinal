@@ -65,7 +65,6 @@ fn version_is_text() {
 fn unimplemented_commands_answer_not_implemented_with_exit_1() {
     let dirs = Dirs::new();
     let commands: &[&[&str]] = &[
-        &["run", "--", "true"],
         &["inventory"],
         &["inventory", "--repo", "/r", "--sizes"],
         &["inbox"],

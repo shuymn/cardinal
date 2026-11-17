@@ -235,10 +235,8 @@ pub fn main_with(args: &[OsString]) -> ExitCode {
 
 fn dispatch(command: Command) -> ExitCode {
     match command {
-        Command::Run(args) => match run::run(args.spec_b64.as_deref(), &args.command) {
-            Ok(code) => code,
-            Err(err) => fail(&err),
-        },
+        // The runner prints nothing of its own: its stdout and stderr are the stage's.
+        Command::Run(args) => run::run(args.spec_b64.as_deref(), &args.command),
         Command::Hook(args) => hook(&args),
         Command::Inventory(args) => respond(context().and_then(|ctx| {
             let options = InventoryOptions {
