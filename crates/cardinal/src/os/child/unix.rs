@@ -151,10 +151,22 @@ mod tests {
 
     use super::{Body, disposition, watch_signals_with};
 
-    /// The handler and flags of `sig`, which a failed watch must leave as they were.
+    /// The flags that change how a signal is handled. glibc on `x86_64` also sets
+    /// `SA_RESTORER` on every action it installs, a restore included: it names the
+    /// trampoline a handler returns through and changes nothing about the disposition.
+    const BEHAVIOUR: i32 = libc::SA_NOCLDSTOP
+        | libc::SA_NOCLDWAIT
+        | libc::SA_SIGINFO
+        | libc::SA_ONSTACK
+        | libc::SA_RESTART
+        | libc::SA_NODEFER
+        | libc::SA_RESETHAND;
+
+    /// The handler of `sig` and the flags that change its handling, which a failed watch
+    /// must leave as they were.
     fn handler(sig: i32) -> (libc::sighandler_t, i32) {
         let action = disposition(sig).unwrap();
-        (action.sa_sigaction, action.sa_flags)
+        (action.sa_sigaction, action.sa_flags & BEHAVIOUR)
     }
 
     /// Starts each reader on a real thread that reports on `ended` when it returns; the
