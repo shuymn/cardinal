@@ -482,10 +482,19 @@ fn plain_target_checks(
 #[cfg(target_os = "macos")]
 #[test]
 fn mount_point_refused() {
-    struct Attached(cardinal_test_support::Command);
+    /// Detaches the image when the test fails part-way; a passing test detaches it itself and
+    /// checks that the detach succeeded.
+    struct Attached(Option<cardinal_test_support::Command>);
+    impl Attached {
+        fn detach(mut self) -> std::process::ExitStatus {
+            self.0.take().unwrap().status().unwrap()
+        }
+    }
     impl Drop for Attached {
         fn drop(&mut self) {
-            let _ = self.0.status();
+            if let Some(mut detach) = self.0.take() {
+                let _ = detach.status();
+            }
         }
     }
     let s = Setup::new();
@@ -520,7 +529,7 @@ fn mount_point_refused() {
     detach
         .args(["detach", "-force", "-quiet"])
         .arg(wt.join("node_modules"));
-    let _attached = Attached(detach);
+    let attached = Attached(Some(detach));
 
     let plan = s.plan(PlanKind::ReclaimDir, &wt.join("node_modules"));
     assert_eq!(check(&plan.checks, "plain_target"), CheckResult::Fail);
@@ -531,6 +540,7 @@ fn mount_point_refused() {
         std::fs::read_to_string(wt.join("node_modules/pkg/index.js")).unwrap(),
         "on the image"
     );
+    assert!(attached.detach().success(), "hdiutil detach");
 }
 
 /// A8: both plan kinds are refused for a worktree managed by another app, whether
