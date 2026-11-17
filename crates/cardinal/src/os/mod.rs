@@ -271,6 +271,12 @@ pub fn current_pid() -> u32 {
     std::process::id()
 }
 
+/// This host's name, if the OS reports one.
+#[must_use]
+pub fn hostname() -> Option<String> {
+    System::host_name().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ProcessInfo, ProcessTable};
