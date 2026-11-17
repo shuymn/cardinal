@@ -136,8 +136,14 @@ impl Bench {
         }
     }
 
+    /// Everything a command can change: generated commands `cd ..` at most four times from
+    /// the work dir, so they stay inside it.
+    fn play(&self) -> PathBuf {
+        self.fixture.root().join("play")
+    }
+
     fn work(&self) -> PathBuf {
-        self.fixture.root().join("work")
+        self.play().join("1/2/3/4/work")
     }
 
     /// The command as the hook rewrites it with `dirs`' configuration; unchanged when the
@@ -150,10 +156,11 @@ impl Bench {
     /// Runs `setup` and `command` in `shell` in a fresh work dir; returns what it printed and
     /// how many times the fake runner ran.
     fn run(&self, shell: &Shell, setup: &str, command: &str) -> (Outcome, usize) {
-        let work = self.work();
-        if work.exists() {
-            std::fs::remove_dir_all(&work).unwrap();
+        let play = self.play();
+        if play.exists() {
+            std::fs::remove_dir_all(&play).unwrap();
         }
+        let work = self.work();
         std::fs::create_dir_all(work.join("sub")).unwrap();
         for (name, contents) in [
             ("a.txt", "a\n"),
@@ -237,6 +244,14 @@ const CASES: &[Case] = &[
         0,
     ),
     case("persisted_cwd", "", "cd sub && probe two", 1, 1),
+    // A write above the work dir is reset between the two runs as well.
+    case(
+        "parent_dir_write",
+        "",
+        "cd ..; probe out >> out.log && cat out.log 2>&1",
+        0,
+        0,
+    ),
     case(
         "documented_example",
         "",
