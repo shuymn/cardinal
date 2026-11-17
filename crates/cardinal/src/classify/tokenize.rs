@@ -20,7 +20,7 @@ pub enum Refusal {
     UnbalancedQuote,
     #[error("`{0}` is outside the supported shell subset")]
     Unsupported(&'static str),
-    #[error("expansion `{0}` is not a plain `$NAME` or `${{NAME}}`")]
+    #[error("expansion `{0}` is not a plain parameter expansion")]
     Expansion(String),
     #[error("keyword `{0}` in command position")]
     Keyword(String),
