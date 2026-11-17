@@ -247,19 +247,6 @@ fn spawn(command: Command) -> std::io::Result<Reaper> {
     })
 }
 
-fn take_output(child: &mut Child) -> [Option<Box<dyn Read + Send>>; 2] {
-    [
-        child
-            .stdout
-            .take()
-            .map(|s| Box::new(s) as Box<dyn Read + Send>),
-        child
-            .stderr
-            .take()
-            .map(|s| Box::new(s) as Box<dyn Read + Send>),
-    ]
-}
-
 /// The process groups of the children alive now (Unix). Held while a child is spawned and
 /// added, while one is killed, reaped, and removed, and by the signal handler while it kills
 /// them, so every group it names is pinned by an unreaped leader.
@@ -379,32 +366,26 @@ impl Drop for Reaper {
     }
 }
 
-/// Reads each present stream to its end on its own thread, stopping one byte past `max`.
-/// Each thread sends its stream's index and what it read; returns the receiver and the
-/// number of threads started.
-fn read_streams(
-    streams: [Option<Box<dyn Read + Send>>; 2],
+/// Reads `stream` to its end on a thread of its own, stopping one byte past `max`, and
+/// sends `index` with what it read.
+fn start_reader<R: Read + Send + 'static>(
+    stream: R,
+    index: usize,
     max: u64,
-) -> std::io::Result<(mpsc::Receiver<(usize, Stream)>, usize)> {
-    let (sender, receiver) = mpsc::channel();
-    let mut started = 0;
-    for (index, stream) in streams.into_iter().enumerate() {
-        let Some(stream) = stream else { continue };
-        let sender = sender.clone();
-        std::thread::Builder::new()
-            .name("child-output".into())
-            .spawn(move || {
-                let mut bytes = Vec::new();
-                let read = match stream.take(max.saturating_add(1)).read_to_end(&mut bytes) {
-                    Ok(_) if bytes.len() as u64 > max => Stream::TooLarge,
-                    Ok(_) => Stream::Read(bytes),
-                    Err(err) => Stream::Failed(err),
-                };
-                let _ = sender.send((index, read));
-            })?;
-        started += 1;
-    }
-    Ok((receiver, started))
+    sender: mpsc::Sender<(usize, Stream)>,
+) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name("child-output".into())
+        .spawn(move || {
+            let mut bytes = Vec::new();
+            let read = match stream.take(max.saturating_add(1)).read_to_end(&mut bytes) {
+                Ok(_) if bytes.len() as u64 > max => Stream::TooLarge,
+                Ok(_) => Stream::Read(bytes),
+                Err(err) => Stream::Failed(err),
+            };
+            let _ = sender.send((index, read));
+        })?;
+    Ok(())
 }
 
 /// Runs `program` with `args` and exactly `env` in `cwd`, stdin closed, within `limits`.
@@ -468,16 +449,20 @@ fn run_guarded(
         drop(live);
     }
 
-    let (receiver, mut pending) = read_streams(take_output(&mut child.child), limits.max_output)
-        .map_err(|source| ChildError::Io {
-            program: name(),
-            source,
-        })?;
-
     let io_err = |source| ChildError::Io {
         program: name(),
         source,
     };
+    let (Some(stdout), Some(stderr)) = (child.child.stdout.take(), child.child.stderr.take())
+    else {
+        return Err(io_err(std::io::Error::other(
+            "the child's output is not piped",
+        )));
+    };
+    let (sender, receiver) = mpsc::channel();
+    start_reader(stdout, 0, limits.max_output, sender.clone()).map_err(io_err)?;
+    start_reader(stderr, 1, limits.max_output, sender).map_err(io_err)?;
+    let mut pending = 2;
     let mut streams = [Vec::new(), Vec::new()];
     let mut ended = false;
     let mut delay = Duration::from_millis(1);
