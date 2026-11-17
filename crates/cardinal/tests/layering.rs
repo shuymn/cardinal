@@ -90,7 +90,6 @@ const PLATFORM_CRATES: &[(&str, &[&str])] = &[
     ("signal_hook", &["os"]),
     ("rustix", &["os", "act"]),
     ("windows_sys", &["os"]),
-    ("process_wrap", &["os"]),
     ("libc", &["os"]),
 ];
 

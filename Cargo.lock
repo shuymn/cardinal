@@ -155,7 +155,6 @@ dependencies = [
  "clap",
  "dunce",
  "libc",
- "process-wrap",
  "proptest",
  "rustix",
  "serde",

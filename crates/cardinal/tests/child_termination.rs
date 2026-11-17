@@ -1,6 +1,7 @@
 //! A cardinal process that is terminated while a child it runs through `os::child` is alive
-//! kills the child's process group (Unix) or job (Windows) first, and on Unix still ends by
-//! the signal (`docs/architecture.md` section 8.1).
+//! takes the child's process group (Unix) or job (Windows) along, and on Unix still ends by
+//! the signal; on Windows a process it started otherwise outlives it (`docs/architecture.md`
+//! section 8.1).
 
 mod observe_common;
 mod support;
@@ -145,8 +146,8 @@ fn a_terminated_cardinal_kills_its_children_and_dies_by_the_signal() {
     }
 }
 
-/// On Windows a terminated cardinal runs no code; its children go with it because cardinal
-/// keeps itself in a job that is killed when its last handle closes.
+/// On Windows a terminated cardinal runs no code; its children go with it because each runs
+/// in a job that is killed when its only handle, which cardinal holds, closes.
 #[cfg(windows)]
 #[test]
 fn a_terminated_cardinal_kills_its_children() {
@@ -187,4 +188,116 @@ fn a_terminated_cardinal_kills_its_children() {
         .is_some(),
         "ping {pid} outlived cardinal"
     );
+}
+
+/// The file `outside_os_child_helper` writes its `ping`'s PID to.
+#[cfg(windows)]
+const HELPER_PID_FILE: &str = "CARDINAL_TEST_HELPER_PID_FILE";
+
+/// Kills and reaps the helper if a failing test left it running.
+#[cfg(windows)]
+struct KillChild(Child);
+
+#[cfg(windows)]
+impl Drop for KillChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Kills the helper's `ping` by PID, if it still runs with its start time.
+#[cfg(windows)]
+struct KillProcess(u32, u64);
+
+#[cfg(windows)]
+impl Drop for KillProcess {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_TERMINATE, TerminateProcess,
+        };
+
+        if !cardinal::os::is_alive(self.0, self.1) {
+            return;
+        }
+        // SAFETY: `OpenProcess` takes no pointers and returns a null handle on failure.
+        let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, self.0) };
+        if handle.is_null() {
+            return;
+        }
+        // SAFETY: `handle` was opened above with `PROCESS_TERMINATE` and is closed once, here.
+        unsafe {
+            TerminateProcess(handle, 1);
+            CloseHandle(handle);
+        }
+    }
+}
+
+/// Started by `a_process_started_outside_os_child_outlives_cardinal`, it stands in for a
+/// cardinal process: it runs a child through `os::child`, starts `ping` directly, writes the
+/// `ping`'s PID to the file `HELPER_PID_FILE` names, and waits to be killed.
+#[cfg(windows)]
+#[test]
+#[ignore = "started by a_process_started_outside_os_child_outlives_cardinal"]
+fn outside_os_child_helper() {
+    use cardinal::os::child::{Limits, git_env, run};
+
+    let Some(pid_file) = std::env::var_os(HELPER_PID_FILE).map(std::path::PathBuf::from) else {
+        return;
+    };
+    let dir = pid_file.parent().unwrap();
+    let limits = Limits {
+        deadline: Instant::now() + Duration::from_secs(30),
+        max_output: 1024,
+    };
+    let args = ["/D".into(), "/C".into(), "exit 0".into()];
+    let out = run("cmd", &args, &git_env(std::env::vars_os()), dir, limits).unwrap();
+    assert_eq!(out.code, Some(0), "{}", out.stderr_line());
+
+    let mut ping = std::process::Command::new("ping")
+        .args(["-n", "31", "127.0.0.1"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let written = dir.join("ping.pid.tmp");
+    std::fs::write(&written, ping.id().to_string()).unwrap();
+    std::fs::rename(&written, &pid_file).unwrap();
+    std::thread::sleep(Duration::from_secs(60));
+    let _ = ping.wait();
+}
+
+/// Only the children cardinal runs through `os::child` go with it: a process it starts
+/// otherwise is in none of their jobs, so it outlives a terminated cardinal.
+#[cfg(windows)]
+#[test]
+fn a_process_started_outside_os_child_outlives_cardinal() {
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("ping.pid");
+    let mut helper = KillChild(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["outside_os_child_helper", "--exact", "--ignored"])
+            .env(HELPER_PID_FILE, &pid_file)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let pid: u32 = poll(Duration::from_secs(30), || {
+        std::fs::read_to_string(&pid_file).ok()?.trim().parse().ok()
+    })
+    .expect("the helper started ping");
+    let start_s = cardinal::os::start_time_s(pid).expect("ping runs");
+    let _ping = KillProcess(pid, start_s);
+
+    helper.0.kill().unwrap();
+    wait_or_kill(&mut helper.0);
+    let survived = (0..50).all(|_| {
+        std::thread::sleep(Duration::from_millis(20));
+        cardinal::os::is_alive(pid, start_s)
+    });
+    assert!(survived, "ping {pid} was killed with the helper");
 }

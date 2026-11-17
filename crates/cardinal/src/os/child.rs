@@ -7,11 +7,13 @@
 //!
 //! No process cardinal starts here outlives what started it: the child's process group
 //! (Unix) or Job Object (Windows) is killed before the child is reaped, after a normal exit
-//! too. The first [`run`] in a process also makes a terminated process take its live
-//! children along (see `guard_termination`): on Unix it installs handlers for SIGTERM,
-//! SIGINT, and SIGHUP that end the process by the same signal, so a process that handles
-//! those signals itself must not use [`run`]. When that fails, no child starts: this and
-//! every later [`run`] in the process return [`ChildError::Setup`].
+//! too. A terminated process takes its live children along. On Unix the first [`run`] in a
+//! process installs handlers for SIGTERM, SIGINT, and SIGHUP that end the process by the
+//! same signal (see `guard_termination`), so a process that handles those signals itself
+//! must not use [`run`]; when that fails, no child starts, and this and every later [`run`]
+//! in the process return [`ChildError::Setup`]. On Windows each child's job is killed when
+//! its only handle, held by this process, closes; other processes this process starts are
+//! not affected.
 //!
 //! For short-lived callers only (a CLI command, a hook): a descendant that left the child's
 //! process group (`setsid`) is not killed, and a reader thread blocked on a pipe it holds
@@ -26,16 +28,10 @@ mod windows;
 use std::ffi::{OsStr, OsString};
 use std::io::Read;
 use std::path::Path;
-#[cfg(unix)]
-use std::process::Child;
-use std::process::{Command, ExitStatus, Stdio};
-#[cfg(windows)]
-use std::sync::Once;
-#[cfg(unix)]
-use std::sync::OnceLock;
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 #[cfg(unix)]
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 /// Variables git children copy from the caller's environment (section 8.1). `LC_*` is
@@ -230,30 +226,28 @@ enum Stream {
     Failed(std::io::Error),
 }
 
-/// A started child: on Unix the leader of its own process group, on Windows the first
-/// process of its own Job Object, which every process it starts joins.
+/// Starts the child as the leader of its own process group.
 #[cfg(unix)]
-type Handle = Child;
-#[cfg(windows)]
-type Handle = Box<dyn process_wrap::std::ChildWrapper>;
-
-#[cfg(unix)]
-fn spawn(mut command: Command) -> std::io::Result<Handle> {
+fn spawn(mut command: Command) -> std::io::Result<Reaper> {
     std::os::unix::process::CommandExt::process_group(&mut command, 0);
-    command.spawn()
+    Ok(Reaper {
+        child: command.spawn()?,
+        complete: false,
+    })
 }
 
-/// Starts the child suspended, assigns it to a new Job Object, then resumes it, so it starts
-/// nothing outside the job.
+/// Starts the child in a Job Object of its own, which every process it starts joins.
 #[cfg(windows)]
-fn spawn(command: Command) -> std::io::Result<Handle> {
-    process_wrap::std::CommandWrap::from(command)
-        .wrap(process_wrap::std::JobObject)
-        .spawn()
+fn spawn(command: Command) -> std::io::Result<Reaper> {
+    let (child, job) = windows::spawn(command)?;
+    Ok(Reaper {
+        child,
+        job,
+        complete: false,
+    })
 }
 
-#[cfg(unix)]
-fn take_output(child: &mut Handle) -> [Option<Box<dyn Read + Send>>; 2] {
+fn take_output(child: &mut Child) -> [Option<Box<dyn Read + Send>>; 2] {
     [
         child
             .stdout
@@ -261,20 +255,6 @@ fn take_output(child: &mut Handle) -> [Option<Box<dyn Read + Send>>; 2] {
             .map(|s| Box::new(s) as Box<dyn Read + Send>),
         child
             .stderr
-            .take()
-            .map(|s| Box::new(s) as Box<dyn Read + Send>),
-    ]
-}
-
-#[cfg(windows)]
-fn take_output(child: &mut Handle) -> [Option<Box<dyn Read + Send>>; 2] {
-    [
-        child
-            .stdout()
-            .take()
-            .map(|s| Box::new(s) as Box<dyn Read + Send>),
-        child
-            .stderr()
             .take()
             .map(|s| Box::new(s) as Box<dyn Read + Send>),
     ]
@@ -320,22 +300,15 @@ fn guard_termination() -> std::io::Result<()> {
         .map_err(std::io::Error::other)
 }
 
-/// Makes this process take its children along when it ends, once per process: the process
-/// joins a job that kills its members when the process ends. Best effort.
-#[cfg(windows)]
-fn guard_termination() {
-    static GUARD: Once = Once::new();
-    GUARD.call_once(|| {
-        windows::contain_self();
-    });
-}
-
 /// Owns the child until it is reaped. On every exit from [`run`], complete or early
 /// (deadline, output over the limit, read error, a reader thread that could not start), it
 /// kills whatever is left of the child's process group (Unix) or Job Object (Windows)
 /// before it reaps the child, so no process cardinal started outlives the run.
 struct Reaper {
-    child: Handle,
+    child: Child,
+    /// The job the child runs in, which ends with this process.
+    #[cfg(windows)]
+    job: windows::Job,
     complete: bool,
 }
 
@@ -371,11 +344,8 @@ impl Reaper {
         }
         #[cfg(windows)]
         {
-            // Terminates every process in the job, then reaps the child alone: the wrapper's
-            // own `wait` also waits for a job notification, which may already have been
-            // consumed.
-            let _ = self.child.start_kill();
-            self.child.inner_mut().wait()
+            let _ = self.job.terminate();
+            self.child.wait()
         }
     }
 }
@@ -436,11 +406,9 @@ pub fn run(
 ) -> Result<Output, ChildError> {
     #[cfg(unix)]
     let guard = guard_termination;
+    // Each child's job ends with this process (`windows::Job`): nothing to set up.
     #[cfg(windows)]
-    let guard = || {
-        guard_termination();
-        Ok(())
-    };
+    let guard = || Ok(());
     run_guarded(guard, program.as_ref(), args, env, cwd, limits)
 }
 
@@ -469,13 +437,10 @@ fn run_guarded(
         .current_dir(cwd);
     #[cfg(unix)]
     let mut live = live();
-    let mut child = Reaper {
-        child: spawn(command).map_err(|source| ChildError::Spawn {
-            program: name(),
-            source,
-        })?,
-        complete: false,
-    };
+    let mut child = spawn(command).map_err(|source| ChildError::Spawn {
+        program: name(),
+        source,
+    })?;
     #[cfg(unix)]
     {
         live.push(child.child.id());
