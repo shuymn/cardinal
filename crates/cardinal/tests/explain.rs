@@ -231,11 +231,7 @@ impl Tracer for FakeTracer {
         &self,
         command: &str,
     ) -> Result<Vec<cardinal::classify::Stage>, cardinal::contract::Error> {
-        Ok(vec![cardinal::classify::Stage {
-            index: 0,
-            span: 0..command.len(),
-            words: command.split_whitespace().map(str::to_owned).collect(),
-        }])
+        cardinal::classify::find_stages(command)
     }
 
     fn trace(
