@@ -91,6 +91,10 @@ fn spawn_with(
 ) -> io::Result<(Child, Job)> {
     let job = Job::new()?;
     command.creation_flags(CREATE_SUSPENDED);
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "os::child's spawn site: a bounded child in a constructed environment"
+    )]
     let mut child = command.spawn()?;
     if let Err(err) = enter(&job, &child) {
         let _ = job.terminate();

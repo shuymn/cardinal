@@ -229,12 +229,41 @@ enum Stream {
     Failed(std::io::Error),
 }
 
+/// The command that runs `program` with `args` and exactly `env` in `cwd`, stdin closed,
+/// stdout and stderr piped.
+fn command(
+    program: &OsStr,
+    args: &[OsString],
+    env: &[(OsString, OsString)],
+    cwd: &Path,
+) -> Command {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "os::child's spawn site: a bounded child in a constructed environment"
+    )]
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .env_clear()
+        .envs(env.iter().map(|(k, v)| (k, v)))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .current_dir(cwd);
+    command
+}
+
 /// Starts the child as the leader of its own process group.
 #[cfg(unix)]
 fn spawn(mut command: Command) -> std::io::Result<Reaper> {
     std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "os::child's spawn site: a bounded child in a constructed environment"
+    )]
+    let child = command.spawn()?;
     Ok(Reaper {
-        child: command.spawn()?,
+        child,
         complete: false,
     })
 }
@@ -430,15 +459,7 @@ fn run_guarded(
         program: name(),
         source,
     })?;
-    let mut command = Command::new(program);
-    command
-        .args(args)
-        .env_clear()
-        .envs(env.iter().map(|(k, v)| (k, v)))
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .current_dir(cwd);
+    let command = command(program, args, env, cwd);
     #[cfg(unix)]
     let mut live = live();
     let mut child = spawn(command).map_err(|source| ChildError::Spawn {
