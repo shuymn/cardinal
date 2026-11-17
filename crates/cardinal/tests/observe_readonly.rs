@@ -115,6 +115,18 @@ fn index_and_refs_unchanged() {
         );
     }
 
+    // Stop a daemon if one started, and prove none is left running for the repository.
+    scene
+        .fx
+        .git_output(&scene.repo, &["fsmonitor--daemon", "stop"]);
+    assert!(
+        !scene
+            .fx
+            .git_output(&scene.repo, &["fsmonitor--daemon", "status"])
+            .status
+            .success(),
+        "no filesystem monitor daemon remains"
+    );
     // Turn the monitor off for the control below.
     scene
         .fx
@@ -171,6 +183,8 @@ fn split_index_is_left_unread() {
         .filter(|k| before.get(*k) != after.get(*k))
         .collect();
     assert!(changed.is_empty(), "observation changed {changed:?}");
+    assert_no_monitor(&scene, &scene.repo);
+    assert_no_monitor(&scene, &wt);
 
     let w = observe_common::worktree(&inv, &wt);
     assert_eq!(w.facts.dirty, cardinal::contract::Tri::Unknown);
@@ -229,6 +243,19 @@ fn observe_all(scene: &Scene) -> cardinal::contract::Inventory {
     scene.inventory()
 }
 
+/// No filesystem monitor daemon runs for the repository at `dir`.
+fn assert_no_monitor(scene: &Scene, dir: &Path) {
+    assert!(
+        !scene
+            .fx
+            .git_output(dir, &["fsmonitor--daemon", "status"])
+            .status
+            .success(),
+        "a filesystem monitor daemon runs for {}",
+        dir.display()
+    );
+}
+
 fn assert_unchanged(before: &Listing, after: &Listing) {
     let changed: Vec<&String> = before
         .keys()
@@ -263,6 +290,7 @@ fn a_configured_base_is_only_a_ref_name() {
     );
     let w = observe_common::worktree(&inv, &wt);
     assert!(w.reclaim.failed.contains(&"observed".to_owned()));
+    assert_no_monitor(&scene, &scene.repo);
 }
 
 /// The parent's status never enters a submodule, whose own split index reading would
@@ -293,6 +321,8 @@ fn a_submodule_split_index_is_left_unread() {
             .contains(&"no_nested_repository".to_owned())
     );
     assert!(!w.reclaim.candidate);
+    assert_no_monitor(&scene, &wt);
+    assert_no_monitor(&scene, &dep);
 
     // Control: a status that enters submodules freshens the submodule's shared index.
     scene.fx.git(&wt, &["status", "--porcelain"]);

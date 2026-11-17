@@ -392,27 +392,44 @@ mod tests {
 
     #[test]
     fn a_missing_program_is_a_spawn_error() {
+        let dir = tempfile::tempdir().unwrap();
         let err = run(
             "cardinal-no-such-program",
             &[],
             &[],
-            None,
+            Some(dir.path()),
             Duration::from_secs(5),
         )
         .unwrap_err();
         assert!(matches!(err, ChildError::Spawn { .. }), "{err}");
     }
 
+    /// `sh -c script` in `dir`, with only `PATH` from this process and `HOME` in `dir`.
     #[cfg(unix)]
-    fn sh(script: &str, timeout: Duration) -> Result<super::Output, ChildError> {
-        let env = constructed_env(std::env::vars_os());
-        run("sh", &["-c".into(), script.into()], &env, None, timeout)
+    fn sh(
+        dir: &std::path::Path,
+        script: &str,
+        timeout: Duration,
+    ) -> Result<super::Output, ChildError> {
+        let mut inherited: Vec<(OsString, OsString)> =
+            std::env::vars_os().filter(|(k, _)| k == "PATH").collect();
+        inherited.push(("HOME".into(), dir.into()));
+        let env = constructed_env(inherited);
+        run(
+            "sh",
+            &["-c".into(), script.into()],
+            &env,
+            Some(dir),
+            timeout,
+        )
     }
 
     #[cfg(unix)]
     #[test]
     fn output_and_status_are_returned() {
+        let dir = tempfile::tempdir().unwrap();
         let out = sh(
+            dir.path(),
             "printf out; printf err >&2; exit 3",
             Duration::from_secs(10),
         )
@@ -429,7 +446,7 @@ mod tests {
         let pid_file = dir.path().join("pid");
         let script = format!("echo $$ > '{}'; exec sleep 30", pid_file.display());
         let start = Instant::now();
-        let err = sh(&script, Duration::from_millis(300)).unwrap_err();
+        let err = sh(dir.path(), &script, Duration::from_millis(300)).unwrap_err();
         assert!(matches!(err, ChildError::Timeout { .. }), "{err}");
         assert!(start.elapsed() < Duration::from_secs(5));
         let pid: u32 = std::fs::read_to_string(&pid_file)
@@ -453,7 +470,7 @@ mod tests {
             pid_file.display()
         );
         let start = Instant::now();
-        let err = sh(&script, Duration::from_millis(300)).unwrap_err();
+        let err = sh(dir.path(), &script, Duration::from_millis(300)).unwrap_err();
         assert!(matches!(err, ChildError::Timeout { .. }), "{err}");
         assert!(
             start.elapsed() < Duration::from_secs(5),

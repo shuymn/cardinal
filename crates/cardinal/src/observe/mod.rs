@@ -193,7 +193,7 @@ impl<'a> Observer<'a> {
             &observe.git,
             &command,
             &self.env,
-            None,
+            Some(dir),
             Duration::from_millis(observe.git_timeout_ms),
         )
     }
@@ -208,13 +208,15 @@ impl<'a> Observer<'a> {
             .success(&what)
     }
 
-    fn gh(&self, args: &[OsString]) -> Result<Output, String> {
+    /// gh with `args`, run in `dir` (the observed repository or worktree) so that it never
+    /// inherits this process's working directory.
+    fn gh(&self, dir: &Path, args: &[OsString]) -> Result<Output, String> {
         let observe = &self.config.host.observe;
         let out = child::run(
             &observe.gh,
             args,
             &self.gh_env,
-            None,
+            Some(dir),
             Duration::from_millis(observe.gh_timeout_ms),
         )
         .map_err(|err| err.to_string())?;
@@ -415,7 +417,7 @@ impl<'a> Observer<'a> {
         let github = remote_url.and_then(|url| gh::github_repo(url, self.gh_host.as_deref()));
         let (gh_status, gh_error, open_prs) = match (&remote, &github) {
             (_, Some(repo)) => match self
-                .gh(&gh::open_args(&repo.spec()))
+                .gh(&dir, &gh::open_args(&repo.spec()))
                 .and_then(|out| gh::parse_open(&out.stdout))
             {
                 Ok(prs) => (GhStatus::Ok, None, Some(prs)),
@@ -668,7 +670,7 @@ impl<'a> Observer<'a> {
         let merged: Option<Option<PrRef>> = match (&ctx.github, head) {
             _ if base_ancestor == Tri::Yes => None,
             (Some(repo), Some(head)) => match self
-                .gh(&gh::merged_args(&repo.spec(), head))
+                .gh(path, &gh::merged_args(&repo.spec(), head))
                 .and_then(|out| gh::parse_merged(&out.stdout))
                 .and_then(|prs| {
                     Ok(gh::merged_pr_for(&prs, head)?.map(|pr| PrRef {
@@ -1171,6 +1173,13 @@ mod tests {
         #[cfg(windows)]
         assert!(
             std::process::Command::new("cmd")
+                .env_clear()
+                .envs(std::env::vars_os().filter(|(k, _)| {
+                    ["PATH", "SystemRoot", "ComSpec", "PATHEXT"]
+                        .iter()
+                        .any(|keep| k.eq_ignore_ascii_case(keep))
+                }))
+                .current_dir(tmp.path())
                 .args(["/C", "mklink", "/J"])
                 .arg(&link)
                 .arg(&real)

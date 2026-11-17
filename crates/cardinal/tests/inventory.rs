@@ -17,6 +17,25 @@ use cardinal::state::{LockMode, try_lock, worktree_key};
 use observe_common::{FakeReservations, Scene, worktree};
 use support::helper::{self, Mode};
 
+/// A sleeping helper in `cwd` (inside the fixture), without the caller's `GIT_*` and
+/// `GH_*`, and with `HOME` and `XDG_CONFIG_HOME` inside the fixture.
+fn spawn_helper(scene: &Scene, cwd: &Path) -> helper::ChildGuard {
+    let mut command = helper::command(&Mode::Sleep);
+    for (name, _) in std::env::vars_os() {
+        let text = name.to_string_lossy();
+        if text.starts_with("GIT_") || text.starts_with("GH_") {
+            command.env_remove(&name);
+        }
+    }
+    let home = scene.fx.path("home");
+    command
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .current_dir(cwd);
+    helper::ChildGuard::new(command.spawn().expect("start a helper process"))
+}
+
 #[test]
 fn helper() {
     helper::run_if_requested();
@@ -89,7 +108,10 @@ fn budget_reserved_and_reservations() {
     let scene = Scene::new();
     std::fs::write(
         scene.config_dir.join("host.toml"),
-        "[budget]\ncpu = 8\ngpu = 1\n",
+        format!(
+            "[budget]\ncpu = 8\ngpu = 1\n\n[observe]\ngh = '{}'\n",
+            scene.gh_program().display()
+        ),
     )
     .unwrap();
     let config = cardinal::config::Config::load(&scene.config_dir).unwrap();
@@ -103,14 +125,17 @@ fn budget_reserved_and_reservations() {
         .with_reservations(&fake)
         .inventory(
             &scene.state(),
-            &cardinal::observe::InventoryOptions::default(),
+            &cardinal::observe::InventoryOptions {
+                repos: vec![scene.repo.clone()],
+                sizes: false,
+            },
         )
         .unwrap();
     assert_eq!(inv.budget["cpu"], NonZeroU64::new(8).unwrap());
     assert_eq!(inv.budget["gpu"], NonZeroU64::new(1).unwrap());
     assert_eq!(inv.reserved["cpu"].get(), 5, "live plus recovery-needed");
     assert_eq!(inv.reservations.len(), 3);
-    assert!(inv.repos.is_empty(), "nothing configured, nothing asked");
+    assert_eq!(inv.repos.len(), 1);
 }
 
 #[test]
@@ -139,7 +164,7 @@ fn reservations_lock_and_processes_make_a_worktree_in_use() {
     .unwrap();
     // Reading another process's working directory is tested where the OS backend reads it
     // reliably; elsewhere the worktree is simply not in use.
-    let mut child = cfg!(unix).then(|| helper::spawn(&Mode::Sleep, Some(&by_process)));
+    let mut child = cfg!(unix).then(|| spawn_helper(&scene, &by_process));
     if let Some(child) = &child {
         let pid = child.id();
         helper::wait_for("the helper's cwd", Duration::from_secs(10), || {
@@ -299,7 +324,7 @@ fn repositories_are_deduplicated_by_common_dir() {
 fn processes_that_outlived_their_session_are_listed() {
     let scene = Scene::new();
     let state = scene.state();
-    let mut child = helper::spawn(&Mode::Sleep, None);
+    let mut child = spawn_helper(&scene, scene.fx.root());
     let pid = child.id();
     let start_s = helper::wait_for("the helper", Duration::from_secs(10), || {
         cardinal::os::start_time_s(pid)

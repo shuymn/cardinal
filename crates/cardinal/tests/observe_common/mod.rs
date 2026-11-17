@@ -68,6 +68,7 @@ impl Scene {
         let config_dir = fx.path("config");
         let state_dir = fx.path("state");
         std::fs::create_dir_all(&gh_dir).unwrap();
+        std::fs::write(fx.path("observe.gitconfig"), "").unwrap();
         std::fs::create_dir_all(config_dir.join("repos")).unwrap();
         let scene = Self {
             fx,
@@ -261,9 +262,35 @@ exit "$code"
         StateDir::open(&self.state_dir).unwrap()
     }
 
-    /// The environment observation builds its children from: the fixture's.
+    /// What observation's children get on top of the fixture's environment: an empty
+    /// global git configuration, and gh's configuration inside the fixture, so neither the
+    /// owner's git nor gh configuration (or keychain entry) is ever read.
+    fn isolation(&self) -> [(OsString, OsString); 2] {
+        [
+            (
+                "GIT_CONFIG_GLOBAL".into(),
+                self.fx.path("observe.gitconfig").into(),
+            ),
+            (
+                "GH_CONFIG_DIR".into(),
+                self.fx.path("home/.config/gh").into(),
+            ),
+        ]
+    }
+
+    /// The environment observation builds its children from: the fixture's (`HOME`,
+    /// `XDG_CONFIG_HOME` inside the fixture, `GIT_CONFIG_NOSYSTEM=1`, `PATH` only from this
+    /// process) with [`Scene::isolation`] on top.
     pub fn env(&self) -> Vec<(OsString, OsString)> {
-        self.fx.env()
+        let isolation = self.isolation();
+        let mut env: Vec<(OsString, OsString)> = self
+            .fx
+            .env()
+            .into_iter()
+            .filter(|(k, _)| !isolation.iter().any(|(name, _)| name == k))
+            .collect();
+        env.extend(isolation);
+        env
     }
 
     /// `inventory --repo <repo>` through the library, with `reservations`.
@@ -297,14 +324,16 @@ exit "$code"
             .observe_worktree(&self.state(), path)
     }
 
-    /// The `cardinal` binary with this scene's state and config directories and the
-    /// fixture's environment.
+    /// The `cardinal` binary with this scene's state and config directories, the scene's
+    /// environment (`env_clear` first), and the fixture root as its working directory. Every
+    /// caller passes `--repo <fixture repository>`.
     pub fn cardinal(&self) -> std::process::Command {
         self.config();
         let mut command = self
             .fx
             .command(env!("CARGO_BIN_EXE_cardinal"), self.fx.root());
         command
+            .envs(self.isolation())
             .env("CARDINAL_STATE_DIR", &self.state_dir)
             .env("CARDINAL_CONFIG_DIR", &self.config_dir);
         command

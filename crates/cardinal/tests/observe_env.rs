@@ -155,7 +155,32 @@ fn children_get_the_constructed_environment() {
                 "{what} inherited {line}"
             );
         }
+        let root = scene.fx.root().to_string_lossy().into_owned();
         for block in text.split("---\n").filter(|b| !b.trim().is_empty()) {
+            let value = |name: &str| {
+                block
+                    .lines()
+                    .find_map(|l| l.strip_prefix(&format!("{name}=")))
+                    .unwrap_or_else(|| panic!("{what} lacks {name}"))
+                    .to_owned()
+            };
+            // The shell sets `PWD` from the directory it was started in.
+            for name in ["PWD", "HOME", "XDG_CONFIG_HOME"] {
+                assert!(
+                    value(name).starts_with(&root),
+                    "{what}: {name}={} is outside the fixture",
+                    value(name)
+                );
+            }
+            if what == "git" {
+                assert_eq!(
+                    value("GIT_CONFIG_GLOBAL"),
+                    scene.fx.path("observe.gitconfig").to_string_lossy()
+                );
+                assert_eq!(value("GIT_CONFIG_NOSYSTEM"), "1");
+            } else {
+                assert!(value("GH_CONFIG_DIR").starts_with(&root));
+            }
             for required in [
                 "GIT_OPTIONAL_LOCKS=0",
                 "GIT_TERMINAL_PROMPT=0",
@@ -212,5 +237,14 @@ fn gh_asks_the_origin_host() {
         assert!(!names.contains(&"GH_HOST"), "{names:?}");
         assert!(!names.contains(&"GH_REPO"), "{names:?}");
         assert!(names.contains(&"GH_TOKEN"), "gh keeps its authentication");
+        // This test process runs in the crate directory; gh must not inherit it.
+        let pwd = env
+            .lines()
+            .find_map(|l| l.strip_prefix("PWD="))
+            .expect("the shell sets PWD");
+        assert!(
+            std::path::Path::new(pwd).starts_with(scene.fx.root()),
+            "gh ran in {pwd}"
+        );
     }
 }
