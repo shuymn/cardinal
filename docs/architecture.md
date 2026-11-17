@@ -77,6 +77,8 @@ Everything lives in the single crate `crates/cardinal` (library plus the `cardin
 | `explain` | Explanation documents | `classify`, `record`, `plan`, `inbox`, `state`, `contract` |
 | `cli` | clap definitions and thin handlers that print JSON | everything |
 
+"May use" is read transitively: a module may also use whatever the modules it may use may use, so `run` may use `contract` through `admission`. `testpoint` is open to every module above the foundation. `tests/layering.rs` checks every `crate::` and `super::` path in `src/` against this reading; a glob import of the crate root or an alias of `crate` counts as using every module, and `clippy::wildcard_imports` is denied, so no module comes into scope without a path the test sees.
+
 ```mermaid
 flowchart TD
   cli --> adapter_claude[adapter::claude]
@@ -103,7 +105,7 @@ flowchart TD
 
 Two rules matter most and are part of the layering test:
 
-- `admission`, `run`, and `exec` never import `observe`, `inbox`, `plan`, or `act`. gh lives only in `observe`, and nothing on the admission path raises inbox items (C17, C18). Section 13.5 checks the same at run time.
+- `admission`, `run`, and `exec` never import `observe`, `inbox`, `plan`, or `act`, and `admission` uses neither `std::net` nor `std::process`. gh lives only in `observe`, and nothing on the admission path raises inbox items (C17, C18). Section 13.5 checks the same at run time.
 - `contract`, `state`, `config`, `testpoint`, and `os` import nothing above them, so every work unit can depend on them from day one.
 
 ## 3. Configuration

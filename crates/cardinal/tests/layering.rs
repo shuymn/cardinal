@@ -2,10 +2,14 @@
 //! only the modules the table allows, transitively: a module may use whatever the modules it
 //! may use may use. On top of the table, `testpoint` (a leaf with no dependencies) is open to
 //! every module above the foundation, because its pause points sit in `run`, `act`, and the
-//! hook. Platform crates stay where the table puts them.
+//! hook. Platform crates stay where the table puts them, and `admission` uses neither
+//! `std::net` nor `std::process`.
 //!
 //! The scanner reads `crate::…` and `super::…` paths (including grouped `use` trees) from the
-//! source with comments and string literals removed.
+//! source with comments and string literals removed. A glob import of the crate root and an
+//! alias of `crate` would bring modules into scope without such a path, so both count as a
+//! reference to the whole crate, which no module may use; other glob imports are denied by
+//! `clippy::wildcard_imports`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -84,6 +88,14 @@ const PLATFORM_CRATES: &[(&str, &[&str])] = &[
     ("signal_hook", &["os"]),
     ("rustix", &["os", "act"]),
 ];
+
+/// Parts of `std` a module may not use: admission neither talks to the network nor starts
+/// processes (gh and git live in `observe`).
+const STD_BANS: &[(&str, &[&str])] = &[("admission", &["net", "process"])];
+
+/// The segment that stands for the root a path starts from (`crate`, `std`) itself:
+/// `use crate::*`, `use crate as c`.
+const ROOT: &str = "<root>";
 
 fn src_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
@@ -358,10 +370,12 @@ fn paths_after(toks: &[Tok], i: usize, prefix: &[String], out: &mut Vec<Vec<Stri
                 return;
             }
             _ => {
-                // `self`, `*`, or the end of a group item.
-                if !segments.is_empty() {
-                    out.push(segments);
+                // `self`, `*`, or the end of a group item; with no segments, the path names
+                // the root it started from (`crate::*`).
+                if segments.is_empty() {
+                    segments.push(ROOT.into());
                 }
+                out.push(segments);
                 return;
             }
         }
@@ -395,6 +409,9 @@ fn references(src: &str, file_path: &[String]) -> Vec<Vec<String>> {
             Tok::Ident(word) if word == "crate" && toks.get(i + 1) == Some(&Tok::PathSep) => {
                 paths_after(&toks, i + 2, &[], &mut out);
             }
+            Tok::Ident(word) if word == "crate" && toks.get(i + 1) == Some(&ident("as")) => {
+                out.push(vec![ROOT.into()]);
+            }
             Tok::Ident(word)
                 if word == "super"
                     && toks.get(i + 1) == Some(&Tok::PathSep)
@@ -423,52 +440,93 @@ fn references(src: &str, file_path: &[String]) -> Vec<Vec<String>> {
     out
 }
 
-/// Every `crate::`/`super::` reference in `src/` that leaves its own module, as layering keys.
-fn module_references() -> Vec<Reference> {
-    let src = src_dir();
-    let mut refs = Vec::new();
-    for file in source_files() {
-        let rel = file.strip_prefix(&src).unwrap();
-        let path = module_path(rel);
-        let from = key_of(&path).unwrap();
-        let text = std::fs::read_to_string(&file).unwrap();
-        for target in references(&text, &path) {
-            let Some(to) = key_of(&target) else { continue };
-            if to != from {
-                refs.push(Reference {
-                    file: rel.display().to_string(),
-                    from: from.clone(),
-                    to,
-                });
-            }
-        }
-    }
-    refs
+fn ident(word: &str) -> Tok {
+    Tok::Ident(word.into())
 }
 
-/// Every use of a platform crate, as (file, module key, crate).
-fn crate_uses() -> Vec<(String, String, &'static str)> {
+/// Every `crate::`/`super::` reference in the file at `rel` that leaves its own module, as
+/// layering keys.
+fn file_references(rel: &Path, src: &str) -> Vec<Reference> {
+    let path = module_path(rel);
+    let from = key_of(&path).unwrap();
+    references(src, &path)
+        .into_iter()
+        .filter_map(|target| key_of(&target))
+        .filter(|to| *to != from)
+        .map(|to| Reference {
+            file: rel.display().to_string(),
+            from: from.clone(),
+            to,
+        })
+        .collect()
+}
+
+/// [`file_references`] of every file in `src/`.
+fn module_references() -> Vec<Reference> {
     let src = src_dir();
-    let mut uses = Vec::new();
-    for file in source_files() {
-        let rel = file.strip_prefix(&src).unwrap();
-        let from = key_of(&module_path(rel)).unwrap();
-        let toks = tokenize(&std::fs::read_to_string(&file).unwrap());
-        for (i, tok) in toks.iter().enumerate() {
-            for (name, _) in PLATFORM_CRATES {
-                // `rustix::…` or `::rustix::…`, but not `crate::rustix` or `os::rustix`.
-                let inner =
-                    i >= 2 && toks[i - 1] == Tok::PathSep && matches!(toks[i - 2], Tok::Ident(_));
-                if *tok == Tok::Ident((*name).into())
-                    && toks.get(i + 1) == Some(&Tok::PathSep)
-                    && !inner
-                {
-                    uses.push((rel.display().to_string(), from.clone(), *name));
-                }
+    source_files()
+        .iter()
+        .flat_map(|file| {
+            let text = std::fs::read_to_string(file).unwrap();
+            file_references(file.strip_prefix(&src).unwrap(), &text)
+        })
+        .collect()
+}
+
+/// Whether `toks[i]` is the external crate `name` at the start of a path: `name` or
+/// `::name`, but not `crate::name` or `os::name`.
+fn is_crate(toks: &[Tok], i: usize, name: &str) -> bool {
+    let inner = i >= 2 && toks[i - 1] == Tok::PathSep && matches!(toks[i - 2], Tok::Ident(_));
+    toks[i] == ident(name) && !inner
+}
+
+/// Every layering violation in the file at `rel` (relative to `src/`) with source `src`:
+/// internal references the table does not allow, platform crates outside their modules,
+/// and banned parts of `std`.
+fn check_source(rel: &Path, src: &str) -> Vec<String> {
+    let file = rel.display();
+    let from = key_of(&module_path(rel)).unwrap();
+    let allowed = allowed();
+    let keys = module_keys();
+    let mut violations: Vec<String> = file_references(rel, src)
+        .into_iter()
+        .filter(|r| r.from != "cli")
+        .filter(|r| {
+            !keys.contains(r.to.as_str()) || !allowed[r.from.as_str()].contains(r.to.as_str())
+        })
+        .map(|r| r.to_string())
+        .collect();
+    let toks = tokenize(src);
+    let banned_std = STD_BANS
+        .iter()
+        .find(|(module, _)| *module == from)
+        .map_or(&[][..], |(_, parts)| *parts);
+    for i in 0..toks.len() {
+        for (name, modules) in PLATFORM_CRATES {
+            if is_crate(&toks, i, name)
+                && toks.get(i + 1) == Some(&Tok::PathSep)
+                && !modules.contains(&from.as_str())
+            {
+                violations.push(format!("{file}: {from} uses {name}"));
+            }
+        }
+        if banned_std.is_empty() || !is_crate(&toks, i, "std") {
+            continue;
+        }
+        let mut paths = Vec::new();
+        match toks.get(i + 1) {
+            Some(Tok::PathSep) => paths_after(&toks, i + 2, &[], &mut paths),
+            Some(tok) if *tok == ident("as") => paths.push(vec![ROOT.into()]),
+            _ => {}
+        }
+        for path in paths {
+            let part = &path[0];
+            if part == ROOT || banned_std.contains(&part.as_str()) {
+                violations.push(format!("{file}: {from} uses std::{part}"));
             }
         }
     }
-    uses
+    violations
 }
 
 #[test]
@@ -486,20 +544,18 @@ fn every_source_file_belongs_to_a_known_module() {
 }
 
 #[test]
-fn module_dependencies_follow_the_table() {
-    let allowed = allowed();
-    let keys = module_keys();
-    let violations: Vec<String> = module_references()
-        .into_iter()
-        .filter(|r| r.from != "cli")
-        .filter(|r| {
-            !keys.contains(r.to.as_str()) || !allowed[r.from.as_str()].contains(r.to.as_str())
+fn sources_follow_the_layering() {
+    let src = src_dir();
+    let violations: Vec<String> = source_files()
+        .iter()
+        .flat_map(|file| {
+            let text = std::fs::read_to_string(file).unwrap();
+            check_source(file.strip_prefix(&src).unwrap(), &text)
         })
-        .map(|r| r.to_string())
         .collect();
     assert!(
         violations.is_empty(),
-        "forbidden module references:\n{}",
+        "layering violations:\n{}",
         violations.join("\n")
     );
 }
@@ -558,17 +614,58 @@ fn foundation_modules_import_nothing_above_them() {
 }
 
 #[test]
-fn platform_crates_stay_in_their_modules() {
-    let violations: Vec<String> = crate_uses()
-        .into_iter()
-        .filter(|(_, from, name)| {
-            PLATFORM_CRATES.iter().any(|(crate_name, modules)| {
-                crate_name == name && !modules.contains(&from.as_str())
-            })
-        })
-        .map(|(file, from, name)| format!("{file}: {from} uses {name}"))
-        .collect();
-    assert!(violations.is_empty(), "{}", violations.join("\n"));
+fn checker_rejects_forbidden_sources() {
+    let cases = [
+        (
+            "use crate::*; fn f() { observe::scan(); }",
+            "admission -> <root>",
+        ),
+        ("use super::*;", "admission -> <root>"),
+        (
+            "use crate as root; fn f() { root::inbox::raise(); }",
+            "admission -> <root>",
+        ),
+        ("use crate::observe as o;", "admission -> observe"),
+        ("use crate::{state, inbox::raise};", "admission -> inbox"),
+        ("use std::net::TcpStream;", "uses std::net"),
+        ("use std::{time::Duration, process};", "uses std::process"),
+        (
+            "fn f() { ::std::process::Command::new(\"gh\"); }",
+            "uses std::process",
+        ),
+        (
+            "use std as s; fn f() { s::net::TcpStream::connect(\"x\"); }",
+            "uses std::<root>",
+        ),
+        ("fn f() { sysinfo::System::new(); }", "uses sysinfo"),
+    ];
+    for (src, expected) in cases {
+        let violations = check_source(Path::new("admission/mod.rs"), src);
+        assert!(
+            violations.iter().any(|v| v.contains(expected)),
+            "{src}: expected {expected}, got {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn checker_accepts_allowed_sources() {
+    let src = r"
+        use crate::{state::StateDir, record::Recorder, contract};
+        use super::store;
+        use std::time::Duration;
+        fn f() { crate::os::process_table(); let _ = os_process::x; }
+        mod tests { use super::*; }
+    ";
+    assert_eq!(
+        check_source(Path::new("admission/budget.rs"), src),
+        Vec::<String>::new()
+    );
+    let run = "use std::process::Command; use crate::testpoint;";
+    assert_eq!(
+        check_source(Path::new("run/mod.rs"), run),
+        Vec::<String>::new()
+    );
 }
 
 fn refs_of(src: &str, path: &[&str]) -> Vec<String> {
