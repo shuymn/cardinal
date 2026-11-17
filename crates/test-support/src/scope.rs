@@ -337,6 +337,10 @@ impl Command {
         let mut wrap =
             process_wrap::std::CommandWrap::from(std::mem::replace(&mut self.inner, placeholder()));
         wrap.wrap(process_wrap::std::JobObject);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the spawn API: the one place tests start a process"
+        )]
         let result = wrap.spawn();
         self.inner = wrap.into_command();
         let mut child = result?;

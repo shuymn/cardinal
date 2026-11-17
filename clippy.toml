@@ -1,6 +1,9 @@
 # Processes start only through the spawn API of crates/test-support (docs/architecture.md
 # section 13.3) and at product spawn sites, each of which carries
-# `#[expect(clippy::disallowed_methods, reason = "…")]`.
+# `#[expect(clippy::disallowed_methods, reason = "…")]`. Every way the dependencies offer to
+# build or start a process is listed: std's `Command`, `assert_cmd`'s constructors (its
+# `Command`, the `CommandCargoExt` trait on std's `Command`, and the macros), and
+# `process-wrap`'s.
 disallowed-methods = [
   { path = "std::process::Command::new", reason = "start processes through cardinal_test_support::Scope::command, or mark a product spawn site with #[expect]" },
   { path = "std::process::Command::spawn", reason = "start processes through cardinal_test_support::Scope::command, or mark a product spawn site with #[expect]" },
@@ -9,5 +12,12 @@ disallowed-methods = [
   { path = "assert_cmd::Command::new", reason = "start processes through cardinal_test_support::Scope::command" },
   { path = "assert_cmd::Command::cargo_bin", reason = "start processes through cardinal_test_support::Scope::command" },
   { path = "assert_cmd::Command::from_std", reason = "start processes through cardinal_test_support::Scope::command" },
-  { path = "assert_cmd::cargo::cargo_bin_cmd", reason = "start processes through cardinal_test_support::Scope::command" },
+  { path = "assert_cmd::cargo::CommandCargoExt::cargo_bin", reason = "start processes through cardinal_test_support::Scope::command" },
+  { path = "process_wrap::std::CommandWrap::with_new", reason = "start processes through cardinal_test_support::Scope::command, or mark a product spawn site with #[expect]" },
+  { path = "process_wrap::std::CommandWrap::spawn", reason = "start processes through cardinal_test_support::Scope::command, or mark a product spawn site with #[expect]" },
+  { path = "process_wrap::std::CommandWrap::spawn_with", reason = "start processes through cardinal_test_support::Scope::command, or mark a product spawn site with #[expect]" },
+  { path = "process_wrap::std::CommandWrap::spawn_with_child", reason = "start processes through cardinal_test_support::Scope::command, or mark a product spawn site with #[expect]" },
+]
+disallowed-macros = [
+  { path = "assert_cmd::cargo_bin_cmd", reason = "start processes through cardinal_test_support::Scope::command" },
 ]

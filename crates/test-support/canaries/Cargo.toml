@@ -11,4 +11,8 @@ publish = false
 [lib]
 doctest = false
 
+# For the lint canary of `examples/cargo_ext_spawn.rs`.
+[dev-dependencies]
+assert_cmd = "=2.2.2"
+
 [workspace]

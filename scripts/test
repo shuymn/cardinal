@@ -323,16 +323,19 @@ self_check() {
   CARGO_TARGET_DIR=$canary_target cargo nextest archive --locked \
     --manifest-path "$canaries/Cargo.toml" --archive-file "$R/canaries.tar.zst"
 
-  # A raw spawn fails the lint.
-  if out=$(CARGO_TARGET_DIR=$canary_target cargo clippy --locked \
-    --manifest-path "$canaries/Cargo.toml" --example raw_spawn -- -D warnings 2>&1); then
-    check "raw Command::new fails the lint" FAILED
-  elif printf '%s' "$out" | grep -q 'disallowed_methods\|disallowed method'; then
-    check "raw Command::new fails the lint" ok
-  else
-    printf '%s\n' "$out" >&2
-    check "raw Command::new fails the lint" FAILED
-  fi
+  # Each way to build a spawnable command outside the spawn API fails the lint.
+  local example
+  for example in raw_spawn cargo_ext_spawn; do
+    if out=$(CARGO_TARGET_DIR=$canary_target cargo clippy --locked \
+      --manifest-path "$canaries/Cargo.toml" --example "$example" -- -D warnings 2>&1); then
+      check "$example fails the lint" FAILED
+    elif printf '%s' "$out" | grep -q 'disallowed_methods\|disallowed method'; then
+      check "$example fails the lint" ok
+    else
+      printf '%s\n' "$out" >&2
+      check "$example fails the lint" FAILED
+    fi
+  done
 
   # A write outside R fails, and nothing is written.
   local escape=$root/target/canary-escape
