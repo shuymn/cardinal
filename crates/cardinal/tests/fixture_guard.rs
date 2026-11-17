@@ -338,3 +338,29 @@ fn fixture_root_is_outside_any_repository() {
         fixture.root().display()
     );
 }
+
+/// Cleaning up a filesystem monitor touches only the repository it was configured for, also
+/// when a test replaced that repository's `.git` with a gitfile naming another one.
+#[test]
+fn fsmonitor_cleanup_follows_no_replaced_git_dir() {
+    let fixture = Fixture::new();
+    let repo = fixture.init("repo");
+    let other = fixture.init("other");
+    let other_monitor = fixture.fsmonitor(&other);
+    let monitor = fixture.fsmonitor(&repo);
+    std::fs::rename(repo.join(".git"), repo.join("moved.git")).unwrap();
+    std::fs::write(
+        repo.join(".git"),
+        format!("gitdir: {}\n", other.join(".git").display()),
+    )
+    .unwrap();
+    drop(monitor);
+    assert_eq!(
+        fixture.config_get(&other, "core.fsmonitor").as_deref(),
+        Some("true"),
+        "the other repository's setting was removed"
+    );
+    std::fs::remove_file(repo.join(".git")).unwrap();
+    std::fs::rename(repo.join("moved.git"), repo.join(".git")).unwrap();
+    drop(other_monitor);
+}

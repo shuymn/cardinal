@@ -43,14 +43,21 @@ impl BareRepo {
 
 /// A filesystem monitor configured for one fixture repository by [`Fixture::fsmonitor`].
 /// Dropping it stops the monitor daemon running for the repository, if any
-/// (`git fsmonitor--daemon stop`), and removes the setting.
+/// (`git fsmonitor--daemon stop`), and removes the setting, but only while the directory
+/// still resolves to the git dirs it had when the monitor was configured: a `.git` replaced
+/// meanwhile (say, by a gitfile naming another repository) is left alone, and a daemon left
+/// running is the scope's to clean up.
 pub struct Fsmonitor<'a> {
     fixture: &'a Fixture,
     repo: PathBuf,
+    dirs: Vec<PathBuf>,
 }
 
 impl Drop for Fsmonitor<'_> {
     fn drop(&mut self) {
+        if self.fixture.git_dirs(&self.repo).as_ref() != Some(&self.dirs) {
+            return;
+        }
         self.fixture
             .output(&self.repo, &["fsmonitor--daemon", "stop"]);
         self.fixture.output(
@@ -287,9 +294,13 @@ impl Fixture {
     /// started it.
     pub fn fsmonitor(&self, repo: &Path) -> Fsmonitor<'_> {
         self.git(repo, &["config", "--local", "core.fsmonitor", "true"]);
+        let dirs = self
+            .git_dirs(repo)
+            .expect("resolve the repository a monitor is configured for");
         Fsmonitor {
             fixture: self,
             repo: repo.to_path_buf(),
+            dirs,
         }
     }
 
@@ -407,6 +418,26 @@ impl Fixture {
                 panic!("refusing git: {} is not a repository", dir.display())
             }
         }
+    }
+
+    /// The git dir and common dir git would use in `dir`, or `None` when it cannot resolve
+    /// them. Never panics for a directory inside the root.
+    fn git_dirs(&self, dir: &Path) -> Option<Vec<PathBuf>> {
+        let output = self.output(
+            dir,
+            &[
+                "rev-parse",
+                "--path-format=absolute",
+                "--absolute-git-dir",
+                "--git-common-dir",
+            ],
+        );
+        output.status.success().then(|| {
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(|line| PathBuf::from(line.trim()))
+                .collect()
+        })
     }
 
     /// Asks git which git dir and common dir it would use in `dir`, and refuses any outside
