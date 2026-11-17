@@ -1014,9 +1014,10 @@ fn reclaim_summary(worktree: &Worktree, inputs: &ReclaimInputs) -> ReclaimSummar
     }
 }
 
-/// `plain_target` for a worktree root: not a symbolic link, and on the same device as its
-/// parent (which also rules out a mount point). Windows has no device number in std, so the
-/// check is `unknown` there.
+/// `plain_target` for a worktree root: not a symbolic link, not a mount point, and on the
+/// same device as its parent. On Unix the device numbers of the root and its parent are
+/// compared. On Windows a root that is not a reparse point passes: another volume, a
+/// junction, or a symbolic link is reachable inside a path only through a reparse point.
 fn plain_target(path: &Path) -> CheckResult {
     let Ok(meta) = std::fs::symlink_metadata(path) else {
         return CheckResult::Unknown;
@@ -1036,7 +1037,17 @@ fn plain_target(path: &Path) -> CheckResult {
             Err(_) => CheckResult::Unknown,
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+            CheckResult::Pass
+        } else {
+            CheckResult::Fail
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         CheckResult::Unknown
     }
@@ -1133,4 +1144,38 @@ fn canonical(path: &Path) -> PathBuf {
 
 fn display(path: &Path) -> String {
     path.to_string_lossy().into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::plain_target;
+    use crate::contract::CheckResult;
+
+    #[test]
+    fn plain_target_passes_a_plain_directory_and_fails_a_link_to_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        let link = tmp.path().join("link");
+        std::fs::create_dir(&real).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        // A junction needs no privilege, unlike a directory symbolic link.
+        #[cfg(windows)]
+        assert!(
+            std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(&link)
+                .arg(&real)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        assert_eq!(plain_target(&real), CheckResult::Pass);
+        assert_eq!(plain_target(&link), CheckResult::Fail);
+        assert_eq!(
+            plain_target(&tmp.path().join("missing")),
+            CheckResult::Unknown
+        );
+    }
 }
