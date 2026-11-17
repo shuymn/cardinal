@@ -91,7 +91,7 @@ impl Entry {
 
     /// An entry from what `os::dir` read of it without following a symbolic link.
     #[cfg(unix)]
-    fn from_stat(rel: PathBuf, st: &crate::os::dir::Stat) -> Self {
+    pub(crate) fn from_stat(rel: PathBuf, st: &crate::os::dir::Stat) -> Self {
         use crate::os::dir::Kind;
         Self {
             rel,

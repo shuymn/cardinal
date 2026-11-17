@@ -2,6 +2,7 @@
 //! section 9.2). `plan`'s walk opens a directory without following a final symbolic link,
 //! checks the descriptor's identity and mount, and lists that same descriptor, reading each
 //! entry's metadata relative to it, so what it lists is the directory it checked.
+//! `stat` is also how `act`'s snapshot reads the metadata it records.
 
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
@@ -78,12 +79,13 @@ pub fn list(dir: File) -> io::Result<Vec<(OsString, Stat)>> {
     Ok(entries)
 }
 
+/// What `st`, read by `stat`, `lstat`, or `fstat`, reports of an entry.
 #[allow(
     clippy::useless_conversion,
     clippy::unnecessary_fallible_conversions,
     reason = "the field types of `struct stat` differ between platforms"
 )]
-fn stat(st: &rustix::fs::Stat) -> Stat {
+pub(crate) fn stat(st: &rustix::fs::Stat) -> Stat {
     let kind = match FileType::from_raw_mode(st.st_mode) {
         FileType::RegularFile => Kind::File,
         FileType::Directory => Kind::Dir,

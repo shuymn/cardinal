@@ -20,6 +20,7 @@ use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, Stat};
 use rustix::io::Errno;
 
 use crate::contract::RootId;
+use crate::os::dir;
 use crate::os::mount::{self, MountId};
 use crate::plan::{Entry, EntryKind, Mount, Walk};
 
@@ -29,29 +30,8 @@ const DIR_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::CLOEXEC);
 
 /// An entry from `lstat`-style metadata.
-#[allow(
-    clippy::useless_conversion,
-    clippy::unnecessary_fallible_conversions,
-    reason = "the field types of `struct stat` differ between platforms"
-)]
 fn entry(rel: PathBuf, st: &Stat) -> Entry {
-    let kind = match FileType::from_raw_mode(st.st_mode) {
-        FileType::RegularFile => EntryKind::File,
-        FileType::Directory => EntryKind::Dir,
-        FileType::Symlink => EntryKind::Symlink,
-        _ => EntryKind::Other,
-    };
-    Entry {
-        rel,
-        kind,
-        dev: u64::try_from(st.st_dev).unwrap_or_default(),
-        ino: u64::try_from(st.st_ino).unwrap_or_default(),
-        size: u64::try_from(st.st_size).unwrap_or_default(),
-        mtime_ns: i128::from(st.st_mtime) * 1_000_000_000 + i128::from(st.st_mtime_nsec),
-        allocated: u64::try_from(st.st_blocks)
-            .unwrap_or_default()
-            .saturating_mul(512),
-    }
+    Entry::from_stat(rel, &dir::stat(st))
 }
 
 fn lstat_at(dir: impl AsFd, name: &OsStr) -> io::Result<Stat> {
