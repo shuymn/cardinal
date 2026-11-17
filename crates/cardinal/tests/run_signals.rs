@@ -145,6 +145,39 @@ fn signals_are_forwarded_to_the_group() {
     assert_eq!(lines, ["grandchild", "stage"]);
 }
 
+/// A stopped stage is still supervised: a signal to the runner reaches its group, and the stage
+/// gets it once continued. (macOS also reports a stopped child to a wait for exits.)
+#[test]
+fn signals_reach_a_stopped_stage() {
+    let env = Env::with_budget(4);
+    let pid_file = env.file("pid");
+    let script = format!(
+        "trap 'exit 7' TERM; echo $$ > '{}'; kill -STOP $$; sleep 1; exit 3",
+        pid_file.display()
+    );
+    let mut runner = ChildGuard::new(env.run(None, &["sh", "-c", &script]).spawn().unwrap());
+    let _group = runner_support::GroupGuard(runner.id());
+    let stage: u32 = support::helper::wait_for("the stage PID", WAIT, || {
+        std::fs::read_to_string(&pid_file).ok()?.trim().parse().ok()
+    });
+    support::helper::wait_for("the stage to stop", WAIT, || {
+        let out = env
+            .isolated("ps")
+            .args(["-o", "stat=", "-p", &stage.to_string()])
+            .output()
+            .ok()?;
+        String::from_utf8_lossy(&out.stdout)
+            .trim_start()
+            .starts_with('T')
+            .then_some(())
+    });
+    cardinal::os::unix::signal_process(runner.id(), cardinal::os::unix::SIGTERM).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    cardinal::os::unix::signal_process(stage, cardinal::os::unix::SIGCONT).unwrap();
+    let status = runner.child().wait().unwrap();
+    assert_eq!(status.code(), Some(7), "{status:?}");
+}
+
 /// On the fail-open path the stage shares the caller's group and gets terminal signals
 /// itself; the runner ignores SIGINT, as `system()` does, and forwards SIGTERM.
 #[test]

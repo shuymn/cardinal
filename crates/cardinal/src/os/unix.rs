@@ -10,11 +10,11 @@ use std::io::{self, Read as _};
 use std::sync::Arc;
 use std::time::Duration;
 
-use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, WaitOptions};
+use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, WaitIdStatus, WaitOptions};
 
 use super::{Detail, ProcessInfo, ProcessTable};
 
-pub use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGKILL, SIGQUIT, SIGTERM};
+pub use signal_hook::consts::signal::{SIGCONT, SIGHUP, SIGINT, SIGKILL, SIGQUIT, SIGTERM};
 
 /// The process group of this process before and after [`lead_group`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -124,6 +124,12 @@ pub fn other_group_members(pgid: u32) -> io::Result<Vec<ProcessInfo>> {
     Ok(members)
 }
 
+/// Whether a `waitid` report is the end of the child. macOS also reports a stopped child to
+/// a wait for `WEXITED` alone.
+fn ended(status: &WaitIdStatus) -> bool {
+    status.exited() || status.killed() || status.dumped()
+}
+
 /// Whether child `pid` has exited, without waiting and without reaping it, so its PID stays
 /// reserved while the caller may still signal it. Fails when the child cannot be waited for,
 /// for example because the parent ignores SIGCHLD and the system reaped the child already.
@@ -134,15 +140,15 @@ pub fn child_exited(raw_pid: u32) -> io::Result<bool> {
             WaitId::Pid(id),
             WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG,
         ) {
-            Ok(status) => return Ok(status.is_some()),
+            Ok(status) => return Ok(status.is_some_and(|s| ended(&s))),
             Err(rustix::io::Errno::INTR) => {}
             Err(err) => return Err(err.into()),
         }
     }
 }
 
-/// Blocks until child `pid` has exited without reaping it, so the caller can still reap it
-/// with `Child::try_wait` and no PID is reused while the caller may signal it. Returns an
+/// Blocks until child `pid` has exited without reaping it, so no PID is reused while the
+/// caller may signal it. Returns an
 /// error when the child cannot be waited for, for example because the parent ignores
 /// SIGCHLD and the system reaped the child already.
 pub fn wait_exited_unreaped(raw_pid: u32) -> io::Result<()> {
@@ -152,7 +158,10 @@ pub fn wait_exited_unreaped(raw_pid: u32) -> io::Result<()> {
             WaitId::Pid(id),
             WaitIdOptions::EXITED | WaitIdOptions::NOWAIT,
         ) {
-            Ok(_) => return Ok(()),
+            Ok(Some(status)) if ended(&status) => return Ok(()),
+            // A stop reported anyway stays until the child changes again; look again later
+            // instead of spinning on it.
+            Ok(_) => std::thread::sleep(Duration::from_millis(100)),
             Err(rustix::io::Errno::INTR) => {}
             Err(err) => return Err(err.into()),
         }
