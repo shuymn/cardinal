@@ -126,10 +126,17 @@ fn an_ignored_sigchld_is_reset_for_the_runner_and_kept_for_the_stage() {
     // Writes SIGCHLD's disposition to the file `out` and exits 3.
     let stage = |out: &str| support::helper::command(&Mode::ChildSignal { out: env.file(out) });
     let read = |out: &str| std::fs::read_to_string(env.file(out)).unwrap();
+    // bash, because dash does not pass an ignored SIGCHLD on to the program it execs.
     let ignoring = |inner: &Command| {
-        let mut shell = env.isolated("sh");
+        let mut shell = env.isolated("bash");
         shell
-            .args(["-c", "trap '' CHLD; exec \"$@\"", "sh"])
+            .args([
+                "--norc",
+                "--noprofile",
+                "-c",
+                "trap '' CHLD; exec \"$@\"",
+                "bash",
+            ])
             .arg(inner.get_program())
             .args(inner.get_args());
         for (key, value) in inner.get_envs() {
