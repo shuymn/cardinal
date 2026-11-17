@@ -1,5 +1,9 @@
-//! Child processes for git and gh (`docs/architecture.md` section 8.1): a constructed
-//! environment, a deadline on every wait, and output read on threads.
+//! Short-lived child processes whose output the caller needs: an environment the caller
+//! constructs, an absolute deadline on every wait, output read on threads, and cleanup on
+//! every early exit (`docs/architecture.md` sections 2.2 and 8.1).
+//!
+//! The environment is always the caller's choice. [`git_env`] and [`gh_env`] build the
+//! constructed environments of section 8.1 from separate allowlists.
 
 use std::ffi::{OsStr, OsString};
 use std::io::Read;
@@ -72,14 +76,14 @@ const ADDED: &[(&str, &str)] = &[
 /// The environment of a git child, built from `inherited`: only the allowlisted variables
 /// pass, so `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, and every other
 /// repository-location variable of the caller never reach git.
-pub fn constructed_env(
+pub fn git_env(
     inherited: impl IntoIterator<Item = (OsString, OsString)>,
 ) -> Vec<(OsString, OsString)> {
     build_env(inherited, GIT_INHERITED)
 }
 
-/// The environment of a gh child, built from `inherited` like [`constructed_env`] with the
-/// gh allowlist.
+/// The environment of a gh child, built from `inherited` like [`git_env`] with the gh
+/// allowlist.
 pub fn gh_env(
     inherited: impl IntoIterator<Item = (OsString, OsString)>,
 ) -> Vec<(OsString, OsString)> {
@@ -119,6 +123,7 @@ fn same_name(name: impl AsRef<OsStr>, other: &str) -> bool {
 }
 
 /// The value of `name` in a constructed environment.
+#[must_use]
 pub fn lookup<'a>(env: &'a [(OsString, OsString)], name: &str) -> Option<&'a OsStr> {
     env.iter()
         .rev()
@@ -167,8 +172,8 @@ pub enum ChildError {
         program: String,
         source: std::io::Error,
     },
-    #[error("{program} did not finish within {} ms", timeout.as_millis())]
-    Timeout { program: String, timeout: Duration },
+    #[error("{program} did not finish by its deadline")]
+    Timeout { program: String },
     #[error("{program}: {source}")]
     Io {
         program: String,
@@ -219,7 +224,7 @@ impl Drop for Reaper {
     }
 }
 
-/// Runs `program` with `args` and exactly `env`, stdin closed, until `timeout`.
+/// Runs `program` with `args` and exactly `env` in `cwd`, stdin closed, until `deadline`.
 ///
 /// Output is read on two threads. On Unix the child leads its own process group. On the
 /// deadline the group is killed and the child reaped, and the result is
@@ -227,14 +232,14 @@ impl Drop for Reaper {
 /// holds its output open. Once the group is gone the reader threads see end of file and
 /// end; nothing waits for them.
 pub fn run(
-    program: &str,
+    program: impl AsRef<OsStr>,
     args: &[OsString],
     env: &[(OsString, OsString)],
-    cwd: Option<&Path>,
-    timeout: Duration,
+    cwd: &Path,
+    deadline: Instant,
 ) -> Result<Output, ChildError> {
-    let deadline = Instant::now() + timeout;
-    let name = || program.to_owned();
+    let program = program.as_ref();
+    let name = || program.to_string_lossy().into_owned();
     let mut command = Command::new(program);
     command
         .args(args)
@@ -242,12 +247,10 @@ pub fn run(
         .envs(env.iter().map(|(k, v)| (k, v)))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        .current_dir(cwd);
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut command, 0);
-    if let Some(cwd) = cwd {
-        command.current_dir(cwd);
-    }
     let mut child = Reaper {
         child: command.spawn().map_err(|source| ChildError::Spawn {
             program: name(),
@@ -271,7 +274,7 @@ pub fn run(
         let Some(mut stream) = stream else { continue };
         let sender = sender.clone();
         std::thread::Builder::new()
-            .name("observe-output".into())
+            .name("child-output".into())
             .spawn(move || {
                 let mut bytes = Vec::new();
                 let result = stream.read_to_end(&mut bytes).map(|_| bytes);
@@ -288,10 +291,7 @@ pub fn run(
         program: name(),
         source,
     };
-    let timed_out = || ChildError::Timeout {
-        program: name(),
-        timeout,
-    };
+    let timed_out = || ChildError::Timeout { program: name() };
     let Some(status) = child.wait_until(deadline).map_err(io_err)? else {
         return Err(timed_out());
     };
@@ -316,11 +316,9 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
-    use std::time::Duration;
-    #[cfg(unix)]
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
-    use super::{ChildError, constructed_env, lookup, run};
+    use super::{ChildError, git_env, lookup, run};
 
     fn pairs(items: &[(&str, &str)]) -> Vec<(OsString, OsString)> {
         items
@@ -331,7 +329,7 @@ mod tests {
 
     #[test]
     fn environment_keeps_only_the_allowlist_and_adds_the_fixed_variables() {
-        let env = constructed_env(pairs(&[
+        let env = git_env(pairs(&[
             ("PATH", "/bin"),
             ("HOME", "/h"),
             ("LC_ALL", "C"),
@@ -397,8 +395,8 @@ mod tests {
             "cardinal-no-such-program",
             &[],
             &[],
-            Some(dir.path()),
-            Duration::from_secs(5),
+            dir.path(),
+            Instant::now() + Duration::from_secs(5),
         )
         .unwrap_err();
         assert!(matches!(err, ChildError::Spawn { .. }), "{err}");
@@ -414,13 +412,13 @@ mod tests {
         let mut inherited: Vec<(OsString, OsString)> =
             std::env::vars_os().filter(|(k, _)| k == "PATH").collect();
         inherited.push(("HOME".into(), dir.into()));
-        let env = constructed_env(inherited);
+        let env = git_env(inherited);
         run(
             "sh",
             &["-c".into(), script.into()],
             &env,
-            Some(dir),
-            timeout,
+            dir,
+            Instant::now() + timeout,
         )
     }
 

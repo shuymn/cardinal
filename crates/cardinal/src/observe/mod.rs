@@ -8,7 +8,6 @@
 //! with `--no-optional-locks` and `GIT_OPTIONAL_LOCKS=0`, never `fetch`, and `inventory`
 //! never deletes reservations or signals processes.
 
-mod child;
 mod data;
 mod gh;
 mod git;
@@ -18,9 +17,9 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-pub use child::{ChildError, Output, constructed_env};
+pub use crate::os::child::{ChildError, Output};
 
 use crate::admission;
 use crate::config::{Config, DataList, Selection};
@@ -29,6 +28,7 @@ use crate::contract::{
     IgnoredEntry, InUse, Inventory, InventorySchema, MergeEvidence, Os, Outlived, PrRef,
     ReclaimSummary, Repo, ReservationView, Resources, ScopedError, SessionSnapshot, Tri, Worktree,
 };
+use crate::os::child;
 use crate::os::{Detail, ProcessTable};
 use crate::state::{Probe, StateDir, find_worktree_root, now_ms, probe, worktree_key};
 
@@ -164,7 +164,7 @@ impl<'a> Observer<'a> {
         self.gh_host = child::lookup(&inherited, "GH_HOST")
             .and_then(OsStr::to_str)
             .map(str::to_owned);
-        self.env = constructed_env(inherited.iter().cloned());
+        self.env = child::git_env(inherited.iter().cloned());
         self.gh_env = child::gh_env(inherited);
         self
     }
@@ -193,8 +193,8 @@ impl<'a> Observer<'a> {
             &observe.git,
             &command,
             &self.env,
-            Some(dir),
-            Duration::from_millis(observe.git_timeout_ms),
+            dir,
+            Instant::now() + Duration::from_millis(observe.git_timeout_ms),
         )
     }
 
@@ -216,8 +216,8 @@ impl<'a> Observer<'a> {
             &observe.gh,
             args,
             &self.gh_env,
-            Some(dir),
-            Duration::from_millis(observe.gh_timeout_ms),
+            dir,
+            Instant::now() + Duration::from_millis(observe.gh_timeout_ms),
         )
         .map_err(|err| err.to_string())?;
         out.success("gh")
