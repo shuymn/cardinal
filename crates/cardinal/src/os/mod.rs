@@ -322,7 +322,8 @@ pub fn disk(path: &Path, measure: Measure) -> Result<Space, Unavailable> {
     disk::space(path, measure)
 }
 
-/// Starts `program` with `args` as a cardinal process in a new session with null standard
+/// Starts `program` with `args` as a cardinal process in a new session (on Windows, outside
+/// the starter's job objects, refused where a job does not allow that) with null standard
 /// streams and does not wait for it; returns its PID (section 10.5).
 pub fn spawn_detached(program: &Path, args: &[OsString]) -> Result<u32, Unavailable> {
     detached::spawn(program, args)

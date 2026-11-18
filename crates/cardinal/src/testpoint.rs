@@ -47,9 +47,11 @@ pub const RECONCILE_OBSERVED: &str = "reconcile.observed";
 pub const ARBITER_LOCKED: &str = "arbiter.locked";
 /// The launcher recorded the pass and its keys in `arbiter/last.json` and assigned no item.
 pub const ARBITER_RECORDED: &str = "arbiter.recorded";
-/// The launcher wrote the pass's outcome into every item of the pass, and not yet its end
-/// into `arbiter/last.json`.
+/// The launcher wrote the pass's outcome into every item of the pass and, still holding
+/// `inbox/.lock`, not yet its end into `arbiter/last.json`.
 pub const ARBITER_OUTCOMES: &str = "arbiter.outcomes";
+/// An `--assigned` answer is about to wait for `inbox/.lock`.
+pub const ARBITER_ANSWERING: &str = "arbiter.answering";
 /// `plan`'s walk found the target a directory on its parent's mount, and has not opened it
 /// to list it.
 pub const WALK_TARGET_CHECKED: &str = "walk.target_checked";
@@ -112,6 +114,7 @@ pub const POINTS: &[&str] = &[
     ARBITER_LOCKED,
     ARBITER_RECORDED,
     ARBITER_OUTCOMES,
+    ARBITER_ANSWERING,
     WALK_TARGET_CHECKED,
     WALK_DIR_CHECKED,
     OBSERVE_FILTERS_LISTED,

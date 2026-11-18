@@ -13,10 +13,13 @@ use std::process::Output;
 use std::time::{Duration, SystemTime};
 
 use cardinal::contract::{
-    DiskReport, DiskState, InboxItem, InboxKind, InboxStatus, Reconcile, Record, RecordKind,
+    ArbiterPass, ArbiterStart, DiskReport, DiskState, InboxItem, InboxKind, InboxStatus, Reconcile,
+    Record, RecordKind, ScopedError,
 };
 use cardinal::inbox::StatusFilter;
+use cardinal::state::{self, Probe};
 use cardinal_test_support::Command;
+use cardinal_test_support::process::wait_for;
 
 use crate::plan_support::{RUN_LIMIT, Setup};
 use crate::support::testpoints::TestPoints;
@@ -28,7 +31,7 @@ const TOTAL: u64 = 64 * MIB;
 
 /// Scopes of the pass's steps whose bodies other units write (`docs/architecture.md` section
 /// 14.2): their errors say nothing about the steps these tests check.
-const OTHER_UNITS: &[&str] = &["arbiter", "ui"];
+const OTHER_UNITS: &[&str] = &["ui"];
 
 pub struct Disk {
     pub s: Setup,
@@ -84,14 +87,38 @@ impl Disk {
         command
     }
 
-    /// One pass, which must succeed.
+    /// One pass, which must succeed; when it started an arbiter pass, once that pass has
+    /// ended, so neither the test's checks nor its next pass race the launcher's writes to
+    /// the items it assigned. On Windows, where a test's every child runs in a job that does
+    /// not let a process leave it, the trigger starts none and records none (see
+    /// [`refused_start`]).
     pub fn reconcile(&self) -> Reconcile {
-        pass(
+        let since_ms = state::now_ms();
+        let pass = pass(
             &self
                 .reconcile_command()
                 .output_within(RUN_LIMIT)
                 .expect("run cardinal reconcile"),
-        )
+        );
+        if cfg!(windows) {
+            assert_ne!(pass.arbiter, ArbiterStart::Started, "{pass:#?}");
+            assert!(!self.s.state.arbiter_last().exists(), "{pass:#?}");
+        } else if pass.arbiter == ArbiterStart::Started {
+            self.arbiter_ended(since_ms);
+        }
+        pass
+    }
+
+    /// The arbiter pass a `reconcile` pass started at or after `since_ms` started, once it has
+    /// ended and its launcher has let go of `arbiter/.lock`. The setup's `[arbiter] command`
+    /// exits at once.
+    pub fn arbiter_ended(&self, since_ms: u64) -> ArbiterPass {
+        wait_for("the arbiter pass to end", RUN_LIMIT, || {
+            let bytes = std::fs::read(self.s.state.arbiter_last()).ok()?;
+            let last: ArbiterPass = serde_json::from_slice(&bytes).ok()?;
+            let released = state::probe(&self.s.state.arbiter_lock()).ok()? != Probe::Held;
+            (last.started_ms >= since_ms && last.ended_ms.is_some() && released).then_some(last)
+        })
     }
 
     /// The disk state files, in file name order.
@@ -156,13 +183,30 @@ pub fn pass(output: &Output) -> Reconcile {
         .unwrap_or_else(|err| panic!("{err}: {}", String::from_utf8_lossy(&output.stdout)))
 }
 
-/// The errors of `pass` from the steps of this unit (not [`OTHER_UNITS`]).
+/// The errors of `pass` from the steps of this unit (not [`OTHER_UNITS`]), but the
+/// [`refused_start`] of a launcher on Windows.
 pub fn own_errors(pass: &Reconcile) -> Vec<String> {
     pass.errors
         .iter()
-        .filter(|e| !OTHER_UNITS.contains(&e.scope.as_str()))
+        .filter(|e| !OTHER_UNITS.contains(&e.scope.as_str()) && !is_refused_start(e))
         .map(|e| format!("{}: {}", e.scope, e.message))
         .collect()
+}
+
+/// Whether the arbiter trigger of `pass` found an item due and could not start the launcher
+/// because the job it runs in does not let a process leave it (`os::spawn_detached`), as
+/// every job test-support starts a child in on Windows: a launcher left in that job would end
+/// when the `reconcile` that started it does, leaving its pass running until `timeout_s`.
+pub fn refused_start(pass: &Reconcile) -> bool {
+    pass.errors.iter().any(is_refused_start)
+}
+
+fn is_refused_start(error: &ScopedError) -> bool {
+    cfg!(windows)
+        && error.scope == "arbiter"
+        && error
+            .message
+            .contains("a job this process runs in does not let a process leave it")
 }
 
 /// The disk report `item` carries in its evidence.

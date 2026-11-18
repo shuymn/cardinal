@@ -36,7 +36,7 @@ use crate::record::Recorder;
 use crate::state::{self, Durability, LockMode, StateDir};
 use crate::testpoint;
 
-pub use assign::{assign, due, list_assigned, record_outcome, resolve_assigned};
+pub use assign::{assign, due, list_assigned, read_last, record_outcome, resolve_assigned};
 
 /// How long an upsert waits for `inbox/.lock`.
 const LOCK_WAIT: Duration = Duration::from_secs(5);
@@ -649,7 +649,19 @@ fn close(
             format!("the inbox item `{key}` is already closed"),
         ));
     }
-    let now = state::now_ms();
+    set_resolution(&mut item, outcome, by, note, state::now_ms());
+    write(state, &path, &item)?;
+    Ok(item)
+}
+
+/// Gives an open or escalated item its outcome: the status, the resolution, and `updated_ms`.
+fn set_resolution(
+    item: &mut InboxItem,
+    outcome: ResolutionOutcome,
+    by: &str,
+    note: &str,
+    at_ms: u64,
+) {
     item.status = match outcome {
         ResolutionOutcome::Resolved => InboxStatus::Resolved,
         ResolutionOutcome::Escalated => InboxStatus::Escalated,
@@ -659,11 +671,9 @@ fn close(
         outcome,
         by: by.to_owned(),
         note: note.to_owned(),
-        at_ms: now,
+        at_ms,
     });
-    item.updated_ms = now;
-    write(state, &path, &item)?;
-    Ok(item)
+    item.updated_ms = at_ms;
 }
 
 fn record_resolution(config: &Config, state: &StateDir, item: &InboxItem) {

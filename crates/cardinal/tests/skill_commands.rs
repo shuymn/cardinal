@@ -1,11 +1,15 @@
-//! Every `cardinal …` command in the arbiter skill parses with the real CLI
-//! definition and stays inside the arbiter's reach, and the skill handles
-//! exactly the results phase 0 `act` returns (architecture §9.5 and §14.3).
+//! Arbiter skill v2 (`docs/architecture.md` section 14.3): every `cardinal …` command in the
+//! skill parses with the real CLI definition and stays inside the arbiter's reach; the text a
+//! pass the timer started follows runs no bare `cardinal plan`, reads and answers only with
+//! `--assigned`, runs `cardinal inventory` once, and checks the subject of every kind of item
+//! about a worktree; the owner's request reads the whole inbox and answers without
+//! `--assigned`; and the skill's tables cover exactly the `act` statuses of section 11.3 and
+//! the inbox kinds of section 10.1.
 
 use std::collections::BTreeSet;
 
 use cardinal::cli::Cli;
-use cardinal::contract::ActStatus;
+use cardinal::contract::{ActStatus, InboxKind};
 use clap::Parser;
 
 const SKILL: &str = include_str!(concat!(
@@ -21,25 +25,82 @@ const README: &str = include_str!(concat!(
     "/../../integrations/claude-code/README.md"
 ));
 
+/// Every status of `cardinal.act-result.v1`, in the order of [`status_index`].
 const STATUSES: [ActStatus; 6] = [
+    ActStatus::DryRun,
     ActStatus::Executed,
     ActStatus::Partial,
-    ActStatus::DryRun,
     ActStatus::Rejected,
     ActStatus::Expired,
     ActStatus::AlreadyExecuted,
 ];
 
-/// Whether phase 0 `act`, which only reports, can return `status`.
-fn phase0_returns(status: ActStatus) -> bool {
+/// `status`'s place in [`STATUSES`]. A status added to the contract fails to compile here
+/// until it gets a place, and then fails [`lists_are_complete`] until [`STATUSES`] has it.
+fn status_index(status: ActStatus) -> usize {
     match status {
-        ActStatus::DryRun | ActStatus::Rejected | ActStatus::Expired => true,
-        ActStatus::Executed | ActStatus::Partial | ActStatus::AlreadyExecuted => false,
+        ActStatus::DryRun => 0,
+        ActStatus::Executed => 1,
+        ActStatus::Partial => 2,
+        ActStatus::Rejected => 3,
+        ActStatus::Expired => 4,
+        ActStatus::AlreadyExecuted => 5,
     }
 }
 
-fn name(status: ActStatus) -> String {
-    serde_json::to_value(status)
+/// Every inbox kind of `cardinal.inbox-item.v1`, in the order of [`kind_index`].
+const KINDS: [InboxKind; 11] = [
+    InboxKind::RecoveryNeeded,
+    InboxKind::OutlivedProcesses,
+    InboxKind::Reclaimable,
+    InboxKind::MergeUndecided,
+    InboxKind::ClosedPrDirty,
+    InboxKind::ManagedMerged,
+    InboxKind::UnclassifiableData,
+    InboxKind::DiskLow,
+    InboxKind::DiskCritical,
+    InboxKind::ArbiterFailing,
+    InboxKind::ReclaimStranded,
+];
+
+/// Whether an item of `kind` is about a worktree: a pass checks the worktree still is as the item
+/// says before it answers. The others are about a job, a session, a volume, a pass, or a trash
+/// entry, which `cardinal explain` reads afresh.
+fn about_a_worktree(kind: InboxKind) -> bool {
+    match kind {
+        InboxKind::Reclaimable
+        | InboxKind::MergeUndecided
+        | InboxKind::ClosedPrDirty
+        | InboxKind::ManagedMerged
+        | InboxKind::UnclassifiableData => true,
+        InboxKind::RecoveryNeeded
+        | InboxKind::OutlivedProcesses
+        | InboxKind::DiskLow
+        | InboxKind::DiskCritical
+        | InboxKind::ArbiterFailing
+        | InboxKind::ReclaimStranded => false,
+    }
+}
+
+/// `kind`'s place in [`KINDS`], as [`status_index`] for statuses.
+fn kind_index(kind: InboxKind) -> usize {
+    match kind {
+        InboxKind::RecoveryNeeded => 0,
+        InboxKind::OutlivedProcesses => 1,
+        InboxKind::Reclaimable => 2,
+        InboxKind::MergeUndecided => 3,
+        InboxKind::ClosedPrDirty => 4,
+        InboxKind::ManagedMerged => 5,
+        InboxKind::UnclassifiableData => 6,
+        InboxKind::DiskLow => 7,
+        InboxKind::DiskCritical => 8,
+        InboxKind::ArbiterFailing => 9,
+        InboxKind::ReclaimStranded => 10,
+    }
+}
+
+fn name(value: impl serde::Serialize) -> String {
+    serde_json::to_value(value)
         .unwrap()
         .as_str()
         .unwrap()
@@ -55,7 +116,17 @@ fn section<'a>(text: &'a str, heading: &str) -> &'a str {
     start.split("\n## ").next().unwrap()
 }
 
-/// Subcommands the arbiter may run.
+/// The first code span of each body row of the first table in `text`.
+fn table_keys(text: &str) -> BTreeSet<String> {
+    text.lines()
+        .skip_while(|line| !line.starts_with("| ---"))
+        .skip(1)
+        .take_while(|line| line.starts_with('|'))
+        .filter_map(|line| Some(line.strip_prefix("| `")?.split('`').next()?.to_owned()))
+        .collect()
+}
+
+/// Subcommands the arbiter may run: the default `[arbiter] command`'s allow list.
 const ALLOWED: [&str; 5] = ["inventory", "inbox", "explain", "plan", "act"];
 
 /// Commands from fenced code lines and inline code spans that start with `cardinal `.
@@ -136,6 +207,14 @@ fn shell_words(command: &str) -> Vec<String> {
     words
 }
 
+/// The value of `flag` in `words`, if given.
+fn flag_value<'a>(words: &'a [String], flag: &str) -> Option<&'a str> {
+    words
+        .windows(2)
+        .find(|pair| pair[0] == flag)
+        .map(|pair| pair[1].as_str())
+}
+
 #[test]
 fn skill_commands_parse_with_the_cli() {
     let commands = skill_commands(SKILL);
@@ -155,9 +234,10 @@ fn skill_commands_parse_with_the_cli() {
             "skill passes --owner-approved: {command}"
         );
         if sub == "act" {
-            assert!(
-                words.windows(2).any(|w| w == ["--caller", "arbiter"]),
-                "act without --caller arbiter: {command}"
+            assert_eq!(
+                flag_value(&words, "--caller"),
+                Some("arbiter"),
+                "act as anyone but the arbiter: {command}"
             );
         }
         used.insert(sub.to_owned());
@@ -167,6 +247,232 @@ fn skill_commands_parse_with_the_cli() {
         missing.is_empty(),
         "no skill command found for {missing:?}; extraction found {commands:?}"
     );
+}
+
+/// What in `skill` would take a pass the timer started beyond its items. Such a pass follows
+/// every section but the owner's request, so the shared sections count too: a plan other than
+/// `cardinal plan reclaim-worktree`, an inbox command without `--assigned`, an inventory with
+/// options, and anything but one inventory in the pass's own steps.
+fn timer_violations(skill: &str) -> Vec<String> {
+    let timer = skill.replacen(section(skill, "The owner's request"), "", 1);
+    let mut violations = Vec::new();
+    for command in skill_commands(&timer) {
+        let words = shell_words(&command);
+        match words[1].as_str() {
+            "plan" if words.get(2).map(String::as_str) != Some("reclaim-worktree") => {
+                violations.push(format!("a plan of another kind: {command}"));
+            }
+            "inbox" if !words.iter().any(|w| w == "--assigned") => {
+                violations.push(format!("the inbox without --assigned: {command}"));
+            }
+            "inventory" if words.len() > 2 => {
+                violations.push(format!("an inventory with options: {command}"));
+            }
+            _ => {}
+        }
+    }
+    let inventories = skill_commands(section(skill, "A pass the timer started"))
+        .iter()
+        .filter(|command| shell_words(command)[1] == "inventory")
+        .count();
+    if inventories != 1 {
+        violations.push(format!("{inventories} inventories in the pass's steps"));
+    }
+    violations
+}
+
+/// A pass the timer started works on its assigned items only: it plans just their
+/// worktrees, never with a bare `cardinal plan` or a `reclaim_dir` plan, runs one bare
+/// `inventory`, and lists and answers items only with `--assigned`, in its own steps and in
+/// the sections it shares with the owner's request.
+#[test]
+fn a_timer_pass_stays_on_its_items() {
+    assert_eq!(timer_violations(SKILL), Vec::<String>::new());
+    let steps = section(SKILL, "A pass the timer started");
+    assert!(
+        skill_commands(steps)
+            .iter()
+            .any(|command| command.starts_with("cardinal plan reclaim-worktree ")),
+        "a timer pass plans its items' worktrees"
+    );
+    // The pass's first command tells a timer pass from the owner's request.
+    assert!(
+        section(SKILL, "Which pass this is").contains("Run `cardinal inbox --assigned` first."),
+        "the skill starts by listing the pass's items"
+    );
+    // A command added to a shared section is in the pass's reach.
+    for added in [
+        "`cardinal plan`",
+        "`cardinal plan reclaim-dir PATH`",
+        "`cardinal inbox`",
+        "`cardinal inbox resolve KEY --outcome resolved`",
+        "`cardinal inventory --sizes`",
+    ] {
+        let skill = SKILL.replacen("\n## Plans\n", &format!("\n## Plans\n\nRun {added}.\n"), 1);
+        assert!(
+            !timer_violations(&skill).is_empty(),
+            "{added} in the Plans section"
+        );
+    }
+    let twice = SKILL.replacen(
+        "5. **Act.**",
+        "5. **Act.** Run `cardinal inventory` again.",
+        1,
+    );
+    assert!(!timer_violations(&twice).is_empty(), "a second inventory");
+}
+
+/// Before it answers an item about a worktree, a pass checks, for every such kind, that the
+/// worktree still is as the item says, leaving one it cannot confirm open, and the owner's
+/// request does as a timer pass does.
+#[test]
+fn the_subject_of_every_worktree_item_is_checked() {
+    let steps = section(SKILL, "A pass the timer started");
+    let subject = steps
+        .split_once("**Subject.**")
+        .expect("a subject step")
+        .1
+        .split("**Act.**")
+        .next()
+        .unwrap();
+    for kind in KINDS.into_iter().filter(|kind| about_a_worktree(*kind)) {
+        let listed = format!("`{}`", name(kind));
+        assert!(
+            subject
+                .lines()
+                .any(|line| line.trim_start().starts_with("- ") && line.contains(&listed)),
+            "the subject step checks {kind:?}"
+        );
+    }
+    // An `unclassifiable_data` item whose evidence lists only part of its set cannot be
+    // confirmed.
+    let unclassifiable = subject
+        .lines()
+        .find(|line| line.trim_start().starts_with("- `unclassifiable_data`"))
+        .expect("an unclassifiable_data check");
+    assert!(
+        unclassifiable.contains("50 paths") && unclassifiable.contains("cannot be confirmed"),
+        "a truncated evidence list is left open: {unclassifiable}"
+    );
+    assert!(
+        section(SKILL, "The owner's request").contains("checking each item's subject as there"),
+        "the owner's request checks subjects too"
+    );
+}
+
+/// The owner's request reads the whole inbox and the inventory, plans every target, and
+/// resolves without `--assigned`; both cases apply decisions to open items only, so an
+/// escalation is not answered again.
+#[test]
+fn the_owners_request_reads_everything() {
+    let owner = section(SKILL, "The owner's request");
+    let commands: Vec<Vec<String>> = skill_commands(owner)
+        .iter()
+        .map(|command| shell_words(command))
+        .collect();
+    let has = |expected: &[&str]| {
+        commands.iter().any(|words| {
+            words
+                .iter()
+                .map(String::as_str)
+                .eq(expected.iter().copied())
+        })
+    };
+    for bare in [
+        ["cardinal", "inbox"],
+        ["cardinal", "inventory"],
+        ["cardinal", "plan"],
+    ] {
+        assert!(has(&bare), "the owner's request runs `{}`", bare.join(" "));
+    }
+    let resolves: Vec<&Vec<String>> = commands
+        .iter()
+        .filter(|words| words.get(2).map(String::as_str) == Some("resolve"))
+        .collect();
+    assert!(!resolves.is_empty(), "the owner's request resolves items");
+    for words in resolves {
+        assert!(
+            !words.iter().any(|w| w == "--assigned"),
+            "the owner's request names no pass: {}",
+            words.join(" ")
+        );
+    }
+    for heading in ["A pass the timer started", "The owner's request"] {
+        assert!(
+            section(SKILL, heading)
+                .contains("Apply the inbox table's decisions to the `open` items"),
+            "{heading}: decisions apply to open items"
+        );
+    }
+}
+
+/// The statuses and kinds are the contract's, every one of them.
+#[test]
+fn lists_are_complete() {
+    for (i, status) in STATUSES.into_iter().enumerate() {
+        assert_eq!(status_index(status), i, "{status:?}");
+    }
+    for (i, kind) in KINDS.into_iter().enumerate() {
+        assert_eq!(kind_index(kind), i, "{kind:?}");
+    }
+}
+
+#[test]
+fn the_tables_cover_every_status_and_kind() {
+    let statuses: BTreeSet<String> = STATUSES.into_iter().map(name).collect();
+    assert_eq!(
+        table_keys(section(SKILL, "Act results")),
+        statuses,
+        "the act result table"
+    );
+    let kinds: BTreeSet<String> = KINDS.into_iter().map(name).collect();
+    assert_eq!(
+        table_keys(section(SKILL, "Inbox items")),
+        kinds,
+        "the inbox table"
+    );
+
+    let codes = |refusal: bool| -> Vec<String> {
+        STATUSES
+            .into_iter()
+            .filter(|s| s.is_refusal() == refusal)
+            .map(|s| format!("`{}`", name(s)))
+            .collect()
+    };
+    let list = |items: Vec<String>| match items.as_slice() {
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{}, or {last}", rest.join(", ")),
+        [] => panic!("no statuses"),
+    };
+    let exit_codes = format!(
+        "Exit 0 from `act` means {}, exit 3 means {}",
+        list(codes(false)),
+        list(codes(true))
+    );
+    assert!(SKILL.contains(&exit_codes), "missing: {exit_codes}");
+}
+
+#[test]
+fn the_report_never_claims_a_reclamation() {
+    let sections: Vec<&str> = section(SKILL, "Report")
+        .lines()
+        .filter_map(|line| line.split_once(". **")?.1.split("**").next())
+        .collect();
+    assert_eq!(
+        sections,
+        [
+            "Reclaimable",
+            "Refused",
+            "Owner decisions",
+            "Inbox",
+            "Errors"
+        ]
+    );
+    for (file, text) in [("SKILL.md", SKILL), ("agent", AGENT), ("README.md", README)] {
+        for claim in ["Reclaimed", "partially deleted", "interrupted act"] {
+            assert!(!text.contains(claim), "{file} says {claim:?}");
+        }
+    }
 }
 
 #[test]
@@ -196,62 +502,10 @@ fn shell_words_follow_quoting() {
 }
 
 #[test]
-fn act_results_are_what_phase_0_act_returns() {
-    let rows: BTreeSet<String> = section(SKILL, "Act results")
-        .lines()
-        .skip_while(|line| !line.starts_with("| ---"))
-        .filter_map(|line| line.strip_prefix("| `")?.split('`').next())
-        .map(str::to_owned)
-        .collect();
-    let returned: BTreeSet<String> = STATUSES
-        .into_iter()
-        .filter(|s| phase0_returns(*s))
-        .map(name)
-        .collect();
-    assert_eq!(rows, returned, "the act result table");
-
-    for status in STATUSES.into_iter().filter(|s| !phase0_returns(*s)) {
-        let code = format!("`{}`", name(status));
-        for (file, text) in [("SKILL.md", SKILL), ("agent", AGENT), ("README.md", README)] {
-            assert!(
-                !text.contains(&code),
-                "{file} handles {code}, which phase 0 act never returns"
-            );
-        }
-    }
-
-    let refusals: Vec<String> = STATUSES
-        .into_iter()
-        .filter(|s| phase0_returns(*s) && s.is_refusal())
-        .map(|s| format!("`{}`", name(s)))
-        .collect();
-    let exit_codes = format!(
-        "Exit 0 from `act` means `{}`, exit 3 means {}",
-        name(ActStatus::DryRun),
-        refusals.join(" or ")
-    );
-    assert!(SKILL.contains(&exit_codes), "missing: {exit_codes}");
-}
-
-#[test]
-fn the_report_never_claims_a_reclamation() {
-    let sections: Vec<&str> = section(SKILL, "Report")
-        .lines()
-        .filter_map(|line| line.split_once(". **")?.1.split("**").next())
-        .collect();
+fn table_keys_read_the_first_code_span_of_each_row() {
+    let text = "intro `x`\n\n| Kind | Decision |\n| --- | --- |\n| `a`, `b` | `c` |\n| `d` | e |\n\nafter\n| `f` | g |\n";
     assert_eq!(
-        sections,
-        [
-            "Would reclaim",
-            "Refused",
-            "Owner decisions",
-            "Inbox",
-            "Errors"
-        ]
+        table_keys(text),
+        BTreeSet::from(["a".to_owned(), "d".to_owned()])
     );
-    for (file, text) in [("SKILL.md", SKILL), ("agent", AGENT), ("README.md", README)] {
-        for claim in ["Reclaimed", "partially deleted", "interrupted act"] {
-            assert!(!text.contains(claim), "{file} says {claim:?}");
-        }
-    }
 }
