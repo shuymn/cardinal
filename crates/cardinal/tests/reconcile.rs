@@ -21,7 +21,7 @@ use cardinal::inbox::{self, StatusFilter};
 use cardinal::testpoint::{RECONCILE_OBSERVED, release_file};
 use cardinal_test_support::Child;
 use cardinal_test_support::process::wait_for;
-use disk_support::{Disk, MIB, carried_report, own_errors, pass};
+use disk_support::{Disk, MIB, carried_report, own_errors, pass, refused_start};
 use support::helper::{self, Mode};
 
 #[test]
@@ -283,7 +283,8 @@ fn raised(d: &Disk, pass: &cardinal::contract::Reconcile, prefix: &str) -> Inbox
 
 /// Section 13.6, the handoff to the arbiter: under pressure, a pass that raises a due worktree
 /// item along with its disk items starts an arbiter pass at step 7, which is assigned that item
-/// and no disk item; the next pass, with nothing due, starts none.
+/// and no disk item; the next pass, with nothing due, starts none. On Windows the test's job
+/// refuses the launcher's start: the pass reports it and assigns nothing.
 #[test]
 fn a_due_worktree_item_starts_an_arbiter_pass() {
     let d = Disk::new(LINES);
@@ -293,9 +294,14 @@ fn a_due_worktree_item_starts_an_arbiter_pass() {
     let first = d.reconcile();
     assert_eq!(own_errors(&first), Vec::<String>::new());
     assert_eq!(first.disk[0].state, DiskLevel::Warning);
-    assert_eq!(first.arbiter, ArbiterStart::Started);
     let reclaimable = raised(&d, &first, "reclaimable:");
     let disk_low = raised(&d, &first, "disk_low:");
+    if cfg!(windows) {
+        assert!(refused_start(&first), "{first:#?}");
+        assert_eq!(reclaimable.arbiter, None, "never assigned");
+        return;
+    }
+    assert_eq!(first.arbiter, ArbiterStart::Started);
     let arbiter = d.arbiter_ended(since_ms);
     assert_eq!(arbiter.items, std::slice::from_ref(&reclaimable.key));
     let assigned = |item: &InboxItem| {
@@ -319,7 +325,8 @@ fn a_due_worktree_item_starts_an_arbiter_pass() {
 /// A `closed_pr_dirty` item from a real pass reaches the arbiter with what its subject check
 /// compares (`integrations/claude-code/skills/cardinal-arbiter/SKILL.md`): its pass is
 /// assigned it, and `cardinal inventory` lists its worktree with the item's HEAD, dirty, and
-/// with the closed pull request its key names.
+/// with the closed pull request its key names. On Windows the test's job refuses the
+/// launcher's start, and the inventory is checked alone.
 #[test]
 fn a_closed_pr_dirty_item_reaches_the_subject_check() {
     let d = Disk::new(LINES);
@@ -345,9 +352,13 @@ fn a_closed_pr_dirty_item_reaches_the_subject_check() {
         "{}",
         item.key
     );
-    assert_eq!(first.arbiter, ArbiterStart::Started);
-    let arbiter = d.arbiter_ended(since_ms);
-    assert!(arbiter.items.contains(&item.key), "{arbiter:#?}");
+    if cfg!(windows) {
+        assert!(refused_start(&first), "{first:#?}");
+    } else {
+        assert_eq!(first.arbiter, ArbiterStart::Started);
+        let arbiter = d.arbiter_ended(since_ms);
+        assert!(arbiter.items.contains(&item.key), "{arbiter:#?}");
+    }
 
     let output =
         d.s.cardinal()

@@ -4,10 +4,13 @@
 //!
 //! The process gets null standard streams, so it holds none of its starter's output, and
 //! starts a session of its own (Unix) or a process group without a console (Windows), so the
-//! starter's terminal signals and job control do not reach it. It inherits the environment
-//! and the working directory; every descriptor cardinal opens is close-on-exec. The starter
-//! never waits for it: on Unix it stays a zombie until the starter exits, which happens right
-//! after.
+//! starter's terminal signals and job control do not reach it. On Windows it also starts
+//! outside the job objects its starter runs in (`CREATE_BREAKAWAY_FROM_JOB`), because a job
+//! that ends with its starter, as a test harness's or a supervisor's does, would end it too;
+//! a job that does not allow that refuses the start, which then started nothing. It inherits
+//! the environment and the working directory; every descriptor cardinal opens is
+//! close-on-exec. The starter never waits for it: on Unix it stays a zombie until the starter
+//! exits, which happens right after.
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -33,11 +36,21 @@ pub fn spawn(program: &Path, args: &[OsString]) -> Result<u32, Unavailable> {
         clippy::disallowed_methods,
         reason = "os::spawn_detached's spawn site: a cardinal command that runs on its own"
     )]
-    let child = command
-        .spawn()
-        .map_err(|err| Unavailable(format!("{}: {err}", program.display())))?;
+    let child = command.spawn().map_err(|err| spawn_error(program, &err))?;
     // Dropping a `Child` neither waits for nor kills it.
     Ok(child.id())
+}
+
+fn spawn_error(program: &Path, err: &std::io::Error) -> Unavailable {
+    // ERROR_ACCESS_DENIED: what `CreateProcess` returns when a job the starter runs in does
+    // not allow `CREATE_BREAKAWAY_FROM_JOB`.
+    if cfg!(windows) && err.raw_os_error() == Some(5) {
+        return Unavailable(format!(
+            "{}: a job this process runs in does not let a process leave it ({err})",
+            program.display()
+        ));
+    }
+    Unavailable(format!("{}: {err}", program.display()))
 }
 
 #[cfg(unix)]
@@ -57,7 +70,8 @@ fn detach(command: &mut Command) {
     use std::os::windows::process::CommandExt;
     const DETACHED_PROCESS: u32 = 0x0000_0008;
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-    command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+    command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB);
 }
 
 #[cfg(not(any(unix, windows)))]

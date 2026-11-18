@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime};
 
 use cardinal::contract::{
     ArbiterPass, ArbiterStart, DiskReport, DiskState, InboxItem, InboxKind, InboxStatus, Reconcile,
-    Record, RecordKind,
+    Record, RecordKind, ScopedError,
 };
 use cardinal::inbox::StatusFilter;
 use cardinal::state::{self, Probe};
@@ -89,7 +89,9 @@ impl Disk {
 
     /// One pass, which must succeed; when it started an arbiter pass, once that pass has
     /// ended, so neither the test's checks nor its next pass race the launcher's writes to
-    /// the items it assigned.
+    /// the items it assigned. On Windows, where a test's every child runs in a job that does
+    /// not let a process leave it, the trigger starts none and records none (see
+    /// [`refused_start`]).
     pub fn reconcile(&self) -> Reconcile {
         let since_ms = state::now_ms();
         let pass = pass(
@@ -98,7 +100,10 @@ impl Disk {
                 .output_within(RUN_LIMIT)
                 .expect("run cardinal reconcile"),
         );
-        if pass.arbiter == ArbiterStart::Started {
+        if cfg!(windows) {
+            assert_ne!(pass.arbiter, ArbiterStart::Started, "{pass:#?}");
+            assert!(!self.s.state.arbiter_last().exists(), "{pass:#?}");
+        } else if pass.arbiter == ArbiterStart::Started {
             self.arbiter_ended(since_ms);
         }
         pass
@@ -178,13 +183,30 @@ pub fn pass(output: &Output) -> Reconcile {
         .unwrap_or_else(|err| panic!("{err}: {}", String::from_utf8_lossy(&output.stdout)))
 }
 
-/// The errors of `pass` from the steps of this unit (not [`OTHER_UNITS`]).
+/// The errors of `pass` from the steps of this unit (not [`OTHER_UNITS`]), but the
+/// [`refused_start`] of a launcher on Windows.
 pub fn own_errors(pass: &Reconcile) -> Vec<String> {
     pass.errors
         .iter()
-        .filter(|e| !OTHER_UNITS.contains(&e.scope.as_str()))
+        .filter(|e| !OTHER_UNITS.contains(&e.scope.as_str()) && !is_refused_start(e))
         .map(|e| format!("{}: {}", e.scope, e.message))
         .collect()
+}
+
+/// Whether the arbiter trigger of `pass` found an item due and could not start the launcher
+/// because the job it runs in does not let a process leave it (`os::spawn_detached`), as
+/// every job test-support starts a child in on Windows: a launcher left in that job would end
+/// when the `reconcile` that started it does, leaving its pass running until `timeout_s`.
+pub fn refused_start(pass: &Reconcile) -> bool {
+    pass.errors.iter().any(is_refused_start)
+}
+
+fn is_refused_start(error: &ScopedError) -> bool {
+    cfg!(windows)
+        && error.scope == "arbiter"
+        && error
+            .message
+            .contains("a job this process runs in does not let a process leave it")
 }
 
 /// The disk report `item` carries in its evidence.
