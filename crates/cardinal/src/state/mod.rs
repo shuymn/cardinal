@@ -8,6 +8,7 @@ mod lock;
 use std::io;
 use std::path::{Path, PathBuf};
 
+pub(crate) use fs::temp_name;
 pub use fs::{
     Durability, append_line, create_new_durable, open_append, parse_jsonl, read_jsonl,
     remove_temp_files_older_than, sync_parent, write_atomic,
@@ -452,7 +453,7 @@ fn create_once(
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
         Err(source) => return Err(io_err(path)(source)),
     }
-    let tmp = tmp_dir.join(fs::temp_name(path.file_name().unwrap_or_default()));
+    let tmp = tmp_dir.join(temp_name(path.file_name().unwrap_or_default()));
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)

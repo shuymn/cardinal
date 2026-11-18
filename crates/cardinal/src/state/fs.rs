@@ -121,7 +121,7 @@ pub fn remove_temp_files_older_than(dir: &Path, max_age: Duration) -> io::Result
 
 /// A new temporary file name for the target `name`: [`TEMP_PREFIX`], the name, this
 /// process's ID, and a counter.
-pub(super) fn temp_name(name: &OsStr) -> OsString {
+pub(crate) fn temp_name(name: &OsStr) -> OsString {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let mut temp = OsString::from(TEMP_PREFIX);
     temp.push(name);
