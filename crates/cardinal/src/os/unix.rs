@@ -463,6 +463,8 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
+    use cardinal_test_support::process::deliverable;
+
     use super::{
         Body, SIGKILL, disposition, group_exists, ignored, parent_pid, pgid_of, register,
         watch_signals_with,
@@ -526,6 +528,7 @@ mod tests {
     #[test]
     fn a_reader_that_cannot_start_leaves_no_handler() {
         let signals = [libc::SIGUSR1, libc::SIGWINCH];
+        deliverable(&signals);
         let before = signals.map(handler);
         let (sender, ended) = mpsc::channel();
         let err = watch_signals_with(
@@ -571,6 +574,7 @@ mod tests {
     #[test]
     fn a_handler_that_cannot_be_installed_leaves_no_handler() {
         let signals = [libc::SIGUSR2, libc::SIGURG];
+        deliverable(&signals);
         set_handler(
             libc::SIGUSR2,
             record_previous as *const () as libc::sighandler_t,
@@ -615,6 +619,7 @@ mod tests {
     #[test]
     fn a_signal_while_its_handler_is_installed_reaches_the_watch() {
         let signals = [libc::SIGVTALRM, libc::SIGALRM];
+        deliverable(&signals);
         let (sender, ended) = mpsc::channel();
         drop(ended);
         let (seen, got) = mpsc::channel();

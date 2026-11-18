@@ -18,10 +18,12 @@ use std::time::{Duration, Instant};
 use cardinal::admission::{list_reservations, recovery_pass};
 use cardinal::config::HostConfig;
 use cardinal::contract::{DerivedState, RecordKind};
-use cardinal::os::unix::{SIGCONT, SIGSTOP, signal_process};
+use cardinal::os::unix::{SIGCONT, SIGHUP, SIGSTOP, SIGTERM, signal_process};
 use cardinal::testpoint::{ADMISSION_WAITING, RUN_AFTER_SPAWN, RUN_BEFORE_STARTING};
 use cardinal_test_support::Child;
-use cardinal_test_support::process::{GroupGuard, PidGuard, is_stopped, wait_for, wait_for_file};
+use cardinal_test_support::process::{
+    GroupGuard, PidGuard, deliverable, is_stopped, wait_for, wait_for_file,
+};
 use cardinal_test_support::pty::Pty;
 use runner_support::{Env, WAIT, wait_gone};
 use support::helper::{self, Mode};
@@ -96,6 +98,7 @@ fn wait_orphaned(runner: u32, parent: u32) {
 /// reservation is left for recovery, which releases it now that the group is empty.
 #[test]
 fn parent_exit_after_the_spawn_stops_the_group() {
+    deliverable(&[SIGTERM]);
     let env = Env::with_budget(1);
     let grandchild_file = env.file("grandchild");
     let script = format!(
@@ -163,6 +166,7 @@ fn parent_exit_after_the_spawn_stops_the_group() {
 /// releases the reservation once the group is empty.
 #[test]
 fn parent_exit_after_the_child_exited_stops_its_descendants() {
+    deliverable(&[SIGTERM]);
     let env = Env::with_budget(1);
     let pids = env.file("pids");
     let script = format!(
@@ -205,6 +209,7 @@ fn parent_exit_after_the_child_exited_stops_its_descendants() {
 /// parent exited and ends the stage by SIGTERM within the bound, which frees the in-use lock.
 #[test]
 fn a_stopped_runner_cancels_once_continued_and_leaves_its_group_alone() {
+    deliverable(&[SIGTERM]);
     for path in ["fail_open", "tty"] {
         let env = Env::with_budget(1);
         let job = StoppedJob::start(&env, path, Caller::Anchored, "");
@@ -242,6 +247,7 @@ fn a_stopped_runner_cancels_once_continued_and_leaves_its_group_alone() {
 /// so only the runner's cancellation can end it.
 #[test]
 fn orphaning_a_stopped_runner_cancels_its_stage() {
+    deliverable(&[SIGHUP, SIGTERM]);
     for path in ["fail_open", "tty"] {
         let env = Env::with_budget(1);
         let job = StoppedJob::start(&env, path, Caller::Session, "trap '' HUP; ");
