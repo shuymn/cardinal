@@ -1318,7 +1318,7 @@ flowchart LR
   R -. "evidence" .-> X["X: executing reclamation, after its own design"]
 ```
 
-F1 makes the tree build with every phase 1 contract in place and every existing test passing. It declares every contract type and schema of section 11.3, the configuration of section 3.2 with its validation, the state paths of section 4.1, the CLI of section 11.2 with handlers that call the new modules, the testpoints of section 13.1, and the module table of section 2.2 in `tests/layering.rs`, and adds `objc2-core-foundation` to `Cargo.toml` and `Cargo.lock`. It also builds the test volumes D uses: `Scope::tmpfs` and `Scope::attach_image` (section 13.3), the empty disk image `scripts/test` creates, and the CI setup they need. For each contract type it changes it migrates the producers, so nothing is left half-built: `PlanTarget.git_dir` in `src/plan/mod.rs`, the new `Worktree` facts in `src/observe/mod.rs` (`unknown` and `null` until D fills them), `ActResult` and `ActOptions.squash_merged` in `src/act/mod.rs`. New entry points get bodies that return `cardinal.error.v1` code `not_implemented`, or `unknown` for a fact: `os::disk` and `os::spawn_detached` in `src/os/mod.rs`, `observe::content_in_base`, the `reconcile` pass of section 10.3 as one stub call per step, and `src/snapshot/`. It moves the merge-evidence check from `src/plan/checks.rs` to `src/plan/merge.rs` unchanged, and fixes phase 0's observation, whose `status` still runs filter drivers: F1 disables them as section 8.1 says, before any unattended pass exists. The other units then fill bodies in the files section 14.2 gives them.
+F1 makes the tree build with every phase 1 contract in place and every existing test passing. It declares every contract type and schema of section 11.3, the configuration of section 3.2 with its validation, the state paths of section 4.1, the CLI of section 11.2 with handlers that call the new modules, the testpoints of section 13.1, and the module table of section 2.2 in `tests/layering.rs`, registers every new module in `src/lib.rs`, and adds `objc2-core-foundation` to the workspace and crate manifests (`Cargo.toml`, `crates/cardinal/Cargo.toml`) and `Cargo.lock`. It also builds the test volumes D uses: `Scope::tmpfs` and `Scope::attach_image` (section 13.3), the empty disk image `scripts/test` creates, and the CI setup they need. For each contract type it changes it migrates the producers, so nothing is left half-built: `PlanTarget.git_dir` in `src/plan/mod.rs`, the new `Worktree` facts in `src/observe/mod.rs` (`unknown` and `null` until D fills them), `ActResult` and `ActOptions.squash_merged` in `src/act/mod.rs`. New entry points get bodies that return `cardinal.error.v1` code `not_implemented`, or `unknown` for a fact: `os::disk` and `os::spawn_detached` in `src/os/mod.rs`, `observe::content_in_base`, the `reconcile` pass of section 10.3 as one stub call per step, and `src/snapshot/`. It prewires the joins between units: `src/inbox/mod.rs` gets the occurrence and assignment entry points as stubs and registers `src/inbox/assign.rs`, and step 6 of the pass hands the disk report to the disk-item raiser, so D, N, and L fill bodies behind calls already in place. It moves the merge-evidence check from `src/plan/checks.rs` to `src/plan/merge.rs` unchanged, and fixes phase 0's observation, whose `status` still runs filter drivers: F1 disables them as section 8.1 says, before any unattended pass exists. The other units then fill bodies in the files section 14.2 gives them.
 
 | Unit | Can start | Integration gate |
 | --- | --- | --- |
@@ -1346,8 +1346,8 @@ Every file a unit changes has one owner at a time; a file F1 touches passes to t
 
 | File | F1 | Then |
 | --- | --- | --- |
-| `Cargo.toml`, `Cargo.lock` | The dependency of section 12 (`objc2-core-foundation`) | A unit that needs another dependency adds it in its own PR and says so |
-| `src/contract/`, `src/config/`, `src/state/mod.rs`, `src/cli/mod.rs`, `src/testpoint.rs` | All of phase 1's additions | Nobody; a contract change found later is a follow-up F PR |
+| `Cargo.toml`, `crates/cardinal/Cargo.toml`, `Cargo.lock` | The dependency of section 12 (`objc2-core-foundation`) | A unit that needs another dependency adds it in its own PR and says so |
+| `src/lib.rs`, `src/contract/`, `src/config/`, `src/state/mod.rs`, `src/cli/mod.rs`, `src/testpoint.rs` | All of phase 1's additions | Nobody; a contract change found later is a follow-up F PR |
 | `src/os/mod.rs` | The entry points and their stubs | D: `src/os/disk.rs` and `src/os/detached.rs` |
 | `src/plan/mod.rs` | The `PlanTarget` producer | D: plans for every linked worktree and every entry matching a regenerable pattern (section 9.2), where phase 0's producer plans a whole worktree only when it is a candidate |
 | `src/plan/checks.rs`, `src/plan/walk.rs` | The merge-evidence check moved out | D: `not_in_use` over the whole worktree, `plain_target`'s mount reads, `regenerable` as a pattern match |
@@ -1355,14 +1355,16 @@ Every file a unit changes has one owner at a time; a file F1 touches passes to t
 | `src/act/` | `ActResult`, `ActOptions` | D: `execution_not_designed` |
 | `src/observe/` | The new facts as `unknown` and `null`; filter drivers disabled (section 8.1) | D |
 | `src/run/mod.rs`, `src/sensor.rs` | — | D: the job-end check, free space |
-| `src/reconcile/` | The pass as one stub call per step | D, except `raise.rs`: N, and `arbiter.rs`: L |
+| `src/reconcile/` | The pass as one stub call per step, step 6 handing the disk report to the disk-item raiser | D, except `raise.rs`: N, and `arbiter.rs`: L |
+| `src/inbox/mod.rs` | The occurrence and assignment entry points as stubs; `assign.rs` registered | N |
+| `src/inbox/assign.rs` | Stubs | L |
 | `src/snapshot/` | The skeleton | U |
 | `crates/test-support/src/scope.rs`, `scope/mount.rs` | `Scope::tmpfs`, `Scope::attach_image` | A unit that needs another typed operation adds it in its own PR and says so |
 | `scripts/test`, `.github/workflows/ci.yml` | The disk image and the CI setup the test volumes need; a new action also goes into `.github/infra.yaml` | Nobody; a change found later is a follow-up F PR |
 | `examples/launchd/`, `examples/systemd/` | — | D |
 | `integrations/claude-code/` | — | L: skill v2; the README says the timer starts the arbiter |
 
-`src/inbox/mod.rs` keeps its refresh; N adds occurrences to its raise (section 10.1) and raises the new kinds from `src/reconcile/raise.rs`, and L adds the due rule and the assignment of section 10.5, which the launcher and `cardinal inbox --assigned` share, in `src/inbox/assign.rs`. Every work unit's completion command is `mise exec -- scripts/test`.
+N fills the occurrences in `src/inbox/mod.rs` (section 10.1) and raises the new kinds, the disk items included, from `src/reconcile/raise.rs`; L fills the due rule and the assignment of section 10.5, which the launcher and `cardinal inbox --assigned` share, in `src/inbox/assign.rs`. Every work unit's completion command is `mise exec -- scripts/test`.
 
 ### 14.3 Arbiter skill v2 contract
 
