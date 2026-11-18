@@ -5,7 +5,9 @@
 //! The snapshot is read from the files a pass has already written: the disk states, the last
 //! full observation, the inbox, the records, and the last arbiter pass. Only the reservations
 //! are read again, under the admission lock with the process table (section 4.3), because
-//! their derived state is never stored. [`page`] renders it.
+//! their derived state is never stored. A part that cannot be read, or is read only in part,
+//! is recorded in the snapshot's `errors` under the part's name and shown as incomplete; it
+//! never ends the snapshot. [`page`] renders it.
 
 mod page;
 
@@ -21,9 +23,9 @@ use crate::admission;
 use crate::config::Config;
 use crate::contract::{
     ArbiterPass, DiskState, Error, ErrorCode, InboxItem, InboxStatus, Inventory, Record,
-    RecordKind, Snapshot, SnapshotItem, SnapshotObservation, SnapshotReservations, SnapshotSchema,
+    RecordKind, Reservation, ScopedError, Snapshot, SnapshotItem, SnapshotObservation,
+    SnapshotReservations, SnapshotSchema,
 };
-use crate::inbox;
 use crate::observe::Observer;
 use crate::record;
 use crate::state::{self, Durability, LockMode, StateDir};
@@ -49,36 +51,49 @@ impl PageOptions {
     }
 }
 
+/// The parts that could not be read, or were read only in part, as they are found.
+#[derive(Default)]
+struct Errors(Vec<ScopedError>);
+
+impl Errors {
+    fn add(&mut self, scope: &str, message: impl Into<String>) {
+        self.0.push(ScopedError {
+            scope: scope.to_owned(),
+            message: message.into(),
+        });
+    }
+}
+
 /// The snapshot of this host's state: disk states, the last full observation,
 /// reservations, open and escalated inbox items, recent records, and the last arbiter pass.
+/// A part that cannot be read is empty or absent, with its error in `errors`.
 pub fn build(config: &Config, state: &StateDir) -> Result<Snapshot, Error> {
-    let disk = disk_states(state)?;
-    let observation = read_doc::<Inventory>(&state.reconcile_observation())?.map(|inventory| {
-        SnapshotObservation {
-            observed_ms: inventory.observed_ms,
-            repos: inventory.repos,
-            errors: inventory.errors,
-        }
-    });
-    let items = admission::list_reservations(state, &config.host)?;
-    let reservations = SnapshotReservations {
-        observed_ms: state::now_ms(),
-        items,
-    };
-    let inbox = pending_items(state)?;
-    let records = recent_records(state)?;
-    let arbiter = read_doc::<ArbiterPass>(&state.arbiter_last())?;
+    let mut errors = Errors::default();
+    let host = Observer::host_info(state, &mut errors.0);
+    let disk = disk_states(state, &mut errors);
+    let observation =
+        read_part::<Inventory>(&state.reconcile_observation(), "observation", &mut errors).map(
+            |inventory| SnapshotObservation {
+                observed_ms: inventory.observed_ms,
+                repos: inventory.repos,
+                errors: inventory.errors,
+            },
+        );
+    let reservations = reservations(config, state, &mut errors);
+    let inbox = pending_items(config, state, &mut errors);
+    let records = recent_records(state, &mut errors);
+    let arbiter = read_part::<ArbiterPass>(&state.arbiter_last(), "arbiter", &mut errors);
     Ok(Snapshot {
         schema: SnapshotSchema,
         generated_ms: state::now_ms(),
-        host: Observer::host_info(state, &mut Vec::new()),
+        host,
         disk,
         observation,
         reservations,
         inbox,
         records,
         arbiter,
-        errors: Vec::new(),
+        errors: errors.0,
     })
 }
 
@@ -100,32 +115,73 @@ fn needs_owner(item: &InboxItem) -> bool {
     item.status == InboxStatus::Escalated || item.kind.is_owners()
 }
 
-/// Every disk state in `disk/` that parses, by mount.
-fn disk_states(state: &StateDir) -> Result<Vec<DiskState>, Error> {
-    let dir = state.disk_dir();
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => return Err(state_error(&dir, &err)),
-    };
-    let mut states = Vec::new();
-    for entry in entries {
-        let path = entry.map_err(|err| state_error(&dir, &err))?.path();
-        if path.extension().is_some_and(|ext| ext == "json")
-            && let Some(disk) = read_doc::<DiskState>(&path)?
-        {
-            states.push(disk);
-        }
-    }
+/// Every disk state in `disk/` that reads, by mount.
+fn disk_states(state: &StateDir, errors: &mut Errors) -> Vec<DiskState> {
+    let mut states: Vec<DiskState> = json_files(&state.disk_dir(), "disk", errors)
+        .into_iter()
+        .filter_map(|path| read_listed::<DiskState>(&path, "disk", errors))
+        .collect();
     states.sort_by(|a, b| (&a.mount, &a.volume).cmp(&(&b.mount, &b.volume)));
-    Ok(states)
+    states
 }
 
-/// The open and escalated items, those for the owner first, then by creation.
-fn pending_items(state: &StateDir) -> Result<Vec<SnapshotItem>, Error> {
-    let mut items: Vec<SnapshotItem> = inbox::read_all(state)?
+/// The reservations with their derived state. A reservation file that does not read is
+/// counted as an error, found by listing `reservations/` under the admission lock as every
+/// listing of it is (section 4.3).
+fn reservations(config: &Config, state: &StateDir, errors: &mut Errors) -> SnapshotReservations {
+    const SCOPE: &str = "reservations";
+    let items = match admission::list_reservations(state, &config.host) {
+        Ok(items) => items,
+        Err(err) => {
+            errors.add(SCOPE, format!("the reservations could not be read: {err}"));
+            Vec::new()
+        }
+    };
+    let observed_ms = state::now_ms();
+    let timeout = Duration::from_millis(config.host.admission.lock_timeout_ms);
+    match admission::lock(state, timeout) {
+        Ok(_lock) => {
+            for path in json_files(&state.reservations_dir(), SCOPE, errors) {
+                let job = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or_default();
+                match std::fs::read(&path) {
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                    Err(err) => errors.add(SCOPE, format!("{}: {err}", path.display())),
+                    Ok(bytes) => match serde_json::from_slice::<Reservation>(&bytes) {
+                        Ok(r) if r.job_id == job => {}
+                        Ok(_) => {
+                            errors.add(SCOPE, format!("{}: names another job", path.display()));
+                        }
+                        Err(err) => errors.add(SCOPE, format!("{}: {err}", path.display())),
+                    },
+                }
+            }
+        }
+        Err(err) => errors.add(
+            SCOPE,
+            format!("the reservation files could not be checked: {err}"),
+        ),
+    }
+    SnapshotReservations { observed_ms, items }
+}
+
+/// The open and escalated items, those for the owner first, then by creation. `inbox/` is
+/// listed under `inbox/.lock`, held shared, so no upsert renames an item during the listing.
+fn pending_items(config: &Config, state: &StateDir, errors: &mut Errors) -> Vec<SnapshotItem> {
+    const SCOPE: &str = "inbox";
+    let deadline = Instant::now() + Duration::from_millis(config.host.admission.lock_timeout_ms);
+    let _no_upsert = match state::lock(&state.inbox_lock(), LockMode::Shared, deadline) {
+        Ok(lock) => lock,
+        Err(err) => {
+            errors.add(SCOPE, format!("the inbox could not be read: {err}"));
+            return Vec::new();
+        }
+    };
+    let mut items: Vec<SnapshotItem> = json_files(&state.inbox_dir(), SCOPE, errors)
         .into_iter()
-        .map(|(_, item)| item)
+        .filter_map(|path| read_listed::<InboxItem>(&path, SCOPE, errors))
         .filter(|item| matches!(item.status, InboxStatus::Open | InboxStatus::Escalated))
         .map(|item| SnapshotItem {
             needs_owner: needs_owner(&item),
@@ -139,61 +195,133 @@ fn pending_items(state: &StateDir) -> Result<Vec<SnapshotItem>, Error> {
             &b.item.key,
         ))
     });
-    Ok(items)
+    items
 }
 
 /// The newest [`RECORDS_SHOWN`] `act`, `planned`, and `inbox_*` records, oldest first, from
 /// the record files `records/` holds, newest first; no older file is read once enough are
 /// found. `records/.lock` is held shared, as an appender holds it, so no rotation renames a
-/// file during the scan and no record is read twice.
-fn recent_records(state: &StateDir) -> Result<Vec<Record>, Error> {
-    let dir = state.records_dir();
-    let _no_rotation = state::lock(
+/// file during the scan and no record is read twice. A line that does not read is counted.
+fn recent_records(state: &StateDir, errors: &mut Errors) -> Vec<Record> {
+    const SCOPE: &str = "records";
+    let _no_rotation = match state::lock(
         &state.records_lock(),
         LockMode::Shared,
         Instant::now() + RECORDS_WAIT,
-    )?;
-    let files = record::files(state).map_err(|err| state_error(&dir, &err))?;
+    ) {
+        Ok(lock) => lock,
+        Err(err) => {
+            errors.add(SCOPE, format!("the records could not be read: {err}"));
+            return Vec::new();
+        }
+    };
+    let files = match record::files(state) {
+        Ok(files) => files,
+        Err(err) => {
+            errors.add(SCOPE, format!("{}: {err}", state.records_dir().display()));
+            return Vec::new();
+        }
+    };
     let mut newest_first = Vec::with_capacity(RECORDS_SHOWN);
     for path in files.iter().rev() {
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                errors.add(SCOPE, format!("{}: {err}", path.display()));
+                continue;
+            }
+        };
+        let mut unreadable = 0;
+        let mut shown = Vec::new();
+        for line in bytes.split(|&b| b == b'\n') {
+            if line.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+            match serde_json::from_slice::<Record>(line) {
+                Ok(record) if is_shown(&record) => shown.push(record),
+                Ok(_) => {}
+                Err(_) => unreadable += 1,
+            }
+        }
+        if unreadable > 0 {
+            let lines = if unreadable == 1 { "line" } else { "lines" };
+            errors.add(
+                SCOPE,
+                format!("{}: {unreadable} {lines} could not be read", path.display()),
+            );
+        }
         let missing = RECORDS_SHOWN - newest_first.len();
-        newest_first.extend(
-            state::read_jsonl::<Record>(path)
-                .map_err(|err| state_error(path, &err))?
-                .into_iter()
-                .rev()
-                .filter(|record| {
-                    matches!(
-                        record.kind,
-                        RecordKind::Act
-                            | RecordKind::Planned
-                            | RecordKind::InboxRaised
-                            | RecordKind::InboxResolved
-                    )
-                })
-                .take(missing),
-        );
+        newest_first.extend(shown.into_iter().rev().take(missing));
         if newest_first.len() == RECORDS_SHOWN {
             break;
         }
     }
     newest_first.reverse();
-    Ok(newest_first)
+    newest_first
 }
 
-/// A document of the state directory: `None` when it is missing or does not parse, as
-/// readers skip what does not parse (section 4.7).
-fn read_doc<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, Error> {
+fn is_shown(record: &Record) -> bool {
+    matches!(
+        record.kind,
+        RecordKind::Act | RecordKind::Planned | RecordKind::InboxRaised | RecordKind::InboxResolved
+    )
+}
+
+/// The `*.json` files in `dir`, in name order; a missing directory has none.
+fn json_files(dir: &Path, scope: &str, errors: &mut Errors) -> Vec<PathBuf> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Vec::new(),
+        Err(err) => {
+            errors.add(scope, format!("{}: {err}", dir.display()));
+            return Vec::new();
+        }
+    };
+    let mut paths = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(entry) if entry.path().extension().is_some_and(|ext| ext == "json") => {
+                paths.push(entry.path());
+            }
+            Ok(_) => {}
+            Err(err) => errors.add(scope, format!("{}: {err}", dir.display())),
+        }
+    }
+    paths.sort();
+    paths
+}
+
+/// A document that may not exist yet (the observation, the arbiter's last pass): `None` when
+/// it is missing, and `None` with an error under `scope` when it cannot be read or does not
+/// parse.
+fn read_part<T: DeserializeOwned>(path: &Path, scope: &str, errors: &mut Errors) -> Option<T> {
     match std::fs::read(path) {
-        Ok(bytes) => Ok(serde_json::from_slice(&bytes).ok()),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(state_error(path, &err)),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+        read => parse(path, read, scope, errors),
     }
 }
 
-fn state_error(path: &Path, err: &io::Error) -> Error {
-    Error::new(
-        ErrorCode::StateUnavailable,
-        format!("{}: {err}", path.display()),
-    )
+/// A document a listing of its directory found: `None` with an error under `scope` when it
+/// cannot be read, a missing one included, or does not parse.
+fn read_listed<T: DeserializeOwned>(path: &Path, scope: &str, errors: &mut Errors) -> Option<T> {
+    parse(path, std::fs::read(path), scope, errors)
+}
+
+fn parse<T: DeserializeOwned>(
+    path: &Path,
+    read: io::Result<Vec<u8>>,
+    scope: &str,
+    errors: &mut Errors,
+) -> Option<T> {
+    let parsed = read
+        .map_err(|err| err.to_string())
+        .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|err| err.to_string()));
+    match parsed {
+        Ok(doc) => Some(doc),
+        Err(err) => {
+            errors.add(scope, format!("{}: {err}", path.display()));
+            None
+        }
+    }
 }

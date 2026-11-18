@@ -212,7 +212,7 @@ fn fixed_snapshot() -> Snapshot {
                 "worktrees": [worktree("/src/app", "main", true),
                               worktree("/src/app/wt/it's", HOSTILE_BRANCH, false)]
             }],
-            "errors": []
+            "errors": [{ "scope": "repo:/src/other", "message": "not a git repository" }]
         },
         "reservations": {
             "observed_ms": GENERATED_MS - 1_000,
@@ -722,7 +722,7 @@ fn record_files_are_found_whatever_keep_is() {
 
 /// No rotation renames a record file while the snapshot reads them, so no record is read
 /// twice: the scan holds `records/.lock` shared, and while a rotation holds it exclusively
-/// the scan does not read.
+/// the scan does not read, and the records show as not read rather than as none.
 #[test]
 fn no_rotation_runs_during_the_record_scan() {
     let env = env_with(HOST_TOML);
@@ -738,10 +738,13 @@ fn no_rotation_runs_during_the_record_scan() {
     .unwrap()
     .expect("the records lock is free");
 
-    let built = snapshot::build(&env.config, &env.state);
+    let built = snapshot::build(&env.config, &env.state).unwrap();
 
-    let err = built.expect_err("the records are not read during a rotation");
-    assert!(err.message.contains("records"), "{}", err.message);
+    assert_eq!(built.records, Vec::new());
+    let scopes: Vec<&str> = built.errors.iter().map(|e| e.scope.as_str()).collect();
+    assert_eq!(scopes, ["records"]);
+    let records = text(section(&render(&built), "records"));
+    assert!(records.contains("No record could be read."), "{records}");
 }
 
 /// A disk item whose evidence holds something shaped like a disk report that does not read
@@ -824,6 +827,32 @@ fn stale_marks_follow_each_parts_observation_time() {
     );
 }
 
+/// The stale marks follow `[reconcile] observe_every_s`: with a full observation due every 15
+/// minutes, an observation 45 minutes old is stale on the page `write_page` writes, which
+/// carries the 30-minute threshold for the view-time marks, and a reading 10 minutes old is
+/// not.
+#[test]
+fn the_stale_threshold_follows_observe_every_s() {
+    let env = env_with("[reconcile]\nobserve_every_s = 900\n");
+    let now = cardinal::state::now_ms();
+    let mut snapshot = fixed_snapshot();
+    snapshot.observation.as_mut().unwrap().observed_ms = now - 45 * MINUTE_MS;
+    for disk in &mut snapshot.disk {
+        for reading in &mut disk.readings {
+            reading.at_ms = now - 10 * MINUTE_MS;
+        }
+    }
+    seed(&env.state, &snapshot);
+
+    let page =
+        std::fs::read_to_string(snapshot::write_page(&env.config, &env.state).unwrap()).unwrap();
+
+    assert!(page.contains(r#"<body data-stale-after-ms="1800000">"#));
+    let stale = r#"<span class="badge stale">stale</span>"#;
+    assert_eq!(section(&page, "worktrees").matches(stale).count(), 1);
+    assert_eq!(section(&page, "disk").matches(stale).count(), 0);
+}
+
 /// A worktree whose use could not be read (its `not_in_use` check is unknown) shows its use
 /// as unknown, never as "no".
 #[test]
@@ -840,6 +869,22 @@ fn a_use_that_could_not_be_read_shows_unknown() {
         .map(|rest| text(&rest[..rest.find("</td>").unwrap()]))
         .collect();
     assert_eq!(cells, ["no", "unknown"]);
+}
+
+/// A worktree whose index time could not be read shows its last activity as unknown, never
+/// as "never".
+#[test]
+fn an_unknown_last_activity_shows_unknown() {
+    let mut snapshot = fixed_snapshot();
+    let repo = &mut snapshot.observation.as_mut().unwrap().repos[0];
+    repo.worktrees[1].last_activity_ms = None;
+
+    let page = render(&snapshot);
+
+    let worktrees = section(&page, "worktrees");
+    let unknown = r#"<td><span class="badge unknown">unknown</span></td>"#;
+    assert_eq!(worktrees.matches(unknown).count(), 1);
+    assert!(!text(worktrees).contains("never"));
 }
 
 /// An item for the arbiter shows its evidence as an owner's item does.
@@ -872,6 +917,160 @@ fn tables_keep_their_column_headers() {
     for banned in ["@container", "display: none", "display: block"] {
         assert!(!style.contains(banned), "the style contains {banned:?}");
     }
+    let scroller = element(style, ".table-wrap {", "}");
+    assert!(scroller.contains("overflow: auto"), "{scroller}");
+}
+
+/// `cardinal ui` writes the page when no part can be read, and the page says so for each
+/// part instead of showing it as empty: an inbox item, a reservation, a disk state, the
+/// observation, the arbiter pass, and a record line that do not parse.
+#[test]
+fn cardinal_ui_marks_the_parts_it_cannot_read() {
+    let dirs = Dirs::new();
+    std::fs::write(dirs.config().join("host.toml"), HOST_TOML).unwrap();
+    let state = StateDir::open(dirs.state()).unwrap();
+    for path in [
+        state.inbox_dir().join("0000000000000000.json"),
+        state.reservation("0123456789abcdef"),
+        state.disk_dir().join("0000000000000000.json"),
+        state.reconcile_observation(),
+        state.arbiter_last(),
+    ] {
+        std::fs::write(path, b"{").unwrap();
+    }
+    std::fs::write(state.records_file(), b"not a record\n").unwrap();
+
+    let out = dirs.cmd().arg("ui").output().unwrap();
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let written: Snapshot =
+        serde_json::from_slice(&std::fs::read(state.ui_snapshot()).unwrap()).unwrap();
+    let mut scopes: Vec<&str> = written.errors.iter().map(|e| e.scope.as_str()).collect();
+    scopes.sort_unstable();
+    assert_eq!(
+        scopes,
+        [
+            "arbiter",
+            "disk",
+            "inbox",
+            "observation",
+            "records",
+            "reservations"
+        ]
+    );
+    let page = std::fs::read_to_string(state.ui_page()).unwrap();
+    assert_every_section(&page);
+    let header = text(element(&page, "<header>", "</header>"));
+    assert!(
+        header.contains("Some parts could not be read in full"),
+        "{header}"
+    );
+    assert!(header.contains("At least 0 for the owner"), "{header}");
+    for (id, says) in [
+        ("owner", "No item that could be read waits for the owner."),
+        ("disk", "No disk state could be read."),
+        (
+            "inbox",
+            "No item that could be read is open for the arbiter.",
+        ),
+        ("worktrees", "The last full observation could not be read."),
+        ("reservations", "No reservation could be read."),
+        ("arbiter", "The last arbiter pass could not be read."),
+        ("records", "No record could be read."),
+    ] {
+        let section = text(section(&page, id));
+        assert!(section.contains("Not read in full: "), "{id}: {section}");
+        assert!(section.contains(says), "{id}: {section}");
+    }
+    for healthy in [
+        "Nothing waits for the owner.",
+        "No watched volume has been read yet.",
+        "No open item for the arbiter.",
+        "No full observation yet.",
+        "No reservation.",
+        "No arbiter pass yet.",
+        "No record yet.",
+    ] {
+        assert!(!text(&page).contains(healthy), "the page says {healthy:?}");
+    }
+}
+
+/// A file a listing found but that does not read, here a link to nothing in `inbox/` and in
+/// `disk/`, is an error for its part, never an absent file.
+#[cfg(unix)]
+#[test]
+fn listed_entries_that_do_not_read_are_errors() {
+    let env = env_with(HOST_TOML);
+    let nothing = env.state.root().join("nothing");
+    for listed in [
+        env.state.inbox_dir().join("0000000000000000.json"),
+        env.state.disk_dir().join("0000000000000000.json"),
+    ] {
+        std::os::unix::fs::symlink(&nothing, listed).unwrap();
+    }
+
+    let built = snapshot::build(&env.config, &env.state).unwrap();
+
+    let mut scopes: Vec<&str> = built.errors.iter().map(|e| e.scope.as_str()).collect();
+    scopes.sort_unstable();
+    assert_eq!(scopes, ["disk", "inbox"], "{:?}", built.errors);
+    let page = render(&built);
+    assert!(text(section(&page, "owner")).contains("No item that could be read waits"));
+    assert!(text(section(&page, "disk")).contains("No disk state could be read."));
+}
+
+/// While another process holds the admission, inbox, or records lock past its deadline, the
+/// part behind it shows as not read, and the rest of the page is written.
+#[test]
+fn busy_locks_mark_their_parts_not_read() {
+    let env = env_with("[admission]\nlock_timeout_ms = 100\n");
+    let hold = |path: &Path| {
+        cardinal::state::try_lock(path, cardinal::state::LockMode::Exclusive)
+            .unwrap()
+            .expect("the lock is free")
+    };
+    let _locks = [
+        hold(&env.state.admission_lock()),
+        hold(&env.state.inbox_lock()),
+        hold(&env.state.records_lock()),
+    ];
+
+    let built = snapshot::build(&env.config, &env.state).unwrap();
+
+    let mut scopes: Vec<&str> = built.errors.iter().map(|e| e.scope.as_str()).collect();
+    scopes.dedup();
+    assert_eq!(scopes, ["reservations", "inbox", "records"]);
+    // The reservations' own reading failed, not only the check of their files.
+    assert!(
+        built.errors.iter().any(|e| e.scope == "reservations"
+            && e.message.starts_with("the reservations could not be read")),
+        "{:?}",
+        built.errors
+    );
+    let page = render(&built);
+    assert!(text(section(&page, "reservations")).contains("No reservation could be read."));
+    assert!(text(section(&page, "owner")).contains("No item that could be read waits"));
+    assert!(text(section(&page, "records")).contains("No record could be read."));
+    assert!(text(section(&page, "disk")).contains("No watched volume has been read yet."));
+}
+
+/// The observation's own errors are kept with it and shown with its worktrees.
+#[test]
+fn the_observations_own_errors_are_shown() {
+    let page = render(&fixed_snapshot());
+
+    let worktrees = text(section(&page, "worktrees"));
+    assert!(
+        worktrees.contains(
+            "The observation could not observe everything:repo:/src/other: not a git repository"
+        ),
+        "{worktrees}"
+    );
 }
 
 fn write_item(state: &StateDir, item: &InboxItem) {

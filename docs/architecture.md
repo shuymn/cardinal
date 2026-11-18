@@ -1050,6 +1050,8 @@ The phase 1 web UI shows one host's state and answers nothing; answering pending
 
 **When and by what.** Every `reconcile` pass writes it at step 8 from what it already holds, with no extra git, gh, or network call; `cardinal ui` writes it on demand and prints the page's path. `snapshot` renders the page as HTML, every value escaped as text, so what the page shows does not depend on its script; the script only shows each time in the viewer's local time with its age and adds the stale marks of when the page is viewed.
 
+**What it cannot read.** A part that cannot be read, or is read only in part, is recorded in the snapshot's `errors` under the part's name, and the page shows it as not read in full, never as empty: a file that does not parse, a directory or file that cannot be read, or a lock not taken by its deadline (the admission lock for the reservations, `inbox/.lock`, held shared, for the items, `records/.lock`, held shared, for the records). None of these stops the page. It is not written only when the state dir cannot be opened, the configuration cannot be loaded (`cardinal ui`; a pass that has its configuration goes on), or writing `ui/snapshot.json` or `ui/index.html` fails; the previous page then stays, and its generation time shows its age.
+
 **Where it is shown:**
 
 | Option | What it takes | Cost | To decide first |

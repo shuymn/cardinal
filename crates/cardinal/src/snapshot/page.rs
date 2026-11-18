@@ -14,7 +14,7 @@ use serde_json::{Map, Value};
 
 use crate::contract::{
     ArbiterPass, DiskReport, DiskState, Error, ErrorCode, InboxItem, InboxStatus, InboxSubject,
-    ItemArbiter, Repo, Snapshot, Worktree,
+    ItemArbiter, Repo, ScopedError, Snapshot, Worktree,
 };
 
 /// The page's content security policy: its own inline style and script, nothing loaded or
@@ -46,6 +46,7 @@ pub fn render(snapshot: &Snapshot, options: PageOptions) -> Result<String, Error
         generated_ms: snapshot.generated_ms,
         stale_after_ms: options.stale_after_ms,
         next_id: 0,
+        errors: &snapshot.errors,
     };
     page.raw("<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n");
     page.raw("<meta http-equiv=\"Content-Security-Policy\" content=\"");
@@ -110,14 +111,16 @@ fn script_json<T: Serialize>(value: &T) -> Result<String, Error> {
 
 /// The HTML being written. Markup comes only from string literals in this file; every value
 /// from the snapshot goes through [`Page::text`] or an attribute value, both escaped.
-struct Page {
+struct Page<'a> {
     out: String,
     generated_ms: u64,
     stale_after_ms: u64,
     next_id: u32,
+    /// The parts of the snapshot that could not be read, or were read only in part.
+    errors: &'a [ScopedError],
 }
 
-impl Page {
+impl Page<'_> {
     fn raw(&mut self, html: &'static str) {
         self.out.push_str(html);
     }
@@ -172,6 +175,26 @@ impl Page {
 
     fn notice(&mut self, text: &str) {
         self.el_text("p", &[("class", "notice"), ("role", "note")], text);
+    }
+
+    /// Shows each error of the part `scope` as a notice; whether there was any, in which case
+    /// the part is incomplete and an empty part is not "nothing".
+    fn incomplete(&mut self, scope: &str) -> bool {
+        let errors = self.errors;
+        let mut any = false;
+        for error in errors.iter().filter(|e| e.scope == scope) {
+            any = true;
+            self.el("p", &[("class", "notice"), ("role", "note")], |p| {
+                p.el_text("strong", &[], "Not read in full: ");
+                p.text(&error.message);
+            });
+        }
+        any
+    }
+
+    /// The empty part's message: `nothing` when the part was read in full, `unread` when not.
+    fn empty(&mut self, incomplete: bool, nothing: &str, unread: &str) {
+        self.el_text("p", &[], if incomplete { unread } else { nothing });
     }
 
     /// A path, key, or ID, which may break after each `/`, `:`, or `@`, so a table column
@@ -310,20 +333,47 @@ impl Page {
                 p.text("Generated ");
                 p.observed(snapshot.generated_ms);
             });
+            p.incomplete("host");
+            let mut parts: Vec<&str> = Vec::new();
+            for error in &snapshot.errors {
+                if !parts.contains(&error.scope.as_str()) {
+                    parts.push(&error.scope);
+                }
+            }
+            if !parts.is_empty() {
+                p.notice(&format!(
+                    "Some parts could not be read in full, and this page shows only what could \
+                     be: {}.",
+                    parts.join(", ")
+                ));
+            }
             let owner = snapshot.inbox.iter().filter(|i| i.needs_owner).count();
             let arbiter = snapshot.inbox.len() - owner;
+            let read_in_full = !snapshot.errors.iter().any(|e| e.scope == "inbox");
             p.el_text(
                 "p",
                 &[],
-                &format!("{owner} for the owner, {arbiter} open for the arbiter."),
+                &if read_in_full {
+                    format!("{owner} for the owner, {arbiter} open for the arbiter.")
+                } else {
+                    format!(
+                        "At least {owner} for the owner and {arbiter} open for the arbiter: \
+                         the inbox could not be read in full."
+                    )
+                },
             );
         });
     }
 
     fn owner_section(&mut self, items: &[&InboxItem]) {
         self.section("owner", "For the owner", |p| {
+            let incomplete = p.incomplete("inbox");
             if items.is_empty() {
-                p.el_text("p", &[], "Nothing waits for the owner.");
+                p.empty(
+                    incomplete,
+                    "Nothing waits for the owner.",
+                    "No item that could be read waits for the owner.",
+                );
             }
             for item in items {
                 p.item(item, true);
@@ -333,8 +383,13 @@ impl Page {
 
     fn arbiter_items_section(&mut self, items: &[&InboxItem]) {
         self.section("inbox", "Open items for the arbiter", |p| {
+            let incomplete = p.incomplete("inbox");
             if items.is_empty() {
-                p.el_text("p", &[], "No open item for the arbiter.");
+                p.empty(
+                    incomplete,
+                    "No open item for the arbiter.",
+                    "No item that could be read is open for the arbiter.",
+                );
             }
             for item in items {
                 p.item(item, false);
@@ -573,8 +628,13 @@ impl Page {
 
     fn disk_section(&mut self, disks: &[DiskState]) {
         self.section("disk", "Disk", |p| {
+            let incomplete = p.incomplete("disk");
             if disks.is_empty() {
-                p.el_text("p", &[], "No watched volume has been read yet.");
+                p.empty(
+                    incomplete,
+                    "No watched volume has been read yet.",
+                    "No disk state could be read.",
+                );
                 return;
             }
             p.table(
@@ -650,14 +710,33 @@ impl Page {
 
     fn worktree_section(&mut self, snapshot: &Snapshot) {
         self.section("worktrees", "Worktrees", |p| {
+            let incomplete = p.incomplete("observation");
             let Some(observation) = &snapshot.observation else {
-                p.el_text("p", &[], "No full observation yet.");
+                p.empty(
+                    incomplete,
+                    "No full observation yet.",
+                    "The last full observation could not be read.",
+                );
                 return;
             };
             p.el("p", &[("class", "muted")], |p| {
                 p.text("Observed ");
                 p.observed(observation.observed_ms);
             });
+            if !observation.errors.is_empty() {
+                p.el("div", &[("class", "notice"), ("role", "note")], |p| {
+                    p.el_text(
+                        "strong",
+                        &[],
+                        "The observation could not observe everything:",
+                    );
+                    p.el("ul", &[], |p| {
+                        for error in &observation.errors {
+                            p.el_text("li", &[], &format!("{}: {}", error.scope, error.message));
+                        }
+                    });
+                });
+            }
             if observation.repos.is_empty() {
                 p.el_text("p", &[], "No repository observed.");
             }
@@ -817,7 +896,7 @@ impl Page {
         });
         self.td(|p| match w.last_activity_ms {
             Some(ms) => p.time(ms),
-            None => p.text("never"),
+            None => p.badge("unknown", "unknown"),
         });
         self.td_text(&bytes_or_unknown(w.allocated_bytes));
     }
@@ -829,8 +908,13 @@ impl Page {
                 p.text("Read ");
                 p.observed(reservations.observed_ms);
             });
+            let incomplete = p.incomplete("reservations");
             if reservations.items.is_empty() {
-                p.el_text("p", &[], "No reservation.");
+                p.empty(
+                    incomplete,
+                    "No reservation.",
+                    "No reservation could be read.",
+                );
                 return;
             }
             p.table(
@@ -916,8 +1000,13 @@ impl Page {
 
     fn arbiter_section(&mut self, pass: Option<&ArbiterPass>) {
         self.section("arbiter", "Arbiter", |p| {
+            let incomplete = p.incomplete("arbiter");
             let Some(pass) = pass else {
-                p.el_text("p", &[], "No arbiter pass yet.");
+                p.empty(
+                    incomplete,
+                    "No arbiter pass yet.",
+                    "The last arbiter pass could not be read.",
+                );
                 return;
             };
             p.el("dl", &[], |p| {
@@ -966,14 +1055,20 @@ impl Page {
                 p.observed(snapshot.generated_ms);
                 p.text("; each record shows when it was recorded.");
             });
+            let incomplete = p.incomplete("records");
             if snapshot.records.is_empty() {
-                p.el_text("p", &[], "No record yet.");
+                p.empty(incomplete, "No record yet.", "No record could be read.");
                 return;
             }
             p.table(
                 &format!(
-                    "The last {} act, planned, and inbox records, newest first",
-                    snapshot.records.len()
+                    "The last {} act, planned, and inbox records{}, newest first",
+                    snapshot.records.len(),
+                    if incomplete {
+                        " that could be read"
+                    } else {
+                        ""
+                    }
                 ),
                 &["Recorded", "Kind", "Subject", "Data"],
                 |p| {
