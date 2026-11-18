@@ -33,14 +33,31 @@ pub const RUN_AFTER_SPAWN: &str = "run.after_spawn";
 /// The stage's child has been reaped and its status not read; an injected failure stands for
 /// a status the wait could not get.
 pub const RUN_REAPED: &str = "run.reaped";
+/// The status was read and `job_finished` appended, the runner's locks are dropped, and the
+/// job-end disk check has not started.
+pub const RUN_FINISHED: &str = "run.finished";
+/// The job-end check found the volume below the warning line and is about to start
+/// `cardinal reconcile`.
+pub const RUN_RECONCILE_SPAWNING: &str = "run.reconcile_spawning";
 /// `act` recorded its snapshot and has not run its checks.
 pub const ACT_SNAPSHOTTED: &str = "act.snapshotted";
+/// A `reconcile` pass kept its full observation and has raised no item.
+pub const RECONCILE_OBSERVED: &str = "reconcile.observed";
+/// The arbiter launcher holds `arbiter/.lock` and has started no command.
+pub const ARBITER_LOCKED: &str = "arbiter.locked";
+/// The launcher recorded the pass and its keys in `arbiter/last.json` and assigned no item.
+pub const ARBITER_RECORDED: &str = "arbiter.recorded";
+/// The launcher wrote the pass's outcome into every item of the pass, and not yet its end
+/// into `arbiter/last.json`.
+pub const ARBITER_OUTCOMES: &str = "arbiter.outcomes";
 /// `plan`'s walk found the target a directory on its parent's mount, and has not opened it
 /// to list it.
 pub const WALK_TARGET_CHECKED: &str = "walk.target_checked";
 /// `plan`'s walk read the mount of a directory below the target by its path, and has not
 /// opened it to list it.
 pub const WALK_DIR_CHECKED: &str = "walk.dir_checked";
+/// Observation listed a worktree's filter drivers and has not run `status`.
+pub const OBSERVE_FILTERS_LISTED: &str = "observe.filters_listed";
 /// The hook classified the command.
 pub const HOOK_CLASSIFIED: &str = "hook.classified";
 /// A record appender holds the shared records lock and the open current file, and has not
@@ -61,9 +78,16 @@ pub const POINTS: &[&str] = &[
     RUN_SPAWNED,
     RUN_AFTER_SPAWN,
     RUN_REAPED,
+    RUN_FINISHED,
+    RUN_RECONCILE_SPAWNING,
     ACT_SNAPSHOTTED,
+    RECONCILE_OBSERVED,
+    ARBITER_LOCKED,
+    ARBITER_RECORDED,
+    ARBITER_OUTCOMES,
     WALK_TARGET_CHECKED,
     WALK_DIR_CHECKED,
+    OBSERVE_FILTERS_LISTED,
     HOOK_CLASSIFIED,
     RECORD_OPENED,
     INBOX_OBSERVED,
@@ -152,5 +176,50 @@ fn pause(dir: &Path, point: &str) {
             std::process::abort();
         }
         std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::path::Path;
+
+    use super::POINTS;
+
+    /// The points `docs/architecture.md` section 13.1 lists: each backticked name of its
+    /// "Points:" paragraph outside the parenthesized descriptions.
+    fn documented() -> BTreeSet<String> {
+        let doc = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/architecture.md"),
+        )
+        .unwrap();
+        let start = doc.find("Points: ").expect("the Points paragraph");
+        let paragraph = &doc[start..];
+        let paragraph = &paragraph[..paragraph.find("**Every contended").unwrap()];
+        let mut depth = 0_u32;
+        let outside: String = paragraph
+            .chars()
+            .filter(|&c| {
+                match c {
+                    '(' => depth += 1,
+                    ')' => depth = depth.saturating_sub(1),
+                    _ => return depth == 0,
+                }
+                false
+            })
+            .collect();
+        outside
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn points_are_the_documented_ones() {
+        let declared: BTreeSet<String> = POINTS.iter().map(|p| (*p).to_owned()).collect();
+        assert_eq!(declared.len(), POINTS.len(), "a point is listed twice");
+        assert_eq!(declared, documented());
     }
 }

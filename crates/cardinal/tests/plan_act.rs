@@ -41,9 +41,11 @@ fn check(plan_or_checks: &[cardinal::contract::Check], name: &str) -> CheckResul
         .result
 }
 
+/// `--owner-approved`, which only the owner gives (section 9.3).
 fn owner_approved() -> cardinal::act::ActOptions {
     cardinal::act::ActOptions {
         owner_approved: true,
+        caller: cardinal::contract::Caller::Owner,
         ..arbiter()
     }
 }

@@ -5,6 +5,9 @@
 //! Short-lived children whose output the caller reads run through [`child`].
 //! Mount identity (Unix) lives in `os/mount.rs`, shared by `plan` and `act`, and listing a
 //! directory through the descriptor that identifies it (Unix, `plan`'s walk) in `os/dir.rs`.
+//! The free space of the volume holding a path ([`disk`], section 10.4) and starting a
+//! detached cardinal process ([`spawn_detached`], section 10.5) are declared here; their
+//! bodies come with the reconcile work unit.
 //!
 //! A process is identified by its PID and start time (`start_s`, Unix seconds as the OS
 //! reports it), so a reused PID never passes for the original process. A process that has
@@ -22,7 +25,8 @@ pub mod unix;
 mod windows;
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 
 use sysinfo::{Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System, UpdateKind};
 
@@ -277,6 +281,42 @@ pub fn boot_time_s() -> Result<u64, OsError> {
 #[must_use]
 pub fn current_pid() -> u32 {
     std::process::id()
+}
+
+/// Which measure of free space [`disk`] reads (`docs/architecture.md` section 10.4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Measure {
+    /// What new data can use: important-usage capacity through `CFURL` on macOS (purgeable
+    /// space included), `statvfs` on Linux. `reconcile` reads this.
+    Usable,
+    /// `statfs`/`statvfs` alone, which takes microseconds: the runner's job-end check.
+    Statfs,
+}
+
+/// A volume's free and total bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Space {
+    pub free_bytes: u64,
+    pub total_bytes: u64,
+}
+
+/// Why free space could not be read or a detached process could not start.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct Unavailable(String);
+
+/// The free space of the volume holding `path`. A read that fails is unknown and changes no
+/// disk state (section 10.4).
+pub fn disk(_path: &Path, _measure: Measure) -> Result<Space, Unavailable> {
+    Err(Unavailable("free space is not implemented".to_owned()))
+}
+
+/// Starts `program` with `args` as a cardinal process in a new session with null standard
+/// streams and does not wait for it; returns its PID (section 10.5).
+pub fn spawn_detached(_program: &Path, _args: &[OsString]) -> Result<u32, Unavailable> {
+    Err(Unavailable(
+        "starting a detached process is not implemented".to_owned(),
+    ))
 }
 
 /// This host's name, if the OS reports one.

@@ -2,8 +2,9 @@
 //! every field present round-trips unchanged, and each malformed variant is rejected.
 
 use cardinal::contract::{
-    ActResult, ClassifyRequest, ClassifyResponse, ErrorDoc, Explain, Inbox, InboxItem, Inventory,
-    Plan, PlanList, Record, Reservation, ReservationView, RunSpec, SessionSnapshot,
+    ActResult, ArbiterPass, ClassifyRequest, ClassifyResponse, DiskState, ErrorDoc, Explain, Inbox,
+    InboxItem, Inventory, Plan, PlanList, Reconcile, ReconcileState, Record, Reservation,
+    ReservationView, RunSpec, SessionSnapshot, Snapshot,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -76,8 +77,9 @@ fn plan() -> Value {
         "schema": "cardinal.plan.v1", "id": "fedcba9876543210", "created_ms": 5,
         "host_id": "00000000000000aa", "kind": "reclaim_worktree",
         "target": {"path": "/w", "repo": "/r/.git", "worktree": "/w", "head": "abc",
-                   "branch": "feature", "root_id": {"dev": 1, "ino": 2}, "root_created_ms": null},
-        "allocated_bytes": 4096,
+                   "branch": "feature", "git_dir": "/r/.git/worktrees/w",
+                   "root_id": {"dev": 1, "ino": 2}, "root_created_ms": null},
+        "allocated_bytes": 4096, "aliased_bytes": 1024,
         "checks": [clean, check("merge_evidence", "condition", "fail")],
         "invariants_ok": true, "approval": "owner",
         "provenance": {
@@ -89,12 +91,81 @@ fn plan() -> Value {
 
 fn inbox_item() -> Value {
     json!({
-        "schema": "cardinal.inbox-item.v1", "key": "recovery_needed:0123456789abcdef",
+        "schema": "cardinal.inbox-item.v1", "key": "recovery_needed:0123456789abcdef@1",
         "kind": "recovery_needed", "status": "escalated",
         "subject": {"job_id": "0123456789abcdef", "worktree": "/w"},
         "evidence": {"members": [101], "verified": false},
-        "created_ms": 1, "updated_ms": 2, "seen": 3,
+        "created_ms": 1, "updated_ms": 2, "seen": 3, "ended_ms": null,
+        "arbiter": {"pass": "fedcba9876543210", "assigned_ms": 2, "outcome": "failed:exit 1",
+                    "ended_ms": 3},
         "resolution": {"outcome": "escalated", "by": "arbiter", "note": "n", "at_ms": 2}
+    })
+}
+
+fn worktree() -> Value {
+    json!({
+        "path": "/w", "main": false, "head": "abc", "branch": "feature",
+        "upstream": "origin/feature", "git_dir": "/r/.git/worktrees/w",
+        "last_activity_ms": 1_700_000_000_000_u64, "managed_by": "git-lock",
+        "facts": {"dirty": "unknown",
+                  "dirty_unknown": {"reason": "filtered_paths", "paths": ["assets/big.bin"]},
+                  "has_upstream": "yes", "unpushed": "unknown",
+                  "open_pr": "no", "merge_evidence": "merged_pr",
+                  "merged_pr": {"number": 12, "url": "https://example.invalid/pr/12"},
+                  "content_in_base": "no", "content_diff": ["src/a.rs"],
+                  "closed_pr": {"number": 9, "url": "https://example.invalid/pr/9"},
+                  "in_use": {"value": true, "jobs": ["0123456789abcdef"]}},
+        "ignored": [{"path": "/w/node_modules", "class": "regenerable", "regenerable_match": true,
+                     "allocated_bytes": 10, "aliased_bytes": 4},
+                    {"path": "/w/fuzz/corpus", "class": "protected", "regenerable_match": false,
+                     "allocated_bytes": null, "aliased_bytes": null}],
+        "reclaim": {"candidate": false, "failed": ["not_managed"], "unknown": ["no_unpushed"]},
+        "allocated_bytes": null
+    })
+}
+
+fn repo() -> Value {
+    json!({
+        "common_dir": "/r/.git", "main_worktree": "/r", "profiles": ["generic"],
+        "github": "owner/name", "base": {"ref": "origin/main", "oid": "abc"},
+        "gh": "unknown", "gh_error": "timeout", "worktrees": [worktree()]
+    })
+}
+
+fn host() -> Value {
+    json!({"id": "00000000000000aa", "hostname": "h", "os": "macos", "arch": "aarch64",
+           "boot_s": 1_700_000_000})
+}
+
+fn disk_state() -> Value {
+    json!({
+        "schema": "cardinal.disk-state.v1", "volume": "af63dc4c8601ec8c", "mount": "/",
+        "measure": "important_usage", "state": "warning", "since_ms": 5,
+        "lines": {"warning_bytes": 300, "recovery_bytes": 400, "critical_bytes": 100},
+        "readings": [{"at_ms": 4, "free_bytes": 250, "total_bytes": 1000},
+                     {"at_ms": 5, "free_bytes": null, "total_bytes": null}]
+    })
+}
+
+fn disk_report() -> Value {
+    json!({
+        "volume": "af63dc4c8601ec8c", "reading": {"at_ms": 5, "free_bytes": 250},
+        "lines": {"warning_bytes": 300, "recovery_bytes": 400, "critical_bytes": 100},
+        "checks_ms": 4,
+        "targets": [{"plan_id": "fedcba9876543210", "worktree": "/w", "target": "/w/target",
+                     "exclusive_bytes": 120}],
+        "shortfall_bytes": 30,
+        "blocked": [{"worktree": "/w2", "target": "/w2/node_modules", "check": "not_in_use",
+                     "bytes": 80},
+                    {"worktree": "/w", "target": "/w/.pnpm", "check": "aliased", "bytes": 9}]
+    })
+}
+
+fn arbiter_pass() -> Value {
+    json!({
+        "schema": "cardinal.arbiter-pass.v1", "id": "fedcba9876543210", "started_ms": 1,
+        "ended_ms": 2, "outcome": "timed_out", "items": ["reclaimable:/w@abc@1"],
+        "log": "/s/arbiter/fedcba9876543210.log", "failures_in_a_row": 1
     })
 }
 
@@ -126,6 +197,19 @@ fn error_document() {
     rejects::<ErrorDoc>(&doc, "an unknown code", |d| {
         d["error"]["code"] = json!("oops");
     });
+    for code in [
+        "state_unavailable",
+        "config_invalid",
+        "not_found",
+        "ambiguous_id",
+        "invalid_argument",
+        "not_assigned",
+        "not_implemented",
+        "internal",
+    ] {
+        round_trips::<ErrorDoc>(&json!({"schema": "cardinal.error.v1",
+                                        "error": {"code": code, "message": "m"}}));
+    }
 }
 
 #[test]
@@ -178,29 +262,14 @@ fn reservation_documents() {
 fn inventory_document() {
     let doc = json!({
         "schema": "cardinal.inventory.v1", "observed_ms": 9,
-        "host": {"id": "00000000000000aa", "hostname": "h", "os": "macos", "arch": "aarch64",
-                 "boot_s": 1_700_000_000},
+        "host": host(),
         "budget": {"cpu": 8}, "reserved": {"cpu": 4},
         "reservations": [view()],
-        "repos": [{
-            "common_dir": "/r/.git", "main_worktree": "/r", "profiles": ["generic"],
-            "github": "owner/name", "base": {"ref": "origin/main", "oid": "abc"},
-            "gh": "unknown", "gh_error": "timeout",
-            "worktrees": [{
-                "path": "/w", "main": false, "head": "abc", "branch": "feature",
-                "upstream": "origin/feature", "managed_by": "git-lock",
-                "facts": {"dirty": "no", "has_upstream": "yes", "unpushed": "unknown",
-                          "open_pr": "no", "merge_evidence": "merged_pr",
-                          "merged_pr": {"number": 12, "url": "https://example.invalid/pr/12"},
-                          "in_use": {"value": true, "jobs": ["0123456789abcdef"]}},
-                "ignored": [{"path": "/w/node_modules", "class": "regenerable", "allocated_bytes": 10},
-                            {"path": "/w/fuzz/corpus", "class": "protected", "allocated_bytes": null}],
-                "reclaim": {"candidate": false, "failed": ["not_managed"], "unknown": ["no_unpushed"]},
-                "allocated_bytes": null
-            }]
-        }],
+        "repos": [repo()],
         "outlived": [{"session_id": "s", "ended_ms": 3,
                       "processes": [{"pid": 5, "start_s": 6, "name": "vite", "command": "vite dev"}]}],
+        "disk": [disk_state()],
+        "arbiter": {"running": true, "last": arbiter_pass()},
         "errors": [{"scope": "repo:/r", "message": "m"}]
     });
     round_trips::<Inventory>(&doc);
@@ -213,12 +282,134 @@ fn inventory_document() {
     rejects::<Inventory>(&doc, "an unknown ignored class", |d| {
         d["repos"][0]["worktrees"][0]["ignored"][0]["class"] = json!("cache");
     });
+    rejects::<Inventory>(&doc, "another dirty_unknown reason", |d| {
+        d["repos"][0]["worktrees"][0]["facts"]["dirty_unknown"]["reason"] = json!("lfs");
+    });
+    // Nullable fields read as null when absent; the others are required.
+    for field in ["content_in_base", "content_diff"] {
+        rejects::<Inventory>(&doc, "facts without a phase 1 fact", |d| {
+            d["repos"][0]["worktrees"][0]["facts"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+        });
+    }
+    rejects::<Inventory>(&doc, "an ignored entry without regenerable_match", |d| {
+        d["repos"][0]["worktrees"][0]["ignored"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("regenerable_match");
+    });
+    rejects::<Inventory>(&doc, "a disk state of another schema", |d| {
+        d["disk"][0]["schema"] = json!("cardinal.disk-state.v2");
+    });
+    rejects::<Inventory>(&doc, "an inventory without the arbiter", |d| {
+        d.as_object_mut().unwrap().remove("arbiter");
+    });
+}
+
+#[test]
+fn disk_state_document() {
+    round_trips::<DiskState>(&disk_state());
+    rejects_wrong_schema_and_missing::<DiskState>(&disk_state(), "lines");
+    rejects::<DiskState>(&disk_state(), "an unknown measure", |d| {
+        d["measure"] = json!("statfs");
+    });
+    rejects::<DiskState>(&disk_state(), "an unknown state", |d| {
+        d["state"] = json!("full");
+    });
+}
+
+#[test]
+fn reconcile_documents() {
+    let doc = json!({
+        "schema": "cardinal.reconcile.v1", "trigger": "job-end", "skipped": null,
+        "disk": [disk_state()], "observed": true, "disk_reports": [disk_report()],
+        "inbox": {"raised": ["disk_low:af63dc4c8601ec8c@5"], "cleared": []},
+        "arbiter": "interval", "errors": [{"scope": "observe", "message": "m"}]
+    });
+    round_trips::<Reconcile>(&doc);
+    rejects_wrong_schema_and_missing::<Reconcile>(&doc, "disk_reports");
+    let busy = json!({
+        "schema": "cardinal.reconcile.v1", "trigger": "timer", "skipped": "busy", "disk": [],
+        "observed": false, "disk_reports": [], "inbox": {"raised": [], "cleared": []},
+        "arbiter": "not_needed", "errors": []
+    });
+    round_trips::<Reconcile>(&busy);
+    for (field, bad) in [
+        ("trigger", json!("job_end")),
+        ("skipped", json!("locked")),
+        ("arbiter", json!("waiting")),
+    ] {
+        rejects::<Reconcile>(&doc, "an unknown enum value", |d| d[field] = bad);
+    }
+    rejects::<Reconcile>(&doc, "a disk report without its shortfall", |d| {
+        d["disk_reports"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("shortfall_bytes");
+    });
+
+    let state = json!({"schema": "cardinal.reconcile-state.v1", "last_pass_ms": 7,
+                       "last_observation_ms": null});
+    round_trips::<ReconcileState>(&state);
+    rejects_wrong_schema_and_missing::<ReconcileState>(&state, "last_pass_ms");
+}
+
+#[test]
+fn arbiter_pass_document() {
+    round_trips::<ArbiterPass>(&arbiter_pass());
+    let running = json!({
+        "schema": "cardinal.arbiter-pass.v1", "id": "fedcba9876543210", "started_ms": 1,
+        "ended_ms": null, "outcome": null, "items": [], "log": "/l", "failures_in_a_row": 0
+    });
+    round_trips::<ArbiterPass>(&running);
+    rejects_wrong_schema_and_missing::<ArbiterPass>(&arbiter_pass(), "items");
+    for bad in ["failed", "failed:", "done"] {
+        rejects::<ArbiterPass>(&arbiter_pass(), "an unknown outcome", |d| {
+            d["outcome"] = json!(bad);
+        });
+    }
+}
+
+#[test]
+fn snapshot_document() {
+    let mut item = inbox_item();
+    item["needs_owner"] = json!(true);
+    let doc = json!({
+        "schema": "cardinal.snapshot.v1", "generated_ms": 11, "host": host(),
+        "disk": [disk_state()],
+        "observation": {"observed_ms": 10, "repos": [repo()]},
+        "reservations": {"observed_ms": 10, "items": [view()]},
+        "inbox": [item],
+        "records": [record()],
+        "arbiter": arbiter_pass()
+    });
+    round_trips::<Snapshot>(&doc);
+    rejects_wrong_schema_and_missing::<Snapshot>(&doc, "reservations");
+    rejects::<Snapshot>(&doc, "an item without needs_owner", |d| {
+        d["inbox"][0].as_object_mut().unwrap().remove("needs_owner");
+    });
+    let empty = json!({
+        "schema": "cardinal.snapshot.v1", "generated_ms": 11, "host": host(), "disk": [],
+        "observation": null, "reservations": {"observed_ms": 10, "items": []}, "inbox": [],
+        "records": [], "arbiter": null
+    });
+    round_trips::<Snapshot>(&empty);
 }
 
 #[test]
 fn plan_documents() {
     round_trips::<Plan>(&plan());
     rejects_wrong_schema_and_missing::<Plan>(&plan(), "target");
+    // A plan stored before `git_dir` and `aliased_bytes` were recorded still loads, with both
+    // null.
+    let mut old = plan();
+    old["target"].as_object_mut().unwrap().remove("git_dir");
+    old.as_object_mut().unwrap().remove("aliased_bytes");
+    let loaded: Plan = serde_json::from_value(old).unwrap();
+    assert_eq!(loaded.target.git_dir, None);
+    assert_eq!(loaded.aliased_bytes, None);
     rejects::<Plan>(&plan(), "an unknown kind", |d| {
         d["kind"] = json!("reclaim_cache");
     });
@@ -252,6 +443,38 @@ fn act_result_document() {
 fn inbox_documents() {
     round_trips::<InboxItem>(&inbox_item());
     rejects_wrong_schema_and_missing::<InboxItem>(&inbox_item(), "evidence");
+    // Every kind of section 10.1, and a worktree subject with a null branch (detached HEAD).
+    for kind in [
+        "recovery_needed",
+        "outlived_processes",
+        "reclaimable",
+        "merge_undecided",
+        "closed_pr_dirty",
+        "managed_merged",
+        "unclassifiable_data",
+        "disk_low",
+        "disk_critical",
+        "arbiter_failing",
+    ] {
+        let mut doc = inbox_item();
+        doc["kind"] = json!(kind);
+        doc["subject"] = json!({"worktree": "/w", "head": "abc", "branch": null});
+        doc["arbiter"] = json!(null);
+        doc["ended_ms"] = json!(9);
+        round_trips::<InboxItem>(&doc);
+    }
+    rejects::<InboxItem>(&inbox_item(), "an unknown kind", |d| {
+        d["kind"] = json!("disk_full");
+    });
+    rejects::<InboxItem>(&inbox_item(), "an unknown pass outcome", |d| {
+        d["arbiter"]["outcome"] = json!("lost");
+    });
+    // An item stored before occurrences and passes still loads, with both null.
+    let mut old = inbox_item();
+    old.as_object_mut().unwrap().remove("ended_ms");
+    old.as_object_mut().unwrap().remove("arbiter");
+    let loaded: InboxItem = serde_json::from_value(old).unwrap();
+    assert_eq!((loaded.ended_ms, loaded.arbiter), (None, None));
     for not_an_object in [json!([1]), json!("text"), json!(null), json!(3)] {
         rejects::<InboxItem>(&inbox_item(), "evidence that is not an object", |d| {
             d["evidence"] = not_an_object;
@@ -302,6 +525,68 @@ fn record_document() {
     rejects::<Record>(&record(), "an unknown kind", |d| {
         d["kind"] = json!("job_lost");
     });
+    for kind in [
+        "disk_state",
+        "reconcile",
+        "arbiter_pass",
+        "planned",
+        "inbox_raised",
+    ] {
+        let mut doc = record();
+        doc["kind"] = json!(kind);
+        round_trips::<Record>(&doc);
+    }
+}
+
+/// The schemas tested above: every `cardinal.<name>.v<N>` that section 11.3 and the
+/// classifier seam of section 7.6 name.
+const TESTED: &[&str] = &[
+    "cardinal.error.v1",
+    "cardinal.run-spec.v1",
+    "cardinal.reservation.v1",
+    "cardinal.inventory.v1",
+    "cardinal.plan.v1",
+    "cardinal.plan-list.v1",
+    "cardinal.act-result.v1",
+    "cardinal.inbox-item.v1",
+    "cardinal.inbox.v1",
+    "cardinal.explain.v1",
+    "cardinal.record.v1",
+    "cardinal.session-snapshot.v1",
+    "cardinal.disk-state.v1",
+    "cardinal.reconcile.v1",
+    "cardinal.reconcile-state.v1",
+    "cardinal.arbiter-pass.v1",
+    "cardinal.snapshot.v1",
+    "cardinal.classify-request.v1",
+    "cardinal.classify-response.v1",
+];
+
+#[test]
+fn every_documented_schema_is_tested() {
+    let doc = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/architecture.md"),
+    )
+    .unwrap();
+    let mut documented = std::collections::BTreeSet::new();
+    for (start, _) in doc.match_indices("cardinal.") {
+        let name: String = doc[start..]
+            .chars()
+            .take_while(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || ".-".contains(*c))
+            .collect();
+        let name = name.trim_end_matches('.');
+        let versioned = name
+            .rsplit_once(".v")
+            .is_some_and(|(_, n)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+        if versioned && name.matches('.').count() == 2 {
+            documented.insert(name.to_owned());
+        }
+    }
+    let tested: std::collections::BTreeSet<String> =
+        TESTED.iter().map(|s| (*s).to_owned()).collect();
+    // `cardinal.job.v1` is a phase 2 placeholder (section 11.4).
+    documented.remove("cardinal.job.v1");
+    assert_eq!(documented, tested);
 }
 
 #[test]

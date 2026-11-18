@@ -78,6 +78,10 @@ impl StateDir {
             root.join("sessions"),
             root.join("inbox"),
             root.join("plans"),
+            root.join("reconcile"),
+            root.join("disk"),
+            root.join("arbiter"),
+            root.join("ui"),
             root.join("records"),
             root.join("tmp"),
         ] {
@@ -214,18 +218,96 @@ impl StateDir {
         self.plan_dir(plan).join("plan.json")
     }
 
-    /// `plans/<plan>/claim`, for the deletion phase: the `act` that executes the plan will
-    /// create it once. Phase 0 `act` never creates it.
+    /// `plans/<plan>/claim`: reserved for the execution design (section 9.7); nothing
+    /// creates it.
     #[must_use]
     pub fn plan_claim(&self, plan: &str) -> PathBuf {
         self.plan_dir(plan).join("claim")
     }
 
-    /// `plans/<plan>/result.json` (`cardinal.act-result.v1`), for the deletion phase. Phase 0
-    /// `act` never writes it.
+    /// `plans/<plan>/result.json`: reserved for the execution design (section 9.7); nothing
+    /// writes it.
     #[must_use]
     pub fn plan_result(&self, plan: &str) -> PathBuf {
         self.plan_dir(plan).join("result.json")
+    }
+
+    /// `reconcile.lock`: one reconcile pass at a time. Never deleted.
+    #[must_use]
+    pub fn reconcile_lock(&self) -> PathBuf {
+        self.root.join("reconcile.lock")
+    }
+
+    #[must_use]
+    pub fn reconcile_dir(&self) -> PathBuf {
+        self.root.join("reconcile")
+    }
+
+    /// `reconcile/state.json` (`cardinal.reconcile-state.v1`): pass times. Written under
+    /// `reconcile.lock`.
+    #[must_use]
+    pub fn reconcile_state(&self) -> PathBuf {
+        self.reconcile_dir().join("state.json")
+    }
+
+    /// `reconcile/observation.json` (`cardinal.inventory.v1`): the last full observation.
+    /// Written under `reconcile.lock`.
+    #[must_use]
+    pub fn reconcile_observation(&self) -> PathBuf {
+        self.reconcile_dir().join("observation.json")
+    }
+
+    #[must_use]
+    pub fn disk_dir(&self) -> PathBuf {
+        self.root.join("disk")
+    }
+
+    /// `disk/<volume>.json` (`cardinal.disk-state.v1`), `volume` the key of a volume's
+    /// identity (section 10.4). Written under `reconcile.lock`.
+    #[must_use]
+    pub fn disk_state(&self, volume: &str) -> PathBuf {
+        self.disk_dir().join(format!("{}.json", file_safe(volume)))
+    }
+
+    #[must_use]
+    pub fn arbiter_dir(&self) -> PathBuf {
+        self.root.join("arbiter")
+    }
+
+    /// `arbiter/.lock`: held by the arbiter launcher (section 10.5). Never deleted.
+    #[must_use]
+    pub fn arbiter_lock(&self) -> PathBuf {
+        self.arbiter_dir().join(".lock")
+    }
+
+    /// `arbiter/last.json` (`cardinal.arbiter-pass.v1`): the last arbiter pass. Written under
+    /// `arbiter/.lock`.
+    #[must_use]
+    pub fn arbiter_last(&self) -> PathBuf {
+        self.arbiter_dir().join("last.json")
+    }
+
+    /// `arbiter/<pass>.log`: an arbiter pass's output, capped.
+    #[must_use]
+    pub fn arbiter_log(&self, pass: &str) -> PathBuf {
+        self.arbiter_dir().join(format!("{}.log", file_safe(pass)))
+    }
+
+    #[must_use]
+    pub fn ui_dir(&self) -> PathBuf {
+        self.root.join("ui")
+    }
+
+    /// `ui/index.html`: the read-only web UI's page (section 10.6).
+    #[must_use]
+    pub fn ui_page(&self) -> PathBuf {
+        self.ui_dir().join("index.html")
+    }
+
+    /// `ui/snapshot.json` (`cardinal.snapshot.v1`), the snapshot the page embeds.
+    #[must_use]
+    pub fn ui_snapshot(&self) -> PathBuf {
+        self.ui_dir().join("snapshot.json")
     }
 
     #[must_use]
@@ -252,19 +334,19 @@ impl StateDir {
         self.records_dir().join(".lock")
     }
 
-    /// `jobs/`: reserved for phase 2 accepted jobs; not created in phase 0.
+    /// `jobs/`: reserved for phase 2 accepted jobs; not created.
     #[must_use]
     pub fn jobs_dir(&self) -> PathBuf {
         self.root.join("jobs")
     }
 
-    /// `tickets/`: reserved for phase 2 queue tickets; not created in phase 0.
+    /// `tickets/`: reserved for phase 2 queue tickets; not created.
     #[must_use]
     pub fn tickets_dir(&self) -> PathBuf {
         self.root.join("tickets")
     }
 
-    /// `reserve`: reserved for the phase 1 disk reserve file; not created in phase 0.
+    /// `reserve`: reserved for the execution design (section 9.7); not created.
     #[must_use]
     pub fn reserve_file(&self) -> PathBuf {
         self.root.join("reserve")
@@ -348,6 +430,10 @@ mod tests {
             "sessions",
             "inbox",
             "plans",
+            "reconcile",
+            "disk",
+            "arbiter",
+            "ui",
             "records",
             "tmp",
         ] {
@@ -405,6 +491,54 @@ mod tests {
             state.session("../x").parent().unwrap(),
             state.sessions_dir()
         );
+    }
+
+    /// Every path of the layout in `docs/architecture.md` section 4.1, relative to the root.
+    #[test]
+    fn paths_follow_the_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = StateDir::open(tmp.path()).unwrap();
+        let rel = |path: std::path::PathBuf| {
+            path.strip_prefix(tmp.path())
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/")
+        };
+        let job = "0123456789abcdef";
+        for (path, expected) in [
+            (state.admission_lock(), "admission.lock"),
+            (state.live_lock(job), "live/0123456789abcdef.lock"),
+            (state.reservation(job), "reservations/0123456789abcdef.json"),
+            (state.worktree_lock(job), "worktrees/0123456789abcdef.lock"),
+            (state.session("s"), "sessions/s.json"),
+            (state.inbox_lock(), "inbox/.lock"),
+            (state.plan_file(job), "plans/0123456789abcdef/plan.json"),
+            (state.plan_claim(job), "plans/0123456789abcdef/claim"),
+            (state.plan_result(job), "plans/0123456789abcdef/result.json"),
+            (state.reconcile_lock(), "reconcile.lock"),
+            (state.reconcile_state(), "reconcile/state.json"),
+            (state.reconcile_observation(), "reconcile/observation.json"),
+            (state.disk_state(job), "disk/0123456789abcdef.json"),
+            (state.arbiter_lock(), "arbiter/.lock"),
+            (state.arbiter_last(), "arbiter/last.json"),
+            (state.arbiter_log(job), "arbiter/0123456789abcdef.log"),
+            (state.ui_page(), "ui/index.html"),
+            (state.ui_snapshot(), "ui/snapshot.json"),
+            (state.records_file(), "records/records.jsonl"),
+            (state.rotated_records(1), "records/records.1.jsonl"),
+            (state.records_lock(), "records/.lock"),
+            (state.jobs_dir(), "jobs"),
+            (state.tickets_dir(), "tickets"),
+            (state.reserve_file(), "reserve"),
+        ] {
+            assert_eq!(rel(path), expected);
+        }
+        // Names that come from outside stay inside their directory.
+        assert_eq!(
+            state.arbiter_log("../x").parent().unwrap(),
+            state.arbiter_dir()
+        );
+        assert_eq!(state.disk_state("../x").parent().unwrap(), state.disk_dir());
     }
 
     #[test]

@@ -24,9 +24,10 @@ pub use crate::os::child::{ChildError, Output};
 use crate::admission;
 use crate::config::{Config, DataList, Selection};
 use crate::contract::{
-    BaseRef, CheckResult, DerivedState, Error, ErrorCode, Facts, GhStatus, HostInfo, IgnoredClass,
-    IgnoredEntry, InUse, Inventory, InventorySchema, MergeEvidence, Os, Outlived, PrRef,
-    ReclaimSummary, Repo, ReservationView, Resources, ScopedError, SessionSnapshot, Tri, Worktree,
+    ArbiterView, BaseRef, CheckResult, DerivedState, Error, ErrorCode, Facts, GhStatus, HostInfo,
+    IgnoredClass, IgnoredEntry, InUse, Inventory, InventorySchema, MergeEvidence, Os, Outlived,
+    PrRef, ReclaimSummary, Repo, ReservationView, Resources, ScopedError, SessionSnapshot, Tri,
+    Worktree,
 };
 use crate::os::child;
 use crate::os::{Detail, ProcessTable};
@@ -79,6 +80,39 @@ pub fn observe_worktree(
     path: &Path,
 ) -> Result<WorktreeObservation, Error> {
     Observer::new(config).observe_worktree(state, path)
+}
+
+/// `content_in_base` (`docs/architecture.md` section 8.2): whether every file the branch at
+/// `head` changed since its merge base with `base` has the same content and mode in `base`,
+/// with up to 20 of the paths that differ.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContentInBase {
+    pub value: Tri,
+    pub diff: Vec<String>,
+}
+
+impl ContentInBase {
+    /// Not read: `unknown` with no paths.
+    #[must_use]
+    pub fn unknown() -> Self {
+        Self {
+            value: Tri::Unknown,
+            diff: Vec::new(),
+        }
+    }
+}
+
+/// Reads `content_in_base` for the worktree at `worktree` from tree-to-tree diffs, which read
+/// no index. Observation reads it only when merge evidence is `none`; `act` reads it again
+/// for `--squash-merged`.
+#[must_use]
+pub fn content_in_base(
+    _config: &Config,
+    _worktree: &Path,
+    _head: &str,
+    _base: &BaseRef,
+) -> ContentInBase {
+    ContentInBase::unknown()
 }
 
 /// Runs `git --no-optional-locks -C <dir> <args>` with the constructed environment of
@@ -245,6 +279,8 @@ impl<'a> Observer<'a> {
             reservations,
             repos,
             outlived,
+            disk: Vec::new(),
+            arbiter: ArbiterView::default(),
             errors,
         })
     }
@@ -585,13 +621,23 @@ impl<'a> Observer<'a> {
         });
         let step_failed = !errors.is_empty() || history.gh_error.is_some() || ctx.failure.is_some();
 
+        let content = match (&ctx.repo.base, head.as_deref()) {
+            (Some(base), Some(head)) if history.merge_evidence == MergeEvidence::None => {
+                content_in_base(self.config, &path, head, base)
+            }
+            _ => ContentInBase::unknown(),
+        };
         let facts = Facts {
             dirty,
+            dirty_unknown: None,
             has_upstream,
             unpushed: history.unpushed,
             open_pr: history.open_pr,
             merge_evidence: history.merge_evidence,
             merged_pr: history.merged_pr,
+            content_in_base: content.value,
+            content_diff: content.diff,
+            closed_pr: None,
             in_use,
         };
         let worktree = Worktree {
@@ -600,6 +646,8 @@ impl<'a> Observer<'a> {
             head,
             branch,
             upstream,
+            git_dir: None,
+            last_activity_ms: None,
             managed_by,
             reclaim: ReclaimSummary::default(),
             allocated_bytes: shared.sizes.then(|| data::allocated_bytes(&path)).flatten(),
@@ -848,7 +896,9 @@ fn ignored_entries(
             IgnoredEntry {
                 path: display(&entry),
                 class,
+                regenerable_match: patterns.covers(DataList::Regenerable, rel),
                 allocated_bytes,
+                aliased_bytes: None,
             }
         })
         .collect()

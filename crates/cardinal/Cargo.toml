@@ -28,6 +28,10 @@ libc.workspace = true
 rustix = { workspace = true, features = ["fs"] }
 signal-hook.workspace = true
 
+# The important-usage capacity of the volume holding a path (`os::disk`).
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-core-foundation.workspace = true
+
 [target.'cfg(windows)'.dependencies]
 windows-sys.workspace = true
 

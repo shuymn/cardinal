@@ -20,6 +20,9 @@ pub enum RecordKind {
     Planned,
     InboxRaised,
     InboxResolved,
+    DiskState,
+    Reconcile,
+    ArbiterPass,
     HookError,
     ConfigError,
 }

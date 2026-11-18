@@ -24,19 +24,21 @@ impl ActStatus {
     }
 }
 
-/// `cardinal.act-result.v1`: the `act` output. Phase 0 `act` prints it and records it in an
-/// `act` or `planned` record; it writes no result file (`docs/architecture.md` section 9.5).
+/// `cardinal.act-result.v1`: the `act` output. `act` prints it and records it in an `act` or
+/// `planned` record; it writes no result file (`docs/architecture.md` section 9.5). Phase 1
+/// reports only `dry_run`, `rejected`, and `expired`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActResult {
     pub schema: ActResultSchema,
     pub plan_id: String,
     pub caller: String,
     pub status: ActStatus,
-    /// Failing check names, `"owner_approval_required"`, `"identity_changed:<field>"`.
+    /// Failing check names, `"owner_approval_required"`, `"identity_changed:<field>"`, and
+    /// `"execution_not_designed"` in every `dry_run` of phase 1.
     pub reasons: Vec<String>,
     pub checks: Vec<Check>,
     pub freed_bytes: Option<u64>,
-    /// Entries changed or created since the snapshot.
+    /// Entries changed or created since the snapshot; empty in phase 1.
     pub skipped_changed: Vec<String>,
     pub error: Option<String>,
     pub finished_ms: u64,

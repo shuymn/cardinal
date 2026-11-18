@@ -97,8 +97,9 @@ const CALLERS: [(&[&str], &str); 4] = [
 ];
 
 /// A plan of each kind, one that needs approval (gh stops reporting the merged PR before it is
-/// made) and ones that do not, acted on twice by every caller with and without
-/// `--owner-approved`: each run reports, and nothing changes.
+/// made) and ones that do not, acted on twice by every caller, and by the owner with
+/// `--owner-approved` too (any other caller giving it is a usage error,
+/// `cli::owner_approved_needs_the_owner`): each run reports, and nothing changes.
 #[test]
 fn repeated_act_changes_nothing() {
     let s = Setup::with_host("[unit.disk-reclaim]\nact = true\n");
@@ -135,6 +136,9 @@ fn repeated_act_changes_nothing() {
                 (ActStatus::DryRun, Vec::new())
             };
             for (caller, named) in CALLERS {
+                if owner_approved && named != "owner" {
+                    continue;
+                }
                 for _ in 0..2 {
                     let mut args = caller.to_vec();
                     if owner_approved {

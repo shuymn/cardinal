@@ -1,30 +1,38 @@
-//! The command line: clap definitions for every phase 0 command and flag
-//! (`docs/architecture.md` section 11.2) and thin handlers that print JSON.
+//! The command line: clap definitions for every command and flag of
+//! `docs/architecture.md` section 11.2 and thin handlers that print JSON.
 //!
 //! Exit codes (section 11.1): 0 success, 1 error with `cardinal.error.v1` on stdout, 2 usage
-//! error, 3 `act` did not execute. `run` exits with the stage's status (section 5.6), and
-//! `hook` always exits 0, also on a usage error or a panic, because a non-zero hook exit can
-//! block the agent's tool call.
+//! error (`--owner-approved` without `--caller owner` included), 3 `act` reports a refusal.
+//! `run` exits with the stage's status (section 5.6), and `hook` always exits 0, also on a
+//! usage error or a panic, because a non-zero hook exit can block the agent's tool call.
 
 use std::ffi::OsString;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::error::ErrorKind;
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
 use crate::act::{self, ActOptions};
 use crate::adapter::claude;
 use crate::config::{self, Config};
-use crate::contract::{Caller, Error, ErrorCode, InboxStatus, PlanKind, ResolutionOutcome};
+use crate::contract::{
+    Caller, Error, ErrorCode, InboxStatus, PlanKind, ResolutionOutcome, Trigger,
+};
 use crate::explain::{self, Subject};
 use crate::inbox::{self, StatusFilter};
 use crate::observe::{self, InventoryOptions};
 use crate::os::child;
 use crate::plan;
+use crate::reconcile;
 use crate::run;
+use crate::snapshot;
 use crate::state::StateDir;
+
+/// The environment variable that names the arbiter pass a session runs for (section 10.5).
+const ARBITER_PASS_VAR: &str = "CARDINAL_ARBITER_PASS";
 
 /// Local compute-resource arbitration and housekeeping for parallel coding agents.
 #[derive(Debug, Parser)]
@@ -46,8 +54,14 @@ pub enum Command {
     Inbox(InboxArgs),
     /// Propose reclaim operations
     Plan(PlanArgs),
-    /// Execute a plan after checking every invariant again
+    /// Evaluate a plan again and report what it would reclaim
     Act(ActArgs),
+    /// Run one pass: inbox refresh, disk states, observation, reports, and the arbiter's start
+    Reconcile(ReconcileArgs),
+    /// Run the arbiter
+    Arbiter(ArbiterArgs),
+    /// Write the read-only web page and print its path
+    Ui,
     /// Show where a decision came from
     Explain(ExplainArgs),
 }
@@ -108,6 +122,9 @@ pub struct InboxArgs {
     /// List without running the refresh first
     #[arg(long)]
     pub no_refresh: bool,
+    /// List the items assigned to the arbiter pass `CARDINAL_ARBITER_PASS` names
+    #[arg(long)]
+    pub assigned: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -135,6 +152,9 @@ pub struct ResolveArgs {
     /// A note for the owner or the record
     #[arg(long, value_name = "TEXT")]
     pub note: Option<String>,
+    /// Refuse an item not assigned to the running arbiter pass `CARDINAL_ARBITER_PASS` names
+    #[arg(long)]
+    pub assigned: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -173,15 +193,44 @@ pub struct ActArgs {
     /// The plan ID, or a unique prefix of at least 4 characters
     #[arg(value_name = "PLAN")]
     pub plan: String,
-    /// Run every check without claiming or deleting
+    /// Accepted; every act reports and executes nothing
     #[arg(long)]
     pub dry_run: bool,
-    /// The owner approved a plan whose conditions fail
+    /// The owner approved a plan whose conditions fail (only with --caller owner)
     #[arg(long)]
     pub owner_approved: bool,
+    /// The caller judged HEAD squash-merged; counts when every changed file is in the base
+    #[arg(long)]
+    pub squash_merged: bool,
     /// Who calls: arbiter, owner, or unit:NAME
     #[arg(long, value_name = "CALLER", default_value = "arbiter")]
     pub caller: Caller,
+}
+
+#[derive(Debug, Args)]
+pub struct ReconcileArgs {
+    /// What started the pass
+    #[arg(long, value_enum, value_name = "TRIGGER", default_value = "manual")]
+    pub trigger: TriggerArg,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum TriggerArg {
+    Timer,
+    JobEnd,
+    Manual,
+}
+
+#[derive(Debug, Args)]
+pub struct ArbiterArgs {
+    #[command(subcommand)]
+    pub command: ArbiterCommand,
+}
+
+#[derive(Clone, Copy, Debug, Subcommand)]
+pub enum ArbiterCommand {
+    /// Run one arbiter pass for the due inbox items, or report the running one
+    Run,
 }
 
 #[derive(Debug, Args)]
@@ -226,12 +275,32 @@ pub fn main() -> ExitCode {
 /// Parses `args` (with the program name first) and runs the command.
 pub fn main_with(args: &[OsString]) -> ExitCode {
     let is_hook = args.get(1).is_some_and(|arg| arg == "hook");
-    match Cli::try_parse_from(args) {
+    match Cli::try_parse_from(args).and_then(validate) {
         Ok(cli) => dispatch(cli.command),
         // A hook must never fail the agent's tool call, not even on a usage error.
         Err(err) if is_hook && err.use_stderr() => ExitCode::SUCCESS,
         Err(err) => err.exit(),
     }
+}
+
+/// The rules clap's definitions do not express, as usage errors: `--owner-approved` only with
+/// `--caller owner` (section 9.3).
+fn validate(cli: Cli) -> Result<Cli, clap::Error> {
+    if let Command::Act(args) = &cli.command
+        && args.owner_approved
+        && args.caller != Caller::Owner
+    {
+        let mut command = Cli::command();
+        let act = command.find_subcommand_mut("act").expect("act is defined");
+        return Err(act.error(
+            ErrorKind::ArgumentConflict,
+            format!(
+                "--owner-approved is accepted only with --caller owner, not --caller {}",
+                args.caller
+            ),
+        ));
+    }
+    Ok(cli)
 }
 
 fn dispatch(command: Command) -> ExitCode {
@@ -250,32 +319,7 @@ fn dispatch(command: Command) -> ExitCode {
                 observe::inventory(&ctx.config, &ctx.state, &options)
             }))
         }
-        Command::Inbox(args) => match args.command {
-            None => respond(context().and_then(|ctx| {
-                let status = args.status.map(|status| match status {
-                    StatusArg::Open => StatusFilter::Only(InboxStatus::Open),
-                    StatusArg::Escalated => StatusFilter::Only(InboxStatus::Escalated),
-                    StatusArg::Resolved => StatusFilter::Only(InboxStatus::Resolved),
-                    StatusArg::Dismissed => StatusFilter::Only(InboxStatus::Dismissed),
-                    StatusArg::All => StatusFilter::All,
-                });
-                inbox::list(&ctx.config, &ctx.state, status, !args.no_refresh)
-            })),
-            Some(InboxCommand::Resolve(resolve)) => respond(context().and_then(|ctx| {
-                let outcome = match resolve.outcome {
-                    OutcomeArg::Resolved => ResolutionOutcome::Resolved,
-                    OutcomeArg::Escalated => ResolutionOutcome::Escalated,
-                    OutcomeArg::Dismissed => ResolutionOutcome::Dismissed,
-                };
-                inbox::resolve(
-                    &ctx.config,
-                    &ctx.state,
-                    &resolve.key,
-                    outcome,
-                    resolve.note.as_deref(),
-                )
-            })),
-        },
+        Command::Inbox(args) => inbox_command(args),
         Command::Plan(args) => {
             // Observes through git and gh, so it sets their cleanup up while this is the only
             // thread.
@@ -293,25 +337,32 @@ fn dispatch(command: Command) -> ExitCode {
                 })),
             }
         }
-        Command::Act(args) => {
-            // Re-observes the worktree through git and gh, as `plan` does.
+        Command::Act(args) => act_command(args),
+        Command::Reconcile(args) => {
+            // Observes through git and gh, so it sets their cleanup up while this is the only
+            // thread.
             child::prepare();
-            let options = ActOptions {
-                dry_run: args.dry_run,
-                owner_approved: args.owner_approved,
-                caller: args.caller,
+            let trigger = match args.trigger {
+                TriggerArg::Timer => Trigger::Timer,
+                TriggerArg::JobEnd => Trigger::JobEnd,
+                TriggerArg::Manual => Trigger::Manual,
             };
-            match context()
-                .and_then(|ctx| act::execute(&ctx.config, &ctx.state, &args.plan, &options))
-            {
-                Ok(result) => {
-                    let refused = result.status.is_refusal();
-                    print_json(&result);
-                    if refused {
-                        ExitCode::from(3)
-                    } else {
-                        ExitCode::SUCCESS
-                    }
+            respond(context().and_then(|ctx| reconcile::run(&ctx.config, &ctx.state, trigger)))
+        }
+        Command::Arbiter(args) => match args.command {
+            ArbiterCommand::Run => {
+                // Runs the session through `os::child`, as `reconcile` runs git.
+                child::prepare();
+                respond(context().and_then(|ctx| reconcile::run_arbiter(&ctx.config, &ctx.state)))
+            }
+        },
+        Command::Ui => {
+            match context().and_then(|ctx| snapshot::write_page(&ctx.config, &ctx.state)) {
+                Ok(page) => {
+                    let mut out = std::io::stdout().lock();
+                    let _ = writeln!(out, "{}", page.display());
+                    let _ = out.flush();
+                    ExitCode::SUCCESS
                 }
                 Err(err) => fail(&err),
             }
@@ -325,6 +376,74 @@ fn dispatch(command: Command) -> ExitCode {
             };
             respond(context().and_then(|ctx| explain::explain(&ctx.config, &ctx.state, &subject)))
         }
+    }
+}
+
+/// `cardinal inbox` and `cardinal inbox resolve`.
+fn inbox_command(args: InboxArgs) -> ExitCode {
+    match args.command {
+        None if args.assigned => respond(context().and_then(|ctx| {
+            inbox::list_assigned(&ctx.config, &ctx.state, arbiter_pass().as_deref())
+        })),
+        None => respond(context().and_then(|ctx| {
+            let status = args.status.map(|status| match status {
+                StatusArg::Open => StatusFilter::Only(InboxStatus::Open),
+                StatusArg::Escalated => StatusFilter::Only(InboxStatus::Escalated),
+                StatusArg::Resolved => StatusFilter::Only(InboxStatus::Resolved),
+                StatusArg::Dismissed => StatusFilter::Only(InboxStatus::Dismissed),
+                StatusArg::All => StatusFilter::All,
+            });
+            inbox::list(&ctx.config, &ctx.state, status, !args.no_refresh)
+        })),
+        Some(InboxCommand::Resolve(resolve)) => respond(context().and_then(|ctx| {
+            let outcome = match resolve.outcome {
+                OutcomeArg::Resolved => ResolutionOutcome::Resolved,
+                OutcomeArg::Escalated => ResolutionOutcome::Escalated,
+                OutcomeArg::Dismissed => ResolutionOutcome::Dismissed,
+            };
+            if resolve.assigned {
+                inbox::resolve_assigned(
+                    &ctx.config,
+                    &ctx.state,
+                    arbiter_pass().as_deref(),
+                    &resolve.key,
+                    outcome,
+                    resolve.note.as_deref(),
+                )
+            } else {
+                inbox::resolve(
+                    &ctx.config,
+                    &ctx.state,
+                    &resolve.key,
+                    outcome,
+                    resolve.note.as_deref(),
+                )
+            }
+        })),
+    }
+}
+
+/// `cardinal act`: exit 3 when it reports a refusal.
+fn act_command(args: ActArgs) -> ExitCode {
+    // Re-observes the worktree through git and gh, as `plan` does.
+    child::prepare();
+    let options = ActOptions {
+        dry_run: args.dry_run,
+        owner_approved: args.owner_approved,
+        squash_merged: args.squash_merged,
+        caller: args.caller,
+    };
+    match context().and_then(|ctx| act::execute(&ctx.config, &ctx.state, &args.plan, &options)) {
+        Ok(result) => {
+            let refused = result.status.is_refusal();
+            print_json(&result);
+            if refused {
+                ExitCode::from(3)
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
+        Err(err) => fail(&err),
     }
 }
 
@@ -348,6 +467,13 @@ fn hook(args: &HookArgs) -> ExitCode {
         let _ = stdout.flush();
     }
     ExitCode::SUCCESS
+}
+
+/// The pass `CARDINAL_ARBITER_PASS` names, if it is set and not empty.
+fn arbiter_pass() -> Option<String> {
+    std::env::var(ARBITER_PASS_VAR)
+        .ok()
+        .filter(|pass| !pass.is_empty())
 }
 
 /// The loaded configuration and opened state directory.
@@ -394,11 +520,15 @@ fn print_json<T: Serialize>(doc: &T) {
 mod tests {
     use clap::{CommandFactory, Parser};
 
-    use super::{Cli, Command, ExplainSubject, InboxCommand, PlanCommand, StatusArg};
+    use super::{
+        ArbiterCommand, Cli, Command, ExplainSubject, InboxCommand, PlanCommand, StatusArg,
+        TriggerArg, validate,
+    };
     use crate::contract::Caller;
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
         Cli::try_parse_from(std::iter::once("cardinal").chain(args.iter().copied()))
+            .and_then(validate)
     }
 
     #[test]
@@ -416,12 +546,18 @@ mod tests {
             (&["hook", "claude", "subagent-stop"], &[]),
             (&["hook", "claude", "session-end"], &[]),
             (&["inventory"], &["repo", "sizes"]),
-            (&["inbox"], &["status", "no-refresh"]),
-            (&["inbox", "resolve"], &["outcome", "note"]),
+            (&["inbox"], &["status", "assigned", "no-refresh"]),
+            (&["inbox", "resolve"], &["outcome", "note", "assigned"]),
             (&["plan"], &["repo"]),
             (&["plan", "reclaim-worktree"], &[]),
             (&["plan", "reclaim-dir"], &[]),
-            (&["act"], &["dry-run", "owner-approved", "caller"]),
+            (
+                &["act"],
+                &["dry-run", "owner-approved", "squash-merged", "caller"],
+            ),
+            (&["reconcile"], &["trigger"]),
+            (&["arbiter", "run"], &[]),
+            (&["ui"], &[]),
             (&["explain", "job"], &[]),
             (&["explain", "plan"], &[]),
             (&["explain", "inbox"], &[]),
@@ -458,9 +594,89 @@ mod tests {
                 "inbox",
                 "plan",
                 "act",
+                "reconcile",
+                "arbiter",
+                "ui",
                 "explain"
             ]
         );
+    }
+
+    #[test]
+    fn owner_approval_only_from_the_owner() {
+        let cli = parse(&["act", "abcd", "--caller", "owner", "--owner-approved"]).unwrap();
+        let Command::Act(args) = cli.command else {
+            panic!()
+        };
+        assert!(args.owner_approved);
+        for caller in [
+            &[][..],
+            &["--caller", "arbiter"],
+            &["--caller", "unit:disk"],
+        ] {
+            let mut args = vec!["act", "abcd", "--owner-approved"];
+            args.extend_from_slice(caller);
+            let err = parse(&args).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{args:?}"
+            );
+            assert_eq!(err.exit_code(), 2, "{args:?}");
+        }
+        let cli = parse(&["act", "abcd", "--squash-merged"]).unwrap();
+        let Command::Act(args) = cli.command else {
+            panic!()
+        };
+        assert!(args.squash_merged && !args.owner_approved);
+    }
+
+    #[test]
+    fn phase_1_command_shapes() {
+        let cli = parse(&["reconcile"]).unwrap();
+        let Command::Reconcile(args) = cli.command else {
+            panic!()
+        };
+        assert_eq!(args.trigger, TriggerArg::Manual);
+        for (text, trigger) in [
+            ("timer", TriggerArg::Timer),
+            ("job-end", TriggerArg::JobEnd),
+            ("manual", TriggerArg::Manual),
+        ] {
+            let cli = parse(&["reconcile", "--trigger", text]).unwrap();
+            let Command::Reconcile(args) = cli.command else {
+                panic!()
+            };
+            assert_eq!(args.trigger, trigger);
+        }
+        assert!(parse(&["reconcile", "--trigger", "job_end"]).is_err());
+        assert!(matches!(
+            parse(&["arbiter", "run"]).unwrap().command,
+            Command::Arbiter(super::ArbiterArgs {
+                command: ArbiterCommand::Run
+            })
+        ));
+        assert!(parse(&["arbiter"]).is_err());
+        assert!(matches!(parse(&["ui"]).unwrap().command, Command::Ui));
+
+        let cli = parse(&["inbox", "--assigned"]).unwrap();
+        let Command::Inbox(args) = cli.command else {
+            panic!()
+        };
+        assert!(args.assigned && args.command.is_none());
+        let cli = parse(&[
+            "inbox",
+            "resolve",
+            "k",
+            "--outcome",
+            "resolved",
+            "--assigned",
+        ])
+        .unwrap();
+        let Command::Inbox(args) = cli.command else {
+            panic!()
+        };
+        assert!(matches!(args.command, Some(InboxCommand::Resolve(ref r)) if r.assigned));
     }
 
     #[test]

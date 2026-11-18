@@ -238,6 +238,7 @@ pub fn arbiter() -> ActOptions {
     ActOptions {
         dry_run: false,
         owner_approved: false,
+        squash_merged: false,
         caller: cardinal::contract::Caller::Arbiter,
     }
 }

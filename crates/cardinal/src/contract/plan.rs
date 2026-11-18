@@ -32,6 +32,10 @@ pub struct PlanTarget {
     pub worktree: String,
     pub head: Option<String>,
     pub branch: Option<String>,
+    /// The worktree's administrative entry (section 8.2). Absent in plans made before it was
+    /// recorded, which read as null.
+    #[serde(default)]
+    pub git_dir: Option<String>,
     pub root_id: Option<RootId>,
     pub root_created_ms: Option<u64>,
 }
@@ -46,6 +50,10 @@ pub struct Plan {
     pub kind: PlanKind,
     pub target: PlanTarget,
     pub allocated_bytes: Option<u64>,
+    /// The part of `allocated_bytes` held by files with links outside the target (section
+    /// 8.5). Absent in plans made before it was recorded, which read as null.
+    #[serde(default)]
+    pub aliased_bytes: Option<u64>,
     pub checks: Vec<Check>,
     pub invariants_ok: bool,
     pub approval: Approval,
@@ -87,8 +95,8 @@ pub struct PlanList {
     pub errors: Vec<ScopedError>,
 }
 
-/// `plans/<plan>/claim`, for the deletion phase: created once by the `act` that executes the
-/// plan. Phase 0 `act` never writes it (`docs/architecture.md` section 9.5).
+/// `plans/<plan>/claim`, reserved for the execution design (`docs/architecture.md` section
+/// 9.7): nothing creates it in phase 1.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanClaim {
     pub pid: u32,

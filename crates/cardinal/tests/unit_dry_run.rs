@@ -14,6 +14,7 @@ fn unit(name: &str) -> ActOptions {
     ActOptions {
         dry_run: false,
         owner_approved: false,
+        squash_merged: false,
         caller: Caller::Unit(name.into()),
     }
 }
