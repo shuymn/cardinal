@@ -1,6 +1,7 @@
 //! Parsers for the git commands of `docs/architecture.md` section 8.2. Every parser refuses
 //! output it does not understand, so the facts built from it become `unknown`.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 /// One entry of `git worktree list --porcelain -z`.
@@ -84,8 +85,11 @@ pub struct Status {
     /// `None` when detached.
     pub branch: Option<String>,
     pub upstream: Option<String>,
-    /// Any entry other than an ignored one.
-    pub dirty: bool,
+    /// Worktree-relative paths of the entries whose only change is a worktree-side
+    /// modification (`1 .M`), which a filtered file shows without its filter (section 8.1).
+    pub modified: Vec<PathBuf>,
+    /// An entry other than an ignored one or a worktree-side modification.
+    pub other_changes: bool,
     /// Worktree-relative paths of ignored entries, without a trailing `/`.
     pub ignored: Vec<PathBuf>,
 }
@@ -123,9 +127,22 @@ pub fn parse_status(bytes: &[u8]) -> Result<Status, String> {
                     _ => {}
                 }
             }
-            b'1' | b'u' | b'?' => status.dirty = true,
+            b'1' => {
+                // `1 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <path>`: the path is the rest.
+                let mut parts = rest.splitn(8, |&b| b == b' ');
+                let xy = parts.next().unwrap_or_default();
+                let path = parts.nth(6).ok_or("changed entry without a path")?;
+                if xy == b".M" {
+                    status.modified.push(path_from_bytes(path)?);
+                } else {
+                    status.other_changes = true;
+                }
+            }
+            b'u' | b'?' => {
+                status.other_changes = true;
+            }
             b'2' => {
-                status.dirty = true;
+                status.other_changes = true;
                 // A rename or copy is followed by its original path as a separate field.
                 fields
                     .next()
@@ -147,6 +164,98 @@ pub fn parse_status(bytes: &[u8]) -> Result<Status, String> {
         return Err("status output has no branch header".into());
     }
     Ok(status)
+}
+
+/// The filter drivers configured for a worktree, from `git config -z --name-only
+/// --get-regexp '^filter\.'`: the subsection of each `filter.<driver>.<key>` name, which may
+/// itself contain dots.
+pub fn parse_filter_drivers(bytes: &[u8]) -> Result<BTreeSet<String>, String> {
+    let mut drivers = BTreeSet::new();
+    for name in bytes.split(|&b| b == 0).filter(|n| !n.is_empty()) {
+        let name = std::str::from_utf8(name)
+            .map_err(|_| "a filter driver's configuration name is not UTF-8")?;
+        let driver = name
+            .strip_prefix("filter.")
+            .and_then(|rest| rest.rsplit_once('.'))
+            .map(|(driver, _key)| driver)
+            .ok_or_else(|| format!("unexpected filter configuration name {name:?}"))?;
+        drivers.insert(driver.to_owned());
+    }
+    Ok(drivers)
+}
+
+/// The paths of `git check-attr -z filter -- <paths>` output whose `filter` attribute may
+/// name one of `drivers`. The output is `<path> NUL filter NUL <value> NUL` per path; the
+/// value is `unspecified`, `unset`, `set`, or the driver's name. A value that names a
+/// configured driver counts, `set` included: check-attr prints `set` both for a bare
+/// attribute and for `filter=set`, so where a driver named `set` exists the two cannot be
+/// told apart, and the path counts as filtered (its `dirty` fails toward `unknown`).
+pub fn parse_filtered(
+    bytes: &[u8],
+    drivers: &BTreeSet<String>,
+) -> Result<BTreeSet<PathBuf>, String> {
+    let fields: Vec<&[u8]> = bytes.split(|&b| b == 0).collect();
+    // The output ends in NUL, so the last field is empty (the only one for no output).
+    let Some(([], fields)) = fields.split_last() else {
+        return Err("check-attr output does not end in NUL".into());
+    };
+    if fields.len() % 3 != 0 {
+        return Err("unexpected check-attr output".into());
+    }
+    let mut filtered = BTreeSet::new();
+    for triple in fields.chunks(3) {
+        let [path, attribute, value] = triple else {
+            return Err("unexpected check-attr output".into());
+        };
+        if *attribute != b"filter" {
+            return Err("check-attr reported another attribute than filter".into());
+        }
+        let value = String::from_utf8_lossy(value);
+        if drivers.contains(&*value) {
+            filtered.insert(path_from_bytes(path)?);
+        }
+    }
+    Ok(filtered)
+}
+
+/// The `(major, minor, patch)` version of `git --version` output such as
+/// `git version 2.54.0`, `git version 2.39.5 (Apple Git-154)`, or
+/// `git version 2.45.1.windows.1`. A patch level without leading digits, or none, reads as
+/// 0, the lowest.
+pub fn parse_version(bytes: &[u8]) -> Option<(u32, u32, u32)> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let version = text.trim().strip_prefix("git version ")?;
+    let mut numbers = version.split(['.', ' ']);
+    let major = numbers.next()?.parse().ok()?;
+    let minor = numbers.next()?.parse().ok()?;
+    let patch = numbers.next().map_or(0, |patch| {
+        let digits = patch.bytes().take_while(u8::is_ascii_digit).count();
+        patch[..digits].parse().unwrap_or(0)
+    });
+    Some((major, minor, patch))
+}
+
+/// Whether `git config -z --get-regexp
+/// '^(extensions\.partialclone|remote\..*\.(promisor|partialclonefilter))$'` output
+/// describes a promisor repository: `extensions.partialClone` or a
+/// `remote.<name>.partialCloneFilter` present (git registers a promisor remote from the
+/// filter even where `promisor` is false), or a `remote.<name>.promisor` that is not false.
+/// A value git would not read as a boolean counts as a promisor, so an unexpected
+/// configuration fails closed.
+pub fn parse_promisor(bytes: &[u8]) -> bool {
+    bytes
+        .split(|&b| b == 0)
+        .filter(|entry| !entry.is_empty())
+        .any(|entry| {
+            let text = String::from_utf8_lossy(entry);
+            let (key, value) = match text.split_once('\n') {
+                Some((key, value)) => (key.to_owned(), Some(value.to_ascii_lowercase())),
+                // A key without a value is a true boolean.
+                None => (text.into_owned(), None),
+            };
+            !key.ends_with(".promisor")
+                || !matches!(value.as_deref(), Some("false" | "no" | "off" | "0" | ""))
+        })
 }
 
 /// Splits one `git ls-files -z --stage` entry into `"<mode> <object> <stage>"` and its
@@ -262,7 +371,7 @@ mod tests {
         assert_eq!(status.head.as_deref(), Some(A));
         assert_eq!(status.branch.as_deref(), Some("feat"));
         assert_eq!(status.upstream.as_deref(), Some("origin/feat"));
-        assert!(!status.dirty);
+        assert!(!status.other_changes && status.modified.is_empty());
         assert_eq!(
             status.ignored,
             [PathBuf::from("target"), PathBuf::from(".DS_Store")]
@@ -273,7 +382,7 @@ mod tests {
              2 R. N... 100644 100644 100644 {A} {A} R100 new\0old\0"
         );
         let status = parse_status(dirty.as_bytes()).unwrap();
-        assert!(status.dirty);
+        assert!(status.other_changes);
         assert_eq!(status.branch, None);
         assert_eq!(status.upstream, None);
         assert!(
@@ -282,13 +391,105 @@ mod tests {
         );
 
         let untracked = format!("# branch.oid {A}\0# branch.head main\0? new.txt\0");
-        assert!(parse_status(untracked.as_bytes()).unwrap().dirty);
+        assert!(parse_status(untracked.as_bytes()).unwrap().other_changes);
 
         let initial = "# branch.oid (initial)\0# branch.head main\0";
         assert_eq!(parse_status(initial.as_bytes()).unwrap().head, None);
 
         assert!(parse_status(b"").is_err(), "no branch header");
         assert!(parse_status(b"# branch.oid x\0garbage\0").is_err());
+    }
+
+    #[test]
+    fn worktree_modifications_are_kept_apart() {
+        let text = format!(
+            "# branch.oid {A}\0# branch.head main\0\
+             1 .M N... 100644 100644 100644 {A} {A} assets/big file.bin\0\
+             1 .M N... 100644 100644 100644 {A} {A} b.bin\0"
+        );
+        let status = parse_status(text.as_bytes()).unwrap();
+        assert!(!status.other_changes);
+        assert_eq!(
+            status.modified,
+            [PathBuf::from("assets/big file.bin"), PathBuf::from("b.bin")]
+        );
+        for other in [
+            format!("1 M. N... 100644 100644 100644 {A} {A} staged.txt"),
+            format!("1 MM N... 100644 100644 100644 {A} {A} both.txt"),
+            format!("1 .D N... 100644 100644 000000 {A} {A} gone.txt"),
+            "? new.txt".to_owned(),
+        ] {
+            let text = format!("# branch.oid {A}\0# branch.head main\0{other}\0");
+            let status = parse_status(text.as_bytes()).unwrap();
+            assert!(status.other_changes, "{other}");
+            assert!(status.modified.is_empty(), "{other}");
+        }
+    }
+
+    #[test]
+    fn filter_drivers_and_filtered_paths() {
+        use super::{parse_filter_drivers, parse_filtered};
+        let drivers = parse_filter_drivers(
+            b"filter.lfs.clean\0filter.lfs.smudge\0filter.lfs.required\0filter.a.b.process\0",
+        )
+        .unwrap();
+        assert_eq!(
+            drivers.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["a.b", "lfs"]
+        );
+        assert!(parse_filter_drivers(b"").unwrap().is_empty());
+        assert!(parse_filter_drivers(b"filter.lfs\0").is_err());
+
+        let out = b"big.bin\0filter\0lfs\0plain.txt\0filter\0unspecified\0\
+                    odd.bin\0filter\0none\0set.bin\0filter\0set\0";
+        let filtered = parse_filtered(out, &drivers).unwrap();
+        assert_eq!(
+            filtered.into_iter().collect::<Vec<_>>(),
+            [PathBuf::from("big.bin")]
+        );
+        assert!(parse_filtered(b"", &drivers).unwrap().is_empty());
+        assert!(parse_filtered(b"a\0filter\0", &drivers).is_err());
+
+        // `set` is a bare attribute or a driver named `set`: with such a driver, it counts.
+        let set = std::collections::BTreeSet::from(["set".to_owned()]);
+        assert_eq!(
+            parse_filtered(b"a.bin\0filter\0set\0b.bin\0filter\0unset\0", &set)
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            [PathBuf::from("a.bin")]
+        );
+        assert!(parse_filtered(b"a\0diff\0lfs\0", &drivers).is_err());
+    }
+
+    #[test]
+    fn versions_and_promisors() {
+        use super::{parse_promisor, parse_version};
+        assert_eq!(parse_version(b"git version 2.54.0\n"), Some((2, 54, 0)));
+        assert_eq!(
+            parse_version(b"git version 2.39.5 (Apple Git-154)\n"),
+            Some((2, 39, 5))
+        );
+        assert_eq!(
+            parse_version(b"git version 2.45.1.windows.1\n"),
+            Some((2, 45, 1))
+        );
+        assert_eq!(parse_version(b"git version 2.45\n"), Some((2, 45, 0)));
+        assert_eq!(parse_version(b"git version 2.45.0-rc1\n"), Some((2, 45, 0)));
+        assert_eq!(parse_version(b"hub version 2.14\n"), None);
+
+        assert!(!parse_promisor(b""));
+        assert!(parse_promisor(b"extensions.partialclone\norigin\0"));
+        assert!(parse_promisor(b"remote.origin.promisor\ntrue\0"));
+        assert!(parse_promisor(b"remote.origin.promisor\0"));
+        assert!(parse_promisor(b"remote.origin.promisor\nmaybe\0"));
+        assert!(!parse_promisor(
+            b"remote.origin.promisor\nfalse\0remote.b.promisor\nOff\0"
+        ));
+        assert!(parse_promisor(
+            b"remote.origin.promisor\nfalse\0remote.origin.partialclonefilter\ntree:0\0"
+        ));
+        assert!(parse_promisor(b"extensions.partialclone\n\0"));
     }
 
     #[test]
