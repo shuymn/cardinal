@@ -1,9 +1,9 @@
 //! Module layering (`docs/architecture.md` section 2.2). Every module of `src/` may reference
 //! only the modules the table allows, transitively: a module may use whatever the modules it
 //! may use may use. On top of the table, `testpoint` (a leaf with no dependencies) is open to
-//! every module above the foundation, because its pause points sit in `run`, `act`, and the
-//! hook. Platform crates stay where the table puts them, and `admission` uses neither
-//! `std::net` nor `std::process`.
+//! every module above the foundation, because its pause points sit in `run`, `act`,
+//! `reconcile`, and the hook. Platform crates stay where the table puts them, and `admission`
+//! uses neither `std::net` nor `std::process`.
 //!
 //! The scanner reads `crate::…` and `super::…` paths (including grouped `use` trees) from the
 //! source with comments and string literals removed. A glob import of the crate root and an
@@ -24,7 +24,7 @@ const TABLE: &[(&str, &[&str])] = &[
     ("record", &["state", "contract"]),
     ("testpoint", &[]),
     ("os", &[]),
-    ("sensor", &["contract"]),
+    ("sensor", &["os", "contract"]),
     ("exec", &["os", "contract"]),
     (
         "admission",
@@ -62,6 +62,7 @@ const TABLE: &[(&str, &[&str])] = &[
             "plan",
             "observe",
             "admission",
+            "inbox",
             "state",
             "record",
             "contract",
@@ -72,6 +73,24 @@ const TABLE: &[(&str, &[&str])] = &[
         "inbox",
         &["admission", "observe", "state", "record", "contract"],
     ),
+    (
+        "reconcile",
+        &[
+            "act",
+            "plan",
+            "inbox",
+            "observe",
+            "sensor",
+            "snapshot",
+            "admission",
+            "record",
+            "state",
+            "config",
+            "os",
+            "contract",
+        ],
+    ),
+    ("snapshot", &["inbox", "record", "state", "contract"]),
     (
         "explain",
         &[
@@ -90,7 +109,8 @@ const TABLE: &[(&str, &[&str])] = &[
 /// `contract`, `state`, `config`, `testpoint`, and `os` import nothing above them.
 const FOUNDATION: &[&str] = &["contract", "state", "config", "testpoint", "os"];
 
-/// The admission path: it never reaches observation, the inbox, plans, or `act` (C17, C18).
+/// The admission path: it never reaches observation, the inbox, plans, `act`, `reconcile`, or
+/// the web UI's snapshot (C17, C18).
 const ADMISSION_PATH: &[&str] = &["admission", "run", "exec"];
 
 /// External crates that only some modules may use.
@@ -100,6 +120,7 @@ const PLATFORM_CRATES: &[(&str, &[&str])] = &[
     ("rustix", &["os", "act"]),
     ("windows_sys", &["os"]),
     ("libc", &["os"]),
+    ("objc2_core_foundation", &["os"]),
 ];
 
 /// Parts of `std` a module may not use: admission neither talks to the network nor starts
@@ -567,7 +588,7 @@ fn sources_follow_the_layering() {
 #[test]
 fn admission_has_no_observe_dependency() {
     for module in ADMISSION_PATH {
-        for banned in ["observe", "plan", "act"] {
+        for banned in ["observe", "plan", "act", "reconcile", "snapshot"] {
             assert!(
                 !allowed()[module].contains(banned),
                 "the table lets {module} use {banned}"

@@ -1,10 +1,10 @@
-# cardinal phase 0 architecture
+# cardinal architecture
 
-This document fixes the contracts that the phase 0 pieces build against: the crate and module layout, configuration, the state directory, the runner, the Claude Code hook, classification, observation, `plan` and `act`, the CLI and its JSON, libraries, tests, and the work split. [design.md](design.md) is the source for principles, non-goals, invariants, purpose-layer conditions G1–G14, and plan-layer claims C1–C21; this document refers to its sections as "design §N" and does not restate them. Where the design turned out to be wrong or incomplete, [section 17](#17-issues-with-the-design) says so and gives the resolution used here.
+This document fixes the contracts that phases 0 and 1 build against: the crate and module layout, configuration, the state directory, the runner, the Claude Code hook, classification, observation, `plan` and `act`, the inbox, `cardinal reconcile` with disk thresholds and the arbiter's start, the read-only web UI, the CLI and its JSON, libraries, tests, and the work split. [design.md](design.md) is the source for principles, non-goals, invariants, purpose-layer conditions G1–G14, and plan-layer claims C1–C21; this document refers to its sections as "design §N" and does not restate them. Where the design turned out to be wrong or incomplete, [section 17](#17-issues-with-the-design) says so and gives the resolution used here.
 
 ## Contents
 
-1. [Phase 0 scope](#1-phase-0-scope)
+1. [Scope](#1-scope)
 2. [Crate and module layout](#2-crate-and-module-layout)
 3. [Configuration](#3-configuration)
 4. [State directory](#4-state-directory)
@@ -13,35 +13,44 @@ This document fixes the contracts that the phase 0 pieces build against: the cra
 7. [Classification](#7-classification)
 8. [Observation](#8-observation)
 9. [plan, act, and invariants](#9-plan-act-and-invariants)
-10. [Inbox and explain](#10-inbox-and-explain)
+10. [Inbox, reconcile, and explain](#10-inbox-reconcile-and-explain)
 11. [CLI and JSON contracts](#11-cli-and-json-contracts)
 12. [Libraries](#12-libraries)
 13. [Test strategy](#13-test-strategy)
 14. [Work split](#14-work-split)
-15. [Purpose layer for phase 0](#15-purpose-layer-for-phase-0)
-16. [Plan layer for phase 0](#16-plan-layer-for-phase-0)
+15. [Purpose layer](#15-purpose-layer)
+16. [Plan layer](#16-plan-layer)
 17. [Issues with the design](#17-issues-with-the-design)
 
-## 1. Phase 0 scope
+## 1. Scope
 
-Phase 0 builds the core (hook adapter, runner, admission and reservations, observation, records, `plan`/`act`/invariants, the inbox, the CLI for the arbiter), the Claude Code adapter, and the first arbiter skill. It is accepted by G4, G5, G10, and G14 (design §12) on macOS and Linux; on Windows the hook does not rewrite (section 5.5).
+Phase 0 built the core (hook adapter, runner, admission and reservations, observation, records, `plan`/`act`/invariants, the inbox, the CLI for the arbiter), the Claude Code adapter, and the first arbiter skill, accepted by G4, G5, G10, and G14 (design §12) on macOS and Linux; on Windows the hook does not rewrite (section 5.5).
 
-**Phase 0 admission decides with exactly this:** the resources of every reservation that is live or recovery-needed, plus the new job's resources, compared per resource against the budgets in `host.toml`; a job gets all of its resources or none. There are no sensors, no priority classes, no queue order, and no measured weights. Resource amounts come from the matching classification rule. This is the design's "sensor read failed, decide from reservations alone" case (design §7), made permanent until phase 2.
+Phase 1's first release is report-only, and this document describes it: where it says phase 1 executes nothing, it means this release. Executing regenerable directories comes later in phase 1 from a design of its own (#33, to the requirements of section 9.7), and executing whole worktrees stays deferred (section 14.5). The first release adds detection and reporting, accepted by G8 and the report parts of G2, G3, G6, and G7 (section 15):
 
-Phase 0 leaves seams for phase 2 and later but implements none of them:
+- **Reports, no execution** (section 9.3): `plan`, `inventory`, `reconcile`, and the arbiter identify reclaimable worktrees and regenerable directories and raise inbox items; `act` evaluates every plan and executes none (`execution_not_designed`).
+- **`cardinal reconcile`** (section 10.3), started by an OS timer and at job ends: the inbox refresh, inbox items raised from observation (section 10.1), disk states and the built-in `disk-reclaim` reconciler's report (section 10.4), starting the arbiter (section 10.5), and the read-only web UI page (section 10.6).
+- **The arbiter skill v2** (section 14.3) with squash-merge judgments and reports of what would be reclaimed.
 
-| Seam | Phase 0 shape | Filled by |
+Phase 1 first runs on macOS against real worktrees (section 14.4); the counts of that run are what the execution design starts from. Linux builds and tests everything; the real-data run is macOS only.
+
+**Admission decides with exactly this:** the resources of every reservation that is live or recovery-needed, plus the new job's resources, compared per resource against the budgets in `host.toml`; a job gets all of its resources or none. There are no sensors in admission, no priority classes, no queue order, and no measured weights. Resource amounts come from the matching classification rule. This is the design's "sensor read failed, decide from reservations alone" case (design §7), kept until phase 2.
+
+Seams left for later phases:
+
+| Seam | Shape | Filled by |
 | --- | --- | --- |
-| Sensors | `sensor::Sensors` trait; the only implementation returns `Unavailable` | Phase 2 (memory), phase 1 (disk) |
+| Sensors in admission | `sensor::Sensors`; phase 1 implements disk free space for `reconcile` and the runner's job-end check (section 10.4); memory and admission's use of sensors stay `Unavailable` | Phase 2 |
 | Priority classes | `Priority` enum with one variant, `Normal`; stored in reservations | Phase 2 |
 | Accepted jobs, `wait`, `cancel`, `logs` | Command names and `jobs/` path reserved; lock handoff fixed in [section 5.7](#57-executor-contract-phase-2-seam); not registered in the CLI | Phase 2 |
 | Queue tickets | `tickets/` path reserved | Phase 2 |
 | Job spec, placement, executor | `exec::Invocation` (local form), `exec::Placement::Local`, and the `Executor` contract of section 5.7 | Phase 2 |
-| Measurements | Records carry `measurements: [{kind, …}]`; phase 0 writes only `wall_time` | Phase 2 (C21) |
+| Measurements | Records carry `measurements: [{kind, …}]`; only `wall_time` is written | Phase 2 (C21) |
 | Parallelism injection | Not implemented; classification rules reject an `env` key | Phase 2 |
-| Classifier and reconciler units | Built-in classifier implements the unit-shaped `Classifier` trait; JSON schemas fixed in [section 7.6](#76-classifier-unit-seam); `act` already honors per-unit `act = false` ([section 9.6](#96-dry-run-and-unit-gating)) | Phase 1+ |
-| Disk reserve file | Path reserved ([section 4.12](#412-disk-reserve-file)) | Phase 1 (C11) |
-| OS timer, reconcile runner, starting the arbiter | None; `cardinal inbox` runs the recovery pass (section 10.1) | Phase 1 |
+| Classifier and reconciler units | The built-in classifier and the built-in `disk-reclaim` reconciler are unit-shaped; the classifier JSON is fixed in [section 7.6](#76-classifier-unit-seam); `act` honors per-unit `act = false` ([section 9.6](#96-dry-run-and-gating)); external units are not run | Later |
+| Disk admission (heavy jobs wait below the critical line, growth reserved before a job) | None; below the critical line the owner is told through the inbox (section 10.4) | Phase 2 |
+| Pushing to the Cloudflare control plane | The snapshot document of section 10.6; nothing is sent | Owner decision (section 10.6) |
+| Executing reclamation | `act` reports `execution_not_designed`; `plans/<plan>/claim`, `result.json`, and `<state>/reserve` stay reserved | Regenerable directories later in phase 1 (#33), to the requirements of section 9.7; whole worktrees deferred |
 
 ## 2. Crate and module layout
 
@@ -60,20 +69,22 @@ Everything lives in the single crate `crates/cardinal` (library plus the `cardin
 | --- | --- | --- |
 | `contract` | serde types for every JSON document in [section 11](#11-cli-and-json-contracts) and the record, reservation, and run-spec files | std, serde |
 | `config` | `host.toml` and `repos/*.toml`: locations, parsing, defaults | `contract` |
-| `state` | State paths, atomic writes, lock helpers with deadlines, IDs and keys, JSONL append and read | `contract` |
+| `state` | State paths, atomic and durable writes, lock helpers with deadlines, IDs and keys, JSONL append and read | `contract` |
 | `record` | Record appending, rotation, reading | `state`, `contract` |
 | `testpoint` | Pause points and failure injection for tests ([section 13.1](#131-deterministic-concurrency)) | std |
-| `os` | Platform backends behind one API: process table, start times, parent PID, process working directories, boot time; process-group setup and signals (Unix); `os::child`, which runs a short-lived child in an environment the caller constructs, under an absolute deadline and an output cap, and kills the child's process group (Unix) or Job Object (Windows) at the end of every run; on Unix it waits, signals groups, and takes over SIGCHLD and the termination signals through `os::unix`, process-wide state that cardinal, a command line program, owns ([section 8.1](#81-child-processes-for-git-and-gh)) | std, rustix, signal-hook, libc, sysinfo, windows-sys |
-| `sensor` | Phase 2 seam: `Sensors` trait, `Unavailable` implementation | `contract` |
+| `os` | Platform backends behind one API: process table, start times, parent PID, process working directories, boot time; process-group setup and signals (Unix); `os::child`, which runs a short-lived child in an environment the caller constructs, under an absolute deadline and an output cap, and kills the child's process group (Unix) or Job Object (Windows) at the end of every run; on Unix it waits, signals groups, and takes over SIGCHLD and the termination signals through `os::unix`, process-wide state that cardinal, a command line program, owns ([section 8.1](#81-child-processes-for-git-and-gh)); `os::disk`, the free space of the volume holding a path (section 10.4); `os::spawn_detached`, which starts a cardinal process in a new session with null standard streams and does not wait for it | std, rustix, signal-hook, libc, sysinfo, windows-sys, objc2-core-foundation |
+| `sensor` | `Sensors` trait; the host implementation reads disk free space by path through `os::disk` (section 10.4); memory stays `Unavailable` | `os`, `contract` |
 | `exec` | `Invocation` (argv; cwd and env by inheritance), `Placement::Local`, `Executor` trait, local executor | `os`, `contract` |
 | `admission` | Budget math (pure), reservation store, liveness and the recovery pass, worktree in-use query | `state`, `config`, `os`, `sensor`, `record`, `contract` |
-| `run` | The runner: start boundary, fail-open, wait loop, child supervision, release | `admission`, `exec`, `record`, `state`, `config`, `os`, `testpoint` |
+| `run` | The runner: start boundary, fail-open, wait loop, child supervision, release, the job-end disk check that starts `cardinal reconcile` as a separate process (section 5.2) | `admission`, `exec`, `record`, `state`, `config`, `os`, `testpoint` |
 | `classify` | Shell tokenizer, stage finder, normalizer, rule matcher, stage rewriting (section 6.4), `Classifier` trait, built-in classifier | `config`, `contract` |
 | `adapter::claude` | Hook input and output, session-end snapshot | `classify`, `config`, `record`, `state`, `os` |
-| `observe` | git and gh invocation with constructed environments and deadlines, repository and worktree facts, merge evidence, ignored-data classification, disk usage, outlived processes | `config`, `state`, `admission` (read-only queries), `os`, `contract` |
-| `plan` | Plan generation, identity binding | `observe`, `admission`, `state`, `record`, `contract` |
-| `act` | Plan evaluation: snapshot inspection, identity recheck, checks; report-only in phase 0 | `plan`, `observe`, `admission`, `state`, `record`, `contract`, `testpoint`, rustix |
-| `inbox` | Inbox store, dedup, refresh (recovery pass and built-in raisers) | `admission`, `observe`, `state`, `record`, `contract` |
+| `observe` | git and gh invocation with constructed environments and deadlines, repository and worktree facts, merge evidence and content in the base, closed pull requests, ignored-data classification, disk usage, outlived processes | `config`, `state`, `admission` (read-only queries), `os`, `contract` |
+| `plan` | Plan generation, identity binding, the checks | `observe`, `admission`, `state`, `record`, `contract` |
+| `act` | Plan evaluation and its report (sections 9.5 and 9.6); it executes nothing in phase 1 | `plan`, `observe`, `admission`, `inbox`, `state`, `record`, `contract`, `testpoint`, rustix |
+| `inbox` | Inbox store, dedup, refresh (recovery pass and outlived processes) | `admission`, `observe`, `state`, `record`, `contract` |
+| `reconcile` | `cardinal reconcile` and `cardinal arbiter run`: the pass order, disk states, the `disk-reclaim` reconciler, inbox items raised from observation, the arbiter's trigger and launcher (sections 10.3–10.5) | `act`, `plan`, `inbox`, `observe`, `sensor`, `snapshot`, `admission`, `record`, `state`, `config`, `os`, `contract` |
+| `snapshot` | `cardinal.snapshot.v1` and the static page of the read-only web UI (section 10.6) | `inbox`, `record`, `state`, `contract` |
 | `explain` | Explanation documents | `adapter::claude` (the hook's repository, origin, and timeout lookups for `explain command`), `classify`, `record`, `plan`, `inbox`, `admission` (the reservation snapshot of `explain job`), `state`, `contract` |
 | `cli` | clap definitions and thin handlers that print JSON | everything |
 
@@ -88,14 +99,21 @@ flowchart TD
   cli --> inbox
   cli --> explain
   cli --> observe
+  cli --> reconcile
+  reconcile --> act
+  reconcile --> snapshot
+  reconcile --> sensor
   explain --> adapter_claude
   adapter_claude --> classify
   run --> admission
   run --> exec
   act --> plan
+  act --> inbox
   plan --> observe
   inbox --> observe
   observe --> admission
+  admission --> sensor
+  sensor --> os
   admission --> os
   exec --> os
   admission --> state
@@ -106,7 +124,7 @@ flowchart TD
 
 Two rules matter most and are part of the layering test:
 
-- `admission`, `run`, and `exec` never import `observe`, `inbox`, `plan`, or `act`, and `admission` uses neither `std::net` nor `std::process`. gh lives only in `observe`, and nothing on the admission path raises inbox items (C17, C18). Section 13.5 checks the same at run time.
+- `admission`, `run`, and `exec` never import `observe`, `inbox`, `plan`, `act`, `reconcile`, or `snapshot`, and `admission` uses neither `std::net` nor `std::process`. gh lives only in `observe`, nothing on the admission path raises inbox items, and the runner starts `cardinal reconcile` only as a separate process after the stage's status is known (C17, C18). Section 13.5 checks the same at run time.
 - `contract`, `state`, `config`, `testpoint`, and `os` import nothing above them, so every work unit can depend on them from day one.
 
 ## 3. Configuration
@@ -161,11 +179,28 @@ managed = [{ app = "t3code", root = "/path/to/t3code/worktrees" }]  # report-onl
 max_bytes = 8388608
 keep = 4
 
-# [unit.<name>] tables (design §5) are parsed from phase 1. In phase 0 the only
-# honored key is `act` for callers that identify as a unit (section 9.6).
+[disk]                   # lines for every watched volume, in MiB of free space (section 10.4)
+warning_mib = 20480      # below: under pressure, reported (C10)
+recovery_mib = 30720     # pressure ends above this
+critical_mib = 5120      # below: critical
+volumes = [{ mount = "/Volumes/Scratch", warning_mib = 600, recovery_mib = 900, critical_mib = 200 }]  # per-mount lines
+
+[arbiter]
+command = ["claude", "-p", "…", "--allowedTools", "…"]  # default: the launch of integrations/claude-code/README.md
+timeout_s = 1200         # the launcher stops the session after this
+min_interval_s = 1800    # between passes (section 10.5)
+retry_s = 7200           # an item is due again this long after its pass ended
+
+[reconcile]
+observe_every_s = 3600   # full observation (git, gh) at most this often; the rest runs every pass
+
+[unit.disk-reclaim]      # [unit.<name>] tables honor only `act` (section 9.6)
+act = false              # an explicit act as this unit records planned while false (C16); the pass's disk report records planned either way
 ```
 
 `[hook] runner` must be absolute and consist only of `A–Z a–z 0–9 / . _ + -`; otherwise the hook does not rewrite and records `config_error`. The path is the only configuration value that appears in shell text, and this rule means it never needs quoting.
+
+`[disk]` lines must satisfy `critical < warning < recovery`, globally and per volume; `volumes` entries match the mount point a path resolves to (section 10.4). `[arbiter] command` is an argv, never a shell string; launchd and systemd start it with the timer's environment, so its first word should be absolute or found on the timer's `PATH` (section 10.3).
 
 ### 3.3 `repos/*.toml` profiles
 
@@ -195,7 +230,7 @@ protected = ["fuzz/corpus", "fuzz/artifacts", "proptest-regressions"]
 
 - **Repository identity** is the canonical git common dir. A profile matches when one of `match.paths` has that common dir, or when `git remote get-url origin` normalizes to one of `match.remotes`. Path matching needs no child process and is tried first; remote matching runs git (section 8.1) and only when a rule could match a stage at all. In the hook, a git still running at the hook's deadline means no rewrite, and a git that fails, or prints anything but one URL, leaves the profiles that match without the remote.
 - **Precedence:** matching profiles in file-name order, then generic profiles in file-name order. The first rule whose pattern matches wins. `[data]` lists and `[classify] skip` are the union of the matching and generic profiles. `[git] base` and `[classify] wrappers` come from the first profile that sets them.
-- **Data patterns:** an entry without `/` matches a file or directory with that name at any depth. A `regenerable` entry with `/` matches that worktree-relative path; a `protected` entry with `/` matches that sequence of names at any depth (`fuzz/corpus` protects `target/a/b/fuzz/corpus`), so protection never depends on where a tool put its data. Observation, `plan`, and `act` all match through `config::data_pattern_covers`. No globs in phase 0.
+- **Data patterns:** an entry without `/` matches a file or directory with that name at any depth. A `regenerable` entry with `/` matches that worktree-relative path; a `protected` entry with `/` matches that sequence of names at any depth (`fuzz/corpus` protects `target/a/b/fuzz/corpus`), so protection never depends on where a tool put its data. Observation, `plan`, and `act` all match through `config::data_pattern_covers`. No globs.
 - **No tool knowledge in code.** The core ships no default rules, wrappers, or data patterns (design §4). The repository ships `examples/config/` with a starting `host.toml` and a generic profile; the owner copies what they want.
 
 ## 4. State directory
@@ -209,18 +244,27 @@ protected = ["fuzz/corpus", "fuzz/artifacts", "proptest-regressions"]
   admission.lock              # empty; exclusive lock = the admission critical section
   live/<job>.lock             # empty; held exclusively by the owning runner for its lifetime
   reservations/<job>.json     # one per reserved job
-  worktrees/<key>.lock        # empty; in-use lock (shared = in use; act only probes it)
+  worktrees/<key>.lock        # empty; in-use lock, held shared by jobs
   sessions/<session>.json     # SessionEnd snapshots awaiting the outlived-process sweep
   inbox/.lock                 # empty; serializes inbox upserts
   inbox/<key-hash>.json       # one per inbox item
   plans/<plan>/plan.json      # immutable after creation
+  plans/<plan>/claim, result.json  # reserved for the execution design (section 9.7); not created
+  reconcile.lock              # empty; one reconcile pass at a time
+  reconcile/state.json        # pass times; the arbiter trigger's last snapshot
+  reconcile/observation.json  # the last full observation (cardinal.inventory.v1)
+  disk/<volume>.json          # disk state of one watched volume (section 10.4)
+  arbiter/.lock               # empty; held by the arbiter launcher (section 10.5)
+  arbiter/last.json           # the last arbiter pass
+  arbiter/<pass>.log          # an arbiter pass's output, capped
+  ui/index.html, ui/snapshot.json  # the read-only web UI (section 10.6)
   records/records.jsonl       # current record file
   records/records.<n>.jsonl   # rotated files, n = 1..keep-1
   records/.lock               # empty; appenders shared, rotation exclusive
   tmp/                        # temporary files for atomic writes (same file system)
   jobs/                       # reserved for phase 2 accepted jobs
   tickets/                    # reserved for phase 2 queue tickets
-  reserve                     # reserved for the phase 1 disk reserve file
+  reserve                     # reserved for the execution design; not created
 ```
 
 | File | Format | Written by | Read by |
@@ -228,14 +272,17 @@ protected = ["fuzz/corpus", "fuzz/artifacts", "proptest-regressions"]
 | `VERSION`, `host-id` | text | first cardinal process that finds them missing: a fully written temp file is hard-linked into place, which fails if another process won, and the loser reads the winner's file | all |
 | `reservations/<job>.json` | `cardinal.reservation.v1` | owning runner; the recovery pass deletes others' reservations; both only under the admission lock (section 4.3) | admission, observe, inbox, plan, act, explain, all under the admission lock |
 | `sessions/<session>.json` | `cardinal.session-snapshot.v1` | `hook claude session-end` | inbox refresh |
-| `inbox/<key-hash>.json` | `cardinal.inbox-item.v1` | inbox raise, refresh, resolve | `inbox`, `explain` |
+| `inbox/<key-hash>.json` | `cardinal.inbox-item.v1` | inbox raise, refresh, resolve, and the arbiter launcher's assignments and outcomes, all under `inbox/.lock` | `inbox`, `explain`, the arbiter trigger (under `inbox/.lock`) |
 | `plans/<plan>/plan.json` | `cardinal.plan.v1` | `plan` | `act`, `explain` |
-| `records/*.jsonl` | one `cardinal.record.v1` object per line | every command | `explain`, `inventory` |
+| `disk/<volume>.json` | `cardinal.disk-state.v1` | `reconcile`, under `reconcile.lock` | `reconcile`, `inventory`, the UI |
+| `reconcile/*.json` | `cardinal.reconcile-state.v1`, `cardinal.inventory.v1` | `reconcile`, under `reconcile.lock` | `reconcile`, the runner's job-end check (file time only), the UI |
+| `arbiter/last.json` | `cardinal.arbiter-pass.v1` | the launcher, under `arbiter/.lock`; a trigger that finds a pass abandoned takes that lock to record it | the arbiter trigger, `inventory`, the UI |
+| `records/*.jsonl` | one `cardinal.record.v1` object per line | every command | `explain`, `inventory`, the UI |
 
 ### 4.2 Write discipline
 
 - **Atomic replace:** write to `tmp/<name>.<pid>.<n>`, flush, rename over the target. Readers see the old or the new file, never a mix. Leftover temp files older than one hour are removed by `plan` and `inbox` runs.
-- **fsync policy:** reservations, live locks, and records are not fsynced; they are meaningless after a power loss (reservations from an earlier boot are released, section 4.5). Inbox items are fsynced (file, then parent directory on Unix), because losing one could bring back a resolved item; plan claims and act results, which the deletion phase brings (section 9.5), will be too, because losing one could run a plan twice. On Windows, `FlushFileBuffers` on the file only.
+- **fsync policy:** reservations, live locks, and records are not fsynced; they are meaningless after a power loss (reservations from an earlier boot are released, section 4.5). Inbox items are fsynced (file, then parent directory on Unix), because losing one could bring back a resolved item or lose a pass's assignment (section 10.5). Plans are written without fsync; one lost to a power loss makes `act` report `not_found`, and the arbiter plans again. Disk states, reconcile state, and arbiter pass records are not fsynced: after a power loss they are measured or decided again. On macOS a durable write uses `F_FULLFSYNC` (std's `File::sync_all`), because `fsync` there leaves the drive's cache unflushed. On Windows, `FlushFileBuffers` on the file only.
 - **Exclusive creation for uniqueness:** a job ID is claimed by creating `live/<job>.lock` with `create_new`, a plan ID by creating `plans/<plan>/` with `create_dir`; a collision retries with a new ID.
 - **IDs:** 16 lowercase hex characters from a randomly keyed SipHash (`std::hash::RandomState`) of time, PID, and a counter. No RNG crate. The CLI accepts any unique prefix of at least 4 characters.
 - **Keys:** worktree keys and inbox key hashes are FNV-1a 64 of the canonical path or key, as 16 hex characters (hand-written, stable across Rust releases unlike `DefaultHasher`). A worktree-key collision only makes two worktrees share an in-use lock (more conservative); inbox files store the full key and probe `-1`, `-2`, … on collision.
@@ -248,9 +295,9 @@ Locks use `std::fs::File::{lock, lock_shared, try_lock, try_lock_shared}` (stabl
 - Lock files are always empty and separate from data files, because Windows locks are mandatory: a locked byte range cannot be read by other processes.
 - std opens files close-on-exec and non-inheritable, so a child never inherits the runner's locks. A surviving child therefore cannot keep a dead runner looking alive.
 - Waiting with a deadline is a `try_lock` loop with backoff (5 ms doubling to 50 ms). Every acquisition has a deadline; there is no unbounded `lock()`.
-- Lock order is always: worktree in-use lock, then admission lock, then inbox or records lock. Nothing takes them in another order.
+- Lock order is always: `reconcile.lock`, then the worktree in-use lock, then the admission lock, then the inbox or records lock. Nothing takes them in another order. `arbiter/.lock` comes after `reconcile.lock` and before the inbox lock: it is held by the arbiter launcher, whose session takes the others in this order through the commands it runs, and briefly by a trigger that records an abandoned pass (section 10.5); it is never inherited.
 - **Reservations and live lock files change only under `admission.lock`, and `reservations/` is listed only under it.** A directory listing that runs while another process renames or unlinks an entry of that directory may omit entries, unchanged ones included, so a pass that listed `reservations/` while a runner replaced its reservation could count too few and admit over budget (C2). Under the lock: the admission and recovery passes (section 4.4), each write of `starting` and `running` and each release (section 4.5), the deletion of the live lock file of a runner that never got a reservation, and the readers `inventory`, `plan`, `act`, and `explain job`. A reader holds the lock only to read every reservation file and releases it before it evaluates them: liveness probes, the process table, git, records, and the inbox stay outside. Every one of these waits at most `lock_timeout_ms`. A reader that times out reports the reservations as unreadable, never as none: `inventory` adds an error with scope `reservations`, `inventory`, `plan`, and `act` leave the `not_in_use` check `unknown`, so it does not pass, and `explain job` fails as it does when the records cannot be read. Section 4.5 gives what a timeout does to a runner's writes.
-- `admission.lock`, `worktrees/*.lock`, `inbox/.lock`, and `records/.lock` are never deleted, so no process can lock a file another process has already unlinked. `worktrees/*.lock` grows by one empty file per worktree ever used; phase 1 may prune them under the admission lock.
+- Lock files (`admission.lock`, `worktrees/*.lock`, `inbox/.lock`, `records/.lock`, `reconcile.lock`, `arbiter/.lock`) are never deleted while in use, so no process can lock a file another process has already unlinked. `worktrees/*.lock` grows by one empty file per worktree ever used and is not pruned: a runner opens it before it takes any other lock, so no lock could make its removal safe.
 
 ### 4.4 Admission protocol
 
@@ -291,8 +338,8 @@ A `recovery_needed` group is **verified** when the recorded child (PID and start
 
 - The worktree of a job is found by walking up from the runner's cwd to the nearest `.git` entry (file or directory); the key is the FNV-1a of that directory's canonical path. A job outside any worktree takes no in-use lock.
 - The runner takes `worktrees/<key>.lock` **shared** at acceptance, before admission and before any wait, and holds it until the stage has exited, on every path that runs the stage: admitted, overflow, fail-open, and TTY passthrough (C15). Several jobs can share a worktree.
-- **The lock marks a worktree in use; it does not protect data.** Phase 0 `act` only probes it and reports, deleting nothing (section 9.5). When the lock cannot be opened or taken within the wait cap (another process holds it exclusively, or the state dir is broken), the runner runs the stage anyway (G4) and records `in_use_unprotected`.
-- `act` probes the lock without taking it or waiting (section 9.5). A worktree is in use when the lock is held, when a `live` or `recovery_needed` reservation names the worktree key (read under the admission lock; this covers a crashed runner, whose shared lock the OS has already dropped), or when a process has its working directory inside the target.
+- **The lock marks a worktree in use; it does not protect data.** When the lock cannot be opened or taken within the wait cap (another process holds it exclusively, or the state dir is broken), the runner runs the stage anyway (G4) and records `in_use_unprotected`, so no deletion could rest on it (section 9.7, section 17 item 6).
+- `plan`, `inventory`, and `act` only probe the lock, never taking it or waiting. A worktree is in use when the lock is held, when a `live` or `recovery_needed` reservation names the worktree key (read under the admission lock; this covers a crashed runner, whose shared lock the OS has already dropped, and a runner that went on without the lock), or when a process other than the reader has its working directory inside the worktree.
 
 ### 4.7 Records
 
@@ -308,7 +355,7 @@ A `recovery_needed` group is **verified** when the recorded child (PID and start
 
 ### 4.9 Plans store
 
-`plans/<plan>/plan.json` is written once. Phase 0 `act` only reads it: it writes nothing to the plan's directory and neither claims nor consumes the plan (section 9.5). Plan directories older than 30 days are removed by `plan` runs.
+`plans/<plan>/plan.json` is written once, without fsync. `act` only reads it: it writes nothing to the plan's directory and neither claims nor consumes the plan (section 9.5). Plan directories older than 30 days are removed by `plan` runs.
 
 ### 4.10 Sessions
 
@@ -327,11 +374,7 @@ A `recovery_needed` group is **verified** when the recorded child (PID and start
 | after the child exits, before release | Reservation | `recovery_needed` while members remain, then `stale`; records lack `job_finished` |
 | during release | Nothing or a free live lock | Recovery pass |
 
-`act` changes nothing but the records, so dying leaves nothing to repair (section 9.5). Power loss: reservations, live locks, and in-use locks are reset by the reboot (`boot_s` check, OS locks). Plans and the inbox survive through fsync.
-
-### 4.12 Disk reserve file
-
-Phase 1 creates `<state>/reserve` with really allocated blocks (written zeros, not `set_len`, which leaves a sparse file), 64 MiB by default, and deletes it when the state volume is full so minimal reclamation can proceed (C11). Phase 0 only reserves the path.
+`act` changes nothing but the records. Power loss: reservations, live locks, and in-use locks are reset by the reboot (`boot_s` check, OS locks); inbox items survive through fsync; plans may be lost and are planned again.
 
 ## 5. Runner
 
@@ -354,9 +397,11 @@ cardinal run [--spec-b64 SPEC] -- COMMAND [ARG]...
 6. Admission (section 4.4). If the budget is full, release the admission lock, sleep (250 ms doubling to 2 s), and retry until the wait cap (section 5.4).
 7. Write `starting` (the start boundary, section 5.3), look again for a signal or the parent's exit, spawn the stage, write `running` with the child's PID and start time, append `job_started`.
 8. Wait for the child, forwarding signals.
-9. Release: delete the reservation when no member of the group other than the runner is left, otherwise leave it for the recovery pass (section 5.5); append `job_finished` (exit status, `waited_ms`, `measurements: [{kind: "wall_time", ms}]`), drop the live lock and the in-use lock, and exit with the child's status or re-raise its signal (section 5.6).
+9. Release: delete the reservation when no member of the group other than the runner is left, otherwise leave it for the recovery pass (section 5.5); append `job_finished` (exit status, `waited_ms`, `measurements: [{kind: "wall_time", ms}]`), drop the live lock and the in-use lock, run the job-end disk check (below), and exit with the child's status or re-raise its signal (section 5.6).
 
 **Fail open** (section 5.3): append `job_fail_open` if records still work, drop the reservation and live lock if taken (abandoning them when the admission lock is not free in time, section 4.5), restore the original process group, spawn the stage in it, and finish as in step 9; the runner never `exec`s, so the in-use lock stays held until the stage exits. Nothing is printed, except `<command>: <OS error>` with exit 127 (not found) or 126 when the stage cannot be executed, as shells do.
+
+**Job-end disk check:** once the stage's status is known and the runner's locks are dropped, on every path that ran the stage, the runner reads the free space of its worktree's volume (or its cwd's) with `statfs`/`statvfs` (microseconds; never the slower measure of section 10.4) and compares it with that volume's warning line from `host.toml`. Below it, and when `reconcile/state.json` is more than 60 s old, it starts `cardinal reconcile --trigger job-end` with `os::spawn_detached` (new session, null standard streams) and does not wait. Any failure is ignored and recorded at most; the check never changes the exit status or output and never runs before the status is known (C18).
 
 **Cancellation:** a handled signal (section 5.5) or the parent's exit before the spawn, seen during any wait or at the spawn itself on every path, ends the run without starting the stage. The runner appends `job_finished` with `cancelled`, releases what it holds, and dies by that signal, or exits 129 when the parent exited.
 
@@ -367,10 +412,10 @@ cardinal run [--spec-b64 SPEC] -- COMMAND [ARG]...
 - **The `starting` record**, written immediately before `spawn()`, is the boundary as seen from the state dir: a reservation at `starting` whose runner died may or may not have a child, and recovery treats it as possibly running.
 - **Zero-run cases that remain:** the runner killed (for example by SIGKILL) between its start and the spawn; a runner path that is executable but cannot be loaded (`[ -x R ]` passes, the exec fails with a loader error); and a cancellation, by the parent's exit or a signal before the spawn (section 5.2). The first two end the Bash call with a visible non-zero status (137, or 126 with the shell's message), nothing runs twice, and nothing reports success (section 17, item 5).
 
-### 5.4 Wait cap and phase 0 overflow
+### 5.4 Wait cap and overflow
 
 - Wait cap: `max_wait_ms` if the spec says background; otherwise `min(max_wait_ms, timeout_ms × wait_fraction)`. Phase 2 subtracts the expected run time once measurements exist.
-- **When the wait reaches the cap, phase 0 starts the stage anyway, over budget** (admission result `overflow`). This is a phase 0 interim rule; phase 2 replaces it with an accepted job (C4). Alternatives rejected for phase 0: returning an error makes agents retry and adds load; waiting until the Bash timeout gets the command moved to the background by Claude Code with the wait still in front of it.
+- **When the wait reaches the cap, the runner starts the stage anyway, over budget** (admission result `overflow`). This is an interim rule until phase 2 replaces it with an accepted job (C4). Alternatives rejected: returning an error makes agents retry and adds load; waiting until the Bash timeout gets the command moved to the background by Claude Code with the wait still in front of it.
 - **Waits add no output,** because text from the runner would enter the stage's pipes (`2>&1 | jq .`); `job_finished` records `waited_ms` and the admission result for `explain job`. Phase 2's accepted-job reply is the only output cardinal adds to a successful command (design §6).
 
 ### 5.5 Child execution
@@ -382,7 +427,7 @@ cardinal run [--spec-b64 SPEC] -- COMMAND [ARG]...
 - **Parent death:** the runner watches its parent from its start and reads the parent PID itself before the spawn and before its wait ends. If the parent exits before the spawn (the Bash call was cancelled), the runner releases what it holds and exits 129 without starting the stage. After the spawn on the admitted path, it sends SIGTERM to the group, also when the child has exited and only descendants are left, and waits until no member is left. If members remain 5 s later, it records the job, leaves the reservation for the recovery pass, and sends SIGKILL to the whole group, itself included while it is a member; the reservation is released once the group is empty. Only a live runner signals: the group's ID is its PID, so the ID cannot pass to another group while it lives.
 - **Parent death in the caller's group:** on the fail-open and TTY paths the runner holds no reservation (TTY passthrough bypasses admission, and fail-open drops what it reserved); what it holds until the child is gone is the in-use lock. After the spawn the child gets SIGTERM, and SIGKILL 5 s later, by its PID, which stays reserved because the runner reaps the child only when its wait ends; the runner waits for it at most 30 s. This cancellation progresses while the runner executes. A runner stopped with its stage (job control above) runs none of its threads, so it sees its parent's exit only once it is continued, and the cancellation waits until then. When the parent's exit leaves the caller's group orphaned, the kernel sends every member SIGHUP and then SIGCONT, which continues the runner; while another member keeps the group from becoming orphaned, nothing does. The kernel's continuation does not cover a runner that found its parent alive just before and stops right after it: the runner then stays stopped with the in-use lock, and the stage, continued by the same SIGCONT, is not guaranteed to stay stopped. In launchd's session on macOS (session ID 1), when a runner that launchd adopted exits, the kernel can send SIGHUP and SIGCONT to a stopped member of the caller's group that is not part of the stage, even one whose parent in another group of the session keeps the group from becoming orphaned; those signals come from the kernel's orphaned-group handling, not from cardinal. cardinal does not cover these cases with a helper process: a signal to the caller's group reaches its unrelated members, a helper in that group is stopped with it, and a helper outside it cannot pin the runner's PID, which could pass to another process between the helper's check and its signal.
 - **Normal exit:** when the direct child exits, the runner returns its status at once. It deletes the reservation only when no member of the group other than itself is left: it moves back into the caller's group and asks `kill(-pgid, 0)`, or reads the process table when it cannot move. Otherwise the reservation stays for the recovery pass, which releases it once the group is empty, so the budget and the worktree stay taken while the stage's descendants run. Those members are not killed (the same as running the stage without cardinal) and show up in `inventory`. Processes that leave the group (`setsid`) are not tracked.
-- **Windows:** in phase 0 the hook does not rewrite (section 6.3) and `cardinal run` always takes the fail-open path; the argument contract and Job Objects are phase 3 (section 17, item 10).
+- **Windows:** the hook does not rewrite (section 6.3) and `cardinal run` always takes the fail-open path; the argument contract and Job Objects are phase 3 (section 17, item 10).
 
 ### 5.6 Exit status and infrastructure failure
 
@@ -413,7 +458,7 @@ pub trait Running {
 pub enum ExecOutcome { Exited(i32), Signaled(i32), InfraFailure(String) }
 ```
 
-Phase 0 has one implementation, the local executor. The start boundary is the same for every executor: `starting` is written before `start`, and an `Ok` from `start` means the stage may have run. For phase 2's accepted jobs, the accepting runner starts a detached runner, which takes its own live lock and a shared in-use lock and rewrites the reservation's owner to itself before the accepting runner drops its locks and prints the job ID; both hold the locks for that moment, so the job is never unowned.
+The local executor is the only implementation. The start boundary is the same for every executor: `starting` is written before `start`, and an `Ok` from `start` means the stage may have run. For phase 2's accepted jobs, the accepting runner starts a detached runner, which takes its own live lock and a shared in-use lock and rewrites the reservation's owner to itself before the accepting runner drops its locks and prints the job ID; both hold the locks for that moment, so the job is never unowned.
 
 ## 6. Claude Code hook contract
 
@@ -505,7 +550,7 @@ cardinal installs no execution grants and delegates approval to Claude Code. The
 
 Accepting Claude Code's suggested persistent rule `cardinal run *`, or any rule that matches a runner prefix, re-opens a way around the owner's rules: an agent could run any command directly as `R run -- cmd`, whatever the rules for `cmd` say. Such a rule must not be used. Bash permission rules match the invocation text and are not a program-level boundary. The G4 real-host check repeats this section for the Claude Code version in use.
 
-**`auto` mode is not rewritten in phase 0,** because the auto-mode classifier may deny a stage's rewritten form while allowing the original; commands in `auto` mode bypass admission. Lifting this needs cardinal to evaluate the owner's permission rules (to rewrite only stages an allow rule covers), or Claude Code to report the original call's permission decision to hooks.
+**`auto` mode is not rewritten,** because the auto-mode classifier may deny a stage's rewritten form while allowing the original; commands in `auto` mode bypass admission. Lifting this needs cardinal to evaluate the owner's permission rules (to rewrite only stages an allow rule covers), or Claude Code to report the original call's permission decision to hooks.
 
 ### 6.6 `subagent-stop` and `session-end`
 
@@ -513,7 +558,7 @@ Both read stdin, append one record (`subagent_stopped` or `session_ended`, with 
 
 `session-end` also writes `sessions/<session>.json`: the agent process (the nearest ancestor of the hook whose name is not a shell: `sh`, `bash`, `zsh`, `dash`, `cmd.exe`, `powershell.exe`, `pwsh.exe`) and every descendant of it except the hook's own chain, each as PID, start time, name, and the first 256 bytes of the command line. It must finish within the 1.5 s default timeout; one process-table refresh takes milliseconds.
 
-A process outlived its session when it is listed in a snapshot, is still alive with the same start time, and the agent process is gone. The agent check matters because `SessionEnd` with `clear` or `resume` keeps the same agent process running. Processes that detach from the agent before `SessionEnd` (double-forked daemons) are not in the snapshot; phase 1 can add a process-environment marker if the owner needs them.
+A process outlived its session when it is listed in a snapshot, is still alive with the same start time, and the agent process is gone. The agent check matters because `SessionEnd` with `clear` or `resume` keeps the same agent process running, and it is why the hook cannot raise the item itself: the sweep runs in the inbox refresh, which every `reconcile` pass runs (section 10.3). Processes that detach from the agent before `SessionEnd` (double-forked daemons) are not in the snapshot; a process-environment marker can be added if the owner needs them.
 
 `SubagentStop` cannot attribute processes to a subagent (nothing in a process identifies the subagent), so it only records.
 
@@ -613,9 +658,10 @@ The built-in classifier implements `trait Classifier { fn classify(&self, req: &
 
 ### 8.1 Child processes for git and gh
 
-- **Constructed environment for git:** start empty and copy an allowlist: `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_*`, `TMPDIR`, `XDG_CONFIG_HOME`, `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`, `GIT_CONFIG_NOSYSTEM`, `GH_TOKEN`, `GITHUB_TOKEN`, `GH_HOST`, `GH_CONFIG_DIR`, `SSH_AUTH_SOCK`, `CARDINAL_TEST_RUN` (the test harness's run marker, section 13.4), and on Windows `SystemRoot`, `SystemDrive`, `ComSpec`, `PATHEXT`, `USERPROFILE`, `APPDATA`, `LOCALAPPDATA`, `ProgramData`, `TEMP`, `TMP`. Every other `GIT_*` (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_COMMON_DIR`, `GIT_OBJECT_DIRECTORY`, `GIT_NAMESPACE`, `GIT_CEILING_DIRECTORIES`, `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT`, …) is dropped, so a cardinal process started from a git hook can never act on another repository. Then add `GIT_OPTIONAL_LOCKS=0`, `GIT_TERMINAL_PROMPT=0`, `GH_PROMPT_DISABLED=1`, `GH_NO_UPDATE_NOTIFIER=1`, `NO_COLOR=1`. The `GIT_CONFIG_*` location variables stay because they decide where the owner's configuration lives, and git must read it the way the owner's git does (design §9).
+- **Constructed environment for git:** start empty and copy an allowlist: `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_*`, `TMPDIR`, `XDG_CONFIG_HOME`, `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`, `GIT_CONFIG_NOSYSTEM`, `GH_TOKEN`, `GITHUB_TOKEN`, `GH_HOST`, `GH_CONFIG_DIR`, `SSH_AUTH_SOCK`, `CARDINAL_TEST_RUN` (the test harness's run marker, section 13.4), and on Windows `SystemRoot`, `SystemDrive`, `ComSpec`, `PATHEXT`, `USERPROFILE`, `APPDATA`, `LOCALAPPDATA`, `ProgramData`, `TEMP`, `TMP`. Every other `GIT_*` (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_COMMON_DIR`, `GIT_OBJECT_DIRECTORY`, `GIT_NAMESPACE`, `GIT_CEILING_DIRECTORIES`, `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT`, …) is dropped, so a cardinal process started from a git hook can never act on another repository. Then add `GIT_OPTIONAL_LOCKS=0`, `GIT_NO_LAZY_FETCH=1`, `GIT_TERMINAL_PROMPT=0`, `GH_PROMPT_DISABLED=1`, `GH_NO_UPDATE_NOTIFIER=1`, `NO_COLOR=1`. The `GIT_CONFIG_*` location variables stay because they decide where the owner's configuration lives, and git must read it the way the owner's git does (design §9).
 - **Constructed environment for gh:** built the same way from its own allowlist: `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_*`, `TMPDIR`, `XDG_CONFIG_HOME`, `GH_CONFIG_DIR`, the tokens gh authenticates with (`GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN`), `CARDINAL_TEST_RUN`, and the Windows variables above, plus the same added variables. `GH_HOST`, `GH_REPO`, and every `GIT_*` are dropped, so gh asks exactly the host and repository observation names (section 8.2). The caller's `GH_HOST` only decides which origin hosts count as GitHub.
-- **Always** `git --no-optional-locks -c core.fsmonitor=false -C <absolute path> …`, so `status` does not refresh and rewrite the index, and a configured filesystem monitor does not start a daemon that writes inside `.git`. Reading a split index still freshens its shared index file, so a worktree that uses one (a `sharedindex.*` file in its git dir or the common dir, or `core.splitIndex` set) is not read with any command that reads the index: its status and tracked files are `unknown`, and the step counts as failed. Every git child runs in that directory, and gh in the directory of the repository or worktree it is asked about, so no child inherits cardinal's working directory. `observe::git` runs git this way for observation, and the hook runs its one git command, `remote get-url origin` (section 3.3), the same way. Observation never runs `fetch` or anything else that writes to a repository; stale remote-tracking refs only make fewer worktrees look merged.
+- **No lazy fetch:** in a partial clone, a promisor repository (`extensions.partialClone` or `remote.<name>.promisor` set), git fetches a missing object from the promisor remote when a command needs it, writing a pack into the repository: `git diff --name-only` against the base in a `--filter=tree:0` clone did (probed with git 2.54). With `GIT_NO_LAZY_FETCH=1` (git 2.45 and later) such a command fails instead (exit 128, nothing written): a failed step, whose facts are `unknown`. Older git ignores the variable, so observation reads `git --version` once and, below 2.45, runs no command that reads objects, `status` included, in a promisor repository, which it tells from its configuration; those facts are `unknown`.
+- **Always** `git --no-optional-locks -c core.fsmonitor=false -C <absolute path> …`, so `status` does not refresh and rewrite the index, and a configured filesystem monitor does not start a daemon that writes inside `.git`. No filter driver runs either: observation first lists the drivers the worktree's configuration defines (`git config --name-only --get-regexp '^filter\.'`, which reads configuration only) and passes each one's `clean`, `smudge`, and `process` as empty and `required` as false (`GIT_CONFIG_KEY_<n>` and `GIT_CONFIG_VALUE_<n>` pairs, which carry any driver name). `status` runs a tracked file's clean filter whenever the file's index entry needs a content check (after a same-size edit, a touch, or a checkout that left the entry racily clean), and a filter is the owner's program, free to write: Git LFS's clean filter stores the file in `.git/lfs/objects`, and a filter that writes into the git dir ran under `--no-optional-locks` (probed with git 2.54). Without its filter, such a file is compared raw with its cleaned blob, so status reports it modified whether or not it changed (section 8.2). Two residuals remain. A driver configured between the listing and `status` still runs: that takes a filter installed within a fraction of a second of a pass, and what runs is the owner's own filter writing its own cache, as the owner's next `git status` would, so nothing of cardinal's is created and no data is lost; observation lists the drivers again after `status`, and a changed list fails that worktree's observation (`filters_changed`). And a filtered file whose worktree bytes equal its cleaned blob reads as unchanged; ordinary edits do not produce such bytes (an LFS pointer left in the worktree is unchanged either way, and a git-crypt user would have to type ciphertext), and those bytes are in git as that blob. Reading a split index still freshens its shared index file, so a worktree that uses one (a `sharedindex.*` file in its git dir or the common dir, or `core.splitIndex` set) is not read with any command that reads the index: its status and tracked files are `unknown`, and the step counts as failed. Every git child runs in that directory, and gh in the directory of the repository or worktree it is asked about, so no child inherits cardinal's working directory. `observe::git` runs git this way for observation, and the hook runs its one git command, `remote get-url origin` (section 3.3), the same way. Observation never runs `fetch` or anything else that writes to a repository; stale remote-tracking refs only make fewer worktrees look merged.
 - **Deadlines and output:** git and gh run through `os::child`; `os::child::git_env` and `os::child::gh_env` build the two environments above, which stay separate. Every child has an absolute deadline (`git_timeout_ms`, `gh_timeout_ms` from its start; the hook's git ends at the hook's deadline, section 6.3) and reads at most 256 MiB from each of stdout and stderr (the hook's git 64 KiB). Output is read on threads; on the deadline the fact is `unknown`, and a stream over the cap makes it `unknown` at once. A child that exits while a descendant still holds its output open (a tool that leaves a helper holding its output) ends the same way on every platform: the run waits for end of file until the deadline, so it ends as a timeout, not success. On Unix each child leads its own process group; on Windows it starts suspended, is assigned to its own Job Object, and only then resumes, so every process it starts is in the job. Every end of a run, a normal exit included, kills what is left of the group or the job before the child is reaped (on Unix the child stays unreaped until then, so the group's ID cannot pass to another group; before its first child cardinal sets SIGCHLD to its default action, because with SIGCHLD ignored, as a caller can pass it on across `exec`, the kernel reaps children itself), so no descendant that is still in the child's process group or job outlives the run. A descendant that called `setsid()` has left the group and is not killed; a reader thread blocked on a pipe it holds open outlives a timeout, so `os::child` serves only short-lived processes (CLI commands and the hook), whose exit ends such threads. A cardinal process that is terminated takes its live children along. On Unix a command that runs children first installs handlers for SIGTERM, SIGINT, and SIGHUP (each unless ignored; `os::child::prepare`, or else the first child does) that kill every live child's group and then end the process by the same signal with its default action, so a process that forwards these signals itself does not use `os::child`. Each handler's reader thread starts before any handler is installed; if setting them up fails, every signal gets its previous disposition back, no child starts, and the step fails, as does every later step of the process that runs a child. While the handlers go in, the three signals are blocked on the installing thread, and so on the reader threads it starts: signal-hook installs its OS handler before it publishes the action that handler runs, and a signal in between would reach a handler that does nothing with it. Blocked, the signal stays pending until the handlers are in place (or the previous dispositions are back) and then reaches them. A signal sent to the process meanwhile can still reach another thread that does not block it and be lost there, so `cardinal inventory`, `plan`, and `act`, the commands that observe, install the handlers before they start any thread. Resetting SIGCHLD and installing these handlers change process-wide signal state, which cardinal owns: it is a command line program, and its library serves only its own binary and tests (section 2.1). On Windows each child's job kills its processes when its last handle closes, and cardinal holds the only handle, so the processes in it end when cardinal ends, by any means. The child enters its job in the call after the one that creates it suspended; a cardinal ended between the two leaves at worst that child suspended, a process that never ran. Creating it inside its job (`PROC_THREAD_ATTRIBUTE_JOB_LIST`) would need a hand-written `CreateProcessW`, because std does not expose that attribute. A process cardinal starts otherwise (such as a detached runner, section 5.7) is in no such job and outlives it. Spawn failure, non-zero exit (where not meaningful), unparsable output, and timeouts all become `unknown`, never "safe". A failed git or gh step of a worktree or its repository also makes that worktree's `observed` check fail, even when other evidence answers the fact.
 
 ### 8.2 Repositories and worktrees
@@ -633,15 +679,21 @@ Per worktree:
 
 | Fact | Command | Value |
 | --- | --- | --- |
-| HEAD, branch, upstream, dirty, ignored entries | `git status --porcelain=v2 -z --branch --ignore-submodules=all --untracked-files=all --ignored=matching` | `dirty` is any entry other than `!` (ignored). Status never enters a submodule, whose own index could be split (section 8.1); a populated gitlink fails `no_nested_repository` anyway |
+| HEAD, branch, upstream, dirty, ignored entries | `git status --porcelain=v2 -z --branch --ignore-submodules=all --untracked-files=all --ignored=matching` | `dirty` is `yes` for any entry other than `!` (ignored), except a worktree-side modification (`.M`) of a path whose `filter` attribute names a configured driver (`git check-attr -z --stdin filter`), which cannot be told from an unchanged file (section 8.1): when only such entries are present, `dirty` is `unknown` with the reason `filtered_paths` and up to 20 of the paths, kept with the facts (`dirty_unknown`, section 11.3) and in the `clean` check's detail and facts. That is not a failed step: it fails `clean`, while a `reclaim_dir` plan in the worktree, which does not depend on `dirty`, keeps `observed` when the facts it needs are known. Status never enters a submodule, whose own index could be split (section 8.1); a populated gitlink fails `no_nested_repository` anyway |
 | `has_upstream` | `# branch.upstream` header | detached HEAD: `no` |
 | `unpushed` | `git rev-list --count HEAD --not --remotes` | `0` → `no`; otherwise `yes`, unless merge evidence is `merged_pr` (the commits exist on GitHub) |
 | `base_ancestor` | `git merge-base --is-ancestor HEAD <base>` | exit 0 → `yes`, 1 → `no`, else `unknown` |
 | `merged_pr` (only if not a base ancestor) | `gh pr list --repo HOST/O/N --state merged --search <HEAD oid> --json number,headRefOid,mergedAt,url --limit 20` | `yes` if a returned PR has `headRefOid == HEAD`; a full page of 20 without one is `unknown` |
 | `open_pr` | from the repository's open PR list | `yes` if a same-repository PR has `headRefName == branch` or `headRefOid == HEAD` |
+| `closed_pr` (only for a worktree that is dirty or has no merge evidence) | `gh pr list --repo HOST/O/N --state closed --head <branch> --json number,state,headRefOid,url --limit 20`, then `git merge-base --is-ancestor <headRefOid> HEAD` for each | the newest PR closed without merging (`state == "CLOSED"`) whose head is HEAD or an ancestor of it (a head missing locally is not); a full page of 20 is `unknown` |
+| `content_in_base` (only when merge evidence is `none`) | `git merge-base HEAD <base>`, then `git diff --name-only -z --no-renames <merge base> HEAD` (the paths the branch changed) and `git diff --name-only -z --no-renames <base> HEAD` (the paths that differ from the base) | `yes` when no path is in both lists: every file the branch changed has the same content and mode in the base, as after a squash merge; otherwise `no`, with up to 20 of the paths in `content_diff`. Tree-to-tree diffs read no index |
+| `git_dir` | `git rev-parse --absolute-git-dir` | the worktree's administrative entry, `<common dir>/worktrees/<id>` for a linked worktree |
+| `last_activity_ms` | `lstat` of the file `git rev-parse --git-path index` names | the index's modification time: commits, checkouts, staging, and status refreshes by other tools (cardinal's own status writes nothing) |
 | Tracked protected data, gitlinks | `git ls-files -z --stage` | a tracked path covered by a protected pattern fails `no_protected`; a gitlink (mode 160000) whose directory has its own `.git` entry fails `no_nested_repository`, with or without `.gitmodules` |
 
-Merge evidence is `base_ancestor` or `merged_pr`, matched on the HEAD object ID, never on the branch name. So commits added after a merged PR, or a reused branch name, give no evidence (C12). Squash merges without a matching head stay without evidence and are left to the arbiter (design §7).
+In a repository that keeps files in Git LFS, `dirty` is therefore `unknown` only while an LFS file's index entry needs a content check: after a checkout (every filtered file of a fresh clone did, probed with a filter that stores files as Git LFS does) until a git command of the owner or an agent refreshes the index, or after a tool touched the file. A worktree an agent has worked in usually has its index refreshed by the agent's own git commands and stays known; section 14.4 counts the others. Making `dirty` `unknown` for every repository that configures a filter driver would instead leave an LFS repository with no worktree ever reported.
+
+Merge evidence is `base_ancestor` or `merged_pr`, matched on the HEAD object ID, never on the branch name. So commits added after a merged PR, or a reused branch name, give no evidence (C12). A squash merge through a pull request whose head is the worktree's HEAD is `merged_pr`. Other squash merges are left to the arbiter (design §7): `content_in_base` is the fact it judges from, and counts as evidence only when the arbiter or the owner passes `--squash-merged` to `act`, which reads the fact again (section 9.3).
 
 ### 8.3 Ignored data
 
@@ -652,6 +704,8 @@ Each `!` entry from `git status` is classified with the profile's `[data]` patte
 3. else `regenerable` if the entry is, or is inside, a regenerable match (a regenerable pattern with `/` is worktree-relative);
 4. else `unclassifiable`, also when the walk could not read part of the entry.
 
+An entry that matches a regenerable pattern keeps that match (`regenerable_match`) whatever its class, so a `target/` holding `fuzz/corpus` is `protected` and still gets a plan, which its failing check keeps ineligible and names (section 9.2), and which the disk report counts as blocked (section 10.4).
+
 Walks never follow symbolic links and never cross into a directory that contains its own `.git` entry.
 
 ### 8.4 Managed worktrees
@@ -660,22 +714,22 @@ A worktree is managed by another app when its path is under a `[observe] managed
 
 ### 8.5 Disk usage
 
-`inventory --sizes` walks each worktree and its regenerable entries (threads per worktree, no symlink following). It reports `allocated_bytes` (blocks × 512 on Unix, file length on Windows). Hard links are not accounted for, so a `node_modules` hard-linked from a package store looks larger than what deleting it frees. Without `--sizes`, size fields are `null`.
+`inventory --sizes` walks each worktree and its regenerable entries (threads per worktree, no symlink following). It reports `allocated_bytes` (blocks × 512 on Unix, file length on Windows) and `aliased_bytes`, the part held by files with links outside the entry (an `st_nlink` above the names the walk found), which deleting the entry does not free: a `node_modules` hard-linked from a package store is mostly aliased. APFS clones are not accounted for. Without `--sizes`, size fields are `null`. Free space per volume is the disk state of section 10.4, which `inventory` reads from `disk/` without measuring: it is as of the last `reconcile` pass, with its reading times.
 
 ### 8.6 Processes
 
-`inventory` lists reservations with their derived state and the members of their process groups, read as a snapshot under the admission lock (section 4.3), and outlived processes from session snapshots (section 6.6). Inventory is read-only: it never deletes stale reservations or signals anything.
+`inventory` lists reservations with their derived state and the members of their process groups, read as a snapshot under the admission lock (section 4.3), outlived processes from session snapshots (section 6.6), and the arbiter's state (section 10.5). Inventory is read-only: it never deletes stale reservations or signals anything.
 
 ## 9. plan, act, and invariants
 
 ### 9.1 Plan kinds
 
-| Kind | Target | Effect |
-| --- | --- | --- |
-| `reclaim_worktree` | A linked worktree (never a main worktree) | Phase 1: deletion of the worktree directory and its administrative entry in the main repository; the branch is kept. Phase 0 `act` only reports (section 9.5) |
-| `reclaim_dir` | A regenerable ignored entry inside an observed worktree | Phase 1: deletion of the entry. Phase 0 `act` only reports |
+| Kind | Target |
+| --- | --- |
+| `reclaim_worktree` | A linked worktree (never a main worktree) |
+| `reclaim_dir` | An ignored entry inside an observed worktree that matches a regenerable pattern (section 8.3) |
 
-`git worktree prune` is not used: it would also drop the entry, index included, of every other worktree whose directory is missing at that moment, such as one on an unmounted volume. Caches outside worktrees (phase 1), process stops for outlived processes, and branch deletion are not phase 0 plan kinds. A recovery-needed reservation is never released by a plan; it is released only when its group is empty (section 4.5).
+Phase 1 executes neither: `act` evaluates a plan and reports it (section 9.3), and section 9.7 lists what executing either kind requires. Caches outside worktrees (the pnpm store, sccache), process stops for outlived processes, and branch deletion are not plan kinds. A recovery-needed reservation is never released by a plan; it is released only when its group is empty (section 4.5).
 
 ### 9.2 Checks
 
@@ -684,61 +738,114 @@ Each plan carries a list of checks. An **invariant** failing or being `unknown` 
 | Check | Kinds | Role | Pass when |
 | --- | --- | --- | --- |
 | `observed` | both | invariant | Every git and gh fact the plan depends on is known |
-| `not_in_use` | both | invariant | A nonblocking probe finds the in-use lock not held, no live or recovery-needed reservation names the worktree, and no process has its working directory inside the target (section 4.6) |
+| `not_in_use` | both | invariant | The in-use lock is not held (probed, section 4.6), no live or recovery-needed reservation names the worktree, and no process other than the reader has its working directory inside the worktree. The whole worktree counts in `reclaim_dir` too: a dev server, a language server, or an open agent session started there uses its `node_modules` and `target/`. Open descriptors are not read (section 9.7, requirement 5) |
 | `not_managed` | both | invariant | The worktree is not under a managed root and not git-locked (design §4) |
 | `clean` | `reclaim_worktree` | invariant | `dirty` is `no` |
 | `no_unpushed` | `reclaim_worktree` | invariant | `unpushed` is `no` |
 | `no_open_pr` | `reclaim_worktree` | invariant | `open_pr` is `no` |
 | `has_upstream` | `reclaim_worktree` | invariant | The branch has an upstream (G6). This also keeps freshly created worktrees, which start clean at the base, from being reclaimed before their first push |
-| `regenerable` | `reclaim_dir` | invariant | The target is a `regenerable` ignored entry of a worktree that observation listed |
-| `plain_target` | both | invariant | The target is not a symbolic link, not a mount point, and on the same device and mount as its parent. A bind mount on the same device counts as a mount point: the mount is told by its mount ID (`statx`) on Linux and by the path it is mounted on (`statfs`) on macOS; a mount that cannot be read is `unknown`. `plan`'s walk and `act`'s snapshot read mounts the same way (`os::mount`), for the target and every directory they would enter, and list a directory only after its mount is read. On Windows a folder a volume is mounted on is a reparse point, which both treat as a symbolic link |
+| `regenerable` | `reclaim_dir` | invariant | The target is an ignored entry of a worktree that observation listed and matches a regenerable pattern; whether everything in it is regenerable is for `no_protected`, `no_unclassifiable`, and `no_nested_repository` |
+| `plain_target` | both | invariant | The target is not a symbolic link, not a mount point, and on the same device and mount as its parent, and no directory below it is on another device or mount, so the walk classified and measured all of it. A bind mount on the same device counts as a mount point: the mount is told by its mount ID (`statx`) on Linux and by the path it is mounted on (`statfs`) on macOS; a mount that cannot be read is `unknown`. `plan`'s walk and `act`'s snapshot read mounts the same way (`os::mount`), for the target and every directory they would enter, and list a directory only after its mount is read. On Windows a folder a volume is mounted on is a reparse point, which both treat as a symbolic link |
 | `no_protected` | both | invariant | Nothing in the target, descendants included, is protected |
 | `no_unclassifiable` | both | invariant | Nothing in the target is unclassifiable ignored data |
 | `no_nested_repository` | both | invariant | No directory below the target's root has its own `.git` entry (another worktree, a submodule, a nested clone) |
-| `merge_evidence` | `reclaim_worktree` | condition | `base_ancestor` or `merged_pr` is `yes` |
+| `merge_evidence` | `reclaim_worktree` | condition | `base_ancestor` or `merged_pr` is `yes`, or the caller passed `--squash-merged` and `content_in_base` is `yes` (section 9.3) |
 
-`plan` evaluates every check on the target; `act` evaluates them again at run time, walking the whole target (section 9.5). Plans are created even when invariants fail, with `invariants_ok: false`, so the arbiter sees the reason and an `act` on them demonstrates the refusal (G10).
+Bulk `cardinal plan` and step 5 of a `reconcile` pass make a plan for every linked worktree that observation lists and for every ignored entry of every worktree that matches a regenerable pattern, whether or not its checks pass: a failing plan carries its reason (G6, G7, G10), and a worktree without merge evidence has the plan `merge_undecided` needs (G8). `plan` evaluates every check on the target; `act` evaluates them again at run time, walking the whole target (section 9.5). Plans are created even when invariants fail, with `invariants_ok: false`, so the arbiter sees the reason and an `act` on them demonstrates the refusal (G10). A `merge_evidence` that fails while `content_in_base` is `yes` says so in its detail and facts, which is how the arbiter finds the plans it may judge.
 
-`plan`'s walk records the target and every entry below it, parents before children in name order, without following symbolic links, with one directory open at a time. A directory whose recorded device is another than the target's is recorded and never listed. Otherwise the walk reads the directory's mount by path: on Linux by `statx` of the path, which does not open the directory, and on macOS by opening it (`O_NOFOLLOW`) for `fstatfs`, which identifies it without reading any of its entries. A directory on another mount than the target is recorded and never listed. To list a directory, the target included, the walk opens it with `O_DIRECTORY | O_NOFOLLOW` and lists it only when that descriptor has the `dev` and `ino` the walk recorded for the directory and the target's mount, read from the descriptor (`statx` with `AT_EMPTY_PATH` on Linux, `fstatfs` on macOS); it then lists through that descriptor and reads each entry's metadata relative to it (`fstatat` without following links). Every directory the walk lists is therefore the one it recorded, on the target's mount, and every entry below the target is read from a directory so listed: a directory replaced by a symbolic link, by another directory, or by a mount after the walk recorded it is not listed. A target that fails this is reported as a mount boundary, which fails `plain_target`; a directory below the target that fails it stays recorded as the walk saw it, with nothing below it. An entry removed before the walk reads its metadata is left out, and a directory removed after that stays recorded as the walk saw it, with nothing below it. The target itself is reached by path, so a directory above it replaced after the walk checked the path for symbolic links is not detected by the walk; `act` reaches the target through descriptors from the worktree root (section 9.5). On Windows the walk lists by path.
+`plan`'s walk records the target and every entry below it, parents before children in name order, without following symbolic links, with one directory open at a time. A directory whose recorded device is another than the target's is recorded and never listed. Otherwise the walk reads the directory's mount by path: on Linux by `statx` of the path, which does not open the directory, and on macOS by opening it (`O_NOFOLLOW`) for `fstatfs`, which identifies it without reading any of its entries. A directory on another mount than the target is recorded and never listed; such a directory, or one on another device, fails `plain_target`. To list a directory, the target included, the walk opens it with `O_DIRECTORY | O_NOFOLLOW` and lists it only when that descriptor has the `dev` and `ino` the walk recorded for the directory and the target's mount, read from the descriptor (`statx` with `AT_EMPTY_PATH` on Linux, `fstatfs` on macOS); it then lists through that descriptor and reads each entry's metadata relative to it (`fstatat` without following links). Every directory the walk lists is therefore the one it recorded, on the target's mount, and every entry below the target is read from a directory so listed: a directory replaced by a symbolic link, by another directory, or by a mount after the walk recorded it is not listed. A target that fails this is reported as a mount boundary, which fails `plain_target`; a directory below the target that fails it stays recorded as the walk saw it, with nothing below it. An entry removed before the walk reads its metadata is left out, and a directory removed after that stays recorded as the walk saw it, with nothing below it. The target itself is reached by path, so a directory above it replaced after the walk checked the path for symbolic links is not detected by the walk; `act` reaches the target through descriptors from the worktree root (section 9.5). On Windows the walk lists by path.
 
-### 9.3 Approval scope
+### 9.3 Approval scope and reports
 
-Approval is needed when a condition fails; otherwise none is needed. This is the design's reclaim scope (design §5): without owner approval, the arbiter can reclaim regenerable data and whole worktrees that meet every reclaim condition. **`act` computes approval from the checks it evaluates at run time**; the `approval` stored in the plan is informational and never widens what `act` may do. A plan that needs approval is `rejected` (`owner_approval_required`) without `--owner-approved`; with it, phase 0 `act` still only reports (section 9.5). The arbiter skill never passes that flag. It is self-regulation, not a security boundary (design §3). Phase 3 replaces the flag with an approval intent bound to the plan ID from the web UI.
+Approval is needed when a condition fails; otherwise none is needed. This is the design's reclaim scope (design §5): without owner approval, the arbiter can reclaim regenerable data and whole worktrees that meet every reclaim condition. **`act` computes approval from the checks it evaluates at run time**; the `approval` stored in the plan is informational and never widens what `act` may do. A plan that needs approval is `rejected` (`owner_approval_required`) unless `--owner-approved` is given, which `act` accepts only together with `--caller owner` (a usage error otherwise). The arbiter skill never passes it. It is self-regulation, not a security boundary (design §3): the arbiter's allow rule for `cardinal act` would let its session pass any flag, and what that could skip is a condition, never an invariant. Phase 3 replaces the flag with an approval intent bound to the plan ID from the web UI.
+
+**Squash-merge judgment.** `--squash-merged` (callers `arbiter` and `owner`) says the caller judged HEAD squash-merged. `act` then counts merge evidence as present only when `content_in_base` is `yes` in its own observation at its checks (section 9.5, step 4); otherwise `merge_evidence` fails as without the flag. The flag can therefore turn only "every file the branch changed is identical in the base" into evidence, and every invariant still holds: the worktree is clean, its commits are on a remote, and its branch is kept (section 17 item 13). In phase 1 the judgment changes a report only: the plan reports `dry_run` instead of `rejected` (`owner_approval_required`).
+
+**No execution in phase 1.** `act` executes no plan, whatever the caller, flags, approval, or configuration. A plan whose invariants pass and whose approval is met (none needed, or `--owner-approved` from the owner) reports `dry_run` with `execution_not_designed` in `reasons`; every other evaluation reports `rejected` or `expired` (section 9.5). The reason names what is missing, a design (section 9.7), rather than a grant, flag, platform, or setting a caller could change, and it is the same for both plan kinds, so the arbiter, the records, and the page read every `dry_run` of phase 1 alike. `--dry-run` is accepted and changes nothing. `[unit.<name>] act` keeps its phase 0 meaning (C16): while it is false the unit's runs are recorded as `planned` naming `unit.<name>.act`, and while it is true as `act` records; both report. A plan that needs approval is `rejected` (`owner_approval_required`) without `--owner-approved`, so `dry_run` always means "would reclaim" (G3's report part).
 
 ### 9.4 Identity binding
 
-A plan stores the target identity: `host_id`, repository common dir, worktree path, worktree root identity (`dev` and `ino` on Unix; creation time where the OS has one), HEAD object ID, branch, and target path. `act` re-reads all of them; any difference makes the plan `expired` (C14). A new worktree created at the same path has a new root identity even if its HEAD and branch are the same.
+A plan stores the target identity: `host_id`, repository common dir, worktree path, worktree root identity (`dev` and `ino` on Unix; creation time where the OS has one), the worktree's git dir (section 8.2), HEAD object ID, branch, and target path. `act` re-reads all of them; any difference makes the plan `expired` (C14), and a new worktree at the same path has a new root identity. The target entry is not bound to the plan (a package manager may have recreated `node_modules`): `act` reports on the entry its snapshot finds. Binding an execution to that entry and to the directories above it is a requirement of section 9.7.
 
 ### 9.5 act procedure
 
-Phase 0 `act` is report-only on every platform. For both plan kinds and every caller, it loads the plan, inspects a snapshot of the target, re-observes identity, and evaluates the applicable checks. It reports `expired` for an observed identity mismatch, `rejected` for failed checks or missing required approval, and `dry_run` otherwise. It does not claim or consume the plan, delete or rename target entries, rewrite `.git`, or remove Git's administrative data for the worktree. Owner approval and unit configuration do not enable destructive execution. Snapshot inspection and identity checks describe observed state; they do not exclude concurrent modification, which is why deletion is deferred: an entry replaced between its check and its unlink, an opened directory moved elsewhere, and HEAD or branch moving can each invalidate a deletion after a successful check. Phase 1 brings deletion with a race-free method.
+`act` reports in these steps on every platform. It takes no lock but the admission lock, to read reservations, and the records lock, to append its record, and writes nothing else.
 
-1. Load the plan; a wrong `host_id` gives `expired`.
-2. Probe the worktree's in-use lock without taking it, so a report never makes a command wait, and read the reservations naming the worktree under the admission lock.
-3. **Snapshot:** open the target from the worktree root through directory descriptors, each directory relative to its parent without following links (`openat` with `O_DIRECTORY | O_NOFOLLOW`), and record each entry's `(dev, ino, type, size, mtime)`. A directory on another device or mount is recorded but not entered. The snapshot keeps a descriptor open for every directory from the target down to the one it is reading, so a target whose directories nest deeper than the open-file limit allows fails the snapshot (`EMFILE`); its checks are then `unknown` and `act` reports `rejected`. On Windows the snapshot walks the target by path without following links.
-4. **Identity:** re-observe the worktree from scratch (section 8) and compare the identity of section 9.4 and, for a worktree plan, that it is not the main worktree; a difference gives `expired` with `identity_changed:<field>` reasons.
-5. **Checks:** evaluate every check of section 9.2: the git and gh facts and, on the snapshot's entries, `plain_target` (a symbolic link on the way to the target or a target on another mount than its parent fails it), `no_protected`, `no_unclassifiable`, `no_nested_repository`, and the process part of `not_in_use`. An invariant not `pass` gives `rejected` with the failed checks, a failed condition without `--owner-approved` gives `rejected` (`owner_approval_required`), and otherwise the result is `dry_run` with the bytes the snapshot holds in `freed_bytes`.
-6. Append an `act` record with the result, or, for a gated unit's run, a `planned` record (section 9.6). Both carry the checks with their facts and the provenance of section 10.2.
+1. **Load.** Load the plan; a wrong `host_id` gives `expired`.
+2. **In-use facts.** Probe the worktree's in-use lock, never taking it or waiting, so a report never makes a command wait, and read the reservations naming the worktree under the admission lock.
+3. **Snapshot.** Open the target from the worktree root through directory descriptors, each relative to its parent without following links (`openat` with `O_DIRECTORY | O_NOFOLLOW`), and walk it as `plan`'s walk does (section 9.2). A tree deeper than the open-file limit fails the snapshot (`EMFILE`), and the checks that read it fail with it. On Windows the snapshot walks by path without following links.
+4. **Observe.** Re-observe the worktree from scratch (section 8): the local git facts, and for a worktree plan gh and, with `--squash-merged`, `content_in_base`. Compare the identity of section 9.4, the worktree root as the snapshot opened it included, and for a worktree plan that it is not the main worktree; a difference gives `expired` with `identity_changed:<field>` reasons.
+5. **Check.** Read the processes whose working directory is inside the worktree and evaluate every check of section 9.2 on these facts and the snapshot: an invariant not `pass` gives `rejected` with the failed checks, a failed condition without approval `rejected` (`owner_approval_required`), and otherwise `dry_run` with `execution_not_designed` and the snapshot's bytes in `freed_bytes`.
+6. **Record.** Append the record of section 9.6 and print the result.
 
-`act` writes nothing inside the repository or to the plan's directory, so repeating it reports again.
+git reads the tree after the snapshot, so a change made before the snapshot is in what git checked. The snapshot and the identity checks describe what `act` observed; they do not exclude a change made meanwhile, which is one reason executing needs a design of its own (section 9.7).
 
-### 9.6 Dry-run and unit gating
+### 9.6 Dry-run and gating
 
-- `act --dry-run` is accepted and changes nothing more in phase 0, where every run is the report of section 9.5.
-- `act --caller unit:<name>` marks the caller. When `host.toml` has `[unit.<name>] act = false` (the default for any unit), `act` appends a `planned` record naming `unit.<name>.act` instead of an `act` record (C16); with `act = true` it appends an `act` record and still only reports. Phase 0 has no units, but the gate is part of `act` now so units cannot bypass it later.
+Every `act` of phase 1 is a dry run (section 9.3). A unit whose `act` is false appends a `planned` record naming the configuration key instead of an `act` record (C16); every other run appends an `act` record. `disk-reclaim`'s automatic report is not an `act`: it appends `planned` records from the pass's checks whatever its unit's `act` (section 10.4). Both carry the status, the checks with their facts, and the provenance of section 10.2. A dry run writes nothing to the plan's directory or inside the repository and reports the same each time it is repeated on unchanged facts.
 
-## 10. Inbox and explain
+### 9.7 Requirements for executing reclamation
+
+Executing a plan is not designed in this document. A design of its own (#33, for regenerable directories) must meet the requirements below before `act` executes anything; each says what must hold and what has been measured, not how. Until then `act` reports `execution_not_designed`, and `plans/<plan>/claim`, `plans/<plan>/result.json`, and `<state>/reserve` stay reserved names that nothing creates (section 4.1). Section 14.5 lists enabling execution as pending that design.
+
+**What is deleted is what was checked**
+
+1. **The target and the directories above it.** An execution is bound to the entry its checks read and to the directories from the worktree root to its parent, by `dev` and `ino`. A moved directory keeps its identity, and a rename through a descriptor held on it still moves the target: probed on macOS, with the target's parent moved into `fuzz/corpus`, which is protected.
+2. **Each deleted entry.** An entry is deleted only while it is the inode that was checked and only while it is inside what the execution owns. Unlinking by name after checking an entry's metadata deletes a file renamed over that name in between (probed), and an atomic save puts a new file, possibly the only copy of unrelated data, exactly there. Descriptors held on a tree follow it when it is moved out of the deletion area, so a deleter that walks through them deletes wherever the tree now is, inside `fuzz/corpus` included. Renaming each entry into a hold directory before its check closes the first window at 2.2 times the deletion time (20,000 files: 0.77 s against 1.73 s).
+3. **Git's classification for the whole execution.** An entry's class can change while the entry does not: a `.gitignore` saved after the checks turns `! target/` into `? target/draft` with the same inode, size, and mtime, so no comparison of metadata sees it. The ignore rules the classification read (each `.gitignore` on the path, `info/exclude`, `core.excludesFile`) must be bound to the checks, or the classification established again once nothing can change the target.
+4. **Later writes and later use.** Live deletion and recovery both keep what was written, created, or brought into use after the checks: a file appended to, protected or unclassifiable data, a nested repository, entries a new protected pattern covers, and entries a process started using.
+
+**Users of the target**
+
+5. **Processes the in-use facts miss.** Section 9.2 reads the in-use lock, reservations, and working directories. A process can also hold a target through open descriptors, which the user's own processes expose (probed on macOS: 648 processes read in 55 ms for 8,192 vnode descriptors), while other users' processes and, on Linux, non-dumpable ones cannot be read. Other ways in leave no descriptor: a reader blocked opening a FIFO (probed on macOS), a writer through a shared mapping whose descriptor it closed, a watcher (FSEvents, inotify), a lookup stalled across a move, a reopen by file identity, a descriptor passed over a socket or opened after a scan, and container and VM file servers. Files with links outside the target (a package store's files hard-linked into `node_modules`) are open in every process that runs a package and are not the target's to free. For each way in, the design detects it or names what a miss costs, and the owner accepts that cost (section 14.5).
+6. **Special files and file systems.** A FIFO or a socket in a target is where processes meet, so deleting one can strand a process, and a device does not belong in build output. A mount below a target moves with it when the target is renamed (probed on APFS and Linux). Processes on other hosts or behind a FUSE server are invisible to any local check, so network and FUSE file systems need a rule; a VirtioFS share or a bind mount into a container is the host's own file system, and its guests' processes are invisible too.
+7. **Jobs that start meanwhile.** A runner whose wait cap ends runs without the in-use lock (G4, section 4.6), so the lock cannot exclude it. A job that starts during an execution finds the target whole or absent, never partly deleted, or fails visibly.
+
+**Rollback, recovery, durability, and space**
+
+8. **Recovery and rollback.** An execution that dies is finished or undone later by another process. Before it deletes anything, recovery establishes the in-use checks again (requirement 5) as well as each entry's inode, size, and mtime, so it keeps what requirement 4 keeps. A rollback stays bound to the target's original parent: when that parent moved, the name is occupied, or a restore did not complete, the data stays where it can be found, and its place is tracked until the plan expires. Entries staged away from the target keep their mapping to their originals across a crash, and a restore counts as done only once the directories it changed are durable.
+9. **A claim never blocks a retry.** A claim written by creating its file and then writing it (`create_new`, as `state::fs::create_new_durable` does) is left empty or short by a crash or a full disk, and every later attempt then finds a claim it cannot read. A claim appears complete or not at all, and an unreadable one has a defined outcome.
+10. **Space on a full volume.** Progress on a full volume covers each volume the execution writes to, the target's and the state dir's, judged on its own: a claim write can succeed while the rename on the target's volume still fails. Working space is released only when a write needs it, right before that write, since space released before cardinal observes it can be taken by another writer. C11 asks cardinal to complete minimal reclamation on a full volume; executing and the disk reconciler do not depend on each other in a cycle, and on APFS a local snapshot can keep the freed blocks (section 17 item 15).
+11. **Starters.** Which starters exist (the owner, the arbiter, a reconciler, recovery) and where they run is the design's. Each has its own rule for what it may delete, with which checks, and how long it may hold `reconcile.lock`, and a recovery and an execution of the same plan never overlap. An execution driven by disk pressure measures free space again after every change it makes, a partial success included, and stops at the recovery line or at a reading it cannot take. Deleting adds to the latency of section 10.4: on one APFS host about 7.5 s for 110,000 entries, after about 1 s for a snapshot and a comparison.
+12. **Power loss.** Each record an execution writes is durable only after the change it describes, and each change only after the record that lets recovery undo or finish it. Killing a process tests the recovery decisions, not this order, since the page cache survives it.
+
+**Who executes, and when**
+
+13. **Grants.** Which callers may execute and how each is enabled. A grant agrees with what its caller does: the arbiter skill only reports (section 14.3), so an arbiter grant waits for a skill that executes, and a unit's grant names what the unit deletes. Enabling is per caller and per host, after the evidence of section 14.4.
+14. **Windows.** Moving and deleting through handles, and files that running programs hold open (design §2); phase 3.
+
+**Whole worktrees** (section 17 item 17)
+
+15. **An idle state that can be enforced.** For a regenerable directory a missed process costs a rebuild; for a worktree it loses work. Removing one needs a state in which nothing may use it, entered and checked through a mechanism every user of the worktree honours, not inferred from a scan.
+16. **The worktree's ID serialized against git.** A linked worktree's `.git` file names its administrative entry, `<common dir>/worktrees/<id>`, and git gives a free ID to the next worktree created with the same directory name. Moving or deleting the entry frees the ID while the worktree still points at it: probed with git 2.54, a worktree created meanwhile took the ID, and `git add` in the first worktree staged into the new worktree's index. A `git worktree prune` can likewise remove an entry that is restored later. The entry's removal and any restore are serialized with git's own creation and pruning of worktrees.
+17. **Per-worktree git state classified as disposable.** A clean, pushed HEAD does not mean nothing of value is left: the worktree's HEAD reflog, its per-worktree refs (`refs/bisect/`, `refs/worktree/`), `config.worktree`, and an operation in progress (a rebase, merge, cherry-pick, or bisect) live in its administrative entry. A commit made on a detached HEAD and left by switching back is reachable only from that reflog, which deleting the entry destroys. Each of these is positively classified as disposable, not merely absent from `git status`.
+
+**Implementation notes.** Deleting in place from the top (`rm -rf`, `remove_dir_all`) lets a job see a half-deleted tree and binds nothing to the checks; a no-replace rename (`renameat2` with `RENAME_NOREPLACE` on Linux, `renameatx_np` with `RENAME_EXCL` on macOS) takes a tree out of every path in about 1 ms; the user's Trash copies between volumes and frees nothing until emptied; and a trash directory inside a worktree is a file cardinal creates in a repository (G5). Descriptors are read through `proc_pidinfo` and `proc_pidfdinfo` on macOS and `/proc/<pid>/fd` on Linux; a durable write on macOS needs `F_FULLFSYNC`; Windows moves and deletes through handles opened with `FILE_FLAG_OPEN_REPARSE_POINT` and renamed with `FileRenameInfo`.
+
+## 10. Inbox, reconcile, and explain
 
 ### 10.1 Inbox
 
-In phase 0 items are raised only by the refresh that `cardinal inbox` runs first (skipped with `--no-refresh`); from phase 1, units raise them through the same `inbox::raise` function. The refresh first runs the recovery pass of section 4.4 under the admission lock, so recovery does not depend on another job being admitted. It then raises and clears. It clears only items it read before it started observing, and only while they are unchanged (checked under `inbox/.lock`), so a refresh never closes an item that another refresh raised or updated from a newer observation:
+Items are raised through `inbox::raise`: by the refresh that `cardinal inbox` runs first (skipped with `--no-refresh`) and that every `reconcile` pass runs, by `reconcile` from its full observation and its disk states, and by the arbiter launcher. The refresh first runs the recovery pass of section 4.4 under the admission lock, so recovery does not depend on another job being admitted; it then raises and clears. Every raiser clears only items it read before it started observing, and only while they are unchanged (checked under `inbox/.lock`), so it never closes an item that another raiser raised or updated from a newer observation:
 
-| Kind | Key | Raised when | Cleared (resolved by `cardinal`) when |
+| Kind | Key | Raised when (by) | Cleared (resolved by `cardinal`) when |
 | --- | --- | --- | --- |
-| `recovery_needed` | `recovery_needed:<job>` | A reservation is `recovery_needed` (evidence: group members, verified or not) | The reservation is gone |
-| `outlived_processes` | `outlived:<session>` | A session snapshot has live processes after its agent process ended | None of them is alive; the session snapshot is then deleted |
+| `recovery_needed` | `recovery_needed:<job>` | A reservation is `recovery_needed` (evidence: group members, verified or not) (refresh) | The reservation is gone |
+| `outlived_processes` | `outlived:<session>` | A session snapshot has live processes after its agent process ended (refresh) | None of them is alive; the session snapshot is then deleted |
+| `reclaimable` | `reclaimable:<worktree>@<head>` | A whole-worktree plan passes every check without approval (reconcile; evidence: the plan ID) | The worktree is gone or its HEAD changed |
+| `merge_undecided` | `merge_undecided:<worktree>@<head>` | Every invariant of a whole-worktree plan passes and `merge_evidence` fails (reconcile; evidence: `content_in_base` with `content_diff`, `closed_pr`, the plan ID) | The worktree is gone, its HEAD changed, or merge evidence appeared |
+| `closed_pr_dirty` | `closed_pr_dirty:<worktree>#<pr>` | The worktree is dirty and its branch's pull request was closed without merging (reconcile) | The worktree is gone or clean |
+| `managed_merged` | `managed_merged:<worktree>@<head>` | A managed worktree (section 8.4) has merge evidence, is clean, and is not in use; only its app or the owner can remove it (reconcile) | The worktree is gone or its HEAD changed |
+| `unclassifiable_data` | `unclassifiable:<worktree>:<set>`, `<set>` the FNV-1a of the sorted paths of its unclassifiable ignored entries | A worktree has unclassifiable ignored data, or part of its ignored-data walk failed (reconcile; evidence: up to 50 paths with their sizes when known, and the observation errors) | The worktree is gone, or its unclassifiable entries are no longer this set: none are left, or a different set raises its own item and supersedes this one |
+| `disk_low` | `disk_low:<volume>` | A watched volume leaves `ok`, entering `warning` or `critical` (reconcile, after `disk-reclaim`; evidence: the volume's disk report, section 11.3, updated by every pass under pressure) | The volume is back to `ok` |
+| `disk_critical` | `disk_critical:<volume>` | A watched volume enters `critical`, from `ok` or `warning` (reconcile, after `disk-reclaim`; evidence as for `disk_low`) | The volume leaves `critical` |
+| `arbiter_failing` | `arbiter_failing:<pass>` | Three arbiter passes in a row failed, timed out, or were abandoned (launcher, trigger; evidence: the passes and their logs) | A pass completes |
 
-Statuses are `open`, `escalated` (waiting for the owner), `resolved`, and `dismissed`. Raising a key that exists updates `seen` and evidence of an open or escalated item and leaves resolved and dismissed items alone (C19). Without `--status`, `cardinal inbox` lists open and escalated items. `cardinal inbox resolve` records the resolution with `by: "cli"`, the refresh with `by: "cardinal"`.
+Statuses are `open`, `escalated` (waiting for the owner), `resolved`, and `dismissed`. `<worktree>` is the worktree's path; `<volume>` is the key of section 10.4. An item about a worktree also names, in `subject`, the HEAD and branch it was raised for. Without `--status`, `cardinal inbox` lists open and escalated items. `cardinal inbox resolve` records the resolution with `by: "cli"`, cardinal's clearing with `by: "cardinal"`.
+
+**Occurrences.** Each key in the table is followed by `@<since_ms>`, the time of the observation that found the condition, so an item is one occurrence of a condition; what else makes a recurrence new is in the key too (a worktree's HEAD, a pull request's number, a set of unclassifiable entries). Raising a condition whose latest occurrence has not ended updates `seen` and evidence of an open or escalated item and leaves a resolved or dismissed one alone (C19), so a resolved item never comes back while its condition lasts. An occurrence ends when a raiser observes its clearing condition (the last column): the raiser sets the item's `ended_ms` and resolves it if it is open or escalated. A condition found again after its occurrence ended is a new occurrence and raises a new item, whatever the old one's status: unclassifiable entries that change from set A to set B and back to A raise three items.
+
+The arbiter decides which items need the owner (section 14.3): it reports `reclaimable` items, which phase 1 does not execute (section 9.3), judges `merge_undecided` items, and escalates what only the owner can decide, such as `closed_pr_dirty`, `managed_merged`, and `unclassifiable_data` (whether each entry is regenerable or protected, a line in the repository's profile). Unclassifiable data is never deleted (design §7), so without this item it would stay unreclaimable without anyone being asked. `disk_low`, `disk_critical`, and `arbiter_failing` are for the owner directly and never start an arbiter (section 10.5): in phase 1 only the owner can free space, and a disk item already holds the evidence the owner needs.
 
 ### 10.2 explain
 
@@ -747,9 +854,93 @@ Statuses are `open`, `escalated` (waiting for the owner), `resolved`, and `dismi
 | Subject | `outcome` |
 | --- | --- |
 | `job` | `exited:<code>` or `signaled:<signal>` (from `job_finished`), `infra_failure:<reason>`, `running`, `waiting` (reserved, not started), `runner_died` (started or reserved, live lock free), or `fail_open:<reason>` |
-| `plan` | The status of the latest `act` or `planned` record (`dry_run`, `rejected`, or `expired`); null before any `act`. A unit's dry run also lists `unit.<name>.act` as a configuration source |
+| `plan` | The status of the latest `act` or `planned` record (`dry_run`, `rejected`, or `expired` in phase 1); null before any `act`. A gated dry run also lists `unit.<name>.act` as a configuration source |
 | `inbox` | `<status> by <by>: <note>` (without `: <note>` when empty) once resolved, escalated, or dismissed; null while open |
 | `command` | null. Each wrapped stage lists its rule, the pattern that matched, the normalized argv, and the profile key, from the classification module's trace; `rewritten` is the command the hook would produce, or null with the reasons it stays unrewritten in `summary` |
+
+### 10.3 Reconcile
+
+`cardinal reconcile [--trigger timer|job-end|manual]` runs one pass and exits; nothing stays resident between passes (design §9). What can notice a disk crossing without a resident service:
+
+| Trigger | Cost | Reach | Verdict |
+| --- | --- | --- | --- |
+| The PreToolUse hook | Work on every Bash call, on the synchronous path, which must write nothing on the way to a rewrite (C1) | Every agent command | Not used |
+| The runner's job end (section 5.2) | One `statfs` per job; a detached start only below the warning line | Growth that cardinal's jobs cause, when they end | Used, for disk |
+| The runner while its job runs | A sampling thread in every runner | Growth during long jobs (fuzzing) | Phase 2, with measurements |
+| An OS timer: a launchd agent (`StartInterval`) on macOS, a systemd user timer on Linux | One process start per interval. A pass without full observation reads a few files, the process table, and the free space (milliseconds); the full observation runs git per worktree and gh per repository, at most every `observe_every_s` | Everything, within one interval | Used: the base trigger |
+| launchd `LaunchEvents` on the notify(3) key `com.apple.system.lowdiskspace` | Nothing until it fires | Only at the system's own threshold, far below the warning line | Not used; a possible backstop |
+| A resident service | A process per host | Immediate | Rejected by design §9 |
+
+The repository ships `examples/launchd/dev.cardinal.reconcile.plist` (`ProgramArguments` with the absolute path of `cardinal`, `reconcile`, `--trigger`, `timer`; `StartInterval` 300; `RunAtLoad`; `ProcessType` `Background`; `LowPriorityIO`; a `PATH` in `EnvironmentVariables` that finds git, gh, and claude; output to `/dev/null`) and `examples/systemd/cardinal-reconcile.service` and `.timer` (`Type=oneshot`, `OnUnitActiveSec=5min`, `Persistent=true`). They are installed by hand in user-level configuration, never in a repository.
+
+A pass runs these steps in order; a failing step is recorded and the next one runs:
+
+1. Take `reconcile.lock` exclusively with one try; when it is held, print `skipped: "busy"` and exit 0.
+2. Remove old temp files.
+3. Run the inbox refresh (section 10.1).
+4. Read the free space of every watched volume and update its disk state (section 10.4).
+5. When the last full observation is older than `observe_every_s`, or a volume is under pressure (section 10.4), observe (`inventory` of section 8, with sizes only for the entries matching a regenerable pattern in worktrees on volumes under pressure), keep the result in `reconcile/observation.json`, build the plans from it (section 9.2), and raise and clear the worktree items of section 10.1. These plans, their checks and exclusive bytes evaluated together and timestamped, are the one set `disk-reclaim` reports from.
+6. For each volume under pressure at step 4, read it again; the pass's last successful reading, this one or else step 4's, updates the disk state (section 10.4), and `disk-reclaim` runs against it while that state is under pressure. Then raise, update, and end the disk items of every watched volume from its state, with the disk report of section 11.3. The trigger and the page, which come next, see the items complete.
+7. Run the arbiter trigger (section 10.5).
+8. Write the UI page (section 10.6) and `reconcile/state.json`.
+9. Print `cardinal.reconcile.v1`.
+
+Watched volumes are the mounts of the state dir and of each worktree in the last full observation.
+
+### 10.4 Disk thresholds and reclamation
+
+**Free space** is what new data can use. On macOS it is the `kCFURLVolumeAvailableCapacityForImportantUsageKey` of the path, read through CoreFoundation's `CFURL` (`objc2-core-foundation`), falling back to `kCFURLVolumeAvailableCapacityKey` when that is missing or zero, as `sysinfo` does; it includes purgeable space (local snapshots, caches the system drops when a write needs room). On Linux it is `statvfs` (`f_bavail × f_frsize`). On one host's APFS volume without local snapshots, important usage read about 10% more than `statfs` and opportunistic usage about 30% less, each query taking 15–30 ms; other hosts and volumes can differ. A read that fails is `unknown` and changes nothing: the disk state and disk items stay as they were, the failure is recorded, and `disk-reclaim` runs only against a successful reading of the pass. The runner's job-end check uses `statfs`, which read lower than important usage on that host, so there it starts a pass early rather than late; where `statfs` reads higher, the check can miss a crossing, and the timer catches it within one interval.
+
+**Volumes and lines.** A path's volume is its mount: the mount path from `statfs` on macOS, the mount ID from `statx` on Linux (`os::mount`). `<volume>` in keys and file names is the FNV-1a of that identity. Lines come from the matching `[disk] volumes` entry, else the global lines.
+
+**States.** Each volume is `ok`, `warning`, or `critical`, kept with the time it entered and its last 12 readings in `disk/<volume>.json`, written only under `reconcile.lock`:
+
+- `ok` → `warning` below the warning line, or when the readings of the last hour predict the critical line within two timer intervals (free space above critical, divided by the growth rate; design §7);
+- `ok` or `warning` → `critical` below the critical line, a first reading included;
+- `critical` → `warning` above the critical line;
+- `warning` or `critical` → `ok` only above the recovery line.
+
+A volume in `warning` or `critical` is **under pressure**: the pass observes and `disk-reclaim` runs in both, so falling below the critical line never stops the report. Leaving `ok` raises `disk_low` for the episode and each entry into `critical` raises `disk_critical`, both at step 6 of the pass, after `disk-reclaim`, with its disk report; every later pass under pressure updates that report. Transitions take the pass's last successful reading, step 6's when it succeeds and else step 4's, so a failed reading never ends a live item. `disk_critical` ends when a reading finds the volume out of `critical` and `disk_low` when one finds it back to `ok`, so a volume that has recovered is never shown as critical. Both go to the owner directly (section 10.1). Stopping heavy jobs below the critical line is admission's, phase 2.
+
+**`disk-reclaim`** (C10) is built in and unit-shaped. It reports from one set of facts: the plans of step 5 of the same pass, whose checks and exclusive bytes were evaluated together and carry their time, and the pass's last successful reading of the volume (section 10.3, step 6). It runs no `act` and observes nothing again; an explicit `act` on a plan is the on-demand recheck (section 9.5). For a volume under pressure it takes the `reclaim_dir` plans on that volume that passed every check without approval (`invariants_ok`, `approval: "none"`), in design §7's reclamation order after its first tier, which is whole worktrees and waits for their execution (section 17 item 17): worktrees by `last_activity_ms`, oldest first, and within a worktree the most exclusive bytes first (`allocated_bytes` less `aliased_bytes`, section 8.5); a target whose bytes are all aliased frees nothing and is skipped. It lists targets in that order until their exclusive bytes would lift that reading above the recovery line, and when all of them would not, it reports the shortfall, the bytes still missing. It appends a `planned` record for each listed target, with the checks and bytes it used. A target a job starts using after the checks stays listed until the next pass finds it in use; the evidence carries the time of the checks. Data in use and protected data are skipped because their plans fail `not_in_use` or `no_protected`; each entry on the volume that matches a regenerable pattern but whose plan failed is reported in the disk report's `blocked` with its worktree, its path, its first failed check, and its bytes, as is a target whose bytes are all aliased, so the owner sees how much space is held and by what. Caches outside worktrees and old toolchain outputs have no plan kind yet.
+
+**One order.** Only `disk-reclaim` evaluates `reclaim_dir` plans for disk pressure. The arbiter never acts on them on its own (section 14.3): a live worktree's regenerable data is reclaimable only when its volume is under pressure, in the order above, because outside pressure no goal needs it gone and each deletion costs a reinstall or a rebuild.
+
+**Latency.** A crossing is noticed at the end of the job that crossed it or at the next timer pass. A pass that finds `reconcile.lock` held exits `busy` (section 10.3), and the pass holding it reports on a volume only when its own reading at step 4 found pressure there. A crossing just after that reading is reported by the first pass that starts after the running one ends: at most the rest of the running pass, one timer interval, and the length of the reporting pass, so one interval and two pass lengths. A pass is bounded by its deadlines (lock waits, and git and gh per worktree and repository, section 8.1) and by its observation with sizes; executing would add its deletions (section 9.7, requirement 11). The warning line leaves room for the growth over that bound; section 14.4 measures a pass under pressure, and the lines are set from it (section 14.5, section 17 item 14).
+
+### 10.5 Starting the arbiter
+
+Only `reconcile` starts the arbiter, at step 7 of a pass, by starting `cardinal arbiter run` with `os::spawn_detached`; the pass does not wait.
+
+**Due items.** Each inbox item records the last pass it was assigned to and how that pass ended (`arbiter` in `cardinal.inbox-item.v1`), written durably with the item. An open item is **due** when no pass has been assigned it, or when `[arbiter] retry_s` (2 hours by default) has passed since that pass ended, whatever its outcome. An item a pass left open, because the arbiter could not finish it (an `act` that a job made `rejected`) or because it waits on something outside (a verified `recovery_needed`), and the items of a pass that failed, timed out, or was abandoned are therefore tried again after that cooldown, and not before. A pass starts when an item is due and `min_interval_s` has passed since the last pass started. `disk_low`, `disk_critical`, and `arbiter_failing` items are never due, being the owner's (section 10.1), and items are read under `inbox/.lock`. An item the arbiter's own commands raise (an `outlived_processes` item from the refresh its `cardinal inbox` runs) waits for the next pass after the interval: the arbiter's commands never start an arbiter, because only `reconcile` does and the arbiter's allow list includes neither `reconcile` nor `arbiter`.
+
+**Assigned items.** Before it starts the session, the launcher records the new pass and the due items' keys in `arbiter/last.json` and then assigns the items to the pass: under `inbox/.lock` it writes `arbiter: {pass, assigned_ms}` into each, durably. The pass works on those and no others, and on their subjects only: it plans just the worktrees they name and acts only on those plans (section 14.3). The launcher names the pass in the session's environment (`CARDINAL_ARBITER_PASS`); the session reads its items with `cardinal inbox --assigned`, the open and escalated items assigned to that pass (section 11.2), and answers them with `cardinal inbox resolve KEY --assigned`, which refuses (`not_assigned`) an item not assigned to that pass, and every item once the pass has ended or been recorded `abandoned`. An item that becomes due while a pass runs therefore waits for a pass of its own, and a session left running after its pass (below) answers nothing. When the pass ends, the launcher writes its outcome and end time into the `arbiter` entry of each item assigned to it, and of no other, before it records the end in `last.json`. When the pass in `last.json` is recorded `abandoned`, its items that have no outcome get that outcome with one end time, `timeout_s` after the pass started, and items that have one keep it. An item whose pass `last.json` no longer names (it is not fsynced, so a power loss can roll it back) is treated the same way, ended `timeout_s` after its `assigned_ms`. So a launcher that dies while assigning or recording strands no item, and an item listed in `last.json` but never assigned is due at the next trigger.
+
+**One at a time.** `cardinal arbiter run` takes `arbiter/.lock` exclusively with one try (held: exit 0, printing the running pass from `arbiter/last.json`) and checks the trigger again from the items it lists. It writes `arbiter/last.json` with a new pass ID, the start time, and the due items' keys, assigns those items to the pass, and starts `[arbiter] command` through `os::child` in a process group of its own, with cwd `arbiter/` (no repository, so no repository's instructions are loaded), its own environment with `CARDINAL_ARBITER_PASS` set, and standard output and error into `arbiter/<pass>.log`, capped at 1 MiB. The lock stays with the launcher, close-on-exec as every lock (section 4.3): a session's processes could not keep it, because a process can close descriptors it inherits, and Node closes every one but the standard three in each child it starts (libuv's `POSIX_SPAWN_CLOEXEC_DEFAULT`; probed). A pass is **running** while the launcher holds the lock, or, after the launcher died (the lock free and `last.json` without an end), until `timeout_s` after the pass started; the next trigger after that records it `abandoned`, in `arbiter/last.json` and in those of its items that have no outcome.
+
+**Bounded.** At `[arbiter] timeout_s` (20 minutes by default) `os::child` kills the session's process group, which cannot have passed to another group because its leader is not yet reaped (section 8.1). When the pass ends, the launcher records its outcome, `completed`, `failed:<status>`, or `timed_out`, in the items assigned to the pass (under `inbox/.lock`), then in `arbiter/last.json` and an `arbiter_pass` record; three failed passes in a row raise `arbiter_failing`. A launcher killed with SIGKILL kills nothing, so its session runs on unwatched, as do processes that left the session's group (`setsid`) while the launcher lived, and a pass started after `timeout_s` may overlap them. Nothing relies on one session at a time: every command a session runs takes its own locks (section 4.3), and in phase 1 nothing executes (section 9.3), so an overlap costs model usage only.
+
+**The command** defaults to the launch in `integrations/claude-code/README.md`: `claude -p` with a prompt that starts the `cardinal-arbiter` subagent, and an allow list of the five `cardinal` subcommands the skill uses. It runs as a subagent because a main-thread agent does not load the skills its definition lists (PR #27). Each pass costs model usage; the trigger limits passes to due items and to one per interval, and tries an item again only after `retry_s` (section 14.5).
+
+### 10.6 Read-only web UI
+
+The phase 1 web UI shows one host's state and answers nothing; answering pending decisions from it is phase 3 (design §12).
+
+**What is shown** is `cardinal.snapshot.v1` (section 11.3): the host; each watched volume's disk state and readings; the worktrees of the last full observation (path, branch, managing app, facts, reclaim candidacy, last activity, and sizes when known); reservations with their derived state; open and escalated inbox items with their evidence; the last 50 `act`, `planned`, and `inbox_*` records; and the last arbiter pass with its report. Each part carries the time it was observed, so stale parts show as stale. Process command lines appear only on the local page.
+
+**Marked for the owner**, and listed first: escalated items, with the arbiter's note as the question, and items of the kinds only the owner can act on (`disk_low`, `disk_critical`, `arbiter_failing`), a disk item with its disk report. Each mark shows the CLI command that answers it as text (`cardinal inbox resolve KEY …`; `cardinal act PLAN --caller owner --owner-approved`, labelled as a recheck that returns a report); the page has no buttons and sends nothing.
+
+**When and by what.** Every `reconcile` pass writes it at step 8 from what it already holds, with no extra git, gh, or network call; `cardinal ui` writes it on demand and prints the page's path.
+
+**Where it is shown:**
+
+| Option | What it takes | Cost | To decide first |
+| --- | --- | --- | --- |
+| **A. Local static page** | `ui/index.html` in the state dir: one self-contained file (inline style and script, the snapshot embedded as JSON, no external resources), opened in a browser | About 300 lines in `snapshot`; nothing leaves the host | Nothing |
+| B. Cloudflare Worker and one Durable Object, push only | A connector step after step 8 (`cardinal push`) sends the same snapshot with a per-host token; the Worker keeps the latest snapshot per host in a SQLite-backed Durable Object and serves the same page behind Cloudflare Access | A TypeScript Worker in this repository, an HTTPS client in the binary (or a `curl` child), a token in `host.toml`. Durable Objects with SQLite storage run on Workers Free (100,000 requests a day) or Workers Paid (from $5 a month); a push every 5 minutes is 288 requests a day per host. Cloudflare Access is free up to 50 users, with a card on file | The account, the plan, the Access application and identity provider, a hostname, per-host tokens, and what may leave the host (paths, branch names, pull request URLs, process names) |
+| C. A static page on Cloudflare (Workers static assets or R2) reading a pushed JSON object | As B without the Durable Object | As B, with less code | As B |
+
+Phase 1 builds A, which needs no account and no decision, and B once the Cloudflare setup is decided (section 14.5). The snapshot is the push payload either way, so B adds a transport and a Worker, not a contract. B is the design's control plane (design §5, §9); C saves the Durable Object but has nowhere to keep phase 3's answers. Prices are Cloudflare's published ones as of November 2026.
 
 ## 11. CLI and JSON contracts
 
@@ -762,12 +953,12 @@ Statuses are `open`, `escalated` (waiting for the owner), `resolved`, and `dismi
 
 | Exit code | Meaning (all commands except `run` and `hook`) |
 | --- | --- |
-| 0 | Success, including an `act` that reports `dry_run` |
+| 0 | Success, including an `act` that reports `executed`, `partial`, or `dry_run`, and a `reconcile` or `arbiter run` that found another one running |
 | 1 | Error; stdout has `cardinal.error.v1` |
-| 2 | Usage error (clap) |
-| 3 | `act` reports a refusal: `rejected` or `expired` |
+| 2 | Usage error (clap), including `--owner-approved` without `--caller owner` |
+| 3 | `act` reports a refusal: `rejected`, `expired`, or `already_executed` |
 
-`run` exits as in section 5.6; `hook` always exits 0.
+`run` exits as in section 5.6; `hook` always exits 0. New enum values (statuses, kinds, reasons) are additions within a schema version: readers treat a value they do not know as unknown, never as success.
 
 ### 11.2 Commands
 
@@ -776,11 +967,14 @@ Statuses are `open`, `escalated` (waiting for the owner), `resolved`, and `dismi
 | `cardinal run [--spec-b64 SPEC] -- COMMAND [ARG]...` | The stage's own output and status (section 5) |
 | `cardinal hook claude pre-tool-use \| subagent-stop \| session-end` | Hook JSON or nothing (section 6) |
 | `cardinal inventory [--repo PATH]... [--sizes]` | `cardinal.inventory.v1` |
-| `cardinal inbox [--status open\|escalated\|resolved\|dismissed\|all] [--no-refresh]` | `cardinal.inbox.v1` |
-| `cardinal inbox resolve KEY --outcome resolved\|escalated\|dismissed [--note TEXT]` | `cardinal.inbox-item.v1` |
-| `cardinal plan [--repo PATH]...` | `cardinal.plan-list.v1`: plans for every whole-worktree candidate and every regenerable entry of worktrees that are not candidates |
+| `cardinal inbox [--status open\|escalated\|resolved\|dismissed\|all] [--assigned] [--no-refresh]` | `cardinal.inbox.v1`; `--assigned`: the open and escalated items assigned to the pass `CARDINAL_ARBITER_PASS` names (section 10.5) |
+| `cardinal inbox resolve KEY --outcome resolved\|escalated\|dismissed [--note TEXT] [--assigned]` | `cardinal.inbox-item.v1`; with `--assigned`, an item not assigned to the pass `CARDINAL_ARBITER_PASS` names, or any item once that pass has ended, is refused (`not_assigned`) and left unchanged |
+| `cardinal plan [--repo PATH]...` | `cardinal.plan-list.v1`: plans for every linked worktree and every ignored entry matching a regenerable pattern, failing ones included (section 9.2) |
 | `cardinal plan reclaim-worktree PATH \| reclaim-dir PATH` | `cardinal.plan.v1` |
-| `cardinal act PLAN [--dry-run] [--owner-approved] [--caller arbiter\|owner\|unit:NAME]` | `cardinal.act-result.v1` (default caller `arbiter`) |
+| `cardinal act PLAN [--dry-run] [--owner-approved] [--squash-merged] [--caller arbiter\|owner\|unit:NAME]` | `cardinal.act-result.v1` (default caller `arbiter`) |
+| `cardinal reconcile [--trigger timer\|job-end\|manual]` | `cardinal.reconcile.v1` (section 10.3) |
+| `cardinal arbiter run` | `cardinal.arbiter-pass.v1` (section 10.5) |
+| `cardinal ui` | The path of the written page as text (section 10.6) |
 | `cardinal explain job ID \| plan ID \| inbox KEY \| command [--cwd DIR] -- STRING` | `cardinal.explain.v1` |
 | `cardinal --version` | text |
 
@@ -800,7 +994,7 @@ type GroupIdentity = { kind: "pgid"; pgid: number; leader_start_s: number };  //
 
 // cardinal.error.v1
 { schema; error: { code: "state_unavailable" | "config_invalid" | "not_found" | "ambiguous_id"
-                        | "invalid_argument" | "not_implemented" | "internal"; message: string } }
+                        | "invalid_argument" | "not_assigned" | "not_implemented" | "internal"; message: string } }
 
 // cardinal.run-spec.v1  (decoded --spec-b64)
 { schema; class: string | null; rule: string | null; resources: Resources;
@@ -835,6 +1029,8 @@ type ReservationView = Reservation & {
   repos: Repo[];
   outlived: { session_id: string; ended_ms: number;
               processes: { pid: number; start_s: number; name: string; command: string }[] }[];
+  disk: DiskState[];                                       // read from disk/, not measured
+  arbiter: { running: boolean; last: ArbiterPass | null };
   errors: { scope: string; message: string }[] }
 
 type Repo = {
@@ -846,13 +1042,17 @@ type Repo = {
 
 type Worktree = {
   path: string; main: boolean; head: string | null; branch: string | null; upstream: string | null;
+  git_dir: string | null; last_activity_ms: number | null;
   managed_by: string | null;                               // app name or "git-lock"
-  facts: { dirty: Tri; has_upstream: Tri; unpushed: Tri; open_pr: Tri;
+  facts: { dirty: Tri; dirty_unknown: null | { reason: "filtered_paths"; paths: string[] };  // up to 20 paths
+           has_upstream: Tri; unpushed: Tri; open_pr: Tri;
            merge_evidence: "base_ancestor" | "merged_pr" | "none" | "unknown";
            merged_pr: null | { number: number; url: string };
+           content_in_base: Tri; content_diff: string[];   // "unknown" unless merge_evidence is "none"
+           closed_pr: null | { number: number; url: string };
            in_use: { value: boolean; jobs: string[] } };
-  ignored: { path: string; class: "regenerable" | "protected" | "unclassifiable" | "nested_repository";
-             allocated_bytes: number | null }[];
+  ignored: { path: string; class: "regenerable" | "protected" | "unclassifiable" | "nested_repository"; regenerable_match: boolean;
+             allocated_bytes: number | null; aliased_bytes: number | null }[];
   reclaim: { candidate: boolean; failed: string[]; unknown: string[] };  // check names
   allocated_bytes: number | null };
 
@@ -860,8 +1060,9 @@ type Worktree = {
 { schema; id: string; created_ms: number; host_id: string;
   kind: "reclaim_worktree" | "reclaim_dir";
   target: { path: string; repo: string; worktree: string; head: string | null; branch: string | null;
+            git_dir: string | null;
             root_id: null | { dev: number; ino: number }; root_created_ms: number | null };
-  allocated_bytes: number | null;
+  allocated_bytes: number | null; aliased_bytes: number | null;  // aliased: held by files with links outside the target
   checks: Check[]; invariants_ok: boolean;
   approval: "none" | "owner";                              // informational; act recomputes it
   provenance: Provenance }
@@ -871,18 +1072,25 @@ type Worktree = {
 
 // cardinal.act-result.v1
 { schema; plan_id: string; caller: string;
-  status: "executed" | "partial" | "dry_run" | "rejected" | "expired" | "already_executed";  // phase 0: dry_run, rejected, expired
-  reasons: string[];                                       // failing check names, "owner_approval_required", "identity_changed:<field>"
-  checks: Check[]; freed_bytes: number | null;
-  skipped_changed: string[];                               // entries a deletion left because they changed; empty in phase 0
+  status: "executed" | "partial" | "dry_run" | "rejected" | "expired" | "already_executed";  // phase 1: dry_run, rejected, expired
+  reasons: string[];                                       // failing check names, "owner_approval_required", "identity_changed:<field>",
+                                                           // "execution_not_designed" (every dry_run of phase 1)
+  checks: Check[]; freed_bytes: number | null;             // dry_run: the snapshot's bytes
+  skipped_changed: string[];                               // empty in phase 1
   error: string | null; finished_ms: number }
 
 // cardinal.inbox-item.v1
-{ schema; key: string; kind: "recovery_needed" | "outlived_processes";
+{ schema; key: string;
+  kind: "recovery_needed" | "outlived_processes" | "reclaimable" | "merge_undecided" | "closed_pr_dirty"
+      | "managed_merged" | "unclassifiable_data" | "disk_low" | "disk_critical" | "arbiter_failing";
   status: "open" | "escalated" | "resolved" | "dismissed";
-  subject: { job_id?: string; session_id?: string; worktree?: string };
+  subject: { job_id?: string; session_id?: string; worktree?: string;
+             head?: string | null; branch?: string | null };  // a worktree item's identity as raised
   evidence: object;                                        // the observation that raised it
   created_ms: number; updated_ms: number; seen: number;
+  ended_ms: number | null;                                 // the occurrence ended: its clearing condition was observed (section 10.1)
+  arbiter: null | { pass: string; assigned_ms: number;     // the last pass the item was assigned to;
+                    outcome: ArbiterPass["outcome"]; ended_ms: number | null };  // outcome and ended_ms set when that pass ends
   resolution: null | { outcome: "resolved" | "escalated" | "dismissed"; by: string; note: string; at_ms: number } }
 
 // cardinal.inbox.v1
@@ -902,7 +1110,8 @@ type Worktree = {
 { schema; ts_ms: number; host_id: string;
   kind: "job_admitted" | "job_started" | "job_finished" | "job_fail_open" | "job_infra_failure"
       | "job_recovered" | "in_use_unprotected" | "tty_passthrough" | "session_ended" | "subagent_stopped"
-      | "plan_created" | "act" | "planned" | "inbox_raised" | "inbox_resolved" | "hook_error" | "config_error";
+      | "plan_created" | "act" | "planned" | "inbox_raised" | "inbox_resolved"
+      | "disk_state" | "reconcile" | "arbiter_pass" | "hook_error" | "config_error";
   job_id?: string; plan_id?: string; inbox_key?: string; session_id?: string;
   data: object }                                           // kind-specific; job_finished.data has exit, signal, waited_ms, admission, measurements
 
@@ -910,11 +1119,53 @@ type Worktree = {
 { schema; session_id: string; reason: string; ended_ms: number;
   agent: { pid: number; start_s: number; name: string };
   processes: { pid: number; start_s: number; name: string; command: string }[] }
+
+// cardinal.disk-state.v1  (disk/<volume>.json); DiskState in inventory and snapshot
+type DiskState = { schema; volume: string; mount: string;
+  measure: "important_usage" | "statvfs";
+  state: "ok" | "warning" | "critical" | "unknown"; since_ms: number;
+  lines: { warning_bytes: number; recovery_bytes: number; critical_bytes: number };
+  readings: { at_ms: number; free_bytes: number | null; total_bytes: number | null }[] }  // last 12
+
+// DiskReport: disk-reclaim's report on one volume (section 10.4); reconcile prints it, disk items carry it, the page shows it
+type DiskReport = { volume: string;
+  reading: { at_ms: number; free_bytes: number };          // the pass's last successful reading
+  lines: { warning_bytes: number; recovery_bytes: number; critical_bytes: number };
+  checks_ms: number;                                       // when the plans' checks and sizes were evaluated
+  targets: { plan_id: string; worktree: string; target: string; exclusive_bytes: number }[];  // in order
+  shortfall_bytes: number;                                 // 0 when the targets reach the recovery line
+  blocked: { worktree: string; target: string; check: string; bytes: number }[] };  // first failed check, or "aliased"
+
+// cardinal.reconcile.v1  (stdout of reconcile)
+{ schema; trigger: "timer" | "job-end" | "manual"; skipped: null | "busy";
+  disk: DiskState[]; observed: boolean;
+  disk_reports: DiskReport[];                              // one per volume disk-reclaim ran on
+  inbox: { raised: string[]; cleared: string[] };
+  arbiter: "started" | "running" | "not_needed" | "interval";
+  errors: { scope: string; message: string }[] }
+
+// cardinal.reconcile-state.v1  (reconcile/state.json)
+{ schema; last_pass_ms: number; last_observation_ms: number | null }
+
+// cardinal.arbiter-pass.v1  (arbiter/last.json, stdout of arbiter run); ArbiterPass
+type ArbiterPass = { schema; id: string; started_ms: number; ended_ms: number | null;
+  outcome: null | "completed" | "timed_out" | "abandoned" | `failed:${string}`;  // null while running
+  items: string[];                                         // the keys of the items assigned to the pass
+  log: string; failures_in_a_row: number }
+
+// cardinal.snapshot.v1  (ui/snapshot.json, embedded in ui/index.html)
+{ schema; generated_ms: number; host: Inventory["host"];
+  disk: DiskState[];
+  observation: { observed_ms: number; repos: Repo[] } | null;   // the last full observation
+  reservations: { observed_ms: number; items: ReservationView[] };
+  inbox: (InboxItem & { needs_owner: boolean })[];         // open and escalated; marked as in section 10.6
+  records: Record[];                                       // the last 50 act, planned, and inbox_* records
+  arbiter: ArbiterPass | null }
 ```
 
 ### 11.4 Phase 2 placeholders
 
-These names are reserved and not registered in phase 0 (an unregistered command is a clap usage error; nothing pretends to work):
+These names are reserved and not registered before phase 2 (an unregistered command is a clap usage error; nothing pretends to work):
 
 | Command | Contract sketch |
 | --- | --- |
@@ -930,8 +1181,9 @@ These names are reserved and not registered in phase 0 (an unregistered command 
 | `clap` (derive) | Use | Already in the workspace; subcommands, typed flags, trailing argv |
 | `serde`, `serde_json` | Use | Every JSON contract; `Value` keeps unknown hook fields intact |
 | `toml` | Use | Configuration (design §9) |
-| `sysinfo` (`system` feature only) | Use | Process table, start times, parents, working directories, boot time on all three OSes; memory sensors later come from the same crate |
-| `rustix` (`process`, `fs` features) | Use (Unix) | Safe `setpgid`, `getpgid`, `kill_process_group`, `test_kill_process_group`, and `openat`/`statat`/`fstat` for snapshot inspection relative to directory descriptors, which never follows a symbolic link or a replaced directory; avoids raw `libc` |
+| `sysinfo` (`system` feature only) | Use | Process table, start times, parents, working directories, boot time on all three OSes; memory sensors later come from the same crate. Its `disk` feature is skipped for free space: on macOS it lists only browsable volumes (a `-nobrowse` disk image or a hidden volume is missing) and reports by mount point, while cardinal needs the volume of a path |
+| `rustix` (`process`, `fs` features) | Use (Unix) | Safe `setpgid`, `getpgid`, `kill_process_group`, `test_kill_process_group`; `openat`/`statat`/`fstat` for the walk and the snapshot relative to directory descriptors, which never follow a symbolic link or a replaced directory; `statvfs`/`statfs` for free space; avoids raw `libc` |
+| `objc2-core-foundation` (`CFURL`, `CFString`, `CFNumber`, `CFDictionary`, `CFArray` features; macOS) | Use | The important-usage capacity of the volume holding a path (`CFURL` resource properties), the measure section 10.4 uses. Already in the lock file as `sysinfo`'s binding; Foundation's `NSURL` would add an Objective-C runtime dependency for the same value |
 | `signal-hook` | Use (Unix) | Forwarding and re-raising signals without hand-written handlers |
 | `libc` | Use (Unix) | `sigaction` and `pthread_sigmask`, which rustix does not expose: reading a signal's disposition, so an ignored signal gets no handler; putting back the one a failed setup replaced; setting SIGCHLD to its default; blocking signals while their handlers are installed |
 | `base64` | Use | `--spec-b64` encoding |
@@ -939,12 +1191,13 @@ These names are reserved and not registered in phase 0 (an unregistered command 
 | `dunce` | Use | Canonical Windows paths without `\\?\`, so they compare equal to paths from git |
 | `windows-sys` (`Win32_Foundation`, `Win32_Security`, `Win32_System_JobObjects`, `Win32_System_Threading`) | Use (Windows) | Telling an exited process from a running one: Windows lists an exited process until its last handle closes, and sysinfo reports every Windows process as running. `os::child`'s Job Objects: each child starts suspended (std's `creation_flags`), joins a job with the kill-on-close limit, resumes through std's `main_thread_handle`, and the job is terminated at the end of every run, so a timed-out child's whole tree goes, nothing a finished child left behind stays, and the tree ends with cardinal. Preferred over `windows` (design candidate) for its smaller compile |
 | `process-wrap` 10 (`os::child`) | Skip | Its sync frontend does the suspended start and the job assignment, but creates the job without the kill-on-close limit and exposes no handle to set it, so the children of a terminated cardinal would run on |
-| `fs4` | Skip | std has file locks since Rust 1.89 with the same `flock`/`LockFileEx` semantics; the reserve file is written with zeros |
+| `fs4` | Skip | std has file locks since Rust 1.89 with the same `flock`/`LockFileEx` semantics |
 | `jobserver` | Skip (phase 2) | Only needed when cardinal shares a jobserver with Cargo |
 | `anyhow` | Skip | Typed errors are needed for JSON error codes anyway |
 | `rand`, `uuid`, `getrandom` | Skip | `RandomState` plus exclusive creation gives unique IDs |
 | `chrono`, `time`, `jiff` | Skip | All times are integer milliseconds |
 | `walkdir` | Skip | `plan`'s walk must read a directory's mount before listing it (section 9.2), and `walkdir` lists every directory it reaches before yielding it (`filter_entry` and `skip_current_dir` act after that), so it would list a mount point below the target. The walk lists one directory at a time, in name order, through the descriptor it checked (`std::fs::read_dir` on Windows), and closes it before listing anything below it |
+| `ureq`, `reqwest` | Skip (section 10.6, option B) | Needed only for a Cloudflare push, which waits for the decision of section 14.5; until then cardinal's own code opens no network connection (gh does, for observation) |
 | `ignore` | Skip | git reports ignored entries |
 | `shlex`, `conch-parser`, `brush-parser` | Skip | `shlex` only splits words, and a parser such as `brush-parser` gives stage spans but not the safe-to-wrap policy, the caller-state analysis, zsh handling, or fail-open refusal, so a parser plus a whitelist would still need everything the subset tokenizer does |
 | `wait-timeout`, `duct` | Skip | `os::child`, polling for the exit status (`waitid` with `WNOWAIT` on Unix, `try_wait` on Windows) with reader threads, covers deadlines and output caps |
@@ -968,7 +1221,7 @@ Tests do not rely on starting processes at the same time. The `testpoint` module
 - `CARDINAL_TEST_FAIL=<point>`: the process returns an injected error at that point.
 - `CARDINAL_TEST_PANIC=<point>[,<point>]`: the process panics at a listed point.
 
-Points: `admission.reserved` (reservation committed, admission lock released), `admission.waiting` (budget full, about to sleep), `inuse.waiting`, `run.watching` (the runner's signal handlers about to be set up), `run.before_starting`, `run.spawning` (admitted path, last cancellation check done, about to spawn), `run.spawned` (the spawn returned, nothing about the child read), `run.after_spawn`, `run.reaped` (the stage's child reaped, its status not read), `act.snapshotted` (snapshot recorded, worktree not observed again, checks not run), `walk.target_checked` (`plan`'s walk found the target a directory on its parent's mount and has not opened it to list it), `walk.dir_checked` (`plan`'s walk read the mount of a directory below the target by path and has not opened it to list it), `hook.classified`, `record.opened` (shared records lock held, current file open, line not written), `inbox.observed` (the refresh observed reservations, processes, and sessions; nothing raised or cleared). **Every contended test waits for the second actor's `.reached` file before releasing the first**, so it proves the second actor actually hit the contended point. Examples:
+Points: `admission.reserved` (reservation committed, admission lock released), `admission.waiting` (budget full, about to sleep), `inuse.waiting`, `run.watching` (the runner's signal handlers about to be set up), `run.before_starting`, `run.spawning` (admitted path, last cancellation check done, about to spawn), `run.spawned` (the spawn returned, nothing about the child read), `run.after_spawn`, `run.reaped` (the stage's child reaped, its status not read), `run.finished` (the status read and `job_finished` appended, the runner's locks dropped, the job-end check not started), `run.reconcile_spawning` (the job-end check found the volume below the warning line and is about to start `cardinal reconcile`), `act.snapshotted` (snapshot recorded, local facts not read again, checks not run), `reconcile.observed` (the full observation kept, no item raised), `arbiter.locked` (the launcher holds `arbiter/.lock`, no command started), `arbiter.recorded` (the pass and its keys in `last.json`, no item assigned), `arbiter.outcomes` (the outcome in every item of the pass, the end not in `last.json`), `walk.target_checked` (`plan`'s walk found the target a directory on its parent's mount and has not opened it to list it), `walk.dir_checked` (`plan`'s walk read the mount of a directory below the target by path and has not opened it to list it), `observe.filters_listed` (a worktree's filter drivers listed, `status` not run), `hook.classified`, `record.opened` (shared records lock held, current file open, line not written), `inbox.observed` (the refresh observed reservations, processes, and sessions; nothing raised or cleared). **Every contended test waits for the second actor's `.reached` file before releasing the first**, so it proves the second actor actually hit the contended point. Examples:
 
 - Two runners and a budget of one job: pause the first at `admission.reserved`; start the second and wait for its `admission.waiting`; release; assert the second starts only after the first's reservation is gone.
 - `act` and a runner: a runner paused at `run.after_spawn` makes `act` `rejected` with `not_in_use`.
@@ -993,8 +1246,9 @@ Recovery tests run real children: `cardinal run -- sh -c 'sleep 30 & sleep 30 & 
 - On Unix every child holds its scope's marker: `Scope::new` creates `.cardinal-scope` in the root and opens it close-on-exec at the first free descriptor from 200, above the small numbers scripts redirect and shells keep for themselves, and between fork and exec each child clears close-on-exec on it, so the child and its descendants hold it unless they close it. A child also keeps every marker the test process inherited, so the children of a helper carry the scope that started the helper too. The marker is identified by device and inode, not by path. The guards below own exactly the processes that hold it: macOS lists a process's descriptors with `proc_pidinfo(PROC_PIDLISTFDS)` and reads each file's identity with `PROC_PIDFDVNODEPATHINFO`, and Linux reads `/proc/<pid>/fd` after opening the process's pidfd. A process that moved into the root does not hold it, and one that left the root still does. The environment would not do as a marker: macOS hides it for platform binaries such as `/bin/sh` and `/bin/sleep`, even from their owner, and most children are platform binaries. A process that closed every descriptor, the marker with them, is left to the end-of-run sweep (section 13.4), which finds it by the run's sandbox on macOS and the run marker on Linux. Windows has no marker: a job object holds every child, `LeftoverGuard` selects the processes working inside the root, and `PidGuard` goes by start time alone.
 - For processes the spawn API does not clean up by itself, and for terminal input, `cardinal-test-support` offers these typed operations: `process::GroupGuard::new(&scope, pgid)` kills by PID every live member of a group that a started process made for itself (`setpgid(0, 0)`), for at most 2 s, and asserts that none is left; `process::LeftoverGuard::new(&scope)` does the same for every process of the scope, for at most 5 s; `process::PidGuard::new(&scope, pid)` kills a process the test did not start, by PID and start time (on Linux through a pidfd it opens when it is made), when dropped or with `kill`; `Child::kill_leader` kills a child alone and leaves its group running; `Command::output_within(limit)` runs a child to completion with one deadline for its exit and the end of its output, kills a child still running then as `Child::kill` does, and fails; `pty::Pty` opens a pseudo-terminal whose slave a child takes as stdin, without becoming anyone's controlling terminal. `Command::copy_env(&other)` gives a command every variable another sets or removes, for a shell that starts the other's program. Each guard signals only processes of its scope: `PidGuard` registers a PID only if its process holds the marker when the guard is made, and every guard reads the start time and the marker again right before the signal (section 13.4), so a process that took over a registered PID, or a group ID that names another group by the time the guard drops (the group emptied and a new process took the ID), is never signalled; start times are compared at the finest resolution the OS reports, microseconds on macOS (`proc_pidinfo`) and clock ticks on Linux (`/proc/<pid>/stat`). A test still drops a group's guard before it reaps the group's leader where it can.
 - Helper processes re-run the test binary in a helper mode named by command-line arguments that `support::helper::args` builds (`support::helper::command` starts one through a scope); inherited variables never select a mode or a path. A test crate's own mode is `Mode::Custom` with one argument (a JSON request), which its `helper` test reads back with `support::helper::custom_request`.
-- `Scope::mount_namespace(command, binds)` (Linux) starts the child in a user namespace and a mount namespace of its own, with each `(source, target)` of `binds` bind-mounted before its program runs; `Scope::bind_mount(child, source, target)` bind-mounts into that namespace later, from a short-lived child that joins it. Both paths must resolve inside the root. The namespaces are entered between fork and exec (`unshare`, `setns`), so the tests run them inside bubblewrap's confinement; no ID map is written, because bubblewrap's `/proc` is read-only (`unshare -r` fails there writing `/proc/self/uid_map`). Inside the namespace the child's IDs and the owner of every file show as the overflow IDs, while file access is still checked against its real IDs. Its mounts never propagate back and end with the namespace.
-- `Fixture` (a scope with git) offers typed operations only: `init`, `init_bare`, `commit_file`, `add`, `commit`, `worktree_add`, `worktree_add_existing`, `worktree_lock`, `worktree_remove`, `worktree_list`, `push`, `remote_add`, `remote_add_url`, `remote_set_url`, `push_remote`, `branch`, `switch`, `detach`, `set_upstream`, `tag`, `update_ref`, `symbolic_ref`, `symbolic_ref_delete`, `split_index`, `stash_push`, `config_set`, `config_get`, `fsmonitor`, `fsmonitor_running`, `rev_parse`, `show_ref`, `for_each_ref`, `log`, `status`. Each builds its own arguments; names must be plain (no leading `-`, no `..`), paths must resolve inside the root with symbolic links followed as the OS would, a remote URL (`remote_add_url`, `remote_set_url`, for an `origin` that observation only reads) must be `https://` with a plain host and path, and `config_set` takes keys of the `branch`, `cardinal`, and `test` sections only. `fsmonitor` sets `core.fsmonitor=true` in one repository's local config, so a test can show that observation starts no filesystem monitor; its guard stops any monitor daemon running for that repository and removes the setting when dropped, and a test that uses it also holds a `LeftoverGuard`, since the daemon leaves the group of the git that started it. Before git runs, `git rev-parse --absolute-git-dir --git-common-dir` in the directory must name dirs inside the root; "not a git repository" is told apart from any other failure, which panics. `Fixture::push` is the one way to move objects: its target is a `BareRepo`, which only `Fixture::init_bare` creates, and only that call enables the `file` transport. `tests/fixture_guard.rs` covers the refusals (a decoy `.git` file pointing outside, links out of the root, config keys, option-shaped names).
+- `Scope::mount_namespace(command, binds)` (Linux) starts the child in a user namespace and a mount namespace of its own, with each `(source, target)` of `binds` bind-mounted before its program runs; `Scope::bind_mount(child, source, target)` bind-mounts into that namespace later, from a short-lived child that joins it. Both paths must resolve inside the root. The namespaces are entered between fork and exec (`unshare`, `setns`), so the tests run them inside bubblewrap's confinement; no ID map is written, because bubblewrap's `/proc` is read-only (`unshare -r` fails there writing `/proc/self/uid_map`). Inside the namespace the child's IDs and the owner of every file show as the overflow IDs, while file access is still checked against its real IDs. Its mounts never propagate back and end with the namespace. `Scope::tmpfs(child, target, size_mib)` mounts a size-limited tmpfs into that namespace the same way, for a small volume that fills up (probed in a user namespace without privileges: writes past the size fail with `ENOSPC`, and space returns at once on unlink). That probe ran in a Linux container on a development host; whether GitHub's Linux runners let an unprivileged user namespace under bubblewrap mount a tmpfs is unverified, and F1's first CI run settles it.
+- `Scope::attach_image(target)` (macOS) clones (`clonefile`) an empty APFS disk image that `scripts/test` creates under `R` before the tests start, attaches the clone at `target` inside the root with `hdiutil attach -nobrowse`, and detaches it (`hdiutil detach -force`) when its guard drops; the process that mounts it runs outside the sandbox, so the guard, not the sweep, ends it. Probed on one development Mac: inside the tests' sandbox `hdiutil create` fails and `hdiutil attach` of an existing image works, which is why the harness creates the image. Whether GitHub's macOS runners allow `hdiutil attach` is unverified, and F1's first CI run settles it. A test that needs it and finds no image fails where `CI` is `true` and is skipped with the reason otherwise, like the bind-mount tests.
+- `Fixture` (a scope with git) offers typed operations only: `init`, `init_bare`, `commit_file`, `add`, `commit`, `worktree_add`, `worktree_add_existing`, `worktree_lock`, `worktree_remove`, `worktree_list`, `push`, `remote_add`, `remote_add_url`, `remote_set_url`, `push_remote`, `branch`, `switch`, `detach`, `set_upstream`, `tag`, `update_ref`, `symbolic_ref`, `symbolic_ref_delete`, `split_index`, `stash_push`, `config_set`, `config_get`, `fsmonitor`, `fsmonitor_running`, `rev_parse`, `show_ref`, `for_each_ref`, `log`, `status`, `partial_clone`. Each builds its own arguments; names must be plain (no leading `-`, no `..`), paths must resolve inside the root with symbolic links followed as the OS would, a remote URL (`remote_add_url`, `remote_set_url`, for an `origin` that observation only reads) must be `https://` with a plain host and path, and `config_set` takes keys of the `branch`, `cardinal`, and `test` sections only. `fsmonitor` sets `core.fsmonitor=true` in one repository's local config, so a test can show that observation starts no filesystem monitor; its guard stops any monitor daemon running for that repository and removes the setting when dropped, and a test that uses it also holds a `LeftoverGuard`, since the daemon leaves the group of the git that started it. Before git runs, `git rev-parse --absolute-git-dir --git-common-dir` in the directory must name dirs inside the root; "not a git repository" is told apart from any other failure, which panics. `Fixture::push` and `Fixture::partial_clone` (a `--filter=tree:0` clone, for the lazy-fetch test) are the only ways to move objects: both reach only a `BareRepo`, which only `Fixture::init_bare` creates, and only that call enables the `file` transport. `tests/fixture_guard.rs` covers the refusals (a decoy `.git` file pointing outside, links out of the root, config keys, option-shaped names).
 - "Remote" repositories are bare fixtures; GitHub is a fake `gh` (a shell script on Unix, a `.cmd` on Windows) selected with `[observe] gh`, returning canned JSON or failing (exit 1, timeout, invalid JSON).
 - Product-side isolation is tested too: observation runs with `GIT_DIR`, `GIT_WORK_TREE`, and `GIT_INDEX_FILE` exported to point at a decoy fixture, and the decoy must be untouched.
 
@@ -1031,115 +1285,203 @@ To reproduce the Linux job on another OS, run `scripts/test` in a container:
 - G5 and C20 tests list the worktree recursively, including ignored files, before and after hook, run, and act, and use stages that write nothing.
 - C6 tests run each input through the real shells (`bash` and `zsh` where installed, `sh` always) once directly and once rewritten, and compare stdout, stderr, exit status, final `pwd` (printed by the outer shell after the command), and `env` output. Inputs include short-circuit lists (`cd missing && cargo test | cat || printf fallback`), `pipefail`, and `errexit` from the rc, from a function, and from the command itself, with stages before `&&` and `||` and after a pipe, non-exported variables and globs in a stage, redirections (also of a stream the stage's pipeline connects), several classified stages, a missing runner path, and stages and commands that must stay unwrapped (section 7.2): among them, operators that read the fallback test's state, earlier stages that write the function or command-path tables, and a command word with a leading `~`. Wrapped stages run through the real runner: the built `cardinal`, linked into the test's `bin/` so the runner path passes the `[hook] runner` rule, with a state and config dir of the test's own. Its `job_started` records count the jobs it started, and a runner that fails open fails the test. The missing runner is a path that does not exist, a regular file without execute permission in place of the link, and a directory. On macOS, CoreFoundation, which `cardinal` links, sets `__CF_USER_TEXT_ENCODING` before `main`, so every stage the runner starts carries it; the agent's shell inherits the same value from the agent, which links CoreFoundation as well, and the test's shells get it from the test process.
 - Tests of what reads reservations (`inventory`, the inbox refresh, `plan`, `act`) make them with the real runner (`tests/support/jobs.rs`): a runner paused after the spawn holds a `live` reservation and the worktree's in-use lock, one killed by SIGKILL after the spawn leaves a verified `recovery_needed` reservation while its group runs (unverified once the test also kills the stage's shell, the recorded child), and one killed before the start boundary leaves a `stale` one, which the next admission pass deletes, so it is made last. Each test's `host.toml` budget admits all its jobs at once, whatever the host's CPU count, and a stage's processes read a pipe the test holds, so they live until the test ends them. `plan`, `act`, and `explain` tests run the binary on fixture repositories whose branches are pushed to a bare remote, with gh answered by a fake that `[observe] gh` names; a fact changes through the fixture, gh's answers, or a real reservation. `explain command` is checked against the hook's own rewrite of the same command and configuration.
-- Fakes remain where a system cannot produce the case on demand: gh; the process table of `tests/recovery.rs` (a reused PGID, a child that left its descendants behind); the reservations `tests/runner_support` writes and holds live to fill the budget at a set moment; the recovery pass of `inbox::concurrent_refresh_keeps_newer_items`, which needs a reservation that a newer refresh observes after an older one observed none; and the recording `git`, `gh`, and `claude` of the admission-isolation test below.
+- Fakes remain where a system cannot produce the case on demand: gh; the process table of `tests/recovery.rs` (a reused PGID, a child that left its descendants behind); the reservations `tests/runner_support` writes and holds live to fill the budget at a set moment; the recovery pass of `inbox::concurrent_refresh_keeps_newer_items`, which needs a reservation that a newer refresh observes after an older one observed none; the recording `git`, `gh`, and `claude` of the admission-isolation test below; free-space readings, which a test writes into `CARDINAL_TEST_DIR` per path prefix and `sensor` reads only when that variable is set, for the order, stop, hysteresis, and prediction tests (the real measure is covered by the volume tests of section 13.6); and the arbiter command, a script `[arbiter] command` names that records its argv, environment, and inherited descriptors, holds or exits on the test's signal, and runs `cardinal` commands the test lists.
+- **One check per refusal.** A refusal test builds a target on which every check passes except the one it names, and asserts that `reasons` equals exactly that check; it also runs the control, the same target without the fault, which reports `dry_run`. Two checks rejecting the same target can hide a missing one.
+- **Tests pin what they assume.** Every test sets the budgets, disk lines, and intervals it depends on in its own `host.toml`, as fractions of what it measured (the test volume's size, the host's CPU count), so a different host cannot change which branch it takes.
+- **Every writer of what a decision reads holds that decision's lock**, and a test shows each: reservations under `admission.lock` (C2), disk states and reconcile state under `reconcile.lock`, the arbiter's pass record under `arbiter/.lock`, and inbox items under `inbox/.lock`. Each such test runs a writer paused inside the lock against the decision and asserts the decision waits or sees the write.
 - The admission path performs no network or arbiter call at run time: `cardinal run` executes with recording fakes for `git`, `gh`, and `claude` first in `PATH` and a recording listener in `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY`; the test asserts no fake was invoked, no connection arrived, and the inbox directory is unchanged. It also asserts that the runner holds no socket at `admission.reserved` and `run.after_spawn` (`/proc/<runner>/fd` on Linux, `proc_pidinfo` on macOS). The runner starts with its standard streams only (section 13.3), so a socket it holds is one it opened. The listener runs on Linux, where the tests' confinement gives them a loopback of their own; the macOS sandbox denies the test every TCP socket, and the runner too, so a listener could neither bind nor see a connection there, and the proxy variables name a closed port. There the check rests on the two socket snapshots, which miss a socket the runner opened and closed between them.
 - C13 fixtures put protected data deep inside a regenerable directory (`target/a/b/fuzz/corpus/seed`), so a check that stops at the top level fails. Refusal tests pair each refusal with a control that passes every check (`dry_run`), including `reclaim_dir` of `node_modules` in a managed worktree (refused) next to the same in an unmanaged one (`dry_run`).
-- The shipped `examples/claude/settings.json` is parsed as JSON, not searched as text: no `permissions.allow` or `permissions.ask` entry may match a runner invocation, and `defaultMode` may not skip approval (section 6.5).
-- CI runs the whole suite on macOS, Linux, and Windows. Unix-only tests (process groups, signals, zsh, rewriting, descriptor-relative snapshots) are `#[cfg(unix)]`; on Windows the hook's no-rewrite rule, the fail-open runner, and report-only `act` are tested; nothing is skipped silently through features. The Linux bind-mount tests need a mount namespace of their own (`Scope::mount_namespace`, section 13.3): where the host forbids it they are skipped with the reason written to stderr past the test harness's capture, and where `CI` is `true` they fail instead; each writes a line to stderr when its assertions ran, which `.config/nextest.toml` shows for a passing test.
+- The shipped `examples/claude/settings.json` is parsed as JSON, not searched as text: no `permissions.allow` or `permissions.ask` entry may match a runner invocation, and `defaultMode` may not skip approval (section 6.5). The shipped launchd plist and systemd units are parsed too: they run `cardinal reconcile --trigger timer` and nothing else.
+- CI runs the whole suite on macOS, Linux, and Windows. Unix-only tests (process groups, signals, zsh, rewriting, descriptor-relative snapshots) are `#[cfg(unix)]`; on Windows the hook's no-rewrite rule, the fail-open runner, and `act` as a dry run are tested; nothing is skipped silently through features. The Linux bind-mount tests need a mount namespace of their own (`Scope::mount_namespace`, section 13.3): where the host forbids it they are skipped with the reason written to stderr past the test harness's capture, and where `CI` is `true` they fail instead; each writes a line to stderr when its assertions ran, which `.config/nextest.toml` shows for a passing test.
+
+### 13.6 Report, disk, and arbiter tests
+
+Each test below records a listing with contents of the worktrees, their repositories' git dirs, and the directories outside them before and after, and asserts it unchanged: phase 1 changes nothing outside cardinal's state dir.
+
+**Filtered paths.** A fixture of its own, observed by the no-write tests (`no_repo_writes`, `observe_readonly`) and the report tests, holds a tracked file whose `filter` attribute names a configured clean filter that writes into the git dir, as Git LFS's does, edited at the same size: the filter never runs; `dirty` is `unknown` with `filtered_paths` and the path, in the observation and the `clean` check; the worktree's plan is refused by `clean` alone; and a `reclaim_dir` plan in it reports `dry_run`. The clean controls of the other tests hold no filtered edit.
+
+**Reports.** For both plan kinds, every caller, and with and without `--dry-run` and `--owner-approved` (from the owner), a plan whose checks pass reports `dry_run` with `execution_not_designed` and a plan whose check fails reports `rejected` with that check, repeated runs reporting the same. A symbolic link in the target to a directory outside, and one as the target; a hard link in the target to a file outside; a pnpm-like `node_modules` (packages linked into `.pnpm`, files hard-linked from a store outside the worktree), whose store files count in `aliased_bytes`; and a mount below the target (bind mount on Linux, `Scope::attach_image` on macOS), refused by `plain_target`.
+
+**Disk.** With the readings fake: hysteresis, prediction, a first reading below the critical line (`critical` at once, and `disk-reclaim` runs), `disk-reclaim`'s order (oldest worktree, then most exclusive bytes: an aliased `node_modules` after a smaller unaliased directory), its stop once the listed bytes would lift the final reading above the recovery line, the shortfall when they would not, a final reading lower than step 4's, the `blocked` bytes per first failed check, an unreadable volume skipped, a `planned` record per listed target, and no `act` and no second observation. On a real small volume (a 64 MiB tmpfs on Linux, a 256 MiB APFS image on macOS, lines set as fractions of its size), with regenerable entries in worktrees, one in use by a paused runner, and protected data: the test writes past the warning line, runs `cardinal reconcile`, and asserts the volume's state and the `disk_low` item's disk report: the final reading, the targets in order, and the in-use worktree's entries and the protected `target/` in `blocked` by worktree and path; a final reading that fails ends no item. **The handoff:** paused at `reconcile.observed`, a pass under pressure has written no disk item; released, its items are complete when the trigger and the page read them, no arbiter pass starts for them, and after the writer's file is deleted `disk_critical` ends at the first pass above the critical line while `disk_low` stays until the recovery line. **The job-end check:** paused at `run.finished`, the runner has made no attempt to start `cardinal reconcile` and `job_finished` is recorded; released, it reaches `run.reconcile_spawning` and a pass starts. A failure injected in the check leaves the stage's output and status as without it.
+
+**Arbiter.** With the fake command: one pass per set of due items, and `reconcile` reports `running` during it; the fake's `cardinal inbox --assigned` lists exactly the pass's items, also when another item becomes due while it runs, its `cardinal inbox resolve KEY --assigned` on an item outside the pass, or on any item after its pass was recorded `abandoned`, is refused (`not_assigned`) and changes nothing, and the launcher writes the outcome into the pass's items only; a launcher killed at `arbiter.recorded` leaves the listed items unassigned and due at the next trigger, while one killed at `arbiter.outcomes` leaves its items' outcomes in place when the pass is recorded `abandoned`, and items given no outcome share one end time and are due `retry_s` after it; an item the fake leaves open (its `act` refused by a reservation) and the items of a fake that exits non-zero are due again after `retry_s`, not before, one it resolves never, and the third failed pass raises `arbiter_failing`; disk items start no pass; a fake that does not exit is killed at the timeout (`timed_out`); items the fake raises wait for the interval. **A launcher killed** with SIGKILL leaves the pass `running` until `timeout_s` after its start; the next `reconcile` records it `abandoned` in `last.json` and its items, which are due after `retry_s`, and nothing signals the fake.
 
 ## 14. Work split
+
+Phase 0 was built as units F and #4–#8 of issue #9; their completion tests stay in the suite. Phase 1 is built as the units below, one PR each, after this document merges. The release pipeline (#10) is separate.
 
 ### 14.1 Order
 
 ```mermaid
 flowchart LR
-  F["F: foundation and contracts (first PR of #4)"] --> R["#4 runner and admission"]
-  F --> H["#5 hook and classification"]
-  F --> O["#6 observation and inventory"]
-  F --> P["#7 plan, act, inbox, explain"]
-  A["#8 arbiter skill"]
-  R -. "integration gate" .-> H
-  R -. "integration gate" .-> O
-  R -. "integration gate" .-> P
-  O -. "integration gate" .-> P
-  H -. "integration gate" .-> P
+  F1["F1: contracts, config, state paths, CLI, testpoints, test volumes"] --> D["D: detection, disk, reconcile, timers"]
+  F1 --> N["N: inbox items"]
+  F1 --> L["L: arbiter launch, skill v2"]
+  F1 --> U["U: snapshot and local page"]
+  D -. "integration gate" .-> N
+  N -. "integration gate" .-> L
+  D -. "integration gate" .-> U
+  N -. "integration gate" .-> U
+  L -. "integration gate" .-> U
+  D --> R["R: real-data report run"]
+  N --> R
+  L --> R
+  U --> R
+  R -. "evidence" .-> X["X (#33): executing regenerable directories"]
 ```
 
-F declares every public function signature named below with bodies that return `cardinal.error.v1` code `not_implemented` (clippy denies `todo!` and `unimplemented!`), so each work unit only fills bodies in modules it owns plus one `match` arm in `cli`. Shared OS process helpers are implemented in F, not declared, because #4, #5, #6, and #7 all need them.
+F1 makes the tree build with every phase 1 contract in place and every existing test passing. It declares every contract type and schema of section 11.3, the configuration of section 3.2 with its validation, the state paths of section 4.1, the CLI of section 11.2 with handlers that call the new modules, the testpoints of section 13.1, and the module table of section 2.2 in `tests/layering.rs`, registers every new module in `src/lib.rs`, and adds `objc2-core-foundation` to the workspace and crate manifests (`Cargo.toml`, `crates/cardinal/Cargo.toml`) and `Cargo.lock`. It also builds the test volumes D uses: `Scope::tmpfs` and `Scope::attach_image` (section 13.3), the empty disk image `scripts/test` creates, and the CI setup they need. For each contract type it changes it migrates the producers, so nothing is left half-built: `PlanTarget.git_dir` in `src/plan/mod.rs`, the new `Worktree` facts in `src/observe/mod.rs` (`unknown` and `null` until D fills them), `ActResult` and `ActOptions.squash_merged` in `src/act/mod.rs`. New entry points get bodies that return `cardinal.error.v1` code `not_implemented`, or `unknown` for a fact: `os::disk` and `os::spawn_detached` in `src/os/mod.rs`, `observe::content_in_base`, the `reconcile` pass of section 10.3 as one stub call per step, and `src/snapshot/`. It prewires the joins between units: `src/inbox/mod.rs` gets the occurrence and assignment entry points as stubs and registers `src/inbox/assign.rs`, and step 6 of the pass hands the disk report to the disk-item raiser, so D, N, and L fill bodies behind calls already in place. It moves the merge-evidence check from `src/plan/checks.rs` to `src/plan/merge.rs` unchanged, and fixes phase 0's observation, which still runs filter drivers and may fetch missing objects: F1 disables both as section 8.1 says, before any unattended pass exists. The other units then fill bodies in the files section 14.2 gives them.
 
-| Work unit | Can start | Completes independently? | Integration gate |
-| --- | --- | --- | --- |
-| F | Immediately | Yes | — |
-| #4 | After F | Yes | — |
-| #5 | After F | Yes | `tests/rewrite_equivalence.rs`, `tests/hook_claude.rs`, and `tests/no_repo_writes.rs` run rewritten commands with the real runner of #4 |
-| #6 | After F | Yes | `tests/inventory.rs` reads the reservations and in-use state that real runners of #4 make |
-| #7 | After F | Yes | `tests/plan_act.rs`, `tests/act_single.rs`, `tests/act_snapshot.rs`, `tests/act_report_only.rs`, `tests/unit_dry_run.rs`, `tests/inbox.rs`, and `tests/explain.rs` run against the real `observe` and `admission` of #4 and #6; `explain command` traces with `classify` of #5 |
-| #8 | Immediately (content depends only on this document) | Yes | `tests/skill_commands.rs` against the clap definitions, after F |
+| Unit | Can start | Integration gate |
+| --- | --- | --- |
+| F1 | Immediately | — |
+| D | After F1 | — |
+| N | After F1 | After D: items raised from the pass's full observation and disk states |
+| L | After F1 | After N: the trigger and the skill meet the new kinds |
+| U | After F1 | After D, N, and L: the page shows their real states |
+| R | After D, N, L, and U | — |
 
-A work unit is done when its own completion tests pass; its integration gate is a follow-up PR by the same unit once the dependency has merged.
+A unit is done when its own completion tests pass; its integration gate is a follow-up PR by the same unit once the dependency has merged. The Cloudflare push (option B of section 10.6) becomes a unit only once section 14.5 decides it. The first release, units F1 to R, is report-only. **X**, executing regenerable directories, follows later in phase 1 through #33: it starts from a design that meets section 9.7, with R's counts in hand, and brings its own tests (races, crashes, durability, full volumes), its claims (C11, and the execution parts of C10 and C15), and the execution parts of the checks of G2 and G7. Executing whole worktrees, with G3's execution part, stays deferred (section 14.5).
 
 ### 14.2 Work units
 
-| Work unit | Owns | Completion tests |
+| Unit | Owns | Completion tests |
 | --- | --- | --- |
-| **F** (first PR of #4) | `src/lib.rs`, `src/main.rs`, `src/cli/mod.rs` (all commands and flags of section 11.2), `src/contract/`, `src/config/`, `src/state/`, `src/record.rs`, `src/sensor.rs`, `src/testpoint.rs`, `src/os/mod.rs` with the process table, start times, parent PID, process working directories, and boot time implemented; skeleton `mod.rs` of every other module with signatures: `admission::{list_reservations, in_use, recovery_pass}`, `observe::{inventory, observe_worktree}`, `classify::{find_stages, classify}`, `inbox::raise`, `plan::create`, `act::execute`; `tests/support/`, `scripts/repo-guard`, `scripts/test`, CI and `lefthook.yml` switched to `mise exec -- scripts/test`; `examples/config/` | `tests/records.rs` (torn tails, rotation), `tests/layering.rs` (passes, and fails when a forbidden import is added), `tests/repo_guard.rs`, `tests/fixture_guard.rs`, `tests/os_process.rs` |
-| **#4** runner, admission, reservations | `src/admission/`, `src/run/`, `src/exec/`, `src/os/unix.rs` (groups, signals) | `tests/admission_concurrency.rs`, `tests/run_start_boundary.rs`, `tests/run_infra_failure.rs`, `tests/run_wait.rs`, `tests/run_tty.rs`, `tests/run_parent_death.rs`, `tests/run_signals.rs`, `tests/recovery.rs`, `tests/in_use.rs`, `tests/admission_isolation.rs` |
-| **#5** Claude Code hook | `src/classify/`, `src/adapter/claude/`, `examples/claude/settings.json` | `tests/hook_claude.rs`, `tests/rewrite_equivalence.rs` (with `rewrite_equivalence::piped_redirection_stays_unwrapped` for zsh's `MULTIOS`), `tests/session_end.rs`, `tests/no_repo_writes.rs`, proptest suites in `classify` |
-| **#6** observation, inventory | `src/observe/`, the `inventory` handler | `tests/observe_worktrees.rs`, `tests/observe_env.rs`, `tests/observe_readonly.rs`, `tests/inventory.rs` |
-| **#7** plan, act, inbox, explain | `src/plan/`, `src/act/`, `src/inbox/`, `src/explain.rs`, their handlers | `tests/plan_act.rs`, `tests/act_single.rs`, `tests/act_snapshot.rs`, `tests/act_report_only.rs`, `tests/inbox.rs`, `tests/unit_dry_run.rs`, `tests/explain.rs` |
-| **#8** arbiter subagent and skill | `integrations/claude-code/agents/cardinal-arbiter.md`, `integrations/claude-code/skills/cardinal-arbiter/SKILL.md`, install notes in `integrations/claude-code/README.md`, `tests/skill_commands.rs` | `tests/skill_commands.rs` parses every `cardinal …` line in the skill with the clap definitions and checks that the skill handles exactly the statuses phase 0 `act` returns |
+| **F1** foundation | Section 14.1, and the F1 column below | `tests/contract.rs`, `tests/cli.rs` (`--owner-approved` only with `--caller owner`), configuration validation, `tests/layering.rs`, and every existing test |
+| **D** detection and reconcile | Observed facts and squash evidence, the checks and `act`'s report, disk states, `disk-reclaim`, the pass, timers, the job-end check | `tests/observe_worktrees.rs`, `tests/squash.rs`, `tests/plan_act.rs`, `tests/act_report_only.rs`, `tests/act_fs.rs`, `tests/unit_dry_run.rs`, `tests/disk_state.rs`, `tests/disk_reclaim.rs`, `tests/disk_volume.rs`, `tests/reconcile.rs`, `tests/run_disk_trigger.rs`, `tests/timer_examples.rs`, `tests/admission_isolation.rs` |
+| **N** inbox | Occurrences, and the item kinds of section 10.1 raised and ended from observation and disk states | `tests/inbox_raisers.rs`, `tests/inbox.rs` |
+| **L** arbiter launch | The due rule and the assignment, the trigger and the launcher, skill v2 | `tests/arbiter_launch.rs`, `tests/skill_commands.rs` |
+| **U** web UI | The snapshot and the page | `tests/ui.rs`: the page from a fixed snapshot, self-contained, written with no git, gh, or network call |
+| **R** real-data report run | No code: section 14.4, run by hand on the development host | Section 14.4's counts, reported on issue #9 |
 
-Every work unit's completion command is `mise exec -- scripts/test`.
+Every file a unit changes has one owner at a time; a file F1 touches passes to the unit named after it:
 
-### 14.3 Arbiter skill v1 (#8) contract
+| File | F1 | Then |
+| --- | --- | --- |
+| `Cargo.toml`, `crates/cardinal/Cargo.toml`, `Cargo.lock` | The dependency of section 12 (`objc2-core-foundation`) | A unit that needs another dependency adds it in its own PR and says so |
+| `src/lib.rs`, `src/contract/`, `src/config/`, `src/state/mod.rs`, `src/cli/mod.rs`, `src/testpoint.rs` | All of phase 1's additions | Nobody; a contract change found later is a follow-up F PR |
+| `src/os/mod.rs` | The entry points and their stubs | D: `src/os/disk.rs` and `src/os/detached.rs` |
+| `src/plan/mod.rs` | The `PlanTarget` producer | D: plans for every linked worktree and every entry matching a regenerable pattern (section 9.2), where phase 0's producer plans a whole worktree only when it is a candidate |
+| `src/plan/checks.rs`, `src/plan/walk.rs` | The merge-evidence check moved out | D: `not_in_use` over the whole worktree, `plain_target`'s mount reads, `regenerable` as a pattern match |
+| `src/plan/merge.rs` | Moved, unchanged | D: `--squash-merged` with `content_in_base` |
+| `src/act/` | `ActResult`, `ActOptions` | D: `execution_not_designed` |
+| `src/observe/` | The new facts as `unknown` and `null`; filter drivers and lazy fetches disabled (section 8.1) | D |
+| `src/run/mod.rs`, `src/sensor.rs` | — | D: the job-end check, free space |
+| `src/reconcile/` | The pass as one stub call per step, step 6 handing the disk report to the disk-item raiser | D, except `raise.rs`: N, and `arbiter.rs`: L |
+| `src/inbox/mod.rs` | The occurrence and assignment entry points as stubs; `assign.rs` registered | N |
+| `src/inbox/assign.rs` | Stubs | L |
+| `src/snapshot/` | The skeleton | U |
+| `crates/test-support/src/scope.rs`, `scope/mount.rs` | `Scope::tmpfs`, `Scope::attach_image` | A unit that needs another typed operation adds it in its own PR and says so |
+| `scripts/test`, `.github/workflows/ci.yml` | The disk image and the CI setup the test volumes need; a new action also goes into `.github/infra.yaml` | Nobody; a change found later is a follow-up F PR |
+| `examples/launchd/`, `examples/systemd/` | — | D |
+| `integrations/claude-code/` | — | L: skill v2; the README says the timer starts the arbiter |
+
+N fills the occurrences in `src/inbox/mod.rs` (section 10.1) and raises the new kinds, the disk items included, from `src/reconcile/raise.rs`; L fills the due rule and the assignment of section 10.5, which the launcher and `cardinal inbox --assigned` share, in `src/inbox/assign.rs`. Every work unit's completion command is `mise exec -- scripts/test`.
+
+### 14.3 Arbiter skill v2 contract
 
 The subagent runs headless, one at a time, and only through the CLI:
 
-1. `cardinal inbox` → for each `open` item, `cardinal explain inbox KEY` and `cardinal inventory`.
-2. Reclaim work: `cardinal plan` (or a targeted plan), then `cardinal act PLAN --caller arbiter` for plans with `invariants_ok: true` and `approval: "none"`. Never `--owner-approved`. Phase 0 `act` only reports (section 9.5), so the report lists `dry_run` plans as what would be reclaimed, with their `freed_bytes`, and never anything as reclaimed.
-3. An inbox item that needs a decision outside the reclaim scope (including `recovery_needed` items whose group is unverified): `cardinal inbox resolve KEY --outcome escalated --note "<what the owner must decide, with the job ID or processes>"`.
-4. Plans that need approval have no inbox item in phase 0, and `inbox resolve` works only on existing keys. They go into the arbiter's final report, each with its plan ID and what the owner must decide. An inbox kind for owner approval comes with the web UI (phases 1 and 3).
-5. Resolve items it handled with `--outcome resolved` and a note; report refused acts with their `reasons`.
+1. On a pass the timer started, `cardinal inbox --assigned`, the items assigned to this pass (section 10.5), and no others; every `cardinal inbox resolve` of that pass carries `--assigned`. On the owner's request, `cardinal inbox`. Then `cardinal explain inbox KEY` for each item listed, and on the owner's request `cardinal inventory` once.
+2. Plans: on a pass the timer started, `cardinal plan reclaim-worktree PATH` for the worktree of each assigned `reclaimable` and `merge_undecided` item, and no other plan; on the owner's request, `cardinal plan`. A whole-worktree plan with `invariants_ok: true` and `approval: "none"`: `cardinal act PLAN --caller arbiter`, which in phase 1 reports `dry_run` with `execution_not_designed` (section 9.3). A `reclaim_dir` plan only when the request that started the session names it (an owner's request, as in G10's check), never on a pass the timer started: regenerable data is `disk-reclaim`'s, under disk pressure (section 10.4). A plan needing approval whose `merge_evidence` facts show `content_in_base: "yes"`: judge from the evidence (an empty `content_diff`, `closed_pr`, the branch and pull-request history in the item) whether HEAD was squash-merged, and if so run `cardinal act PLAN --caller arbiter --squash-merged`; otherwise, and for every other plan needing approval, report it for the owner. Before it acts on or resolves an assigned item, a pass the timer started compares the item's subject (path, HEAD, branch) with the fresh plan's target; on a mismatch it leaves the item open, and the next `reconcile` pass ends it and raises the new state.
+3. Disk items are the owner's and never assigned to a pass (section 10.5). On the owner's request, report them from their disk report, never from `inventory`'s `disk`.
+4. Items: `reclaimable` by acting on its plan as in step 2, resolved with the result as its note once that `act` reports `dry_run`, which is the report the item asks for (the worktree stays until the owner removes it), and left open when it is refused; `merge_undecided` as in step 2, resolved with the judgment once its `act` reports `dry_run`, and escalated otherwise; `closed_pr_dirty` and `managed_merged` (to be removed in its app) escalated with their paths; `unclassifiable_data` escalated with its paths and the question whether each is `regenerable` or `protected` in the repository's profile; `recovery_needed` and `outlived_processes` as in v1. A verified `recovery_needed` stays open, to be read again after `retry_s`: cardinal releases its reservation once the group has ended, and nothing signals the group.
+5. `act` results: `dry_run` is "would reclaim" (`execution_not_designed` in phase 1); `rejected`, `expired`, and `already_executed` are refused with their `reasons`; `executed`, `partial`, and anything else go under errors, since phase 1 executes nothing.
+6. Never `--owner-approved` or `--caller owner`; never `rm`, `git worktree remove`, `kill`, or edits in repositories.
+7. The report adds a "Reclaimable" section (plans that report `dry_run`, with their bytes) to v1's sections.
 
-It never edits files in repositories, and never runs `git worktree remove`, `rm`, or `kill` directly. Starting it from an OS timer is phase 1; in phase 0 the owner starts it by hand and reads its report.
+`tests/skill_commands.rs` parses every `cardinal …` line of the skill with the clap definitions and checks that the skill's tables cover exactly the statuses of section 11.3 and the inbox kinds of section 10.1, and that a pass the timer started runs no bare `cardinal plan`.
 
-## 15. Purpose layer for phase 0
+### 14.4 First run on real data
 
-Real-host checks run on macOS with Claude Code and the hook installed as in section 6.2, a scratch state and config dir, and scratch repositories outside the owner's projects. Windows real-host checks are phase 3.
+Phase 1 first runs on a macOS development host against the worktrees of a real TypeScript monorepo (design §12). Nothing is deleted: the run checks the reports and measures what the execution design starts from.
 
-| ID | Condition (design §10) | Check on a real host |
+1. **Install.** The binary (#10, or `cargo install --path crates/cardinal`), the hook, the arbiter files, and the launchd agent. `host.toml`: `[observe] repos` with the monorepo's main worktree; `[observe] managed` with T3 Code's worktree root. A profile for the monorepo whose `[data] regenerable` lists `node_modules` and the build and cache outputs it uses (such as `.turbo`, `dist`, `.wrangler/tmp`) and whose `protected` lists local state that cannot be regenerated (such as `.wrangler/state`, local D1, KV, and R2 data); anything unlisted is unclassifiable and never deleted.
+2. **Check the classification.** `cardinal inventory --sizes` and `cardinal plan`. First, every worktree under T3 Code's root must show `managed_by: "t3code"`; without that, they look like any other worktree and could be reclaimed. Then compare, worktree by worktree, cardinal's verdict (candidate, failing checks, `content_in_base`) with what is known about each worktree, and record the counts: worktrees, candidates, needing approval, refused per check, bytes, and worktrees whose `dirty` is `unknown` because of filtered paths (section 8.2). This answers design §14's question whether every existing worktree is classified correctly.
+3. **A report week.** The timer and the arbiter run for at least a week. Once, with the lines of every watched volume set above its free space for one pass, record how long a `reconcile` pass under pressure takes (observation with sizes and plans, with each target's entry count). The warning line is set from these: the room between the warning and critical lines must exceed the growth over one interval and two such passes (section 10.4). Each `planned` record and `dry_run` result is a deletion that would have happened and is reviewed on the page (section 10.6); a target that had to be kept, or a planned target used again later, is a false positive and is recorded with its cause.
+
+Issue #9 gets the counts: worktrees, candidates, refusals per check, bytes, pass times, entry counts, and false positives with their causes. They are what the execution design starts from (section 9.7, section 14.5); real paths and branch names stay on the host.
+
+### 14.5 Open decisions
+
+Each row is decided outside this document: it involves an account, money, behaviour outside the host, a change to design.md, or a host's own settings. Until it is decided, the proposal holds; a decided row says so.
+
+| Decision | Options | Proposed |
 | --- | --- | --- |
-| G4 | Before the child starts, a missing, crashed, or unresponsive cardinal, or a runner that cannot start, leaves the command running exactly once with the same result; after start, no rerun and an infrastructure failure | A classified probe prints its args, `pwd`, sorted `env`, writes to stdout and stderr, appends one line to a counter file outside the repository, and exits 7. An agent runs it inside `cd sub && probe 2>&1 \| tail -5 \|\| echo fallback` (a) without the hook, (b) with the runner path not executable, (c) with the state dir unwritable, (d) with `admission.lock` held by another process past `lock_timeout_ms`, (e) with the hook's deadline forced to be missed, (f) with a failure injected before the start boundary. All outputs equal (a), and the counter grows by one each time. Permissions, with the shipped settings: in `default` and `acceptEdits` modes each rewritten call prompts once for all its stages, also with an allow rule for the probe; a deny rule for the probe still denies the rewritten call; with `Bash(probe)` denied, an agent's direct `R run -- probe` does not run without approval; a session without an approval surface refuses the rewritten call; `bypassPermissions` runs it without a prompt, as it runs the original; in `auto` mode nothing is rewritten. After start: SIGKILL the runner of a long probe; the counter shows one start, the exit status is 137, and `cardinal explain job` reports `runner_died`. The accepted zero-run cases (runner killed before the spawn, Bash call cancelled before the spawn) end with no run |
-| G5 | No files or instructions are added to target repositories | Snapshot `git status --porcelain --ignored --untracked-files=all` and a recursive listing (ignored files included) of a real worktree; install, run classified commands that write nothing, run `inventory`, `plan`, and `act` on plans for a sibling worktree and a regenerable directory of this worktree; compare. Also confirm no repository file mentions cardinal |
-| G10 | With valid plans, safe operations succeed and only G6/G7 operations are refused | Prepare: a merged clean worktree with `node_modules` (control), the `target/` of a dirty worktree (control), a worktree with `fuzz/corpus`, a `target/` with protected data deep inside, a dirty worktree, a worktree with an unpushed commit, a worktree without upstream, a worktree with a waiting job, and `node_modules` of an app-managed worktree. Ask the arbiter to reclaim all of them. In phase 0 the two controls report `dry_run` and nothing is deleted; each other one is refused with the matching check; the protected worktree's clean `target/` reports `dry_run` on its own |
-| G14 | After a runner crash, reservation and in-use state remain until the group stops, then are released | Budget of one job. Start a classified command whose script starts background children; SIGKILL the runner. Immediately: `inventory` shows `recovery_needed` and `in_use`; `act` on that worktree's plan is refused (`not_in_use`). Start another classified command: it waits while the group lives (recovery never signals it). End the group's members by their PIDs; the waiting command then runs. Afterwards `ps -g <pgid>` is empty and the reservation is gone |
+| Where the web UI is shown (section 10.6) | A local page; B a Cloudflare Worker and Durable Object, which needs the account, a plan (Workers Free, or Paid from $5 a month), Access with a card on file, a hostname, per-host tokens, and agreement on what leaves the host; C a static page on Cloudflare | A now, B after this decision |
+| The arbiter's squash-merge judgment (section 9.3, section 17 item 13) | Accept `--squash-merged` from the arbiter, checked against `content_in_base`; or require owner approval for every merge without merge evidence, so G3's squash case needs approval. In phase 1 it changes reports only | Accept, with the design §7 change of section 17 item 13 |
+| Regenerable data in app-managed worktrees (section 17 item 16) | Keep them report-only; or let `reclaim_dir` run in them, a design §4 change | Report-only; revisit with the counts of section 14.4 |
+| Whole-worktree execution and G3 (section 9.7, section 17 item 17) | (A) Defer executing whole worktrees, and G3's execution part, to a later phase: phase 1 reports reclaimable worktrees and the owner removes them. (B) Keep it in phase 1 and design now what section 9.7 requirements 15–17 list | Decided: A |
+| A scratch GitHub repository for the real-host checks of section 15 | A private repository created for the checks and deleted after them; or no real-host check of the pull-request cases of G3, G6, and G8 | Create one |
+| Enabling execution (section 9.7) | Which callers execute, on which hosts, after which evidence (section 14.4), accepting which residual costs of section 9.7 (requirements 5, 6, and 10), and whether worktrees that containers or VMs use are listed under `[observe] managed` first | Pending the execution design (#33); the first release executes nothing |
+| Unattended model usage | Each arbiter pass costs model usage. Passes run only for due items, at most one per `min_interval_s`; an item is tried again only after `retry_s`, so items left open or failing cost at most one pass per `retry_s`; disk items start none | `min_interval_s` 30 minutes, `retry_s` 2 hours |
+| Disk lines and the timer interval (section 10.4) | Defaults: warning, recovery, and critical at 20, 30, and 5 GiB; 5 minutes. The warning line must leave room for the growth over one interval plus two passes under pressure (section 10.4); section 14.4 measures these, and none is derived here | Set per host from section 14.4's measurements |
+| Installing the timer | cardinal installs its launchd agent or systemd timer; or it is copied by hand from `examples/` | By hand: cardinal writes nothing to the user's service configuration |
 
-## 16. Plan layer for phase 0
+## 15. Purpose layer
 
-Claims from design §11 that phase 0 implements, restated for phase 0, plus new claims A1–A13. EARS, one line each.
+Real-host checks run on macOS with Claude Code and the hook installed as in section 6.2, a scratch state and config dir, and scratch repositories outside real projects. Phase 1's checks also use a scratch GitHub repository, for the pull-request facts (section 14.5), and a 2 GiB APFS disk image attached at a scratch path, for disk pressure. Every refused case sits next to a control that is reclaimed in the same run (design §10); in phase 1 the control reports `dry_run` instead. Windows real-host checks are phase 3.
+
+| ID | Phase | Condition (design §10) | Check on a real host |
+| --- | --- | --- | --- |
+| G2 | 1 (detection and report); execution pending (section 14.5) | When free space drops below the warning line while reclaimable outputs exist, they are reclaimed before space runs out, and reclamation stops above the recovery line | On the image: four scratch worktrees with 300 MiB of regenerable `target/` and `node_modules` each and different last activity, one in use by a paused classified command, one with `fuzz/corpus` inside its `target/`. Lines for the image: warning 600 MiB, recovery 900 MiB, critical 200 MiB; the launchd agent of `examples/launchd` with `StartInterval` 60. A writer outside cardinal grows a file on the image by 4 MiB/s until 400 MiB are free. Within one interval and two pass lengths of the crossing (the bound of section 10.4, with the pass lengths measured in this run), a pass publishes a `disk_low` item and the page shows it marked for the owner, with the pass's final reading, the targets `disk-reclaim` lists in the order of section 10.4 down to the recovery line or the shortfall, and, in `blocked` by worktree and path, the in-use worktree's entries and the protected `target/`; no arbiter pass starts for it, and nothing is deleted. The same with the writer stopping 100 MiB below the critical line: `disk_critical` is raised too, and the report runs there as well; once the writer's file is deleted, `disk_critical` ends at the next pass and `disk_low` above the recovery line. Then, with the interval at one hour, a classified command that writes past the warning line starts a pass when it ends |
+| G3 | 1 (report); execution pending (section 14.5) | A worktree meeting every reclamation condition is reclaimed without the owner or an orchestrator; in dry-run, reported | In the scratch GitHub repository, after a `git fetch` in the main worktree: clean, pushed worktrees whose pull request was merged with a merge commit, whose pull request was squash-merged, whose branch was squash-merged into the base without a pull request (`git merge --squash`, pushed), and one not merged. Only the timer runs. The first reports `dry_run` with merge evidence `base_ancestor` (the merge commit makes HEAD an ancestor of the base), the second with `merged_pr`, both with `execution_not_designed`, and both raise `reclaimable`, which the arbiter resolves with that result; the third reports `dry_run` after the arbiter judged it (`--squash-merged`, section 9.3), and the unmerged one is refused (`merge_evidence`). Nothing is removed and every branch stays |
+| G4 | 0 | Before the child starts, a missing, crashed, or unresponsive cardinal, or a runner that cannot start, leaves the command running exactly once with the same result; after start, no rerun and an infrastructure failure | A classified probe prints its args, `pwd`, sorted `env`, writes to stdout and stderr, appends one line to a counter file outside the repository, and exits 7. An agent runs it inside `cd sub && probe 2>&1 \| tail -5 \|\| echo fallback` (a) without the hook, (b) with the runner path not executable, (c) with the state dir unwritable, (d) with `admission.lock` held by another process past `lock_timeout_ms`, (e) with the hook's deadline forced to be missed, (f) with a failure injected before the start boundary. All outputs equal (a), and the counter grows by one each time. Permissions, with the shipped settings: in `default` and `acceptEdits` modes each rewritten call prompts once for all its stages, also with an allow rule for the probe; a deny rule for the probe still denies the rewritten call; with `Bash(probe)` denied, an agent's direct `R run -- probe` does not run without approval; a session without an approval surface refuses the rewritten call; `bypassPermissions` runs it without a prompt, as it runs the original; in `auto` mode nothing is rewritten. After start: SIGKILL the runner of a long probe; the counter shows one start, the exit status is 137, and `cardinal explain job` reports `runner_died`. The accepted zero-run cases (runner killed before the spawn, Bash call cancelled before the spawn) end with no run |
+| G5 | 0, 1 | No files or instructions are added to target repositories | Snapshot `git status --porcelain --ignored --untracked-files=all`, a recursive listing (ignored files included) of a real worktree, and a listing of its repository's common dir; install, run classified commands that write nothing, run `inventory`, `plan`, `act` on the plans of this worktree and of a sibling, and a `reconcile` pass; compare. Nothing was added or removed. Also confirm no repository file mentions cardinal |
+| G6 | 1 (report); the control's reclamation pending with execution | Worktrees with uncommitted changes, unpushed commits, an open PR, no upstream, a failed observation, or in use (a waiting job included) are not reclaimed, and a reclaimable worktree beside them is | In the scratch GitHub repository, next to a merged, clean, pushed control: a worktree with uncommitted changes, one with an unpushed commit, one with an open pull request, one whose branch has no upstream, one running a classified command, and one whose classified command waits because the budget of one job is taken by a job in another worktree; plus a worktree of a second repository whose `origin` names a GitHub repository gh cannot read. The timer and the arbiter run. In `cardinal plan` only the control's plan has `invariants_ok: true`; its `act` by the arbiter reports `dry_run` (`execution_not_designed`) and `reclaimable` is raised for it alone. Every other plan fails its check there (`invariants_ok: false`, the check named in `checks`), the arbiter runs no `act` on it, and its files, HEAD, branch, and status are unchanged |
+| G7 | 1 (report); execution pending (section 14.5) | Protected data and the worktree containing it are never deleted, and regenerable directories beside them are | On the image, under the pressure of G2: a merged, clean worktree holding `fuzz/corpus`, `fuzz/artifacts`, and `proptest-regressions`, with `target/a/b/fuzz/corpus/seed` in its `target/`, next to a control worktree's `target/`. The control is among `disk-reclaim`'s listed targets, with a `planned` record, and an explicit `act` on its plan, the recheck, reports `dry_run`; the worktree's plan is refused (`no_protected`), its `target/` is refused and counted in `blocked` under `no_protected`, and every protected file is unchanged byte for byte |
+| G8 | 1 | The arbiter resolves what it can, and only decisions only the owner can make reach the owner | With the timer running: the branch squash-merged without a pull request (G3), a dirty worktree whose pull request was closed without merging, and a session that ends leaving a background dev server running. Nobody asks for a pass: the timer starts the arbiter, which judges the squash-merged worktree (its `act --squash-merged` reports `dry_run`, and its `merge_undecided` item is resolved with the judgment) and escalates `closed_pr_dirty` and `outlived_processes`. Those two are the only items in the report's owner section and marked for the owner on the page; the dirty worktree and the dev server are untouched |
+| G10 | 0, 1 (report); the controls' reclamation pending with execution | With valid plans, safe operations succeed and only G6/G7 operations are refused | Prepare: a merged clean worktree with `node_modules` (control), the `target/` of a dirty worktree (control), a worktree with `fuzz/corpus`, a `target/` with protected data deep inside, a dirty worktree, a worktree with an unpushed commit, a worktree without upstream, a worktree with a waiting job, and `node_modules` of an app-managed worktree. Ask the arbiter to reclaim all of them. Both controls report `dry_run` (`execution_not_designed`); each other one is refused with the matching check, and the protected worktree's clean `target/` reports `dry_run` on its own |
+| G14 | 0 | After a runner crash, reservation and in-use state remain until the group stops, then are released | Budget of one job. Start a classified command whose script starts background children; SIGKILL the runner. Immediately: `inventory` shows `recovery_needed` and `in_use`; `act` on that worktree's plan is refused (`not_in_use`). Start another classified command: it waits while the group lives (recovery never signals it). End the group's members by their PIDs; the waiting command then runs. Afterwards `ps -g <pgid>` is empty and the reservation is gone |
+
+## 16. Plan layer
+
+Claims from design §11 that phases 0 and 1 implement, restated, plus new claims A1–A24. EARS, one line each; test names in files that phase 1 adds are planned (section 14.2).
 
 | ID | Claim (EARS) | Source | Test |
 | --- | --- | --- | --- |
 | C1 | When a classified stage reaches the PreToolUse hook, the hook shall rewrite it to run through `cardinal run` and shall not create a reservation. | G14 | `hook_claude::rewrite_takes_no_reservation`, `hook_claude::rewrite_runs_through_the_real_runner` |
 | C2 | When the runner decides admission, it shall decide inside the admission lock from the live and recovery-needed reservations and the new job's resources against the host budgets, and shall reserve all resources or none. (Sensors: phase 2.) | G1 | `admission_concurrency::*`, `reservation_lock::*` |
 | C5 | If the runner path is not executable, the shell fallback shall run the original stage; if the runner fails in any observable way before `spawn()` returns a child, the runner shall run the stage once; after that, cardinal shall not rerun it and shall report an infrastructure failure; if the hook misses its deadline, the command shall not be rewritten. | G4 | `run_start_boundary::*`, `run_infra_failure::*`, `hook_claude::deadline_no_rewrite`, `rewrite_equivalence::runner_missing` |
-| C6 | When the hook rewrites a command, the other Bash input fields shall be unchanged, only classified stages shall be wrapped, and the command shall keep its meaning, including lists, pipelines, shell options, cwd, persisted cwd, environment, and output. (No injection in phase 0.) | G4 | `rewrite_equivalence::*`, `hook_claude::other_fields_preserved`, `run_wait::no_output_added` |
+| C6 | When the hook rewrites a command, the other Bash input fields shall be unchanged, only classified stages shall be wrapped, and the command shall keep its meaning, including lists, pipelines, shell options, cwd, persisted cwd, environment, and output. (No injection in phases 0 and 1.) | G4 | `rewrite_equivalence::*`, `hook_claude::other_fields_preserved`, `run_wait::no_output_added` |
 | C8 | When a runner dies, or its stage's direct child exits with group members left, its reservation and in-use state shall count as reserved and in use until its process group is empty or the boot changes. | G14 | `recovery::*`, `inventory::budget_reserved_and_reservations`, `inventory::jobs_make_a_worktree_in_use`, `inbox::recovery_needed_raised_and_cleared` |
-| C9 | On SubagentStop and SessionEnd, cardinal shall record the end and shall not stop processes; processes that outlive their session shall appear in the inbox. | G8 | `session_end::*`, `inbox::outlived_processes_raised` |
-| C12 | A whole worktree shall be a plan without approval only when it has merge evidence, is clean, has no unpushed commits, no open PR, an upstream, is not in use or managed, contains no protected, unclassifiable, or nested-repository data, and observation succeeded. | G3, G6, G7 | `plan_act::candidates::*` (commits after merged PR, reused branch name, no upstream, gh failure, control) |
-| C13 | When phase-0 `act` evaluates a plan, it shall inspect the whole target including descendants and reject it if inspection or observation identifies protected or unclassifiable ignored data. | G7, G10 | `plan_act::protected_deep_in_target_refused`, `plan_act::protected_worktree_refused_target_dir_passes` |
-| C14 | When phase-0 `act` evaluates a plan, it shall require a plan ID, report `expired` for an observed bound-identity mismatch, apply the same checks for every caller, and leave the plan unclaimed. | G10 | `plan_act::identity::*`, `act_snapshot::branch_switch_expires_the_plan`, `act_single::*`, `act_report_only::repeated_act_changes_nothing` |
-| C15 | The runner shall hold the worktree's in-use lock from acceptance until the stage exits on every path where it can take it, and reclamation shall proceed only with the lock taken exclusively. | G6 | `in_use::waiting_and_running_jobs_block_act`, `in_use::held_on_fail_open_and_tty` |
+| C9 | On SubagentStop and SessionEnd, cardinal shall record the end and shall not stop processes; processes that outlive their session shall appear in the inbox at the next `reconcile` pass or `cardinal inbox`. | G8 | `session_end::*`, `inbox::outlived_processes_raised`, `reconcile::refresh_raises_and_clears` |
+| C10 | When a watched volume is under pressure (`warning` or `critical`), `disk-reclaim` shall list, from one set of checks and exclusive sizes evaluated in the same pass, that volume's `reclaim_dir` plans that pass every check without approval, oldest worktree first and the most exclusive bytes first, skipping targets that free nothing, until their exclusive bytes would lift the final reading above the recovery line, and shall report any shortfall. (Executing them: section 9.7.) | G2 | `disk_reclaim::order_and_stop`, `disk_reclaim::exclusive_bytes_first`, `disk_reclaim::in_use_and_protected_skipped`, `disk_reclaim::runs_in_critical`, `disk_reclaim::shortfall_against_the_final_reading`, `disk_reclaim::one_set_of_checks`, `disk_volume::reported_before_full` |
+| C12 | A whole worktree shall pass without owner approval only when it has merge evidence (`base_ancestor`, `merged_pr`, or `content_in_base` with `--squash-merged`), is clean, has no unpushed commits, no open PR, an upstream, is not in use or managed, contains no protected, unclassifiable, or nested-repository data, is a plain target, and observation succeeded; in phase 1 such a plan is reported, not executed (A10). | G3, G6, G7 | `plan_act::candidates::*` (commits after merged PR, reused branch name, no upstream, gh failure, control), `squash::*` |
+| C13 | When `act` evaluates a plan, it shall inspect the whole target including descendants and reject it if inspection or observation identifies protected or unclassifiable ignored data. | G7, G10 | `plan_act::protected_deep_in_target_refused`, `plan_act::protected_worktree_refused_target_dir_passes` |
+| C14 | When `act` evaluates a plan, it shall require a plan ID, report `expired` for an observed bound-identity mismatch, apply the same checks for every caller, and leave the plan unclaimed. | G10 | `plan_act::identity::*`, `act_snapshot::branch_switch_expires_the_plan`, `act_single::*`, `act_report_only::repeated_act_changes_nothing` |
+| C15 | The runner shall hold the worktree's in-use lock from acceptance until the stage exits on every path where it can take it, and `act` shall count the worktree in use while the lock is held, a live or recovery-needed reservation names it, or another process has its working directory in it. (What execution needs beyond the lock: section 9.7, section 17 item 6.) | G6 | `in_use::waiting_and_running_jobs_block_act`, `in_use::held_on_fail_open_and_tty`, `plan_act::working_directory_in_the_worktree_refused` |
 | C16 | While a unit's `act` is false, `act` called as that unit shall leave the target unchanged and record the planned operation. | G3 | `unit_dry_run::*` |
 | C17 | The admission path shall not use the network. | G11 | `layering::admission_has_no_observe_dependency`, `admission_isolation::no_network` |
-| C18 | The admission path shall not call the arbiter or wait for it. | G1, G4 | `layering::admission_has_no_inbox_dependency`, `admission_isolation::no_arbiter` |
-| C19 | When an item is raised, the inbox shall not duplicate an existing key and shall not reopen resolved or dismissed items. | G8 | `inbox::*` |
+| C18 | The admission path shall not call the arbiter or wait for it, and the runner's job-end disk check shall start a pass only detached, after the stage's status is fixed. | G1, G4 | `layering::admission_has_no_inbox_dependency`, `admission_isolation::no_arbiter`, `run_disk_trigger::*` |
+| C19 | When an item is raised, the inbox shall not duplicate an existing key and shall not reopen resolved or dismissed items, and every item a `reconcile` pass raises shall carry the observations behind it. | G8 | `inbox::*`, `inbox_raisers::*`, `inbox_raisers::unclassifiable_data_once_per_set`, `inbox::occurrence_ends_and_recurs` |
 | C20 | cardinal shall create no files inside target repositories. | G5 | `no_repo_writes::*`, `act_report_only::repeated_act_changes_nothing` |
-| A1 | When the wait reaches the wait cap, the phase 0 runner shall start the stage once over budget and record `overflow`. | Phase 0 interim rule: G4, and the seam for C4 | `run_wait::overflow_runs_once` |
+| A1 | When the wait reaches the wait cap, the runner shall start the stage once over budget and record `overflow`. | Interim rule until phase 2: G4, and the seam for C4 | `run_wait::overflow_runs_once` |
 | A2 | When cardinal runs git or gh, it shall pass a constructed environment from which repository-location variables inherited from the caller are absent. | G5 | `observe_env::inherited_git_vars_ignored` |
-| A3 | Observation shall not write inside any repository, including its `.git` directory. | G5, C20 | `observe_readonly::index_and_refs_unchanged` |
+| A3 | Observation shall not write inside any repository, including its `.git` directory, shall run no filter driver a repository configures, and shall fetch no object. | G5, C20 | `observe_readonly::index_and_refs_unchanged`, `observe_readonly::configured_filters_never_run` (a same-size edit of a filtered file: the filter's marker absent, `dirty` `unknown`), `observe_readonly::filter_added_during_observation` (a driver configured at `observe.filters_listed`: `filters_changed`), `observe_readonly::no_lazy_fetch` (a local `--filter=tree:0` clone missing the base's trees: its packs unchanged, the base facts `unknown`), `observe::tests::promisor_below_2_45_reads_no_objects` |
 | A4 | When a reservation's runner is dead, cardinal shall release it only when its process group is empty or the boot changed, and recovery shall never signal the group. | G14 | `recovery::crashed_runner_group_is_kept_until_empty`, `recovery::unverified_group_not_signalled`, `recovery::reused_pgid_*`, `recovery::previous_boot_released` |
 | A5 | If the hook runs on Windows, fails, reads malformed input, misses its deadline, or sees `permission_mode` `auto`, it shall exit 0 with empty stdout. | G4 | `hook_claude::never_blocks::*`, `hook_claude::auto_mode_not_rewritten`, `hook_claude::windows_not_rewritten` |
-| A6 | When `act` runs, it shall compute the need for owner approval from the checks it evaluates, and shall reject a plan that needs it without `--owner-approved`. | design §5 | `plan_act::approval_recomputed_when_merge_evidence_disappears` |
-| A7 | `act` shall refuse a target that is a symbolic link, a mount point, or on another device than its parent, or that contains another repository below its root. | G7 | `plan_act::nested_repository_refused`, `plan_act::mount_point_refused`, `act_snapshot::bind_mounts_are_not_entered`, `act_snapshot::bind_mounts_are_not_listed`, `act_snapshot::walk_lists_only_the_directories_it_recorded`, `act_snapshot::walk_does_not_list_a_mount_made_after_its_check` |
+| A6 | When `act` runs, it shall compute the need for owner approval from the checks it evaluates, and shall reject a plan that needs it unless `--owner-approved` is given with `--caller owner`. | design §5 | `plan_act::approval_recomputed_when_merge_evidence_disappears` |
+| A7 | `act` shall refuse a target that is a symbolic link or a mount point, that is on another device or mount than its parent or has a directory below it that is, or that contains another repository below its root. | G7 | `plan_act::nested_repository_refused`, `plan_act::mount_point_refused`, `act_snapshot::*`, `act_fs::mount_below_the_target_refused` |
 | A8 | `act` shall refuse both plan kinds for a worktree under a managed root or locked by git. | design §4 | `plan_act::managed_worktree_refused`, `plan_act::managed_reclaim_dir_refused` |
 | A9 | If the in-use lock cannot be taken within the wait cap, the runner shall run the stage and record `in_use_unprotected`. | G4 | `in_use::unprotected_run_recorded` |
-| A10 | While phase 0 is active, `act` shall perform no target deletion or relocation and shall leave worktree contents, Git linkage and Git administrative metadata unchanged, regardless of caller, approval or unit configuration. | G5, G7 | `act_report_only::*`, `act_single::act_neither_claims_nor_deletes`, `unit_dry_run::unit_with_act_true_is_recorded_as_act` |
+| A10 | `act` shall perform no target deletion or relocation and shall leave worktree contents, Git linkage and Git administrative metadata unchanged, regardless of caller, flags, approval or unit configuration, and shall report a plan whose checks pass and whose approval is met as `dry_run` with `execution_not_designed`. | G5, G7 | `act_report_only::*`, `act_report_only::execution_not_designed_for_every_caller`, `act_single::act_neither_claims_nor_deletes`, `unit_dry_run::unit_with_act_true_is_recorded_as_act` |
 | A11 | When stdin is a terminal, the runner shall run the stage without a process group or admission, holding the in-use lock, and record `tty_passthrough`. | G4 | `run_tty::passthrough` |
 | A12 | If the runner's parent exits, the runner shall not start the stage, or, after the spawn, shall stop the group (on the fail-open and TTY paths, the stage, once the runner is not stopped, unless a signal the runner does not handle ends it first), and the reservation shall remain until the group is empty. | G14 | `run_parent_death::*` |
 | A13 | When the stage dies by a signal, the runner shall die by the same signal. | G4 | `run_signals::same_signal_death` |
+| A14 | `act` shall count `--squash-merged` as merge evidence only when its own observation at its checks finds `content_in_base` to be `yes`. | G3, G8 | `squash::*`, `squash::content_in_base_read_at_the_checks` (the plan made with `content_in_base: "yes"`; at `act.snapshotted` only the local base ref moves to a commit that changes a file the branch changed; `rejected` by `merge_evidence`, while the same run without the move reports `dry_run`) |
+| A15 | If `--owner-approved` is given without `--caller owner`, the CLI shall exit 2 without evaluating the plan. | design §3 | `cli::owner_approved_needs_the_owner` |
+| A16 | When a watched volume's free space is unknown, `disk-reclaim` shall not run on it, its disk state and disk items shall stay as they were, and cardinal shall record the failure. | design §7 | `disk_reclaim::unreadable_volume_skipped` (with an eligible control on a volume whose reading is known, which is reported in the same pass), `disk_state::failed_final_reading_keeps_the_items` |
+| A17 | A watched volume shall enter `warning` below the warning line or when the last hour's readings predict the critical line within two timer intervals, enter `critical` below the critical line from either state, a first reading included, and leave pressure only above the recovery line; `disk-reclaim` shall run in `warning` and `critical` alike. | G2 | `disk_state::*`, `disk_state::first_reading_below_critical`, `disk_reclaim::runs_in_critical` |
+| A18 | When the runner's job ends below the warning line and no pass ran in the last 60 s, it shall start `cardinal reconcile` detached only after the stage's status is read and recorded, and a failure of the check shall not change the stage's output or status. | G2, C18 | `run_disk_trigger::starts_after_the_status_is_recorded` (the attempt at `run.reconcile_spawning` observed, and only after `run.finished`), `run_disk_trigger::failure_changes_nothing` |
+| A19 | One `reconcile` pass and one arbiter launcher shall run at a time; an arbiter pass shall start only for due items (never assigned to a pass, or assigned to one that ended at least `retry_s` ago) and at most once per `min_interval_s`, and shall assign them to itself durably before its session starts; with `--assigned`, the session shall list and answer only items assigned to its own pass, and none once that pass has ended, and the launcher shall write the pass's outcome only into them; a launcher that dies while assigning or recording shall strand no item: an item never assigned stays due, and an assigned one keeps the outcome written into it or gets `abandoned`. | G8 | `reconcile::one_pass_at_a_time`, `arbiter_launch::due_items_only`, `arbiter_launch::assigned_items_only`, `arbiter_launch::retried_after_the_cooldown`, `arbiter_launch::killed_before_assigning`, `arbiter_launch::outcomes_kept_when_abandoned` |
+| A20 | While its launcher lives, an arbiter session shall be killed at `timeout_s`; a pass whose launcher died shall count as running until `timeout_s` after its start and then be recorded `abandoned`, with nothing signalled; three failed passes in a row shall raise `arbiter_failing`. | G8 | `arbiter_launch::timeout_kills_the_session`, `arbiter_launch::launcher_killed`, `arbiter_launch::failing_raised` |
+| A21 | The web UI page shall be written from the state cardinal already holds, without git, gh, or network calls, and shall open with no network. | design §12 | `ui::*` |
+| A22 | When observation finds unclassifiable ignored data in a worktree, or cannot read part of its ignored data, `reconcile` shall raise one item per worktree, set of entries, and occurrence, with the paths and the observation errors, and end it when the worktree is gone or its set has changed; a set found again after its occurrence ended shall raise a new item and leave the old one as it was. | design §7, G8 | `inbox_raisers::unclassifiable_data_once_per_set`, `inbox_raisers::unclassifiable_data_cleared`, `inbox_raisers::unclassifiable_data_superseded`, `inbox_raisers::unclassifiable_data_set_returns` (sets A, B, A: three items, a dismissal of the first kept) |
+| A23 | When a `reconcile` pass finds a watched volume under pressure, it shall write that volume's disk items with its disk report (the last successful reading, the time of the checks, the targets in order, any shortfall, and the blocked entries by worktree and path) before it runs the arbiter trigger or writes the page; disk items shall go to the owner and start no arbiter pass, and `disk_critical` shall end when a successful reading finds the volume out of `critical`. | G2, G8 | `reconcile::disk_items_complete_before_the_trigger`, `arbiter_launch::disk_items_start_no_pass`, `disk_state::critical_ends_above_the_critical_line` |
+| A24 | When `cardinal plan` runs without a target, or a `reconcile` pass builds its plans, it shall make a plan for every linked worktree and every ignored entry matching a regenerable pattern, whatever its checks find. | G6, G7, G8 | `plan_act::bulk_plans_every_worktree`, `plan_act::protected_target_dir_planned_and_refused` (refused by `no_protected` alone) |
 
-Out of scope for phase 0: C3 and C4 (phase 2, memory pressure and accepted jobs), C7 (phase 3, WSL), C10 and C11 (phase 1, disk thresholds and the reserve file), C21 (phase 2, measurement kinds).
+Out of scope for phases 0 and 1: C3 and C4 (phase 2, memory pressure and accepted jobs), C7 (phase 3, WSL), C11 (with executing reclamation, section 9.7), C21 (phase 2, measurement kinds).
 
 ## 17. Issues with the design
 
@@ -1148,10 +1490,15 @@ Out of scope for phase 0: C3 and C4 (phase 2, memory pressure and accepted jobs)
 3. **The Bash timeout does not kill.** design §6 bounds the wait by the Bash tool timeout. Claude Code moves a foreground command that reaches its timeout to the background instead of stopping it ([tools reference](https://code.claude.com/docs/en/tools-reference)), so an overrun costs the agent a background task, not the command. The bound is kept (section 5.4); design §14's first question is answered by section 6.1.
 4. **Stopping "the recorded process group" needs an identity that survives a crash.** design §6 says admission or a reconciler stops a dead runner's group before releasing it. A child-led group's PGID is unknown until after the spawn, and a PGID can be reused once its group empties. Resolution: the runner leads the group, so the PGID is recorded before the reservation exists; the reservation is released only when the group is empty or the boot changed; recovery never signals a dead runner's group, because its ID can pass to an unrelated group between a check and a signal (section 4.5). design §6 and C8 now say so.
 5. **G4 has zero-run cases.** A runner killed between its start and the spawn, and a runner path that is executable but cannot be loaded, run the stage zero times. They are accepted because they end with a visible non-zero status, never run the stage twice, and never report success; a shell-side fallback on the exit status would run the stage twice after a real failure (section 5.3).
-6. **Reclaim safety cannot depend on the in-use lock.** design §7 and C15 tie reclamation to the in-use lock, but G4 requires a stage to run even when its runner cannot take that lock. Resolution: phase 0 `act` deletes nothing (section 9.5), and phase 1 brings deletion with a race-free method that does not rely on the lock; the lock only keeps running commands from losing files under them.
-7. **No accepted jobs in phase 0.** design §6's step for a wait that reaches the cap is an accepted job, which is phase 2. Phase 0 starts the stage over budget instead (A1). This weakens G1 until phase 2, which phase 0 does not claim.
+6. **Reclaim safety cannot depend on the in-use lock, nor on what cardinal can see.** design §7 and C15 tie reclamation to the in-use lock, but G4 requires a stage to run even when its runner cannot take that lock (section 4.6), and a process that holds no lock is invisible to it. Reading working directories and open descriptors extends what cardinal sees, but not to every way a process uses a directory (section 9.7, requirement 5): for regenerable data a missed process costs a rebuild, for a worktree it loses work. Resolution: phase 1 executes nothing (item 17), and the in-use lock only marks a worktree in use for reports; the execution design must establish that a target is unused without relying on the lock alone. Proposed for design §7 and C15: name the lock as what makes commands wait, not what makes reclamation safe, name the boundary of what cardinal can see, and treat worktrees used through containers or VMs as managed.
+7. **No accepted jobs before phase 2.** design §6's step for a wait that reaches the cap is an accepted job, which is phase 2. Until then the runner starts the stage over budget instead (A1). This weakens G1 until phase 2, which phases 0 and 1 do not claim.
 8. **`git status` writes.** Without `--no-optional-locks`, `git status` refreshes and rewrites the index of the worktree it observes. Observation always disables optional locks (A3) so that observing does not change repositories.
 9. **"No upstream" is an invariant.** G6 and G10 make a branch without upstream unreclaimable, so `act` refuses it even with owner approval. A worktree whose work was never pushed has to be pushed or removed by hand. This is intended: it also protects freshly created worktrees.
 10. **Windows needs its own contract.** Git Bash converts arguments for native programs, Rust does not resolve extensionless `.cmd` shims, and Claude Code on Windows without Git Bash runs a separate PowerShell tool, which design §9 does not name. Phase 0 does not rewrite on Windows; phase 3 defines the contract and adds Job Objects.
 11. **Hook defaults are unsafe for cardinal.** Command hooks default to a 600 s timeout, and several hooks returning `updatedInput` have no defined order. The installation sets explicit timeouts and requires cardinal to be the only Bash-rewriting hook (section 6.2).
 12. **Process groups do not track processes that leave them.** A tool that calls `setsid` or `setpgid` for its own children takes them out of the job's group; the reservation can be released while they run.
+13. **A squash merge has no evidence the arbiter may act on.** design §7 leaves inferring a squash merge to the arbiter, design §5 lets the arbiter reclaim without approval only worktrees that meet every reclamation condition, the first of which is evidence that HEAD was merged (an ancestor of the base, or the head of a merged pull request), and G3 and G8 expect a squash-merged worktree reclaimed without the owner. A squash merge whose pull request head is not the worktree's HEAD (the branch got commits on GitHub after the last pull, from "Update branch" or a bot) or that was made without a pull request (`git merge --squash`) has neither, so every such worktree would need the owner. Resolution: the arbiter's judgment counts as evidence only through `--squash-merged`, which `act` accepts only when its own observation finds every file the branch changed identical in the base (`content_in_base`, section 9.3); every invariant still applies, and the branch is kept. Proposed for design §7: "or the arbiter judged a squash merge and every file the branch changed is identical in the base". In phase 1 the judgment changes reports only, because phase 1 executes nothing (item 17). Section 14.5 lists it as an open decision.
+14. **G2 has no immediate trigger.** design §9 rules out a resident process, so a crossing of the warning line is noticed at the end of a cardinal job and at each OS timer pass (section 10.3); growth inside a long job that cardinal runs is noticed only by the timer until the runner samples in phase 2. A pass that finds another one running exits, so the report of a crossing can come one timer interval and two pass lengths after it (section 10.4), and executing would add its deletion time. G2's "before space runs out" therefore holds when the room between the warning and critical lines exceeds the growth over that time; the prediction of section 10.4 moves the crossing earlier when growth is fast. Proposed for design §7 and G2's verification: name the growth rate, interval, and pass length the warning line is set for (the check of section 15 uses 4 MiB/s, 60 s, and 400 MiB).
+15. **APFS keeps deleted blocks for local snapshots** (design §14, third question). Blocks a local snapshot (Time Machine) still references are freed only when the snapshot goes, so a deletion can free nothing while one exists; important-usage capacity counts purgeable space, which the system frees only when a write needs it. On one host's volume without local snapshots, important usage read about 10% more than `statfs` and opportunistic usage about 30% less. cardinal measures with important usage, the space a write can get, and never deletes snapshots (`tmutil` does). The question stays open for a host with local snapshots, where section 14.4's run records the numbers. On such a volume deleting a reserve file frees nothing either; the execution design answers that for C11 (section 9.7, requirement 10).
+16. **Regenerable data in app-managed worktrees is never reclaimed.** design §4 makes worktrees created by T3 Code report-only, and A8 refuses `reclaim_dir` inside them as well as the whole worktree, because the app runs its sessions and servers there. On a host where most worktrees are T3 Code's, their `node_modules` and `target/` are out of reach, and G2 can fall short even with reclaimable data on the volume. Deleting a regenerable directory changes no state the app keeps, and `not_in_use` already refuses a worktree with a process inside it. Open (section 14.5): whether `reclaim_dir` may run in managed worktrees; design §4 would then name removing the worktree, not its regenerable data, as the operation left to the app. Until then they stay report-only.
+17. **Phase 1's first release executes no reclamation.** design §12 lists G2 and G3 among phase 1's conditions, and design §7 has cardinal reclaim. Executing safely needs what section 9.7 lists: every deletion bound to what was checked, git's classification included; users of the target that no check sees; recovery that deletes nothing written later; space to finish on a full volume; and, for whole worktrees, an idle state every user honours, the worktree's git ID serialized against git, and its per-worktree git state classified as disposable. No design in this document meets them. Resolution: the first release detects and reports; `act` evaluates every plan and reports `execution_not_designed`, `reconcile` raises `reclaimable` and disk items, and the owner reclaims. G2 is met as detection, report, and inbox, G3 in its report part ("in dry-run, they report it"), and the controls of G6, G7, and G10 report `dry_run` instead of being reclaimed. #33 adds executing regenerable directories later in phase 1, which completes G2 and G7; executing whole worktrees, and with it G3's execution part, stays deferred (section 14.5). Proposed for design §12: move G3's execution part to the phase that executes whole worktrees, and keep its report part in phase 1.
