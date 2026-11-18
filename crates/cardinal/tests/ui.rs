@@ -211,7 +211,8 @@ fn fixed_snapshot() -> Snapshot {
                 "gh": "ok", "gh_error": null,
                 "worktrees": [worktree("/src/app", "main", true),
                               worktree("/src/app/wt/it's", HOSTILE_BRANCH, false)]
-            }]
+            }],
+            "errors": []
         },
         "reservations": {
             "observed_ms": GENERATED_MS - 1_000,
@@ -241,7 +242,8 @@ fn fixed_snapshot() -> Snapshot {
             "started_ms": GENERATED_MS - 60 * MINUTE_MS, "ended_ms": GENERATED_MS - 50 * MINUTE_MS,
             "outcome": "completed", "items": ["merge_undecided:/src/app/wt/it's@0123456789ab@1794950000000"],
             "log": "/state/arbiter/c1c2c3d4e5f60718.log", "failures_in_a_row": 0
-        }
+        },
+        "errors": []
     }))
     .expect("the fixed snapshot is a cardinal.snapshot.v1")
 }
@@ -894,7 +896,7 @@ fn seed(state: &StateDir, snapshot: &Snapshot) {
                 "schema": "cardinal.inventory.v1", "observed_ms": observation.observed_ms,
                 "host": snapshot.host, "budget": { "cpu": 8 }, "reserved": {},
                 "reservations": [], "repos": observation.repos, "outlived": [], "disk": [],
-                "arbiter": { "running": false, "last": null }, "errors": []
+                "arbiter": { "running": false, "last": null }, "errors": observation.errors
             }),
         );
     }

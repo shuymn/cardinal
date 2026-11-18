@@ -394,21 +394,30 @@ fn snapshot_document() {
     let doc = json!({
         "schema": "cardinal.snapshot.v1", "generated_ms": 11, "host": host(),
         "disk": [disk_state()],
-        "observation": {"observed_ms": 10, "repos": [repo()]},
+        "observation": {"observed_ms": 10, "repos": [repo()],
+                        "errors": [{"scope": "repo:/r", "message": "git failed"}]},
         "reservations": {"observed_ms": 10, "items": [view()]},
         "inbox": [item],
         "records": [record()],
-        "arbiter": arbiter_pass()
+        "arbiter": arbiter_pass(),
+        "errors": [{"scope": "inbox", "message": "1 item could not be read"}]
     });
     round_trips::<Snapshot>(&doc);
     rejects_wrong_schema_and_missing::<Snapshot>(&doc, "reservations");
     rejects::<Snapshot>(&doc, "an item without needs_owner", |d| {
         d["inbox"][0].as_object_mut().unwrap().remove("needs_owner");
     });
+    // A snapshot written before `errors` and the observation's `errors` existed still loads.
+    let mut old = doc.clone();
+    old.as_object_mut().unwrap().remove("errors");
+    old["observation"].as_object_mut().unwrap().remove("errors");
+    let loaded: Snapshot = serde_json::from_value(old).unwrap();
+    assert_eq!(loaded.errors, []);
+    assert_eq!(loaded.observation.unwrap().errors, []);
     let empty = json!({
         "schema": "cardinal.snapshot.v1", "generated_ms": 11, "host": host(), "disk": [],
         "observation": null, "reservations": {"observed_ms": 10, "items": []}, "inbox": [],
-        "records": [], "arbiter": null
+        "records": [], "arbiter": null, "errors": []
     });
     round_trips::<Snapshot>(&empty);
 }

@@ -1296,11 +1296,15 @@ type ArbiterPass = { schema; id: string; started_ms: number; ended_ms: number | 
 // cardinal.snapshot.v1  (ui/snapshot.json, embedded in ui/index.html)
 { schema; generated_ms: number; host: Inventory["host"];
   disk: DiskState[];
-  observation: { observed_ms: number; repos: Repo[] } | null;   // the last full observation
+  observation: { observed_ms: number; repos: Repo[];       // the last full observation,
+                 errors?: { scope: string; message: string }[] } | null;  // with Inventory["errors"]; absent: none
   reservations: { observed_ms: number; items: ReservationView[] };
   inbox: (InboxItem & { needs_owner: boolean })[];         // open and escalated; marked as in section 10.6
   records: Record[];                                       // the last 50 act, planned, and inbox_* records
-  arbiter: ArbiterPass | null }
+  arbiter: ArbiterPass | null;
+  errors?: { scope: string; message: string }[] }         // parts not read, or read in part: scope "host", "disk",
+                                                           // "observation", "reservations", "inbox", "records", or "arbiter";
+                                                           // absent (a snapshot written before it): none
 ```
 
 ### 11.4 Phase 2 placeholders

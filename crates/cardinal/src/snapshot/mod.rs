@@ -57,6 +57,7 @@ pub fn build(config: &Config, state: &StateDir) -> Result<Snapshot, Error> {
         SnapshotObservation {
             observed_ms: inventory.observed_ms,
             repos: inventory.repos,
+            errors: inventory.errors,
         }
     });
     let items = admission::list_reservations(state, &config.host)?;
@@ -77,6 +78,7 @@ pub fn build(config: &Config, state: &StateDir) -> Result<Snapshot, Error> {
         inbox,
         records,
         arbiter,
+        errors: Vec::new(),
     })
 }
 
