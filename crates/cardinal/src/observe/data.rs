@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::config::{DataList, data_pattern_covers};
+use crate::config::{DataList, data_patterns_cover};
 use crate::contract::IgnoredClass;
 
 /// The `[data]` lists of the profiles that apply to a repository.
@@ -23,9 +23,7 @@ impl DataPatterns {
             DataList::Regenerable => &self.regenerable,
             DataList::Protected => &self.protected,
         };
-        patterns
-            .iter()
-            .any(|pattern| data_pattern_covers(list, pattern, rel))
+        data_patterns_cover(list, patterns, rel)
     }
 }
 

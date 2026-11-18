@@ -711,7 +711,7 @@ Merge evidence is `base_ancestor` or `merged_pr`, matched on the HEAD object ID,
 
 Each `!` entry from `git status` is classified with the profile's `[data]` patterns:
 
-1. `protected` if the entry, a directory it is inside, or anything below it (found by walking the entry) matches a protected pattern. Protected patterns match at any depth, a pattern with `/` as that sequence of components, so `fuzz/corpus` also protects `target/a/b/fuzz/corpus`; every module matches through `config::data_pattern_covers`;
+1. `protected` if the entry, a directory it is inside, or anything below it (found by walking the entry) matches a protected pattern. Protected patterns match at any depth, a pattern with `/` as that sequence of components, so `fuzz/corpus` also protects `target/a/b/fuzz/corpus`; every module matches through `config::data_pattern_covers`, or `config::data_patterns_cover` for a list of patterns, which splits the path once;
 2. else `nested_repository` if a directory at or below the entry has its own `.git` entry or is a git directory itself (`HEAD`, `objects/`, and `refs/`, as git recognizes a bare repository);
 3. else `regenerable` if the entry is, or is inside, a regenerable match (a regenerable pattern with `/` is worktree-relative);
 4. else `unclassifiable`, also when the walk could not read part of the entry.
