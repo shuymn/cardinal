@@ -29,6 +29,8 @@ use support::testpoints::TestPoints;
 #[test]
 fn helper() {
     walk_if_requested();
+    #[cfg(unix)]
+    walk_taken_if_requested();
 }
 
 /// The custom helper mode that runs `plan::walk`.
@@ -51,6 +53,39 @@ fn walk_if_requested() {
         "entries": walk.entries.iter().map(|e| e.rel.display().to_string()).collect::<Vec<_>>(),
     });
     std::fs::write(path("out"), doc.to_string()).expect("write the walk");
+    std::process::exit(0);
+}
+
+/// The custom helper mode that takes a target's walk from its worktree's walk
+/// (`plan::Tree`).
+#[cfg(unix)]
+const WALK_TAKEN_MODE: &str = "walk-taken";
+
+/// Runs the [`WALK_TAKEN_MODE`] a helper process was started for: walks the worktree, creates
+/// `<out>.walked`, and waits for `<out>.go`; then writes whether the target's walk was taken
+/// from the worktree's walk and the mount a walk of the target alone finds, and exits. Returns
+/// at once otherwise.
+#[cfg(unix)]
+fn walk_taken_if_requested() {
+    let Some(request) = support::helper::custom_request(WALK_TAKEN_MODE) else {
+        return;
+    };
+    let request: serde_json::Value = serde_json::from_str(&request).expect("a walk request");
+    let path = |key: &str| std::path::PathBuf::from(request[key].as_str().expect(key));
+    for key in ["worktree", "target", "out"] {
+        plan_support::assert_inside(&path("root"), &path(key), key);
+    }
+    let (worktree, target, out) = (path("worktree"), path("target"), path("out"));
+    let tree = cardinal::plan::Tree::walk(&worktree).expect("the worktree's walk");
+    std::fs::write(out.with_extension("walked"), b"").expect("mark the walk");
+    cardinal_test_support::process::wait_for_file(&out.with_extension("go"), WAIT);
+    let rel = target
+        .strip_prefix(&worktree)
+        .expect("a target in the worktree");
+    let taken = tree.walk_of(&worktree, rel).is_some();
+    let alone = cardinal::plan::walk(&worktree, &target).expect("walk");
+    let doc = serde_json::json!({ "taken": taken, "mount": format!("{:?}", alone.mount) });
+    std::fs::write(&out, doc.to_string()).expect("write the walk");
     std::process::exit(0);
 }
 
@@ -424,6 +459,41 @@ fn bind_mounts_are_not_listed() {
         "the snapshot does not list the bind mount"
     );
     ran_in_namespace("bind_mounts_are_not_listed");
+}
+
+/// A target bind-mounted onto itself after its worktree's walk listed it is still the directory
+/// recorded (device, inode, and type) but on a mount of its own: its walk is not taken from the
+/// worktree's, and a walk of it alone finds the mount (section 9.2).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_target_bound_onto_itself_after_the_worktree_walk_is_not_taken() {
+    let test = "a_target_bound_onto_itself_after_the_worktree_walk_is_not_taken";
+    let s = Setup::new();
+    if !mount_namespace(&s, test) {
+        return;
+    }
+    let wt = s.fx.path("taken");
+    write(&wt, "node_modules/pkg/index.js", "x");
+    let target = wt.join("node_modules");
+    let out = s.fx.path("walk-taken.json");
+    let request = serde_json::json!({
+        "root": s.fx.root(), "worktree": wt, "target": target, "out": out,
+    });
+    let mode = Mode::Custom {
+        name: WALK_TAKEN_MODE,
+        arg: request.to_string(),
+    };
+    let mut walk = support::helper::command(s.fx.scope(), &mode, s.fx.root());
+    s.fx.scope().mount_namespace(&mut walk, &[]);
+    let mut child = walk.spawn().unwrap();
+    cardinal_test_support::process::wait_for_file(&out.with_extension("walked"), WAIT);
+    s.fx.scope().bind_mount(&child, &target, &target).unwrap();
+    std::fs::write(out.with_extension("go"), b"").unwrap();
+    assert!(child.wait().unwrap().success());
+    let doc: serde_json::Value = serde_json::from_slice(&std::fs::read(&out).unwrap()).unwrap();
+    assert_eq!(doc["mount"], "Boundary", "{doc}");
+    assert_eq!(doc["taken"], false, "{doc}");
+    ran_in_namespace(test);
 }
 
 /// A target, and a directory below it, set up for a walk race: `walk-<n>/node_modules` holds
