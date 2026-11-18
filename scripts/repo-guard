@@ -35,10 +35,12 @@
 # agents add and remove them, so by default their work is left out: the branches they have
 # checked out at the snapshot or at the verify (refs, remote-tracking refs, `branch.<name>.*`
 # config, `packed-refs` lines), their entries in the worktree list and their
-# `worktrees/<name>/gitdir` lines, their git dirs, and the objects. That is safe because,
-# where the tests run confined, their confinement already denies writes to the shared git
-# dir and the guard is the second check, and CI=true compares the whole worktree list on every
-# platform. Lines that belong to a branch carry an `@<branch> ` prefix in the state, and
+# `worktrees/<name>/gitdir` lines, their git dirs, and the objects. Where the tests run
+# confined, their confinement already denies writes to the shared git dir and the guard is the
+# second check, and CI=true compares the whole worktree list on every platform. A local run
+# that is not confined (Linux without bubblewrap) has neither: a test that changes another
+# worktree's branch, the objects, or a ref outside git's own namespaces passes it and fails
+# only in CI. Lines that belong to a branch carry an `@<branch> ` prefix in the state, and
 # verify drops those of every branch another worktree had checked out at either point from
 # both states before comparing them; a branch another worktree had checked out only in
 # between counts as a change. Refs outside git's own namespaces (heads, tags, remotes, notes,
