@@ -136,6 +136,16 @@ fn rename_if_exists(from: &std::path::Path, to: &std::path::Path) -> io::Result<
 /// Reads every record, oldest first: rotated files from the highest number down, then the
 /// current file. Lines that do not parse as `cardinal.record.v1` are skipped.
 pub fn read_all(state: &StateDir) -> io::Result<Vec<Record>> {
+    let mut records = Vec::new();
+    for path in files(state)? {
+        records.extend(state::read_jsonl::<Record>(&path)?);
+    }
+    Ok(records)
+}
+
+/// The record files, oldest first: the rotated files `records/` holds, from the highest
+/// number down, whatever `keep` is now, then the current file, which may not exist.
+pub fn files(state: &StateDir) -> io::Result<Vec<PathBuf>> {
     let mut rotated: Vec<(u32, PathBuf)> = Vec::new();
     for entry in std::fs::read_dir(state.records_dir())? {
         let entry = entry?;
@@ -150,10 +160,9 @@ pub fn read_all(state: &StateDir) -> io::Result<Vec<Record>> {
         }
     }
     rotated.sort_by_key(|(n, _)| std::cmp::Reverse(*n));
-    let mut records = Vec::new();
-    for (_, path) in rotated {
-        records.extend(state::read_jsonl::<Record>(&path)?);
-    }
-    records.extend(state::read_jsonl::<Record>(&state.records_file())?);
-    Ok(records)
+    Ok(rotated
+        .into_iter()
+        .map(|(_, path)| path)
+        .chain(std::iter::once(state.records_file()))
+        .collect())
 }
