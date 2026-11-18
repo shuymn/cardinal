@@ -16,7 +16,10 @@ pub use checks::{
     DataLists, FACT_ENTRIES, InUseFacts, Inspection, approval, bound_facts, evaluate,
     invariants_ok, processes_inside, provenance,
 };
-pub use walk::{Entry, EntryKind, Mount, Walk, root_identity, walk};
+pub use walk::{Entry, EntryKind, Mount, Tree, Walk, root_identity, walk};
+
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::admission;
 use crate::config::Config;
@@ -55,11 +58,23 @@ impl Real<'_> {
     }
 
     /// Live and recovery-needed reservations naming the worktree with key `worktree_key`,
-    /// read under the admission lock.
+    /// read under the admission lock, one read at a time in this process
+    /// ([`ADMISSION_READS`]).
     pub fn in_use(&self, worktree_key: &str) -> Result<InUse, Error> {
+        let _one_at_a_time = ADMISSION_READS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         admission::in_use(self.state, &self.config.host, worktree_key)
     }
 }
+
+/// Held by each [`Real::in_use`] of this process. Plans built at once (section 9.2) would
+/// otherwise meet on the locks a read takes: one read would find the admission lock held by
+/// another and, past `admission.lock_timeout_ms`, fail, and one read's probe of a job's live
+/// lock would find it held by another's probe and count a gone job as live. One at a time,
+/// each read is the read a plan built alone makes, at the moment its plan makes it. A wait
+/// here ends once the reads before it end, each bounded by the admission lock's deadline.
+static ADMISSION_READS: Mutex<()> = Mutex::new(());
 
 /// `cardinal plan reclaim-worktree PATH | reclaim-dir PATH`.
 pub fn create(
@@ -136,6 +151,10 @@ pub struct Built {
 /// entry matching a regenerable pattern in the worktrees `entries_in` picks, whatever their
 /// checks find; a plan that cannot be stored is reported in `errors` (section 9.2). `reconcile`
 /// builds its plans with this from the observation it holds (section 10.3).
+///
+/// The plans of one worktree are built together, those of up to [`BUILD_WORKERS`] worktrees at
+/// a time, and stored in the order of `inventory`, so the plans and their records come out as
+/// one worktree after another makes them.
 pub fn create_from(
     config: &Config,
     state: &StateDir,
@@ -144,7 +163,7 @@ pub fn create_from(
     errors: &mut Vec<ScopedError>,
 ) -> Vec<Built> {
     let sources = Real { config, state };
-    let mut plans = Vec::new();
+    let mut jobs = Vec::new();
     for repo in &inventory.repos {
         let bare = Repo {
             worktrees: Vec::new(),
@@ -176,19 +195,141 @@ pub fn create_from(
                     )
                 });
             let targets: Vec<(PlanKind, PathBuf)> = whole.into_iter().chain(entries).collect();
-            for (kind, target) in targets {
-                let built = build(config, state, &sources, kind, &target, &observation);
-                match store(config, state, built.plan) {
-                    Ok(plan) => plans.push(Built { plan, ..built }),
-                    Err(err) => errors.push(ScopedError {
-                        scope: target.display().to_string(),
-                        message: err.message,
-                    }),
-                }
+            jobs.push((observation, targets));
+        }
+    }
+    let built = parallel(&jobs, &|(observation, targets)| {
+        build_worktree(config, state, &sources, observation, targets)
+    });
+    let mut plans = Vec::new();
+    for ((_, targets), built) in jobs.iter().zip(built) {
+        for ((_, target), built) in targets.iter().zip(built) {
+            match store(config, state, built.plan) {
+                Ok(plan) => plans.push(Built { plan, ..built }),
+                Err(err) => errors.push(ScopedError {
+                    scope: target.display().to_string(),
+                    message: err.message,
+                }),
             }
         }
     }
     plans
+}
+
+/// The most worktrees whose plans are built at a time. Their walks are metadata reads in this
+/// process, which contend in the kernel: more threads cost more kernel time and memory than
+/// they save (section 9.2).
+const BUILD_WORKERS: usize = 4;
+
+/// `build` of each of `jobs`, in their order, on one thread per logical CPU, at least one and
+/// at most [`BUILD_WORKERS`]. Once a `build` panics no worker takes another job, and the panic
+/// goes on, with its own payload, when the builds under way have ended.
+fn parallel<J: Sync, T: Send>(jobs: &[J], build: &(dyn Fn(&J) -> T + Sync)) -> Vec<T> {
+    let results: Mutex<Vec<(usize, T)>> = Mutex::new(Vec::with_capacity(jobs.len()));
+    let next = AtomicUsize::new(0);
+    let panicked = AtomicBool::new(false);
+    let workers = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZero::get)
+        .clamp(1, BUILD_WORKERS)
+        .min(jobs.len().max(1));
+    let panic = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    let _set = SetOnPanic(&panicked);
+                    while !panicked.load(Ordering::Relaxed) {
+                        let n = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(job) = jobs.get(n) else { break };
+                        let result = build(job);
+                        results
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push((n, result));
+                    }
+                })
+            })
+            .collect();
+        let mut panic = None;
+        for handle in handles {
+            if let Err(payload) = handle.join() {
+                panic.get_or_insert(payload);
+            }
+        }
+        panic
+    });
+    if let Some(payload) = panic {
+        std::panic::resume_unwind(payload);
+    }
+    let mut results = results
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    results.sort_by_key(|(n, _)| *n);
+    results.into_iter().map(|(_, result)| result).collect()
+}
+
+/// Sets its flag when a panic drops it.
+struct SetOnPanic<'a>(&'a AtomicBool);
+
+impl Drop for SetOnPanic<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The plans of `targets`, all in the worktree of `observation`, built in their order and not
+/// stored. The worktree's own walk, taken first when its plan is among them, gives each
+/// directory below it its walk when it listed that directory and the path holds it still
+/// ([`Tree::walk_of`]); any other target is walked on its own.
+fn build_worktree(
+    config: &Config,
+    state: &StateDir,
+    sources: &Real<'_>,
+    observation: &WorktreeObservation,
+    targets: &[(PlanKind, PathBuf)],
+) -> Vec<Built> {
+    let worktree = Path::new(&observation.worktree.path);
+    let whole =
+        |kind: PlanKind, target: &Path| kind == PlanKind::ReclaimWorktree && target == worktree;
+    // The worktree's plan comes first, so its walk is taken where it was.
+    let tree = targets
+        .first()
+        .filter(|(kind, target)| whole(*kind, target))
+        .map(|_| Tree::walk(worktree).map_err(|err| walk_error(worktree, &err)));
+    let mut plans = Vec::with_capacity(targets.len());
+    for (kind, target) in targets {
+        let own: Result<Walk, String>;
+        let walked = match &tree {
+            Some(tree) if whole(*kind, target) => {
+                tree.as_ref().map(|tree| &tree.walk).map_err(String::as_str)
+            }
+            _ => {
+                let taken = tree.as_ref().and_then(|tree| {
+                    let rel = target.strip_prefix(worktree).ok()?;
+                    tree.as_ref().ok()?.walk_of(worktree, rel)
+                });
+                own = taken.map_or_else(
+                    || walk(worktree, target).map_err(|err| walk_error(target, &err)),
+                    Ok,
+                );
+                own.as_ref().map_err(String::as_str)
+            }
+        };
+        plans.push(build_with(
+            config,
+            state,
+            sources,
+            (*kind, target),
+            observation,
+            walked,
+        ));
+    }
+    plans
+}
+
+fn walk_error(target: &Path, err: &std::io::Error) -> String {
+    format!("{}: {err}", target.display())
 }
 
 /// Loads the plan whose ID starts with `prefix` (at least 4 characters, unique).
@@ -238,8 +379,28 @@ fn build(
     target: &Path,
     observation: &WorktreeObservation,
 ) -> Built {
+    let worktree = Path::new(&observation.worktree.path);
+    let walked = walk(worktree, target).map_err(|err| walk_error(target, &err));
+    build_with(
+        config,
+        state,
+        sources,
+        (kind, target),
+        observation,
+        walked.as_ref().map_err(String::as_str),
+    )
+}
+
+/// [`build`] from `walked`, the walk of `target` or why it failed.
+fn build_with(
+    config: &Config,
+    state: &StateDir,
+    sources: &Real<'_>,
+    (kind, target): (PlanKind, &Path),
+    observation: &WorktreeObservation,
+    walked: Result<&Walk, &str>,
+) -> Built {
     let worktree = PathBuf::from(&observation.worktree.path);
-    let walked = walk(&worktree, target).map_err(|err| format!("{}: {err}", target.display()));
     let (root_id, root_created_ms) = root_identity(&worktree).unwrap_or((None, None));
     let in_use = probe_in_use(state, sources, &worktree);
     let patterns = patterns(config, &observation.repo);
@@ -248,7 +409,7 @@ fn build(
         worktree: &worktree,
         target,
         observation: Ok(observation),
-        walk: walked.as_ref().map_err(String::as_str),
+        walk: walked,
         in_use: &in_use,
         patterns: &patterns,
         managed: &config.host.observe.managed,
@@ -272,8 +433,8 @@ fn build(
             root_id,
             root_created_ms,
         },
-        allocated_bytes: walked.as_ref().ok().map(Walk::allocated),
-        aliased_bytes: walked.as_ref().ok().map(Walk::aliased),
+        allocated_bytes: walked.ok().map(Walk::allocated),
+        aliased_bytes: walked.ok().map(Walk::aliased),
         invariants_ok: invariants_ok(&checks),
         approval: approval(&checks),
         checks,
@@ -281,7 +442,7 @@ fn build(
     };
     Built {
         plan,
-        own_file_bytes: walked.as_ref().ok().map(Walk::own_file_bytes),
+        own_file_bytes: walked.ok().map(Walk::own_file_bytes),
     }
 }
 
@@ -385,4 +546,111 @@ fn state_error(path: &Path, err: &std::io::Error) -> Error {
         ErrorCode::StateUnavailable,
         format!("{}: {err}", path.display()),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroU64;
+    use std::panic::AssertUnwindSafe;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use super::{Config, Real, parallel};
+    use crate::config::HostConfig;
+    use crate::contract::{
+        AdmissionResult, GroupIdentity, Priority, ProcessIdentity, Reservation, ReservationSchema,
+        ReservationState, ReservationWorktree,
+    };
+    use crate::state::StateDir;
+
+    /// Plans built at once read reservations as a plan built alone does: with
+    /// `admission.lock_timeout_ms = 0`, no read finds the admission lock held by another, and
+    /// no read finds the live lock of a gone job held by another's probe of it.
+    #[test]
+    fn plans_built_at_once_read_reservations_one_at_a_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::open(&dir.path().join("state")).unwrap();
+        let mut host = HostConfig::defaults();
+        host.admission.lock_timeout_ms = 0;
+        let config = Config {
+            dir: dir.path().join("config"),
+            host,
+            profiles: Vec::new(),
+        };
+        let sources = Real {
+            config: &config,
+            state: &state,
+        };
+        // A job of another boot whose live lock is free: stale, so the worktree is not in use.
+        let job = "aaaa000000000001";
+        let gone = Reservation {
+            schema: ReservationSchema,
+            job_id: job.into(),
+            state: ReservationState::Running,
+            boot_s: 1,
+            created_ms: 1,
+            updated_ms: 1,
+            runner: ProcessIdentity {
+                pid: 999_999,
+                start_s: 1,
+            },
+            group: GroupIdentity::Pgid {
+                pgid: 999_999,
+                leader_start_s: 1,
+            },
+            child: None,
+            stop_signal_ms: None,
+            priority: Priority::Normal,
+            resources: [("cpu".to_owned(), NonZeroU64::MIN)].into_iter().collect(),
+            admission: AdmissionResult::WithinBudget,
+            class: None,
+            rule: None,
+            worktree: Some(ReservationWorktree {
+                key: "key".into(),
+                path: "/w".into(),
+                protected: true,
+            }),
+            session: None,
+            cwd: "/w".into(),
+            argv: vec!["x".into()],
+        };
+        std::fs::write(state.reservation(job), serde_json::to_vec(&gone).unwrap()).unwrap();
+        std::fs::write(state.live_lock(job), b"").unwrap();
+        let reads = parallel(&[(); 4], &|()| {
+            (0..500).map(|_| sources.in_use("key")).collect::<Vec<_>>()
+        });
+        for read in reads.into_iter().flatten() {
+            let in_use = read.unwrap();
+            assert!(!in_use.value, "{:?}", in_use.jobs);
+        }
+        // The reservation is read: with its live lock held, the job counts.
+        let held = crate::state::try_lock(&state.live_lock(job), crate::state::LockMode::Exclusive)
+            .unwrap()
+            .unwrap();
+        assert!(sources.in_use("key").unwrap().value);
+        drop(held);
+    }
+
+    /// Once a build panics, no worker takes another job, and the panic goes on with its own
+    /// payload.
+    #[test]
+    fn a_panicking_build_stops_the_others_and_goes_on() {
+        let built = AtomicUsize::new(0);
+        let jobs: Vec<usize> = (0..100).collect();
+        let panic = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            parallel(&jobs, &|&n| {
+                assert!(n != 0, "build 0 failed");
+                std::thread::sleep(Duration::from_millis(20));
+                built.fetch_add(1, Ordering::Relaxed);
+            })
+        }))
+        .unwrap_err();
+        let message = panic
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| panic.downcast_ref::<String>().map(String::as_str));
+        assert_eq!(message, Some("build 0 failed"));
+        let built = built.into_inner();
+        assert!(built < jobs.len() - 1, "{built} builds ran");
+    }
 }
