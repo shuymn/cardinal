@@ -5,9 +5,9 @@
 //! Short-lived children whose output the caller reads run through [`child`].
 //! Mount identity (Unix) lives in `os/mount.rs`, shared by `plan` and `act`, and listing a
 //! directory through the descriptor that identifies it (Unix, `plan`'s walk) in `os/dir.rs`.
-//! The free space of the volume holding a path ([`disk`], section 10.4) and starting a
-//! detached cardinal process ([`spawn_detached`], section 10.5) are declared here; their
-//! bodies come with the reconcile work unit.
+//! The free space and the volume of a path ([`disk`] and [`volume`], section 10.4) live in
+//! `os/disk.rs`, and starting a detached cardinal process ([`spawn_detached`], sections 5.2
+//! and 10.5) in `os/detached.rs`.
 //!
 //! A process is identified by its PID and start time (`start_s`, Unix seconds as the OS
 //! reports it), so a reused PID never passes for the original process. A process that has
@@ -15,8 +15,10 @@
 //! an open handle on Windows.
 
 pub mod child;
+mod detached;
 #[cfg(unix)]
 pub mod dir;
+mod disk;
 #[cfg(unix)]
 pub mod mount;
 #[cfg(unix)]
@@ -29,6 +31,8 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use sysinfo::{Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System, UpdateKind};
+
+pub use disk::{Volume, volume};
 
 /// One process.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -307,16 +311,14 @@ pub struct Unavailable(String);
 
 /// The free space of the volume holding `path`. A read that fails is unknown and changes no
 /// disk state (section 10.4).
-pub fn disk(_path: &Path, _measure: Measure) -> Result<Space, Unavailable> {
-    Err(Unavailable("free space is not implemented".to_owned()))
+pub fn disk(path: &Path, measure: Measure) -> Result<Space, Unavailable> {
+    disk::space(path, measure)
 }
 
 /// Starts `program` with `args` as a cardinal process in a new session with null standard
 /// streams and does not wait for it; returns its PID (section 10.5).
-pub fn spawn_detached(_program: &Path, _args: &[OsString]) -> Result<u32, Unavailable> {
-    Err(Unavailable(
-        "starting a detached process is not implemented".to_owned(),
-    ))
+pub fn spawn_detached(program: &Path, args: &[OsString]) -> Result<u32, Unavailable> {
+    detached::spawn(program, args)
 }
 
 /// This host's name, if the OS reports one.
