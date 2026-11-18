@@ -10,7 +10,8 @@ use std::collections::BTreeSet;
 
 use cardinal::cli::Cli;
 use cardinal::contract::{ActStatus, InboxKind};
-use clap::Parser;
+use clap::Parser as _;
+use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
 const SKILL: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -107,48 +108,140 @@ fn name(value: impl serde::Serialize) -> String {
         .to_owned()
 }
 
-/// The text of the `## heading` section of `text`.
+/// The Markdown of `text` under its `## heading`, up to the next level-2 heading.
 fn section<'a>(text: &'a str, heading: &str) -> &'a str {
-    let start = text
-        .split_once(&format!("\n## {heading}\n"))
-        .unwrap_or_else(|| panic!("no section {heading}"))
-        .1;
-    start.split("\n## ").next().unwrap()
+    let (mut title, mut start) = (None::<String>, None);
+    for (event, range) in Parser::new(text).into_offset_iter() {
+        match event {
+            Event::Start(Tag::Heading {
+                level: HeadingLevel::H2,
+                ..
+            }) => {
+                if let Some(start) = start {
+                    return &text[start..range.start];
+                }
+                title = Some(String::new());
+            }
+            Event::Text(part) | Event::Code(part) => {
+                if let Some(title) = &mut title {
+                    title.push_str(&part);
+                }
+            }
+            Event::End(TagEnd::Heading(HeadingLevel::H2)) => {
+                let read = title.take();
+                if read.as_deref() == Some(heading) {
+                    start = Some(range.end);
+                }
+            }
+            _ => {}
+        }
+    }
+    start.map_or_else(|| panic!("no section {heading}"), |start| &text[start..])
 }
 
-/// The first code span of each body row of the first table in `text`.
+/// The code span each body row of the first table in `text` starts with.
 fn table_keys(text: &str) -> BTreeSet<String> {
-    text.lines()
-        .skip_while(|line| !line.starts_with("| ---"))
-        .skip(1)
-        .take_while(|line| line.starts_with('|'))
-        .filter_map(|line| Some(line.strip_prefix("| `")?.split('`').next()?.to_owned()))
-        .collect()
+    let (mut keys, mut in_body, mut at_row_start) = (BTreeSet::new(), false, false);
+    for event in Parser::new_ext(text, Options::ENABLE_TABLES) {
+        match event {
+            Event::End(TagEnd::TableHead) => in_body = true,
+            Event::End(TagEnd::Table) => break,
+            Event::Start(Tag::TableRow) => at_row_start = in_body,
+            Event::Start(Tag::TableCell) => {}
+            Event::Code(code) if at_row_start => {
+                keys.insert(code.into_string());
+                at_row_start = false;
+            }
+            _ => at_row_start = false,
+        }
+    }
+    keys
+}
+
+/// A list item as Markdown reads it.
+#[derive(Debug, Default)]
+struct Item {
+    /// 1 for an item of a top-level list, 2 for one nested in it, and so on.
+    depth: usize,
+    ordered: bool,
+    /// The bold text the item starts with.
+    lead: Option<String>,
+    /// The item's text, its nested items' included, with code spans in backticks.
+    text: String,
+}
+
+/// Every list item of `text`, each before the items nested in it.
+fn list_items(text: &str) -> Vec<Item> {
+    fn add(items: &mut [Item], open: &[usize], in_lead: bool, part: &str) {
+        if let (true, Some(&innermost)) = (in_lead, open.last()) {
+            items[innermost].lead.get_or_insert_default().push_str(part);
+        }
+        for &i in open {
+            items[i].text.push_str(part);
+        }
+    }
+
+    let (mut items, mut lists, mut open) = (Vec::<Item>::new(), Vec::new(), Vec::new());
+    let mut in_lead = false;
+    for event in Parser::new(text) {
+        match event {
+            Event::Start(Tag::List(first)) => lists.push(first.is_some()),
+            Event::End(TagEnd::List(_)) => {
+                lists.pop();
+            }
+            Event::Start(Tag::Item) => {
+                open.push(items.len());
+                items.push(Item {
+                    depth: lists.len(),
+                    ordered: lists.last() == Some(&true),
+                    ..Item::default()
+                });
+            }
+            Event::End(TagEnd::Item) => {
+                open.pop();
+            }
+            Event::Start(Tag::Strong) => {
+                if let Some(&i) = open.last()
+                    && items[i].text.is_empty()
+                    && items[i].lead.is_none()
+                {
+                    items[i].lead = Some(String::new());
+                    in_lead = true;
+                }
+            }
+            Event::End(TagEnd::Strong) => in_lead = false,
+            Event::Text(part) => add(&mut items, &open, in_lead, &part),
+            Event::Code(code) => add(&mut items, &open, in_lead, &format!("`{code}`")),
+            Event::SoftBreak | Event::HardBreak => {
+                for &i in &open {
+                    items[i].text.push(' ');
+                }
+            }
+            _ => {}
+        }
+    }
+    items
 }
 
 /// Subcommands the arbiter may run: the default `[arbiter] command`'s allow list.
 const ALLOWED: [&str; 5] = ["inventory", "inbox", "explain", "plan", "act"];
 
-/// Commands from fenced code lines and inline code spans that start with `cardinal `.
+/// Commands from code block lines and code spans that start with `cardinal `.
 fn skill_commands(text: &str) -> Vec<String> {
-    let mut commands = Vec::new();
-    let mut in_fence = false;
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("```") {
-            in_fence = !in_fence;
-            continue;
-        }
-        if in_fence {
-            if trimmed.starts_with("cardinal ") {
-                commands.push(trimmed.to_owned());
-            }
-            continue;
-        }
-        for (i, span) in line.split('`').enumerate() {
-            if i % 2 == 1 && span.starts_with("cardinal ") {
-                commands.push(span.to_owned());
-            }
+    let (mut commands, mut in_block) = (Vec::new(), false);
+    for event in Parser::new_ext(text, Options::ENABLE_TABLES) {
+        match event {
+            Event::Start(Tag::CodeBlock(_)) => in_block = true,
+            Event::End(TagEnd::CodeBlock) => in_block = false,
+            Event::Text(block) if in_block => commands.extend(
+                block
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| line.starts_with("cardinal "))
+                    .map(str::to_owned),
+            ),
+            Event::Code(span) if span.starts_with("cardinal ") => commands.push(span.into_string()),
+            _ => {}
         }
     }
     commands
@@ -327,28 +420,28 @@ fn a_timer_pass_stays_on_its_items() {
 /// request does as a timer pass does.
 #[test]
 fn the_subject_of_every_worktree_item_is_checked() {
-    let steps = section(SKILL, "A pass the timer started");
-    let subject = steps
-        .split_once("**Subject.**")
-        .expect("a subject step")
-        .1
-        .split("**Act.**")
-        .next()
-        .unwrap();
+    let items = list_items(section(SKILL, "A pass the timer started"));
+    let step = items
+        .iter()
+        .position(|item| item.depth == 1 && item.lead.as_deref() == Some("Subject."))
+        .expect("a subject step");
+    let checks: Vec<&str> = items[step + 1..]
+        .iter()
+        .take_while(|item| item.depth > 1)
+        .map(|item| item.text.as_str())
+        .collect();
     for kind in KINDS.into_iter().filter(|kind| about_a_worktree(*kind)) {
         let listed = format!("`{}`", name(kind));
         assert!(
-            subject
-                .lines()
-                .any(|line| line.trim_start().starts_with("- ") && line.contains(&listed)),
+            checks.iter().any(|check| check.contains(&listed)),
             "the subject step checks {kind:?}"
         );
     }
     // An `unclassifiable_data` item whose evidence lists only part of its set cannot be
     // confirmed.
-    let unclassifiable = subject
-        .lines()
-        .find(|line| line.trim_start().starts_with("- `unclassifiable_data`"))
+    let unclassifiable = checks
+        .iter()
+        .find(|check| check.starts_with("`unclassifiable_data`"))
         .expect("an unclassifiable_data check");
     assert!(
         unclassifiable.contains("50 paths") && unclassifiable.contains("cannot be confirmed"),
@@ -454,9 +547,10 @@ fn the_tables_cover_every_status_and_kind() {
 
 #[test]
 fn the_report_never_claims_a_reclamation() {
-    let sections: Vec<&str> = section(SKILL, "Report")
-        .lines()
-        .filter_map(|line| line.split_once(". **")?.1.split("**").next())
+    let sections: Vec<String> = list_items(section(SKILL, "Report"))
+        .into_iter()
+        .filter(|item| item.depth == 1 && item.ordered)
+        .filter_map(|item| item.lead)
         .collect();
     assert_eq!(
         sections,
@@ -497,6 +591,25 @@ fn shell_words_follow_quoting() {
             "two words",
             "--x",
             "a b"
+        ]
+    );
+}
+
+#[test]
+fn list_items_read_nesting_and_leads() {
+    let text = "1. **One.** Run `x`:\n   - `a`: first\n     line\n2. **Two**: done\n\n- plain\n";
+    let items = list_items(text);
+    let read: Vec<(usize, bool, Option<&str>, &str)> = items
+        .iter()
+        .map(|i| (i.depth, i.ordered, i.lead.as_deref(), i.text.as_str()))
+        .collect();
+    assert_eq!(
+        read,
+        [
+            (1, true, Some("One."), "One. Run `x`:`a`: first line"),
+            (2, false, None, "`a`: first line"),
+            (1, true, Some("Two"), "Two: done"),
+            (1, false, None, "plain"),
         ]
     );
 }
