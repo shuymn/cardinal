@@ -44,7 +44,10 @@ fn assert_only_planned(host_toml: Option<&str>) {
         before,
         "the target is unchanged"
     );
-    assert!(!s.state.plan_claim(&plan.id).exists(), "nothing claimed");
+    assert!(
+        !s.state.execution_claim(&plan.id).exists(),
+        "nothing claimed"
+    );
     let planned = records_of(&s, &plan.id, RecordKind::Planned);
     assert_eq!(planned.len(), 2, "each run records the planned operation");
     assert_eq!(planned[0].data["caller"], "unit:disk-reclaim");
@@ -84,7 +87,7 @@ fn unit_with_act_true_is_recorded_as_act() {
     let result = s.act(&plan.id, &unit("disk-reclaim")).unwrap();
     assert_eq!(result.status, ActStatus::DryRun, "{result:#?}");
     assert!(wt.join("target/debug/app").exists());
-    assert!(!s.state.plan_claim(&plan.id).exists());
+    assert!(!s.state.execution_claim(&plan.id).exists());
     assert_eq!(records_of(&s, &plan.id, RecordKind::Act).len(), 1);
     assert_eq!(records_of(&s, &plan.id, RecordKind::Planned).len(), 0);
 }
@@ -101,6 +104,6 @@ fn gated_unit_reports_refusals() {
     assert_eq!(result.status, ActStatus::Rejected);
     // Observation classifies `target`, which holds protected data, as protected.
     assert_eq!(result.reasons, ["regenerable", "no_protected"]);
-    assert!(!s.state.plan_claim(&plan.id).exists());
+    assert!(!s.state.execution_claim(&plan.id).exists());
     assert_eq!(records_of(&s, &plan.id, RecordKind::Planned).len(), 1);
 }

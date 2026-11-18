@@ -10,6 +10,7 @@ mod arbiter;
 mod classify;
 mod disk;
 mod error;
+mod execution;
 mod explain;
 mod inbox;
 mod inventory;
@@ -24,7 +25,7 @@ mod snapshot;
 use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 pub use act::{ActResult, ActStatus, Caller, CallerParseError};
 pub use arbiter::{ArbiterPass, PassOutcome};
@@ -36,6 +37,10 @@ pub use disk::{
     ReportReading, ReportTarget,
 };
 pub use error::{Error, ErrorBody, ErrorCode, ErrorDoc};
+pub use execution::{
+    ActClaim, ActManifest, ChainDir, ClaimStage, ClaimTarget, ClaimWorktree, EntryPath, EntryType,
+    ManifestEntry,
+};
 pub use explain::{Explain, ExplainKind, ExplainSource, ExplainSubject};
 pub use inbox::{
     Inbox, InboxItem, InboxKind, InboxStatus, InboxSubject, ItemArbiter, Resolution,
@@ -47,10 +52,11 @@ pub use inventory::{
     ReclaimSummary, Repo, Worktree,
 };
 pub use plan::{
-    Approval, ConfigKey, ObservedError, Plan, PlanClaim, PlanKind, PlanList, PlanTarget,
-    Provenance, RootId,
+    Approval, ConfigKey, ObservedError, Plan, PlanKind, PlanList, PlanTarget, Provenance, RootId,
 };
-pub use reconcile::{ArbiterStart, InboxChanges, Reconcile, ReconcileState, Skipped, Trigger};
+pub use reconcile::{
+    ArbiterStart, InboxChanges, Reconcile, ReconcileState, RecoveredExecution, Skipped, Trigger,
+};
 pub use record::{Record, RecordKind};
 pub use reservation::{
     AdmissionResult, DerivedState, GroupMember, Priority, ProcessIdentity, Reservation,
@@ -128,6 +134,14 @@ schema_marker!(
     ActResultSchema = "cardinal.act-result.v1"
 );
 schema_marker!(
+    /// `cardinal.act-claim.v1`
+    ActClaimSchema = "cardinal.act-claim.v1"
+);
+schema_marker!(
+    /// `cardinal.act-manifest.v1`
+    ActManifestSchema = "cardinal.act-manifest.v1"
+);
+schema_marker!(
     /// `cardinal.inbox-item.v1`
     InboxItemSchema = "cardinal.inbox-item.v1"
 );
@@ -175,6 +189,18 @@ schema_marker!(
     /// `cardinal.classify-response.v1`
     ClassifyResponseSchema = "cardinal.classify-response.v1"
 );
+
+/// A field that is present, null or not: `Some(None)` for null. An absent field is `None`
+/// through `#[serde(default)]`.
+#[expect(
+    clippy::option_option,
+    reason = "the contract tells an absent field from a null one (`head?: string | null`)"
+)]
+fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+    deserializer: D,
+) -> Result<Option<Option<T>>, D::Error> {
+    Option::<T>::deserialize(deserializer).map(Some)
+}
 
 /// A tri-state fact: `"yes" | "no" | "unknown"`. `Unknown` is never treated as safe.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -780,6 +780,29 @@ mod tests {
         }
     }
 
+    /// Unit X's settings (section 9.7) come with X: in the first release each is an unknown
+    /// key, so no host can grant a caller execution before anything executes.
+    #[test]
+    fn execution_settings_are_unknown_in_the_first_release() {
+        for (text, expected) in [
+            (
+                "[act]\nexecute = { owner = [\"reclaim_dir\"] }",
+                "unknown field `act`",
+            ),
+            ("[disk]\nreserve_mib = 64", "unknown field `reserve_mib`"),
+            (
+                "[reconcile]\nreclaim_budget_s = 120",
+                "unknown field `reclaim_budget_s`",
+            ),
+        ] {
+            let message = match parse(text) {
+                Ok(_) => panic!("accepted: {text}"),
+                Err(err) => err.to_string(),
+            };
+            assert!(message.contains(expected), "{text}: {message}");
+        }
+    }
+
     #[test]
     fn single_cpu_default_resources_stay_positive() {
         let host = HostConfig::parse(Path::new("host.toml"), "", 1, None).unwrap();

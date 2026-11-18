@@ -218,18 +218,67 @@ impl StateDir {
         self.plan_dir(plan).join("plan.json")
     }
 
-    /// `plans/<plan>/claim`: reserved for the execution design (section 9.7); nothing
-    /// creates it.
+    /// `executions/`: one directory per plan an execution worked on (section 9.7). Unit X
+    /// creates it; the first release does not.
     #[must_use]
-    pub fn plan_claim(&self, plan: &str) -> PathBuf {
-        self.plan_dir(plan).join("claim")
+    pub fn executions_dir(&self) -> PathBuf {
+        self.root.join("executions")
     }
 
-    /// `plans/<plan>/result.json`: reserved for the execution design (section 9.7); nothing
-    /// writes it.
+    /// `executions/<plan>/`: an execution's records.
     #[must_use]
-    pub fn plan_result(&self, plan: &str) -> PathBuf {
-        self.plan_dir(plan).join("result.json")
+    pub fn execution_dir(&self, plan: &str) -> PathBuf {
+        self.executions_dir().join(plan)
+    }
+
+    /// `executions/<plan>/act.lock`: empty; held by the `act` or the recovery working on the
+    /// plan's execution. Removed only with its directory (section 4.3).
+    #[must_use]
+    pub fn execution_lock(&self, plan: &str) -> PathBuf {
+        self.execution_dir(plan).join("act.lock")
+    }
+
+    /// `executions/<plan>/manifest` (`cardinal.act-manifest.v1`).
+    #[must_use]
+    pub fn execution_manifest(&self, plan: &str) -> PathBuf {
+        self.execution_dir(plan).join("manifest")
+    }
+
+    /// `executions/<plan>/claim` (`cardinal.act-claim.v1`).
+    #[must_use]
+    pub fn execution_claim(&self, plan: &str) -> PathBuf {
+        self.execution_dir(plan).join("claim")
+    }
+
+    /// `executions/<plan>/result.json` (`cardinal.act-result.v1`).
+    #[must_use]
+    pub fn execution_result(&self, plan: &str) -> PathBuf {
+        self.execution_dir(plan).join("result.json")
+    }
+
+    /// `trash/`: where an execution moves its targets, on the state dir's mount (section
+    /// 9.7). Unit X creates it; the first release does not.
+    #[must_use]
+    pub fn trash_dir(&self) -> PathBuf {
+        self.root.join("trash")
+    }
+
+    /// `trash/<plan>/`: the trash entry an execution owns.
+    #[must_use]
+    pub fn trash_entry(&self, plan: &str) -> PathBuf {
+        self.trash_dir().join(plan)
+    }
+
+    /// `trash/<plan>/t`: the target as moved out of its worktree.
+    #[must_use]
+    pub fn trash_target(&self, plan: &str) -> PathBuf {
+        self.trash_entry(plan).join("t")
+    }
+
+    /// `trash/<plan>/h`: the hold the target's entries pass through while they are deleted.
+    #[must_use]
+    pub fn trash_hold(&self, plan: &str) -> PathBuf {
+        self.trash_entry(plan).join("h")
     }
 
     /// `reconcile.lock`: one reconcile pass at a time. Never deleted.
@@ -346,7 +395,8 @@ impl StateDir {
         self.root.join("tickets")
     }
 
-    /// `reserve`: reserved for the execution design (section 9.7); not created.
+    /// `reserve`: the reserve file of the state dir's volume (section 9.7). Unit X writes it;
+    /// the first release does not.
     #[must_use]
     pub fn reserve_file(&self) -> PathBuf {
         self.root.join("reserve")
@@ -439,7 +489,7 @@ mod tests {
         ] {
             assert!(tmp.path().join(dir).is_dir(), "{dir}");
         }
-        for reserved in ["jobs", "tickets", "reserve"] {
+        for reserved in ["jobs", "tickets", "reserve", "executions", "trash"] {
             assert!(!tmp.path().join(reserved).exists(), "{reserved}");
         }
         assert_eq!(
@@ -513,8 +563,24 @@ mod tests {
             (state.session("s"), "sessions/s.json"),
             (state.inbox_lock(), "inbox/.lock"),
             (state.plan_file(job), "plans/0123456789abcdef/plan.json"),
-            (state.plan_claim(job), "plans/0123456789abcdef/claim"),
-            (state.plan_result(job), "plans/0123456789abcdef/result.json"),
+            (
+                state.execution_lock(job),
+                "executions/0123456789abcdef/act.lock",
+            ),
+            (
+                state.execution_manifest(job),
+                "executions/0123456789abcdef/manifest",
+            ),
+            (
+                state.execution_claim(job),
+                "executions/0123456789abcdef/claim",
+            ),
+            (
+                state.execution_result(job),
+                "executions/0123456789abcdef/result.json",
+            ),
+            (state.trash_target(job), "trash/0123456789abcdef/t"),
+            (state.trash_hold(job), "trash/0123456789abcdef/h"),
             (state.reconcile_lock(), "reconcile.lock"),
             (state.reconcile_state(), "reconcile/state.json"),
             (state.reconcile_observation(), "reconcile/observation.json"),

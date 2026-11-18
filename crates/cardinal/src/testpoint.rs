@@ -66,6 +66,31 @@ pub const RECORD_OPENED: &str = "record.opened";
 /// The inbox refresh observed reservations, processes, and sessions, and has not raised or
 /// cleared anything.
 pub const INBOX_OBSERVED: &str = "inbox.observed";
+/// `act` or recovery opened an execution's `act.lock` and has not tried it.
+pub const ACT_LOCK_OPENED: &str = "act.lock_opened";
+/// `act` holds the plan's `act.lock` and the worktree's in-use lock and has taken no
+/// snapshot.
+pub const ACT_EXCLUDED: &str = "act.excluded";
+/// The claim is written and synced under a temporary name and not renamed into place.
+pub const ACT_PUBLISHING: &str = "act.publishing";
+/// The claim is published and the trash entry created; nothing moved.
+pub const ACT_CLAIMED: &str = "act.claimed";
+/// The target is moved and synced; nothing checked after the move.
+pub const ACT_MOVED: &str = "act.moved";
+/// Every check after the move passed; the commit's checks have not run.
+pub const ACT_CHECKED: &str = "act.checked";
+/// `committed` is durable and the in-use lock released; nothing taken.
+pub const ACT_COMMITTED: &str = "act.committed";
+/// An entry is in the hold and not checked.
+pub const ACT_TAKEN: &str = "act.taken";
+/// An entry in the hold passed its check and is not deleted.
+pub const ACT_HELD: &str = "act.held";
+/// A restore renamed the target back and has not synced.
+pub const ACT_RESTORED: &str = "act.restored";
+/// `t` is removed after the deletion; `h` and the trash entry are left, and no result.
+pub const ACT_FINISHING: &str = "act.finishing";
+/// A recovery holds an execution's `act.lock` and has read nothing.
+pub const RECOVER_LOCKED: &str = "recover.locked";
 
 /// Every pause point.
 pub const POINTS: &[&str] = &[
@@ -91,6 +116,18 @@ pub const POINTS: &[&str] = &[
     HOOK_CLASSIFIED,
     RECORD_OPENED,
     INBOX_OBSERVED,
+    ACT_LOCK_OPENED,
+    ACT_EXCLUDED,
+    ACT_PUBLISHING,
+    ACT_CLAIMED,
+    ACT_MOVED,
+    ACT_CHECKED,
+    ACT_COMMITTED,
+    ACT_TAKEN,
+    ACT_HELD,
+    ACT_RESTORED,
+    ACT_FINISHING,
+    RECOVER_LOCKED,
 ];
 
 /// How long a paused process waits for its release file before aborting.

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use super::{DiskReport, DiskState, ReconcileSchema, ReconcileStateSchema, ScopedError};
+use super::{ActStatus, DiskReport, DiskState, ReconcileSchema, ReconcileStateSchema, ScopedError};
 
 /// What started a `reconcile` pass.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,6 +40,13 @@ pub struct InboxChanges {
     pub cleared: Vec<String>,
 }
 
+/// An execution a pass recovered, with the status of its result.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveredExecution {
+    pub plan_id: String,
+    pub status: ActStatus,
+}
+
 /// `cardinal.reconcile.v1`: the stdout of `cardinal reconcile` (section 10.3).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Reconcile {
@@ -50,6 +57,8 @@ pub struct Reconcile {
     pub observed: bool,
     /// One per volume `disk-reclaim` ran on.
     pub disk_reports: Vec<DiskReport>,
+    /// The executions that died, finished or undone at step 2 (unit X, section 9.7).
+    pub recovered: Vec<RecoveredExecution>,
     pub inbox: InboxChanges,
     pub arbiter: ArbiterStart,
     pub errors: Vec<ScopedError>,

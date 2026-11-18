@@ -261,6 +261,8 @@ impl Run<'_> {
             checks: outcome.checks,
             freed_bytes: outcome.freed_bytes,
             skipped_changed: Vec::new(),
+            trash: None,
+            recovered: false,
             error: outcome.error,
             finished_ms: state::now_ms(),
         };

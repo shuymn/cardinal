@@ -29,8 +29,8 @@ fn act_neither_claims_nor_deletes() {
             result.freed_bytes.unwrap() > 0,
             "reports what it would free"
         );
-        assert!(!s.state.plan_claim(&plan.id).exists());
-        assert!(!s.state.plan_result(&plan.id).exists());
+        assert!(!s.state.execution_claim(&plan.id).exists());
+        assert!(!s.state.execution_result(&plan.id).exists());
         assert!(wt.join("target/debug/app").exists());
     }
 }

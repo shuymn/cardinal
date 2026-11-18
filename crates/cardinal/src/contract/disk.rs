@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use super::DiskStateSchema;
+use super::{ActStatus, DiskStateSchema, present};
 
 /// How free space was measured (`docs/architecture.md` section 10.4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,6 +70,17 @@ pub struct ReportTarget {
     pub target: String,
     /// `allocated_bytes` less `aliased_bytes`.
     pub exclusive_bytes: u64,
+    /// The status of the `act` that ran on the target when `disk-reclaim` executes (unit X,
+    /// section 10.4); absent when it only lists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<ActStatus>,
+    /// That `act`'s `freed_bytes`, null or not; absent when it only lists.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    pub freed_bytes: Option<Option<u64>>,
 }
 
 /// An entry matching a regenerable pattern whose plan failed, with its first failed check

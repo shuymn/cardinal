@@ -293,7 +293,7 @@ mod identity {
         assert_eq!(result.reasons, ["identity_changed:host_id"]);
         assert!(wt.join("target/x").exists());
         assert!(
-            !s.state.plan_claim(&plan.id).exists(),
+            !s.state.execution_claim(&plan.id).exists(),
             "an expired plan of another host is not claimed"
         );
     }

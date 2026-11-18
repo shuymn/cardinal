@@ -2,9 +2,10 @@
 //! every field present round-trips unchanged, and each malformed variant is rejected.
 
 use cardinal::contract::{
-    ActResult, ArbiterPass, ClassifyRequest, ClassifyResponse, DiskState, ErrorDoc, Explain, Inbox,
-    InboxItem, Inventory, Plan, PlanList, Reconcile, ReconcileState, Record, Reservation,
-    ReservationView, RunSpec, SessionSnapshot, Snapshot,
+    ActClaim, ActManifest, ActResult, ArbiterPass, ClassifyRequest, ClassifyResponse, DiskState,
+    EntryPath, ErrorDoc, Explain, Inbox, InboxItem, Inventory, ManifestEntry, Plan, PlanList,
+    Reconcile, ReconcileState, Record, Reservation, ReservationView, RunSpec, SessionSnapshot,
+    Snapshot,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -153,7 +154,11 @@ fn disk_report() -> Value {
         "lines": {"warning_bytes": 300, "recovery_bytes": 400, "critical_bytes": 100},
         "checks_ms": 4,
         "targets": [{"plan_id": "fedcba9876543210", "worktree": "/w", "target": "/w/target",
-                     "exclusive_bytes": 120}],
+                     "exclusive_bytes": 120},
+                    {"plan_id": "0123456789abcdef", "worktree": "/w", "target": "/w/dist",
+                     "exclusive_bytes": 60, "status": "partial", "freed_bytes": 40},
+                    {"plan_id": "0123456789abcdee", "worktree": "/w", "target": "/w/out",
+                     "exclusive_bytes": 20, "status": "rejected", "freed_bytes": null}],
         "shortfall_bytes": 30,
         "blocked": [{"worktree": "/w2", "target": "/w2/node_modules", "check": "not_in_use",
                      "bytes": 80},
@@ -325,14 +330,24 @@ fn reconcile_documents() {
     let doc = json!({
         "schema": "cardinal.reconcile.v1", "trigger": "job-end", "skipped": null,
         "disk": [disk_state()], "observed": true, "disk_reports": [disk_report()],
+        "recovered": [{"plan_id": "0123456789abcdef", "status": "executed"},
+                      {"plan_id": "0123456789abcdee", "status": "rejected"}],
         "inbox": {"raised": ["disk_low:af63dc4c8601ec8c@5"], "cleared": []},
         "arbiter": "interval", "errors": [{"scope": "observe", "message": "m"}]
     });
     round_trips::<Reconcile>(&doc);
     rejects_wrong_schema_and_missing::<Reconcile>(&doc, "disk_reports");
+    rejects_wrong_schema_and_missing::<Reconcile>(&doc, "recovered");
+    rejects::<Reconcile>(&doc, "a recovered execution with an unknown status", |d| {
+        d["recovered"][0]["status"] = json!("done");
+    });
+    rejects::<Reconcile>(&doc, "a disk report target with an unknown status", |d| {
+        d["disk_reports"][0]["targets"][1]["status"] = json!("done");
+    });
     let busy = json!({
         "schema": "cardinal.reconcile.v1", "trigger": "timer", "skipped": "busy", "disk": [],
-        "observed": false, "disk_reports": [], "inbox": {"raised": [], "cleared": []},
+        "observed": false, "disk_reports": [], "recovered": [],
+        "inbox": {"raised": [], "cleared": []},
         "arbiter": "not_needed", "errors": []
     });
     round_trips::<Reconcile>(&busy);
@@ -432,11 +447,109 @@ fn act_result_document() {
         "schema": "cardinal.act-result.v1", "plan_id": "fedcba9876543210", "caller": "unit:disk",
         "status": "already_executed", "reasons": ["identity_changed:head"],
         "checks": [check("not_in_use", "invariant", "unknown")], "freed_bytes": null,
-        "skipped_changed": ["/w/new.txt"], "error": null, "finished_ms": 8
+        "skipped_changed": ["/w/new.txt"], "trash": null, "recovered": false, "error": null,
+        "finished_ms": 8
     });
     round_trips::<ActResult>(&doc);
     rejects_wrong_schema_and_missing::<ActResult>(&doc, "status");
     rejects::<ActResult>(&doc, "an unknown status", |d| d["status"] = json!("done"));
+    // A partial execution's result as recovery writes it to `executions/<plan>/result.json`.
+    let partial = json!({
+        "schema": "cardinal.act-result.v1", "plan_id": "fedcba9876543210",
+        "caller": "unit:disk-reclaim", "status": "partial", "reasons": ["in_use_while_deleting"],
+        "checks": [], "freed_bytes": 4096, "skipped_changed": ["debug/app", "debug/app.d"],
+        "trash": "/state/trash/fedcba9876543210", "recovered": true, "error": null,
+        "finished_ms": 9
+    });
+    round_trips::<ActResult>(&partial);
+    // A result recorded before `trash` and `recovered` existed still loads.
+    let mut old = doc.clone();
+    old.as_object_mut().unwrap().remove("trash");
+    old.as_object_mut().unwrap().remove("recovered");
+    let loaded: ActResult = serde_json::from_value(old).unwrap();
+    assert_eq!((loaded.trash, loaded.recovered), (None, false));
+}
+
+#[test]
+fn act_claim_document() {
+    let doc = json!({
+        "schema": "cardinal.act-claim.v1", "plan_id": "fedcba9876543210", "caller": "owner",
+        "stage": "claimed", "created_ms": 5, "updated_ms": 6,
+        "worktree": {"path": "/w", "root": {"dev": 1, "ino": 2}},
+        "chain": [{"name": "packages", "dev": 1, "ino": 3}, {"name": "app", "dev": 1, "ino": 4}],
+        "target": {"name": "node_modules", "dev": 1, "ino": 5, "type": "dir"},
+        "manifest_entries": 120
+    });
+    round_trips::<ActClaim>(&doc);
+    let mut committed = doc.clone();
+    committed["stage"] = json!("committed");
+    committed["chain"] = json!([]);
+    round_trips::<ActClaim>(&committed);
+    rejects_wrong_schema_and_missing::<ActClaim>(&doc, "chain");
+    rejects::<ActClaim>(&doc, "an unknown stage", |d| d["stage"] = json!("moved"));
+    rejects::<ActClaim>(&doc, "an unknown target type", |d| {
+        d["target"]["type"] = json!("fifo");
+    });
+    rejects::<ActClaim>(&doc, "a worktree root without its inode", |d| {
+        d["worktree"]["root"].as_object_mut().unwrap().remove("ino");
+    });
+}
+
+#[test]
+fn act_manifest_document() {
+    let header = json!({"schema": "cardinal.act-manifest.v1", "plan_id": "fedcba9876543210",
+                        "entries": 3});
+    round_trips::<ActManifest>(&header);
+    rejects_wrong_schema_and_missing::<ActManifest>(&header, "entries");
+
+    let entry = |path: Value| {
+        let mut entry = json!({"i": 1, "dev": 1, "ino": 7, "type": "file", "size": 10,
+                               "mtime_ns": 1_700_000_000_123_456_789_i64, "nlink": 1});
+        entry
+            .as_object_mut()
+            .unwrap()
+            .extend(path.as_object().unwrap().clone());
+        entry
+    };
+    // The target itself, a UTF-8 name, and a name that is not UTF-8 (`f`, 0xff).
+    for (path, expected) in [
+        (json!({"path": ""}), EntryPath::Utf8(String::new())),
+        (
+            json!({"path": "debug/app"}),
+            EntryPath::Utf8("debug/app".to_owned()),
+        ),
+        (
+            json!({"path_b64": "Zv8="}),
+            EntryPath::Bytes(vec![b'f', 0xff]),
+        ),
+    ] {
+        let doc = entry(path);
+        round_trips::<ManifestEntry>(&doc);
+        let parsed: ManifestEntry = serde_json::from_value(doc).unwrap();
+        assert_eq!(parsed.path, expected);
+    }
+    for (path, what) in [
+        (json!({}), "an entry without a path"),
+        (
+            json!({"path": "a", "path_b64": "YQ=="}),
+            "an entry with both paths",
+        ),
+        (
+            json!({"path_b64": "not base64!"}),
+            "a path_b64 that is not base64",
+        ),
+    ] {
+        let doc = entry(path);
+        assert!(
+            serde_json::from_value::<ManifestEntry>(doc.clone()).is_err(),
+            "{what} was accepted: {doc}"
+        );
+    }
+    let doc = entry(json!({"path": "debug"}));
+    rejects::<ManifestEntry>(&doc, "an unknown type", |d| d["type"] = json!("socket"));
+    rejects::<ManifestEntry>(&doc, "a missing mtime", |d| {
+        d.as_object_mut().unwrap().remove("mtime_ns");
+    });
 }
 
 #[test]
@@ -455,6 +568,7 @@ fn inbox_documents() {
         "disk_low",
         "disk_critical",
         "arbiter_failing",
+        "reclaim_stranded",
     ] {
         let mut doc = inbox_item();
         doc["kind"] = json!(kind);
@@ -548,6 +662,8 @@ const TESTED: &[&str] = &[
     "cardinal.plan.v1",
     "cardinal.plan-list.v1",
     "cardinal.act-result.v1",
+    "cardinal.act-claim.v1",
+    "cardinal.act-manifest.v1",
     "cardinal.inbox-item.v1",
     "cardinal.inbox.v1",
     "cardinal.explain.v1",

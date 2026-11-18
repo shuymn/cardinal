@@ -106,6 +106,7 @@ impl Reconcile {
             disk: Vec::new(),
             observed: false,
             disk_reports: Vec::new(),
+            recovered: Vec::new(),
             inbox: InboxChanges::default(),
             arbiter: ArbiterStart::NotNeeded,
             errors: Vec::new(),

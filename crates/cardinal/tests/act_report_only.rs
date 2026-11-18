@@ -42,8 +42,8 @@ impl Untouched {
             main,
             registered: s.fx.worktree_list(&s.main),
             plan: std::fs::read(s.state.plan_file(plan)).unwrap(),
-            claimed: s.state.plan_claim(plan).exists(),
-            result: s.state.plan_result(plan).exists(),
+            claimed: s.state.execution_claim(plan).exists(),
+            result: s.state.execution_result(plan).exists(),
         }
     }
 

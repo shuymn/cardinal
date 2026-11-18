@@ -94,11 +94,3 @@ pub struct PlanList {
     pub plans: Vec<Plan>,
     pub errors: Vec<ScopedError>,
 }
-
-/// `plans/<plan>/claim`, reserved for the execution design (`docs/architecture.md` section
-/// 9.7): nothing creates it in phase 1.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PlanClaim {
-    pub pid: u32,
-    pub claimed_ms: u64,
-}

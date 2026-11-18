@@ -1,6 +1,6 @@
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 
-use super::{InboxItemSchema, InboxSchema, PassOutcome};
+use super::{InboxItemSchema, InboxSchema, PassOutcome, present};
 
 /// The item kinds of `docs/architecture.md` section 10.1.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -16,6 +16,8 @@ pub enum InboxKind {
     DiskLow,
     DiskCritical,
     ArbiterFailing,
+    /// An execution left data in the trash (section 9.7).
+    ReclaimStranded,
 }
 
 impl InboxKind {
@@ -25,7 +27,7 @@ impl InboxKind {
     pub fn is_owners(self) -> bool {
         matches!(
             self,
-            Self::DiskLow | Self::DiskCritical | Self::ArbiterFailing
+            Self::DiskLow | Self::DiskCritical | Self::ArbiterFailing | Self::ReclaimStranded
         )
     }
 }
@@ -70,18 +72,6 @@ pub struct InboxSubject {
         deserialize_with = "present"
     )]
     pub branch: Option<Option<String>>,
-}
-
-/// A field that is present, null or not: `Some(None)` for null. An absent field is `None`
-/// through `#[serde(default)]`.
-#[expect(
-    clippy::option_option,
-    reason = "the contract tells an absent field from a null one (`head?: string | null`)"
-)]
-fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
-    deserializer: D,
-) -> Result<Option<Option<T>>, D::Error> {
-    Option::<T>::deserialize(deserializer).map(Some)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -161,10 +151,11 @@ mod tests {
     }
 
     #[test]
-    fn only_disk_and_arbiter_items_are_the_owners() {
+    fn only_disk_arbiter_and_stranded_items_are_the_owners() {
         assert!(InboxKind::DiskLow.is_owners());
         assert!(InboxKind::DiskCritical.is_owners());
         assert!(InboxKind::ArbiterFailing.is_owners());
+        assert!(InboxKind::ReclaimStranded.is_owners());
         assert!(!InboxKind::Reclaimable.is_owners());
         assert!(!InboxKind::RecoveryNeeded.is_owners());
     }
