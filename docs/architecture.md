@@ -710,7 +710,7 @@ Merge evidence is `base_ancestor` or `merged_pr`, matched on the HEAD object ID,
 
 ### 8.3 Ignored data
 
-Each `!` entry from `git status` is classified with the profile's `[data]` patterns, as a whole: git lists a directory whose rule excludes it itself as one entry and nothing inside it, so a regenerable pattern naming a path inside such a directory never matches (section 3.3).
+Each `!` entry from `git status` is classified as a whole with the profile's `[data]` patterns (under a rule that excludes a directory itself, git lists the directory as one entry and nothing inside it while nothing below it is tracked, so a regenerable pattern naming a path inside such a directory never matches, section 3.3):
 
 1. `protected` if the entry, a directory it is inside, or anything below it (found by walking the entry) matches a protected pattern. Protected patterns match at any depth, a pattern with `/` as that sequence of components, so `fuzz/corpus` also protects `target/a/b/fuzz/corpus`; every module matches through `config::data_pattern_covers`;
 2. else `nested_repository` if a directory at or below the entry has its own `.git` entry or is a git directory itself (`HEAD`, `objects/`, and `refs/`, as git recognizes a bare repository);
