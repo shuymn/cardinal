@@ -158,7 +158,6 @@ fn unbuilt_entry_points_answer_not_implemented() {
         &["reconcile"][..],
         &["reconcile", "--trigger", "job-end"],
         &["arbiter", "run"],
-        &["ui"],
         &["inbox", "--assigned"],
         &[
             "inbox",
