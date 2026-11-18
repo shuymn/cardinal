@@ -322,10 +322,13 @@ exit "$code"
     /// environment (`env_clear` first), and the fixture root as its working directory. Every
     /// caller passes `--repo <fixture repository>`.
     pub fn cardinal(&self) -> Command {
+        self.cardinal_in(self.fx.root())
+    }
+
+    /// [`Scene::cardinal`] started in `dir`, which must be inside the fixture.
+    pub fn cardinal_in(&self, dir: &Path) -> Command {
         self.config();
-        let mut command = self
-            .fx
-            .command(env!("CARGO_BIN_EXE_cardinal"), self.fx.root());
+        let mut command = self.fx.command(env!("CARGO_BIN_EXE_cardinal"), dir);
         for (name, value) in self.isolation() {
             command.env(name, value);
         }

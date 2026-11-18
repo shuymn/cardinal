@@ -122,12 +122,17 @@ impl Setup {
 
     /// `cardinal plan reclaim-worktree|reclaim-dir TARGET`.
     pub fn try_plan(&self, kind: PlanKind, target: &Path) -> Result<Plan, Error> {
+        self.try_plan_in(kind, target, self.fx.root())
+    }
+
+    /// [`Setup::try_plan`] run from `dir`, inside the fixture.
+    pub fn try_plan_in(&self, kind: PlanKind, target: &Path, dir: &Path) -> Result<Plan, Error> {
         let sub = match kind {
             PlanKind::ReclaimWorktree => "reclaim-worktree",
             PlanKind::ReclaimDir => "reclaim-dir",
         };
         let output = self
-            .cardinal()
+            .cardinal_in(dir)
             .args(["plan", sub])
             .arg(target)
             .output()

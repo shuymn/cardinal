@@ -346,17 +346,20 @@ pub fn approval(checks: &[Check]) -> Approval {
     }
 }
 
-/// The PIDs of live processes whose working directory is `target` or inside it; `plan` and
-/// `act` ask it of the whole worktree for both plan kinds (section 9.2).
+/// The PIDs of live processes whose working directory is `target` or inside it, this one
+/// left out: a `plan` or `act` run from inside the worktree reads the target, never uses it.
+/// `plan` and `act` ask it of the whole worktree for both plan kinds (section 9.2).
 pub fn processes_inside(target: &Path) -> Result<Vec<u32>, String> {
     let table = ProcessTable::snapshot(Detail {
         cmd: false,
         cwd: true,
     })
     .map_err(|err| err.to_string())?;
+    let own = std::process::id();
     Ok(table
         .iter()
-        .filter(|p| !p.zombie && p.cwd.as_deref().is_some_and(|cwd| cwd.starts_with(target)))
+        .filter(|p| p.pid != own && !p.zombie)
+        .filter(|p| p.cwd.as_deref().is_some_and(|cwd| cwd.starts_with(target)))
         .map(|p| p.pid)
         .collect())
 }

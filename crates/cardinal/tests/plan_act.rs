@@ -805,6 +805,25 @@ fn working_directory_in_the_worktree_refused() {
     assert!(busy.join("node_modules/pkg/index.js").exists());
 }
 
+/// A `plan` run from inside the worktree does not count itself: its own working directory is
+/// in the worktree, and `not_in_use` passes.
+#[cfg(unix)]
+#[test]
+fn the_planning_process_is_not_in_use() {
+    let s = Setup::new();
+    let wt = s.worktree("here");
+    write(&wt, "target/x", "x");
+    let plan = s
+        .try_plan_in(PlanKind::ReclaimDir, &wt.join("target"), &wt.join("src"))
+        .unwrap();
+    assert_eq!(
+        check(&plan.checks, "not_in_use"),
+        CheckResult::Pass,
+        "{plan:#?}"
+    );
+    assert!(plan.invariants_ok, "{plan:#?}");
+}
+
 /// A git directory (`HEAD`, `objects/`, `refs/`) below a regenerable entry.
 #[cfg(unix)]
 fn bare_repository(at: &Path) {
