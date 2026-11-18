@@ -1,8 +1,9 @@
 //! The `reconcile` pass (`docs/architecture.md` sections 10.3 and 13.6): one at a time
 //! (A19), the inbox refresh at step 3, which raises processes that outlived their session
-//! and clears them once they are gone (C9), and the handoff of the disk items after the
-//! observation. The readings fake keeps every volume above its lines unless a test says
-//! otherwise.
+//! and clears them once they are gone (C9), the handoff of the disk items after the
+//! observation, and the arbiter trigger at step 7, which starts a pass for due items and
+//! none for disk items. The readings fake keeps every volume above its lines unless a test
+//! says otherwise.
 
 mod disk_support;
 mod observe_common;
@@ -13,8 +14,8 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use cardinal::contract::{
-    DiskLevel, InboxKind, InboxStatus, ResolutionOutcome, SessionProcess, SessionSnapshot,
-    SessionSnapshotSchema, Skipped, SnapshotAgent,
+    ArbiterStart, DiskLevel, InboxItem, InboxKind, InboxStatus, Inventory, ResolutionOutcome,
+    SessionProcess, SessionSnapshot, SessionSnapshotSchema, Skipped, SnapshotAgent, Tri,
 };
 use cardinal::inbox::{self, StatusFilter};
 use cardinal::testpoint::{RECONCILE_OBSERVED, release_file};
@@ -95,7 +96,7 @@ fn paused_pass(d: &Disk) -> Child {
 
 /// Section 13.6, the handoff: paused at `reconcile.observed`, a pass under pressure has
 /// written no disk item; released, its `disk_low` and `disk_critical` items carry its disk
-/// report. The pass ends only the items it read before step 4: `disk_critical`, escalated by
+/// report, and the trigger starts no arbiter pass for them. The pass ends only the items it read before step 4: `disk_critical`, escalated by
 /// the owner while the next pass observes, keeps the escalation although that pass left
 /// `critical`; the pass after it ends the item, and `disk_low` stays until the recovery line.
 #[test]
@@ -117,6 +118,12 @@ fn disk_items_follow_the_observation() {
     let first = pass(&first.wait_with_output().unwrap());
     assert_eq!(own_errors(&first), Vec::<String>::new());
     assert_eq!(first.disk[0].state, DiskLevel::Critical);
+    assert_eq!(
+        first.arbiter,
+        ArbiterStart::NotNeeded,
+        "disk items are not due"
+    );
+    assert!(!d.s.state.arbiter_last().exists(), "no arbiter pass");
     let items = d.disk_items();
     let kinds: Vec<_> = items.iter().map(|i| (i.kind, i.status)).collect();
     assert_eq!(
@@ -256,4 +263,110 @@ fn temp_cleanup_keeps_other_files() {
         assert!(tmp.join(name).exists(), "{name} was removed");
     }
     assert!(!tmp.join(names[3]).exists(), "the leftover temp file stays");
+}
+
+/// The item `pass` raised whose key starts with `prefix`.
+fn raised(d: &Disk, pass: &cardinal::contract::Reconcile, prefix: &str) -> InboxItem {
+    let key = pass
+        .inbox
+        .raised
+        .iter()
+        .find(|key| key.starts_with(prefix))
+        .unwrap_or_else(|| panic!("no {prefix} item raised: {pass:#?}"));
+    inbox::list(&d.s.config(), &d.s.state, Some(StatusFilter::All), false)
+        .unwrap()
+        .items
+        .into_iter()
+        .find(|item| item.key == *key)
+        .unwrap()
+}
+
+/// Section 13.6, the handoff to the arbiter: under pressure, a pass that raises a due worktree
+/// item along with its disk items starts an arbiter pass at step 7, which is assigned that item
+/// and no disk item; the next pass, with nothing due, starts none.
+#[test]
+fn a_due_worktree_item_starts_an_arbiter_pass() {
+    let d = Disk::new(LINES);
+    d.fixture_reads(&[Some(MIB + MIB / 2)]);
+    d.s.worktree("done");
+    let since_ms = cardinal::state::now_ms();
+    let first = d.reconcile();
+    assert_eq!(own_errors(&first), Vec::<String>::new());
+    assert_eq!(first.disk[0].state, DiskLevel::Warning);
+    assert_eq!(first.arbiter, ArbiterStart::Started);
+    let reclaimable = raised(&d, &first, "reclaimable:");
+    let disk_low = raised(&d, &first, "disk_low:");
+    let arbiter = d.arbiter_ended(since_ms);
+    assert_eq!(arbiter.items, std::slice::from_ref(&reclaimable.key));
+    let assigned = |item: &InboxItem| {
+        inbox::list(&d.s.config(), &d.s.state, Some(StatusFilter::All), false)
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|i| i.key == item.key)
+            .unwrap()
+            .arbiter
+            .map(|a| a.pass)
+    };
+    assert_eq!(assigned(&reclaimable), Some(arbiter.id));
+    assert_eq!(assigned(&disk_low), None, "never assigned");
+
+    let next = d.reconcile();
+    assert_eq!(own_errors(&next), Vec::<String>::new());
+    assert_eq!(next.arbiter, ArbiterStart::NotNeeded);
+}
+
+/// A `closed_pr_dirty` item from a real pass reaches the arbiter with what its subject check
+/// compares (`integrations/claude-code/skills/cardinal-arbiter/SKILL.md`): its pass is
+/// assigned it, and `cardinal inventory` lists its worktree with the item's HEAD, dirty, and
+/// with the closed pull request its key names.
+#[test]
+fn a_closed_pr_dirty_item_reaches_the_subject_check() {
+    let d = Disk::new(LINES);
+    d.fixture_reads(&[Some(10 * MIB)]);
+    let wt = d.s.fx.worktree_add(&d.s.main, "abandoned", "abandoned");
+    d.s.fx
+        .commit_file(&wt, "src/lib.rs", "// abandoned\n", "work");
+    d.s.publish(&wt, "abandoned");
+    let head = d.s.head(&wt);
+    d.s.set_closed(&format!(
+        r#"[{{"number":7,"state":"CLOSED","headRefOid":"{head}","url":"https://github.com/acme/app/pull/7"}}]"#
+    ));
+    std::fs::write(wt.join("src/lib.rs"), "// changed\n").unwrap();
+
+    let since_ms = cardinal::state::now_ms();
+    let first = d.reconcile();
+    assert_eq!(own_errors(&first), Vec::<String>::new());
+    let item = raised(&d, &first, "closed_pr_dirty:");
+    let worktree = item.subject.worktree.clone().expect("the item's worktree");
+    assert!(
+        item.key
+            .starts_with(&format!("closed_pr_dirty:{worktree}#7@")),
+        "{}",
+        item.key
+    );
+    assert_eq!(first.arbiter, ArbiterStart::Started);
+    let arbiter = d.arbiter_ended(since_ms);
+    assert!(arbiter.items.contains(&item.key), "{arbiter:#?}");
+
+    let output =
+        d.s.cardinal()
+            .arg("inventory")
+            .output_within(plan_support::RUN_LIMIT)
+            .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let inventory: Inventory = serde_json::from_slice(&output.stdout).unwrap();
+    let listed = inventory
+        .repos
+        .iter()
+        .flat_map(|repo| &repo.worktrees)
+        .find(|w| w.path == worktree)
+        .expect("the inventory lists the item's worktree");
+    assert_eq!(
+        Some(listed.head.clone()),
+        item.subject.head,
+        "the item's HEAD"
+    );
+    assert_eq!(listed.facts.dirty, Tri::Yes);
+    assert_eq!(listed.facts.closed_pr.as_ref().map(|pr| pr.number), Some(7));
 }

@@ -13,10 +13,13 @@ use std::process::Output;
 use std::time::{Duration, SystemTime};
 
 use cardinal::contract::{
-    DiskReport, DiskState, InboxItem, InboxKind, InboxStatus, Reconcile, Record, RecordKind,
+    ArbiterPass, ArbiterStart, DiskReport, DiskState, InboxItem, InboxKind, InboxStatus, Reconcile,
+    Record, RecordKind,
 };
 use cardinal::inbox::StatusFilter;
+use cardinal::state::{self, Probe};
 use cardinal_test_support::Command;
+use cardinal_test_support::process::wait_for;
 
 use crate::plan_support::{RUN_LIMIT, Setup};
 use crate::support::testpoints::TestPoints;
@@ -28,7 +31,7 @@ const TOTAL: u64 = 64 * MIB;
 
 /// Scopes of the pass's steps whose bodies other units write (`docs/architecture.md` section
 /// 14.2): their errors say nothing about the steps these tests check.
-const OTHER_UNITS: &[&str] = &["arbiter", "ui"];
+const OTHER_UNITS: &[&str] = &["ui"];
 
 pub struct Disk {
     pub s: Setup,
@@ -84,14 +87,33 @@ impl Disk {
         command
     }
 
-    /// One pass, which must succeed.
+    /// One pass, which must succeed; when it started an arbiter pass, once that pass has
+    /// ended, so neither the test's checks nor its next pass race the launcher's writes to
+    /// the items it assigned.
     pub fn reconcile(&self) -> Reconcile {
-        pass(
+        let since_ms = state::now_ms();
+        let pass = pass(
             &self
                 .reconcile_command()
                 .output_within(RUN_LIMIT)
                 .expect("run cardinal reconcile"),
-        )
+        );
+        if pass.arbiter == ArbiterStart::Started {
+            self.arbiter_ended(since_ms);
+        }
+        pass
+    }
+
+    /// The arbiter pass a `reconcile` pass started at or after `since_ms` started, once it has
+    /// ended and its launcher has let go of `arbiter/.lock`. The setup's `[arbiter] command`
+    /// exits at once.
+    pub fn arbiter_ended(&self, since_ms: u64) -> ArbiterPass {
+        wait_for("the arbiter pass to end", RUN_LIMIT, || {
+            let bytes = std::fs::read(self.s.state.arbiter_last()).ok()?;
+            let last: ArbiterPass = serde_json::from_slice(&bytes).ok()?;
+            let released = state::probe(&self.s.state.arbiter_lock()).ok()? != Probe::Held;
+            (last.started_ms >= since_ms && last.ended_ms.is_some() && released).then_some(last)
+        })
     }
 
     /// The disk state files, in file name order.
