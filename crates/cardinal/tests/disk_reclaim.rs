@@ -406,7 +406,7 @@ fn a_planned_record_that_fails_is_reported() {
 
     let pass = disk_support::pass(
         &command
-            .output_within(Duration::from_secs(120))
+            .output_within(plan_support::RUN_LIMIT)
             .expect("run cardinal reconcile"),
     );
     let report = report(&pass);

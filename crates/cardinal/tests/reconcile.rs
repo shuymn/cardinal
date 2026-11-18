@@ -51,7 +51,11 @@ fn one_pass_at_a_time() {
     .unwrap();
     let readings = std::fs::read(d.points.dir().join("disk-readings.json")).unwrap();
 
-    let busy = pass(&d.reconcile_command().output().unwrap());
+    let busy = pass(
+        &d.reconcile_command()
+            .output_within(plan_support::RUN_LIMIT)
+            .unwrap(),
+    );
     assert_eq!(busy.skipped, Some(Skipped::Busy));
     assert!(busy.disk.is_empty() && !busy.observed, "{busy:#?}");
     assert_eq!(d.states().len(), 1);

@@ -39,6 +39,9 @@ regenerable = ["node_modules", "target", ".DS_Store"]
 protected = ["fuzz/corpus", "fuzz/artifacts", "proptest-regressions"]
 "#;
 
+/// How long one `cardinal plan` or `cardinal act` may take before the test fails.
+pub const RUN_LIMIT: Duration = Duration::from_secs(120);
+
 /// What the main repository ignores, so worktrees stay clean around their ignored data.
 const GITIGNORE: &str = "node_modules/\ntarget/\n.DS_Store\nfuzz/corpus/\nfuzz/artifacts/\n";
 
@@ -135,7 +138,7 @@ impl Setup {
             .cardinal_in(dir)
             .args(["plan", sub])
             .arg(target)
-            .output()
+            .output_within(RUN_LIMIT)
             .expect("run cardinal plan");
         document(&output, &[0])
     }
@@ -153,7 +156,7 @@ impl Setup {
             .arg("plan")
             .arg("--repo")
             .arg(&self.main)
-            .output()
+            .output_within(RUN_LIMIT)
             .expect("run cardinal plan");
         document(&output, &[0]).expect("a plan list")
     }
@@ -181,7 +184,7 @@ impl Setup {
     pub fn act(&self, plan: &str, options: &ActOptions) -> Result<ActResult, Error> {
         let output = self
             .act_command(plan, options)
-            .output()
+            .output_within(RUN_LIMIT)
             .expect("run cardinal act");
         act_result(&output)
     }

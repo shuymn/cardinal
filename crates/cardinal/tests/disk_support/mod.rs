@@ -15,7 +15,7 @@ use std::time::{Duration, SystemTime};
 use cardinal::contract::{DiskReport, DiskState, Reconcile, Record, RecordKind};
 use cardinal_test_support::Command;
 
-use crate::plan_support::Setup;
+use crate::plan_support::{RUN_LIMIT, Setup};
 use crate::support::testpoints::TestPoints;
 
 pub const MIB: u64 = 1024 * 1024;
@@ -92,7 +92,7 @@ impl Disk {
         pass(
             &self
                 .reconcile_command()
-                .output()
+                .output_within(RUN_LIMIT)
                 .expect("run cardinal reconcile"),
         )
     }
