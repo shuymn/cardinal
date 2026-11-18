@@ -70,6 +70,7 @@ impl Scene {
         scene.write_gh();
         scene.set_open("[]");
         scene.set_merged_default("[]");
+        scene.set_closed("[]");
         scene
     }
 
@@ -119,7 +120,12 @@ impl Scene {
         std::fs::write(self.gh_dir.join("merged.out"), json).unwrap();
     }
 
-    /// Makes the `kind` (`open` or `merged`) query exit with `code`.
+    /// The closed pull request list gh returns for any branch.
+    pub fn set_closed(&self, json: &str) {
+        std::fs::write(self.gh_dir.join("closed.out"), json).unwrap();
+    }
+
+    /// Makes the `kind` (`open`, `merged`, or `closed`) query exit with `code`.
     pub fn gh_fails(&self, kind: &str, code: u8) {
         std::fs::write(self.gh_dir.join(format!("{kind}.code")), code.to_string()).unwrap();
     }

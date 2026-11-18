@@ -22,6 +22,10 @@ use crate::plan::{self, DataLists, InUseFacts, Inspection, Real, Walk};
 use crate::state::{self, Probe, StateDir};
 use crate::testpoint;
 
+/// Why a plan whose checks pass and whose approval is met reports `dry_run`: the first
+/// release executes nothing (section 9.3).
+pub const EXECUTION_NOT_DESIGNED: &str = "execution_not_designed";
+
 /// `cardinal act` flags. No flag enables execution: every run reports (section 9.3).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ActOptions {
@@ -138,7 +142,8 @@ impl Run<'_> {
         let in_use = InUseFacts {
             lock_held,
             reservations,
-            processes: plan::processes_inside(&target),
+            // The whole worktree for both kinds (section 9.2).
+            processes: plan::processes_inside(&worktree),
         };
         let patterns = observation.as_ref().map_or_else(
             |_| DataLists::default(),
@@ -153,6 +158,7 @@ impl Run<'_> {
             in_use: &in_use,
             patterns: &patterns,
             managed: &self.config.host.observe.managed,
+            squash_merged: self.options.squash_merged,
         };
         let checks = plan::evaluate(&inspection);
         let failed: Vec<String> = checks
@@ -173,7 +179,10 @@ impl Run<'_> {
             outcome.status = ActStatus::Rejected;
             outcome.reasons = vec!["owner_approval_required".into()];
         } else {
+            // The first release has no grants: every plan that would execute is reported
+            // (section 9.3).
             outcome.status = ActStatus::DryRun;
+            outcome.reasons = vec![EXECUTION_NOT_DESIGNED.into()];
             outcome.freed_bytes = snapshot.walk.as_ref().ok().map(Walk::allocated);
         }
         outcome
@@ -206,6 +215,10 @@ impl Run<'_> {
             }
             if o.worktree.branch != target.branch {
                 changed.push("branch");
+            }
+            // A git dir observation could not read is left to the `observed` check.
+            if o.worktree.git_dir.is_some() && o.worktree.git_dir != target.git_dir {
+                changed.push("git_dir");
             }
             if self.plan.kind == PlanKind::ReclaimWorktree && o.worktree.main {
                 changed.push("main");

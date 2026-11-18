@@ -15,7 +15,7 @@ use crate::contract::{
 use crate::observe::WorktreeObservation;
 use crate::os::{Detail, ProcessTable};
 
-use super::walk::{Mount, Walk};
+use super::walk::{EntryKind, Mount, Walk};
 
 /// What makes a worktree in use (`docs/architecture.md` section 4.6). `Err` holds why a fact
 /// could not be read.
@@ -43,6 +43,8 @@ pub struct Inspection<'a> {
     pub patterns: &'a DataLists,
     /// `[observe] managed` roots.
     pub managed: &'a [Managed],
+    /// The caller judged HEAD squash-merged (`act --squash-merged`, section 9.3).
+    pub squash_merged: bool,
 }
 
 /// The `[data]` lists that apply to one repository, matched with
@@ -88,12 +90,7 @@ pub fn evaluate(i: &Inspection<'_>) -> Vec<Check> {
     let mut checks = vec![observed(i), not_in_use(i), not_managed(i)];
     if worktree {
         let facts = i.observation.ok().map(|o| &o.worktree.facts);
-        checks.push(tri(
-            "clean",
-            facts.map(|f| f.dirty),
-            Tri::No,
-            "uncommitted changes",
-        ));
+        checks.push(clean(i));
         checks.push(tri(
             "no_unpushed",
             facts.map(|f| f.unpushed),
@@ -128,17 +125,49 @@ pub fn evaluate(i: &Inspection<'_>) -> Vec<Check> {
     checks
 }
 
+/// One fact a check read, with what produced it; null when it was not read.
+fn fact(name: &str, value: Option<impl serde::Serialize>, source: &str) -> CheckFact {
+    CheckFact {
+        name: name.to_owned(),
+        value: value
+            .and_then(|v| serde_json::to_value(v).ok())
+            .unwrap_or_default(),
+        source: source.to_owned(),
+    }
+}
+
+/// The facts `merge_evidence` reads.
+fn merge_facts(i: &Inspection<'_>) -> Vec<CheckFact> {
+    let repo = i.observation.ok().map(|o| &o.repo);
+    let facts = i.observation.ok().map(|o| &o.worktree.facts);
+    vec![
+        fact(
+            "worktree.facts.merge_evidence",
+            facts.map(|f| f.merge_evidence),
+            "git, gh",
+        ),
+        fact(
+            "worktree.facts.merged_pr",
+            facts.map(|f| &f.merged_pr),
+            "gh",
+        ),
+        fact("repo.base", repo.map(|r| &r.base), "git"),
+        fact(
+            "worktree.facts.content_in_base",
+            facts.map(|f| f.content_in_base),
+            "git",
+        ),
+        fact(
+            "worktree.facts.content_diff",
+            facts.map(|f| &f.content_diff),
+            "git",
+        ),
+        fact("act.squash_merged", Some(i.squash_merged), "cardinal act"),
+    ]
+}
+
 /// The facts the check `name` reads from `i`, each with what produced it.
 fn facts(name: &str, i: &Inspection<'_>) -> Vec<CheckFact> {
-    fn fact(name: &str, value: Option<impl serde::Serialize>, source: &str) -> CheckFact {
-        CheckFact {
-            name: name.to_owned(),
-            value: value
-                .and_then(|v| serde_json::to_value(v).ok())
-                .unwrap_or_default(),
-            source: source.to_owned(),
-        }
-    }
     let repo = i.observation.ok().map(|o| &o.repo);
     let wt = i.observation.ok().map(|o| &o.worktree);
     let facts = wt.map(|w| &w.facts);
@@ -168,7 +197,14 @@ fn facts(name: &str, i: &Inspection<'_>) -> Vec<CheckFact> {
             wt.map(|w| &w.managed_by),
             "git",
         )],
-        "clean" => vec![fact("worktree.facts.dirty", facts.map(|f| f.dirty), "git")],
+        "clean" => vec![
+            fact("worktree.facts.dirty", facts.map(|f| f.dirty), "git"),
+            fact(
+                "worktree.facts.dirty_unknown",
+                facts.map(|f| &f.dirty_unknown),
+                "git",
+            ),
+        ],
         "no_unpushed" => vec![fact(
             "worktree.facts.unpushed",
             facts.map(|f| f.unpushed),
@@ -187,19 +223,7 @@ fn facts(name: &str, i: &Inspection<'_>) -> Vec<CheckFact> {
             ),
             fact("worktree.upstream", wt.map(|w| &w.upstream), "git"),
         ],
-        "merge_evidence" => vec![
-            fact(
-                "worktree.facts.merge_evidence",
-                facts.map(|f| f.merge_evidence),
-                "git, gh",
-            ),
-            fact(
-                "worktree.facts.merged_pr",
-                facts.map(|f| &f.merged_pr),
-                "gh",
-            ),
-            fact("repo.base", repo.map(|r| &r.base), "git"),
-        ],
+        "merge_evidence" => merge_facts(i),
         "regenerable" | "no_unclassifiable" | "no_nested_repository" | "no_protected" => {
             vec![fact(
                 "worktree.ignored",
@@ -224,6 +248,11 @@ fn facts(name: &str, i: &Inspection<'_>) -> Vec<CheckFact> {
                 "stat, statx, statfs",
             ),
             fact("walk.link_in_path", walk.map(|w| &w.link_in_path), "lstat"),
+            fact(
+                "walk.boundaries",
+                walk.map(|w| &w.boundaries),
+                "stat, statx, statfs",
+            ),
         ],
         _ => Vec::new(),
     }
@@ -317,7 +346,8 @@ pub fn approval(checks: &[Check]) -> Approval {
     }
 }
 
-/// The PIDs of live processes whose working directory is `target` or inside it.
+/// The PIDs of live processes whose working directory is `target` or inside it; `plan` and
+/// `act` ask it of the whole worktree for both plan kinds (section 9.2).
 pub fn processes_inside(target: &Path) -> Result<Vec<u32>, String> {
     let table = ProcessTable::snapshot(Detail {
         cmd: false,
@@ -409,8 +439,15 @@ fn observed(i: &Inspection<'_>) -> Check {
     let wt = &observation.worktree;
     let facts = &wt.facts;
     let mut unknown = Vec::new();
-    if facts.dirty == Tri::Unknown {
-        unknown.push("dirty");
+    // `dirty` is unknown because status could not be read, or because only filtered paths
+    // changed (`dirty_unknown`), which is no failed step: it fails `clean`, and leaves a
+    // `reclaim_dir` plan, which needs status but not `dirty`, observed (section 8.2).
+    if facts.dirty == Tri::Unknown && facts.dirty_unknown.is_none() {
+        unknown.push(if i.kind == PlanKind::ReclaimWorktree {
+            "dirty"
+        } else {
+            "status"
+        });
     }
     if i.kind == PlanKind::ReclaimWorktree {
         for (name, value) in [
@@ -500,6 +537,28 @@ fn not_managed(i: &Inspection<'_>) -> Check {
     }
 }
 
+/// `clean`: `dirty` is `no`. Unknown because only filtered paths changed, it names them
+/// with the reason (section 8.2).
+fn clean(i: &Inspection<'_>) -> Check {
+    let Ok(observation) = i.observation else {
+        return invariant("clean", CheckResult::Unknown, "not observed");
+    };
+    let facts = &observation.worktree.facts;
+    match (facts.dirty, &facts.dirty_unknown) {
+        (Tri::No, _) => pass("clean"),
+        (Tri::Yes, _) => invariant("clean", CheckResult::Fail, "uncommitted changes"),
+        (Tri::Unknown, Some(unknown)) => invariant(
+            "clean",
+            CheckResult::Unknown,
+            format!(
+                "filtered_paths: status cannot tell whether these changed, because their filter does not run: {}",
+                list(&unknown.paths)
+            ),
+        ),
+        (Tri::Unknown, None) => invariant("clean", CheckResult::Unknown, "unknown"),
+    }
+}
+
 fn tri(name: &str, fact: Option<Tri>, good: Tri, bad: &str) -> Check {
     match fact {
         None => invariant(name, CheckResult::Unknown, "not observed"),
@@ -523,36 +582,23 @@ fn regenerable(i: &Inspection<'_>) -> Check {
     let Ok(observation) = i.observation else {
         return invariant("regenerable", CheckResult::Unknown, "not observed");
     };
-    let listed = observation.worktree.ignored.iter().find_map(|e| {
-        let entry = ignored_rel(i.worktree, &e.path)?;
-        rel.starts_with(&entry).then_some((entry, e.class))
-    });
-    match listed {
-        None => invariant("regenerable", CheckResult::Fail, "not an ignored entry"),
-        Some((entry, class)) if class != IgnoredClass::Regenerable => invariant(
-            "regenerable",
-            CheckResult::Fail,
-            format!(
-                "the ignored entry {} is {}",
-                entry.display(),
-                class_name(class)
-            ),
-        ),
-        Some(_) if !i.patterns.covers(DataList::Regenerable, &rel) => invariant(
+    // A pattern match, whatever the entry's class: what is inside is for `no_protected`,
+    // `no_unclassifiable`, and `no_nested_repository` (section 9.2).
+    let listed = observation
+        .worktree
+        .ignored
+        .iter()
+        .any(|e| ignored_rel(i.worktree, &e.path).is_some_and(|entry| rel.starts_with(&entry)));
+    if !listed {
+        invariant("regenerable", CheckResult::Fail, "not an ignored entry")
+    } else if !i.patterns.covers(DataList::Regenerable, &rel) {
+        invariant(
             "regenerable",
             CheckResult::Fail,
             "no regenerable pattern matches it",
-        ),
-        Some(_) => pass("regenerable"),
-    }
-}
-
-fn class_name(class: IgnoredClass) -> &'static str {
-    match class {
-        IgnoredClass::Regenerable => "regenerable",
-        IgnoredClass::Protected => "protected",
-        IgnoredClass::Unclassifiable => "unclassifiable",
-        IgnoredClass::NestedRepository => "a nested repository",
+        )
+    } else {
+        pass("regenerable")
     }
 }
 
@@ -566,6 +612,16 @@ fn plain_target(i: &Inspection<'_>) -> Check {
             "plain_target",
             CheckResult::Fail,
             format!("{} is a symbolic link", link.display()),
+        );
+    }
+    if !walk.boundaries.is_empty() {
+        return invariant(
+            "plain_target",
+            CheckResult::Fail,
+            format!(
+                "on another device or mount, so not walked: {}",
+                list(&walk.boundaries)
+            ),
         );
     }
     match (walk.root.kind, &walk.mount) {
@@ -674,6 +730,24 @@ fn no_nested_repository(i: &Inspection<'_>) -> Check {
         .filter(|e| Some(&e.rel) != own.as_ref())
         .filter_map(|e| e.rel.parent().map(Path::to_path_buf))
         .collect();
+    // A git directory itself: `HEAD`, `objects/`, and `refs/`, as git recognizes a bare
+    // repository (section 9.2).
+    let kinds: std::collections::HashMap<&Path, EntryKind> =
+        walk.all().map(|e| (e.rel.as_path(), e.kind)).collect();
+    let has = |dir: &Path, name: &str, kind: EntryKind| {
+        kinds.get(dir.join(name).as_path()) == Some(&kind)
+    };
+    for entry in walk.all().filter(|e| e.kind == EntryKind::Dir) {
+        let dir = entry.rel.as_path();
+        if Some(dir) != own.as_deref()
+            && has(dir, "HEAD", EntryKind::File)
+            && has(dir, "objects", EntryKind::Dir)
+            && has(dir, "refs", EntryKind::Dir)
+            && !found.iter().any(|f| f == dir)
+        {
+            found.push(dir.to_path_buf());
+        }
+    }
     if let Some(ignored) = ignored_in_target(i) {
         add_class(&mut found, ignored, IgnoredClass::NestedRepository);
     }

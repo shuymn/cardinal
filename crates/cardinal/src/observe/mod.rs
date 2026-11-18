@@ -28,8 +28,8 @@ pub use crate::os::child::{ChildError, Output};
 use crate::admission;
 use crate::config::{Config, DataList, Selection};
 use crate::contract::{
-    ArbiterView, BaseRef, CheckResult, DerivedState, DirtyUnknown, DirtyUnknownReason, Error,
-    ErrorCode, Facts, GhStatus, HostInfo, IgnoredClass, IgnoredEntry, InUse, Inventory,
+    ArbiterView, BaseRef, CheckResult, DerivedState, DirtyUnknown, DirtyUnknownReason, DiskState,
+    Error, ErrorCode, Facts, GhStatus, HostInfo, IgnoredClass, IgnoredEntry, InUse, Inventory,
     InventorySchema, MergeEvidence, Os, Outlived, PrRef, ReclaimSummary, Repo, ReservationView,
     Resources, ScopedError, SessionSnapshot, Tri, Worktree,
 };
@@ -108,16 +108,53 @@ impl ContentInBase {
 }
 
 /// Reads `content_in_base` for the worktree at `worktree` from tree-to-tree diffs, which read
-/// no index. Observation reads it only when merge evidence is `none`; `act` reads it again
-/// for `--squash-merged`.
+/// no index. Observation reads it only when merge evidence is `none`, which `act` repeats for
+/// `--squash-merged` in its own observation. A step that fails is `unknown`.
 #[must_use]
 pub fn content_in_base(
-    _config: &Config,
-    _worktree: &Path,
-    _head: &str,
-    _base: &BaseRef,
+    config: &Config,
+    worktree: &Path,
+    head: &str,
+    base: &BaseRef,
 ) -> ContentInBase {
-    ContentInBase::unknown()
+    Observer::new(config)
+        .content_in_base(worktree, head, base)
+        .unwrap_or_else(|_| ContentInBase::unknown())
+}
+
+/// How many paths `content_diff` lists.
+const CONTENT_DIFF_PATHS: usize = 20;
+
+/// The disk states of `disk/`, as the last `reconcile` pass left them (section 8.5), in file
+/// name order; a file that cannot be read is reported in `errors`.
+pub fn disk_states(state: &StateDir, errors: &mut Vec<ScopedError>) -> Vec<DiskState> {
+    let dir = state.disk_dir();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(err) => {
+            errors.push(scoped("disk", format!("{}: {err}", dir.display())));
+            return Vec::new();
+        }
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    paths.sort();
+    let mut states = Vec::new();
+    for path in paths {
+        match std::fs::read(&path)
+            .map_err(|err| err.to_string())
+            .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|err| err.to_string()))
+        {
+            Ok(state) => states.push(state),
+            Err(_) if !path.exists() => {}
+            Err(message) => errors.push(scoped(&format!("disk:{}", path.display()), message)),
+        }
+    }
+    states
 }
 
 /// Runs `git --no-optional-locks -C <dir> <args>` with the constructed environment of
@@ -402,6 +439,7 @@ impl<'a> Observer<'a> {
 
         let (budget, reserved, reservations) = budget_view(self.config, shared.reservations);
         let outlived = outlived(state, shared.processes.as_ref(), &mut errors);
+        let disk = disk_states(state, &mut errors);
         Ok(Inventory {
             schema: InventorySchema,
             observed_ms: now_ms(),
@@ -411,7 +449,7 @@ impl<'a> Observer<'a> {
             reservations,
             repos,
             outlived,
-            disk: Vec::new(),
+            disk,
             arbiter: ArbiterView::default(),
             errors,
         })
@@ -767,20 +805,22 @@ impl<'a> Observer<'a> {
         } else {
             self.history(ctx, &path, head.as_deref(), branch.as_deref(), &mut note)
         };
+        let (git_dir, last_activity_ms) = self.admin(&path, &mut note);
+        let (closed_pr, content, gh_error) = self.unmerged_facts(
+            ctx,
+            &path,
+            (branch.as_deref(), head.as_deref()),
+            dirty,
+            &history,
+            &mut note,
+        );
 
         let (in_use, in_use_known) = in_use(&path, shared);
 
         let ignored = status.as_ref().map_or_else(Vec::new, |s| {
             ignored_entries(&path, &s.ignored, &ctx.patterns, shared.sizes)
         });
-        let step_failed = !errors.is_empty() || history.gh_error.is_some() || ctx.failure.is_some();
-
-        let content = match (&ctx.repo.base, head.as_deref()) {
-            (Some(base), Some(head)) if history.merge_evidence == MergeEvidence::None => {
-                content_in_base(self.config, &path, head, base)
-            }
-            _ => ContentInBase::unknown(),
-        };
+        let step_failed = !errors.is_empty() || gh_error.is_some() || ctx.failure.is_some();
         let facts = Facts {
             dirty,
             dirty_unknown,
@@ -791,7 +831,7 @@ impl<'a> Observer<'a> {
             merged_pr: history.merged_pr,
             content_in_base: content.value,
             content_diff: content.diff,
-            closed_pr: None,
+            closed_pr,
             in_use,
         };
         let worktree = Worktree {
@@ -800,8 +840,8 @@ impl<'a> Observer<'a> {
             head,
             branch,
             upstream,
-            git_dir: None,
-            last_activity_ms: None,
+            git_dir,
+            last_activity_ms,
             managed_by,
             reclaim: ReclaimSummary::default(),
             allocated_bytes: shared.sizes.then(|| data::allocated_bytes(&path)).flatten(),
@@ -822,8 +862,181 @@ impl<'a> Observer<'a> {
                 ..worktree
             },
             errors,
-            gh_error: history.gh_error,
+            gh_error,
         }
+    }
+
+    /// `content_in_base` (section 8.2): the paths the branch changed since its merge base with
+    /// `base` (`git diff` of the merge base and HEAD) against the paths where HEAD differs from
+    /// `base`, renames off, tree to tree. `yes` when no path is in both.
+    fn content_in_base(
+        &self,
+        path: &Path,
+        head: &str,
+        base: &BaseRef,
+    ) -> Result<ContentInBase, String> {
+        let out = self.git_ok(path, &["merge-base", head, &base.oid])?;
+        let merge_base = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        if !git::is_oid(&merge_base) {
+            return Err(format!("git merge-base printed {merge_base:?}"));
+        }
+        let names = |from: &str| -> Result<BTreeSet<Vec<u8>>, String> {
+            let out = self.git_ok(
+                path,
+                &[
+                    "diff",
+                    "--name-only",
+                    "-z",
+                    "--no-renames",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    // A gitlink the branch changed counts as any path does, whatever
+                    // `diff.ignoreSubmodules` says.
+                    "--ignore-submodules=none",
+                    from,
+                    head,
+                    "--",
+                ],
+            )?;
+            Ok(out
+                .stdout
+                .split(|&b| b == 0)
+                .filter(|p| !p.is_empty())
+                .map(<[u8]>::to_vec)
+                .collect())
+        };
+        let changed = names(&merge_base)?;
+        let differ = names(&base.oid)?;
+        let both: Vec<String> = changed
+            .intersection(&differ)
+            .take(CONTENT_DIFF_PATHS)
+            .map(|p| String::from_utf8_lossy(p).into_owned())
+            .collect();
+        Ok(ContentInBase {
+            value: if both.is_empty() { Tri::Yes } else { Tri::No },
+            diff: both,
+        })
+    }
+
+    /// The facts of a worktree that may not have been merged: `closed_pr` for one that is
+    /// dirty or has no merge evidence, and `content_in_base` for one without merge evidence
+    /// (section 8.2), with the gh error of the worktree's history or of the closed pull
+    /// request query. Neither is read where history could not read objects: its merge
+    /// evidence and `dirty` are then `unknown`.
+    fn unmerged_facts(
+        &self,
+        ctx: &RepoContext,
+        path: &Path,
+        (branch, head): (Option<&str>, Option<&str>),
+        dirty: Tri,
+        history: &History,
+        note: &mut dyn FnMut(String),
+    ) -> (Option<PrRef>, ContentInBase, Option<String>) {
+        let mut gh_error = history.gh_error.clone();
+        let unmerged = history.merge_evidence == MergeEvidence::None;
+        let closed_pr = match (branch, head) {
+            (Some(branch), Some(head)) if dirty == Tri::Yes || unmerged => self
+                .closed_pr(ctx, path, branch, head, note)
+                .unwrap_or_else(|message| {
+                    gh_error.get_or_insert(message);
+                    None
+                }),
+            _ => None,
+        };
+        let content = match (&ctx.repo.base, head) {
+            (Some(base), Some(head)) if unmerged => self
+                .content_in_base(path, head, base)
+                .unwrap_or_else(|message| {
+                    note(message);
+                    ContentInBase::unknown()
+                }),
+            _ => ContentInBase::unknown(),
+        };
+        (closed_pr, content, gh_error)
+    }
+
+    /// The worktree's git dir (`git rev-parse --absolute-git-dir`) and the modification time
+    /// of its index (`--git-path index`, read with `lstat`), which read no object and no
+    /// index. A missing index has no time.
+    fn admin(&self, path: &Path, note: &mut dyn FnMut(String)) -> (Option<String>, Option<u64>) {
+        let out = match self.git_ok(
+            path,
+            &[
+                "rev-parse",
+                "--path-format=absolute",
+                "--absolute-git-dir",
+                "--git-path",
+                "index",
+            ],
+        ) {
+            Ok(out) => out,
+            Err(message) => {
+                note(message);
+                return (None, None);
+            }
+        };
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut lines = text.lines();
+        let (Some(git_dir), Some(index)) = (lines.next(), lines.next()) else {
+            note(format!("git rev-parse printed {text:?}"));
+            return (None, None);
+        };
+        let modified = std::fs::symlink_metadata(index)
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+        (Some(display(&canonical(Path::new(git_dir)))), modified)
+    }
+
+    /// The newest pull request of `branch` closed without merging whose head is HEAD or an
+    /// ancestor of it (section 8.2); a head missing locally does not count. `Err` when gh
+    /// fails or its answer is incomplete; a git step that fails is noted and leaves it null.
+    fn closed_pr(
+        &self,
+        ctx: &RepoContext,
+        path: &Path,
+        branch: &str,
+        head: &str,
+        note: &mut dyn FnMut(String),
+    ) -> Result<Option<PrRef>, String> {
+        let Some(repo) = &ctx.github else {
+            return Ok(None);
+        };
+        let prs = self
+            .gh(path, &gh::closed_args(&repo.spec(), branch))
+            .and_then(|out| gh::parse_closed(&out.stdout))?;
+        for pr in prs {
+            if !git::is_oid(&pr.head_ref_oid) {
+                return Err(format!("gh printed a head {:?}", pr.head_ref_oid));
+            }
+            let spec = format!("{}^{{commit}}", pr.head_ref_oid);
+            let answer = |args: &[&str]| match self.git(path, args) {
+                Ok(out) => match out.code {
+                    Some(0) => Ok(true),
+                    Some(1) => Ok(false),
+                    _ => Err(format!("git {} failed: {}", args[0], out.stderr_line())),
+                },
+                Err(err) => Err(err.to_string()),
+            };
+            let found = answer(&["rev-parse", "--verify", "--quiet", &spec]).and_then(|present| {
+                Ok(present && answer(&["merge-base", "--is-ancestor", &pr.head_ref_oid, head])?)
+            });
+            match found {
+                Ok(true) => {
+                    return Ok(Some(PrRef {
+                        number: pr.number,
+                        url: pr.url,
+                    }));
+                }
+                Ok(false) => {}
+                Err(message) => {
+                    note(message);
+                    return Ok(None);
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// Merge evidence, unpushed commits, and the open pull request of a worktree at `head`.
@@ -1004,6 +1217,22 @@ impl<'a> Observer<'a> {
             .tracked(path, patterns, &disabled)
             .map_err(&mut *note)
             .ok();
+        // Status ignores submodules, a staged gitlink change included, and the removal of the
+        // last gitlink from the index too: whatever the index holds that HEAD does not is an
+        // uncommitted change of this worktree.
+        let (dirty, dirty_unknown) = match &status {
+            Some(s) if dirty != Tri::Yes && s.head.is_some() => {
+                match self.staged_gitlinks(path, &disabled) {
+                    Ok(true) => (Tri::Yes, None),
+                    Ok(false) => (dirty, dirty_unknown),
+                    Err(message) => {
+                        note(message);
+                        (Tri::Unknown, None)
+                    }
+                }
+            }
+            _ => (dirty, dirty_unknown),
+        };
         match self.filter_drivers(path) {
             Ok(after) if after == drivers => IndexFacts {
                 status,
@@ -1020,6 +1249,33 @@ impl<'a> Observer<'a> {
                 IndexFacts::unknown()
             }
         }
+    }
+
+    /// Whether the index of the worktree at `path` differs from HEAD's tree in a path status
+    /// does not report: `git diff-index --cached` compares index entries with the tree, a
+    /// gitlink by its recorded commit, and enters no submodule. Called only when status
+    /// found the worktree otherwise clean (or could not tell) and HEAD exists, so a path it
+    /// lists is a staged gitlink change, such as a gitlink added, moved, or removed.
+    fn staged_gitlinks(
+        &self,
+        path: &Path,
+        disabled: &[(OsString, OsString)],
+    ) -> Result<bool, String> {
+        let out = self.git_ok_with(
+            path,
+            &[
+                "diff-index",
+                "--cached",
+                "--name-only",
+                "-z",
+                "--no-renames",
+                "--ignore-submodules=none",
+                "HEAD",
+                "--",
+            ],
+            disabled,
+        )?;
+        Ok(out.stdout.iter().any(|&b| b != 0))
     }
 
     /// The filter drivers the configuration of the worktree at `path` defines. Reads
@@ -1237,8 +1493,8 @@ struct Tracked {
     nested: bool,
 }
 
-/// The ignored entries of the worktree at `root`, classified, with sizes of regenerable ones
-/// when `sizes` is set.
+/// The ignored entries of the worktree at `root`, classified, with the sizes of those matching
+/// a regenerable pattern when `sizes` is set.
 fn ignored_entries(
     root: &Path,
     ignored: &[PathBuf],
@@ -1250,15 +1506,16 @@ fn ignored_entries(
         .map(|rel| {
             let class = data::classify(root, rel, patterns);
             let entry = root.join(rel);
-            let allocated_bytes = (sizes && class == IgnoredClass::Regenerable)
-                .then(|| data::allocated_bytes(&entry))
+            let regenerable_match = patterns.covers(DataList::Regenerable, rel);
+            let measured = (sizes && regenerable_match)
+                .then(|| data::sizes(&entry))
                 .flatten();
             IgnoredEntry {
                 path: display(&entry),
                 class,
-                regenerable_match: patterns.covers(DataList::Regenerable, rel),
-                allocated_bytes,
-                aliased_bytes: None,
+                regenerable_match,
+                allocated_bytes: measured.map(|m| m.allocated),
+                aliased_bytes: measured.and_then(|m| m.aliased),
             }
         })
         .collect()
@@ -1422,7 +1679,8 @@ fn reclaim_summary(worktree: &Worktree, inputs: &ReclaimInputs) -> ReclaimSummar
 
 /// `plain_target` for a worktree root: not a symbolic link, not a mount point, and on the
 /// same device as its parent. On Unix the device numbers of the root and its parent are
-/// compared. On Windows a root that is not a reparse point passes: another volume, a
+/// compared, then their mounts (`os::mount`), so a bind mount on the same device is a mount
+/// point too. On Windows a root that is not a reparse point passes: another volume, a
 /// junction, or a symbolic link is reachable inside a path only through a reparse point.
 fn plain_target(path: &Path) -> CheckResult {
     let Ok(meta) = std::fs::symlink_metadata(path) else {
@@ -1438,9 +1696,17 @@ fn plain_target(path: &Path) -> CheckResult {
             return CheckResult::Fail;
         };
         match std::fs::metadata(parent) {
-            Ok(parent) if parent.dev() == meta.dev() => CheckResult::Pass,
-            Ok(_) => CheckResult::Fail,
-            Err(_) => CheckResult::Unknown,
+            Ok(parent) if parent.dev() == meta.dev() => {}
+            Ok(_) => return CheckResult::Fail,
+            Err(_) => return CheckResult::Unknown,
+        }
+        match (
+            crate::os::mount::of_path(parent),
+            crate::os::mount::of_path(path),
+        ) {
+            (Ok(parent), Ok(own)) if parent == own => CheckResult::Pass,
+            (Ok(_), Ok(_)) => CheckResult::Fail,
+            _ => CheckResult::Unknown,
         }
     }
     #[cfg(windows)]

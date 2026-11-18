@@ -279,9 +279,8 @@ fn walk_with_bind_at(
 }
 
 /// A7 on Linux: a bind mount on the same filesystem is a mount point. `act` rejects a target
-/// that is one, and the snapshot does not enter one below its target: what it would free
-/// leaves out the bound data. The bound data survives both. `plan`'s walk by path tells the
-/// same mounts.
+/// that is one, and one that has one below it, which the snapshot does not enter. The bound
+/// data survives both. `plan`'s walk by path tells the same mounts.
 #[cfg(target_os = "linux")]
 #[test]
 fn bind_mounts_are_not_entered() {
@@ -305,13 +304,19 @@ fn bind_mounts_are_not_entered() {
     assert_eq!(result.status, ActStatus::Rejected, "{result:#?}");
     assert_eq!(result.reasons, ["plain_target"]);
 
+    // A bind mount below the target is not entered, and refuses the target: the walk did not
+    // classify or measure what is on it (section 9.2).
     let cache = wt.join("node_modules/cache");
     let plan = s.plan(PlanKind::ReclaimDir, &wt.join("node_modules"));
     let result = act_with_binds(&s, &plan.id, &[(&data, &cache)]);
-    assert_eq!(result.status, ActStatus::DryRun, "{result:#?}");
+    assert_eq!(result.status, ActStatus::Rejected, "{result:#?}");
+    assert_eq!(result.reasons, ["plain_target"]);
     assert!(
-        result.freed_bytes.unwrap() < big.len() as u64,
-        "the bound data is not counted: {result:#?}"
+        result
+            .checks
+            .iter()
+            .any(|c| c.name == "plain_target" && c.detail.contains("node_modules/cache")),
+        "{result:#?}"
     );
 
     assert_eq!(std::fs::read_to_string(data.join("keep")).unwrap(), big);
@@ -371,8 +376,9 @@ impl Watch {
 
 /// A7 on Linux: a bind mount below the target is told by its mount before it is read. `plan`'s
 /// walk neither opens nor lists it; `act`'s snapshot opens it to read its mount and does not
-/// list it. The observation `act` runs after its snapshot walks the ignored entry, bind mount
-/// included (section 8.3), so the events are read where the snapshot has just been recorded.
+/// list it, and the target is refused (`plain_target`). The observation `act` runs after its
+/// snapshot walks the ignored entry, bind mount included (section 8.3), so the events are read
+/// where the snapshot has just been recorded.
 #[cfg(target_os = "linux")]
 #[test]
 fn bind_mounts_are_not_listed() {
@@ -410,7 +416,8 @@ fn bind_mounts_are_not_listed() {
         cardinal::testpoint::ACT_SNAPSHOTTED,
         || listed.set(Some(watch.seen().1)),
     );
-    assert_eq!(result.status, ActStatus::DryRun, "{result:#?}");
+    assert_eq!(result.status, ActStatus::Rejected, "{result:#?}");
+    assert_eq!(result.reasons, ["plain_target"]);
     assert_eq!(
         listed.get(),
         Some(false),

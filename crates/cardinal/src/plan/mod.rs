@@ -21,8 +21,8 @@ pub use walk::{Entry, EntryKind, Mount, Walk, root_identity, walk};
 use crate::admission;
 use crate::config::Config;
 use crate::contract::{
-    Error, ErrorCode, IgnoredClass, InUse, Inventory, Plan, PlanKind, PlanList, PlanListSchema,
-    PlanSchema, PlanTarget, Record, RecordKind, Repo, ScopedError,
+    Error, ErrorCode, InUse, Inventory, Plan, PlanKind, PlanList, PlanListSchema, PlanSchema,
+    PlanTarget, Record, RecordKind, Repo, ScopedError,
 };
 use crate::observe::{self, InventoryOptions, WorktreeObservation};
 use crate::record::Recorder;
@@ -106,8 +106,8 @@ pub fn create(
     store(config, state, plan)
 }
 
-/// `cardinal plan [--repo PATH]...`: plans for every whole-worktree candidate and every
-/// regenerable entry of worktrees that are not candidates.
+/// `cardinal plan [--repo PATH]...`: a plan for every linked worktree and for every ignored
+/// entry matching a regenerable pattern, whatever their checks find (section 9.2).
 pub fn create_all(config: &Config, state: &StateDir, repos: &[PathBuf]) -> Result<PlanList, Error> {
     let sources = Real { config, state };
     housekeeping(state);
@@ -124,22 +124,19 @@ pub fn create_all(config: &Config, state: &StateDir, repos: &[PathBuf]) -> Resul
                 repo: bare.clone(),
                 worktree: worktree.clone(),
             };
-            let targets: Vec<(PlanKind, PathBuf)> = if !worktree.main && worktree.reclaim.candidate
-            {
-                vec![(PlanKind::ReclaimWorktree, PathBuf::from(&worktree.path))]
-            } else {
-                worktree
-                    .ignored
-                    .iter()
-                    .filter(|e| e.class == IgnoredClass::Regenerable)
-                    .map(|e| {
-                        (
-                            PlanKind::ReclaimDir,
-                            Path::new(&worktree.path).join(&e.path),
-                        )
-                    })
-                    .collect()
-            };
+            let whole = (!worktree.main)
+                .then(|| (PlanKind::ReclaimWorktree, PathBuf::from(&worktree.path)));
+            let entries = worktree
+                .ignored
+                .iter()
+                .filter(|e| e.regenerable_match)
+                .map(|e| {
+                    (
+                        PlanKind::ReclaimDir,
+                        Path::new(&worktree.path).join(&e.path),
+                    )
+                });
+            let targets: Vec<(PlanKind, PathBuf)> = whole.into_iter().chain(entries).collect();
             for (kind, target) in targets {
                 let plan = build(config, state, &sources, kind, &target, &observation);
                 match store(config, state, plan) {
@@ -183,19 +180,16 @@ pub fn patterns(config: &Config, repo: &Repo) -> DataLists {
 
 /// The in-use facts of `target` when nothing is held: the lock probed, reservations read
 /// under the admission lock (an error when it is not free in time), and processes.
-fn probe_in_use(
-    state: &StateDir,
-    sources: &Real<'_>,
-    worktree: &Path,
-    target: &Path,
-) -> InUseFacts {
+fn probe_in_use(state: &StateDir, sources: &Real<'_>, worktree: &Path) -> InUseFacts {
     let key = state::worktree_key(worktree);
     InUseFacts {
         lock_held: state::probe(&state.worktree_lock(&key))
             .map(|probe| probe == Probe::Held)
             .map_err(|err| err.to_string()),
         reservations: sources.in_use(&key).map_err(|err| err.message),
-        processes: processes_inside(target),
+        // The whole worktree for both kinds: a process working anywhere in it can use the
+        // target (section 9.2).
+        processes: processes_inside(worktree),
     }
 }
 
@@ -212,7 +206,7 @@ fn build(
     let worktree = PathBuf::from(&observation.worktree.path);
     let walked = walk(&worktree, target).map_err(|err| format!("{}: {err}", target.display()));
     let (root_id, root_created_ms) = root_identity(&worktree).unwrap_or((None, None));
-    let in_use = probe_in_use(state, sources, &worktree, target);
+    let in_use = probe_in_use(state, sources, &worktree);
     let patterns = patterns(config, &observation.repo);
     let inspection = Inspection {
         kind,
@@ -223,6 +217,7 @@ fn build(
         in_use: &in_use,
         patterns: &patterns,
         managed: &config.host.observe.managed,
+        squash_merged: false,
     };
     let checks = evaluate(&inspection);
     let provenance = provenance(config, &inspection);
@@ -243,7 +238,7 @@ fn build(
             root_created_ms,
         },
         allocated_bytes: walked.as_ref().ok().map(Walk::allocated),
-        aliased_bytes: None,
+        aliased_bytes: walked.as_ref().ok().and_then(Walk::aliased),
         invariants_ok: invariants_ok(&checks),
         approval: approval(&checks),
         checks,

@@ -33,7 +33,9 @@ impl DataPatterns {
 ///
 /// 1. `protected` if the entry, a directory it is inside, or anything below it matches a
 ///    protected pattern;
-/// 2. `nested_repository` if a directory at or below it has its own `.git` entry;
+/// 2. `nested_repository` if a directory at or below it has its own `.git` entry or is a git
+///    directory itself (`HEAD`, `objects/`, and `refs/`, as git recognizes a bare
+///    repository);
 /// 3. `regenerable` if the entry is, or is inside, a regenerable match;
 /// 4. else `unclassifiable`, also when the walk could not read part of the entry.
 #[must_use]
@@ -76,7 +78,7 @@ impl Walk {
             if !meta.is_dir() {
                 continue;
             }
-            if std::fs::symlink_metadata(dir.join(".git")).is_ok() {
+            if std::fs::symlink_metadata(dir.join(".git")).is_ok() || is_git_dir(&dir) {
                 walk.nested = true;
                 continue;
             }
@@ -108,46 +110,121 @@ impl Walk {
     }
 }
 
-/// Bytes allocated to `path` and everything below it, without following symbolic links and
-/// without entering directories with their own `.git` entry below `path`: blocks × 512 on
-/// Unix, file lengths on Windows. Hard links are counted once per name. `None` if `path`
+/// Whether `dir` is a git directory: `HEAD`, `objects/`, and `refs/`, as git recognizes a
+/// bare repository (section 8.3).
+pub fn is_git_dir(dir: &Path) -> bool {
+    let is = |name: &str, dir_wanted: bool| {
+        std::fs::symlink_metadata(dir.join(name)).is_ok_and(|m| m.is_dir() == dir_wanted)
+    };
+    is("HEAD", false) && is("objects", true) && is("refs", true)
+}
+
+/// The disk usage of an entry (section 8.5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Sizes {
+    /// Bytes allocated: blocks × 512 on Unix, file lengths on Windows; a file with several
+    /// names inside the entry counted once.
+    pub allocated: u64,
+    /// The part of `allocated` held by files with names outside the entry (a link count above
+    /// the names the walk found), which deleting the entry does not free; `None` on Windows,
+    /// where link counts are not read.
+    pub aliased: Option<u64>,
+}
+
+/// The disk usage of `path` and everything below it, without following symbolic links and
+/// without entering directories with their own `.git` entry below `path`. `None` if `path`
 /// cannot be read.
 #[must_use]
-pub fn allocated_bytes(path: &Path) -> Option<u64> {
+pub fn sizes(path: &Path) -> Option<Sizes> {
     let meta = std::fs::symlink_metadata(path).ok()?;
-    let mut total = allocated(&meta);
-    if !meta.is_dir() {
-        return Some(total);
-    }
-    let mut stack = vec![path.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let Ok(meta) = entry.metadata() else { continue };
-            if meta.is_dir() {
-                let child = entry.path();
-                if std::fs::symlink_metadata(child.join(".git")).is_ok() {
-                    continue;
+    let mut usage = Usage::default();
+    usage.add(&meta);
+    if meta.is_dir() {
+        let mut stack = vec![path.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                // Not followed: `DirEntry::metadata` reads a symbolic link itself.
+                let Ok(meta) = entry.metadata() else { continue };
+                if meta.is_dir() {
+                    let child = entry.path();
+                    if std::fs::symlink_metadata(child.join(".git")).is_ok() {
+                        continue;
+                    }
+                    stack.push(child);
                 }
-                stack.push(child);
+                usage.add(&meta);
             }
-            total = total.saturating_add(allocated(&meta));
         }
     }
-    Some(total)
+    Some(usage.sizes())
 }
 
-#[cfg(unix)]
-fn allocated(meta: &std::fs::Metadata) -> u64 {
-    use std::os::unix::fs::MetadataExt;
-    meta.blocks().saturating_mul(512)
+/// Bytes allocated to `path` and everything below it ([`sizes`]).
+#[must_use]
+pub fn allocated_bytes(path: &Path) -> Option<u64> {
+    sizes(path).map(|s| s.allocated)
 }
 
-#[cfg(not(unix))]
-fn allocated(meta: &std::fs::Metadata) -> u64 {
-    if meta.is_dir() { 0 } else { meta.len() }
+/// What [`sizes`] has added up so far.
+#[derive(Default)]
+struct Usage {
+    allocated: u64,
+    /// (device, inode) → (link count, names found, bytes allocated), for files with several
+    /// names.
+    #[cfg(unix)]
+    linked: std::collections::HashMap<(u64, u64), (u64, u64, u64)>,
+}
+
+impl Usage {
+    #[cfg(unix)]
+    fn add(&mut self, meta: &std::fs::Metadata) {
+        use std::os::unix::fs::MetadataExt;
+        let bytes = meta.blocks().saturating_mul(512);
+        if meta.is_dir() || meta.nlink() <= 1 {
+            self.allocated = self.allocated.saturating_add(bytes);
+            return;
+        }
+        let slot = self
+            .linked
+            .entry((meta.dev(), meta.ino()))
+            .or_insert((meta.nlink(), 0, bytes));
+        if slot.1 == 0 {
+            self.allocated = self.allocated.saturating_add(bytes);
+        }
+        slot.1 += 1;
+    }
+
+    #[cfg(not(unix))]
+    fn add(&mut self, meta: &std::fs::Metadata) {
+        if !meta.is_dir() {
+            self.allocated = self.allocated.saturating_add(meta.len());
+        }
+    }
+
+    #[cfg(unix)]
+    fn sizes(&self) -> Sizes {
+        let aliased = self
+            .linked
+            .values()
+            .filter(|(nlink, names, _)| nlink > names)
+            .map(|(_, _, bytes)| bytes)
+            .sum();
+        Sizes {
+            allocated: self.allocated,
+            aliased: Some(aliased),
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn sizes(&self) -> Sizes {
+        Sizes {
+            allocated: self.allocated,
+            aliased: None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -182,6 +259,9 @@ mod tests {
         touch(root, "fuzz/corpus/seed");
         touch(root, "fuzz/target/x");
         touch(root, "vendor/dep/.git/HEAD");
+        touch(root, "cache/bare.git/HEAD");
+        touch(root, "cache/bare.git/objects/info/x");
+        touch(root, "cache/bare.git/refs/heads/x");
         touch(root, "notes.log");
         touch(root, "pkg/.DS_Store");
         let data = patterns(
@@ -193,6 +273,7 @@ mod tests {
                 "fuzz/target",
                 ".DS_Store",
                 "vendor",
+                "cache",
             ],
             &["fuzz/corpus", "proptest-regressions"],
         );
@@ -222,6 +303,11 @@ mod tests {
             "inside a protected path"
         );
         assert_eq!(class("vendor"), IgnoredClass::NestedRepository);
+        assert_eq!(
+            class("cache"),
+            IgnoredClass::NestedRepository,
+            "a bare repository below"
+        );
         assert_eq!(class("notes.log"), IgnoredClass::Unclassifiable);
         assert_eq!(class("missing"), IgnoredClass::Unclassifiable);
     }
@@ -258,5 +344,33 @@ mod tests {
         touch(tmp.path(), "d/b/c");
         assert!(allocated_bytes(&tmp.path().join("d")).unwrap() >= 8);
         assert_eq!(allocated_bytes(&tmp.path().join("missing")), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn files_with_names_outside_are_aliased_and_counted_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("store")).unwrap();
+        std::fs::create_dir_all(root.join("entry")).unwrap();
+        std::fs::write(root.join("store/shared"), vec![1u8; 64 * 1024]).unwrap();
+        std::fs::hard_link(root.join("store/shared"), root.join("entry/shared")).unwrap();
+        std::fs::write(root.join("entry/own"), vec![2u8; 64 * 1024]).unwrap();
+        std::fs::hard_link(root.join("entry/own"), root.join("entry/own2")).unwrap();
+        let sizes = super::sizes(&root.join("entry")).unwrap();
+        let file = |rel: &str| {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(root.join(rel)).unwrap().blocks() * 512
+        };
+        assert_eq!(sizes.aliased, Some(file("store/shared")), "{sizes:?}");
+        let dir = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(root.join("entry")).unwrap().blocks() * 512
+        };
+        assert_eq!(
+            sizes.allocated,
+            dir + file("store/shared") + file("entry/own"),
+            "two names inside count once"
+        );
     }
 }

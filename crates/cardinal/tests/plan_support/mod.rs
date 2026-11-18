@@ -165,6 +165,9 @@ impl Setup {
         if options.owner_approved {
             command.arg("--owner-approved");
         }
+        if options.squash_merged {
+            command.arg("--squash-merged");
+        }
         command
     }
 

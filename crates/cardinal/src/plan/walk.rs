@@ -35,6 +35,8 @@ pub struct Entry {
     pub mtime_ns: i128,
     /// Bytes allocated on disk: blocks × 512 on Unix, the length on Windows.
     pub allocated: u64,
+    /// The number of names the entry has, here and elsewhere (1 on Windows).
+    pub nlink: u64,
 }
 
 impl Entry {
@@ -68,6 +70,7 @@ impl Entry {
                 size: meta.size(),
                 mtime_ns: i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec()),
                 allocated: meta.blocks().saturating_mul(512),
+                nlink: meta.nlink(),
             }
         }
         #[cfg(not(unix))]
@@ -85,6 +88,7 @@ impl Entry {
                 size: meta.len(),
                 mtime_ns,
                 allocated: meta.len(),
+                nlink: 1,
             }
         }
     }
@@ -106,6 +110,7 @@ impl Entry {
             size: st.size,
             mtime_ns: st.mtime_ns,
             allocated: st.blocks.saturating_mul(512),
+            nlink: st.nlink,
         }
     }
 }
@@ -159,6 +164,9 @@ pub struct Walk {
     /// or mount than the root is recorded but not entered; nothing below a root that is not on
     /// its parent's mount is read.
     pub entries: Vec<Entry>,
+    /// The directories below the root on another device or mount than the root, recorded and
+    /// not entered, which fail `plain_target` (section 9.2).
+    pub boundaries: Vec<PathBuf>,
 }
 
 impl Walk {
@@ -167,10 +175,47 @@ impl Walk {
         std::iter::once(&self.root).chain(&self.entries)
     }
 
-    /// The bytes allocated by the root and everything below it.
+    /// The bytes allocated by the root and everything below it, each file counted once
+    /// however many of its names the walk found.
     #[must_use]
     pub fn allocated(&self) -> u64 {
-        self.all().map(|e| e.allocated).sum()
+        self.sizes().0
+    }
+
+    /// The part of [`Walk::allocated`] held by files with names outside the target (a link
+    /// count above the names the walk found), which removing the target does not free
+    /// (section 8.5); `None` on Windows, where link counts are not read.
+    #[must_use]
+    pub fn aliased(&self) -> Option<u64> {
+        cfg!(unix).then(|| self.sizes().1)
+    }
+
+    /// Allocated and aliased bytes, files with several names counted once.
+    fn sizes(&self) -> (u64, u64) {
+        // (device, inode) → (link count, names found, bytes allocated)
+        let mut linked: std::collections::HashMap<(u64, u64), (u64, u64, u64)> =
+            std::collections::HashMap::new();
+        let mut allocated = 0u64;
+        for entry in self.all() {
+            if entry.kind == EntryKind::Dir || entry.nlink <= 1 {
+                allocated = allocated.saturating_add(entry.allocated);
+                continue;
+            }
+            let slot =
+                linked
+                    .entry((entry.dev, entry.ino))
+                    .or_insert((entry.nlink, 0, entry.allocated));
+            if slot.1 == 0 {
+                allocated = allocated.saturating_add(entry.allocated);
+            }
+            slot.1 += 1;
+        }
+        let aliased = linked
+            .values()
+            .filter(|(nlink, names, _)| nlink > names)
+            .map(|(_, _, bytes)| bytes)
+            .sum();
+        (allocated, aliased)
     }
 }
 
@@ -206,6 +251,7 @@ pub fn walk(worktree: &Path, target: &Path) -> io::Result<Walk> {
     let root_mount = mount_id(target);
     let mut mount = Mount::between(parent_dev, root.dev, &mount_id(parent), &root_mount);
     let mut entries = Vec::new();
+    let mut boundaries = Vec::new();
     // A target that is not on its parent's mount is refused, so nothing below it is read.
     let listable = root.kind == EntryKind::Dir && link_in_path.is_none() && mount == Mount::Same;
     if let (true, Ok(on_mount)) = (listable, &root_mount) {
@@ -215,10 +261,9 @@ pub fn walk(worktree: &Path, target: &Path) -> io::Result<Walk> {
                 walk_dir(
                     worktree,
                     listing,
-                    &root.rel,
-                    root.dev,
-                    on_mount,
+                    (&root.rel, root.dev, on_mount),
                     &mut entries,
+                    &mut boundaries,
                 )?;
             }
             None => mount = Mount::Boundary,
@@ -229,6 +274,7 @@ pub fn walk(worktree: &Path, target: &Path) -> io::Result<Walk> {
         mount,
         link_in_path,
         entries,
+        boundaries,
     })
 }
 
@@ -265,14 +311,14 @@ fn mount_id(_path: &Path) -> Result<MountKey, String> {
 /// the descriptor it is listed through: one on another device or mount, or replaced since its
 /// entry was read, is recorded but never listed, and a mount that cannot be read fails the
 /// walk. Each directory is listed in full and closed before anything below it is opened, so
-/// one directory is open at a time.
+/// one directory is open at a time. A directory found on another device or mount by its path
+/// goes into `boundaries` too.
 fn walk_dir(
     worktree: &Path,
     listing: Listing,
-    rel: &Path,
-    dev: u64,
-    on_mount: &MountKey,
+    (rel, dev, on_mount): (&Path, u64, &MountKey),
     out: &mut Vec<Entry>,
+    boundaries: &mut Vec<PathBuf>,
 ) -> io::Result<()> {
     // The remaining entries of each directory being walked, innermost last.
     let mut pending = vec![listing.entries(rel)?.into_iter()];
@@ -281,6 +327,9 @@ fn walk_dir(
             pending.pop();
             continue;
         };
+        if entry.kind == EntryKind::Dir && entry.dev != dev {
+            boundaries.push(entry.rel.clone());
+        }
         if entry.kind == EntryKind::Dir && entry.dev == dev {
             let path = worktree.join(&entry.rel);
             let enter = match mount_id(&path) {
@@ -289,6 +338,9 @@ fn walk_dir(
                 Err(_) if gone(&path) => false,
                 Err(err) => return Err(io::Error::other(err)),
             };
+            if !enter && !gone(&path) {
+                boundaries.push(entry.rel.clone());
+            }
             if enter {
                 testpoint::hit(testpoint::WALK_DIR_CHECKED).map_err(io::Error::other)?;
                 let listed = Listing::open(&path, &entry, on_mount)

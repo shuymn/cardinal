@@ -400,6 +400,30 @@ impl Fixture {
         self.git(repo, &["update-index", "--split-index"]);
     }
 
+    /// `git update-index --add --cacheinfo 160000,oid,rel`: stages a gitlink at `rel` that
+    /// records the commit `oid`, with nothing checked out there (an unpopulated submodule).
+    pub fn stage_gitlink(&self, repo: &Path, rel: &str, oid: &str) {
+        self.file(repo, rel);
+        let info = format!(
+            "160000,{},{}",
+            checked_name("object ID", oid),
+            checked_name("path", rel)
+        );
+        self.git(repo, &["update-index", "--add", "--cacheinfo", &info]);
+    }
+
+    /// `git rm -q --cached -- rel`: removes `rel` from the index of `repo` only.
+    pub fn rm_cached(&self, repo: &Path, rel: &str) {
+        self.file(repo, rel);
+        self.git(repo, &["rm", "-q", "--cached", "--", rel]);
+    }
+
+    /// `git config --local diff.ignoreSubmodules all`: diffs in `repo` hide every gitlink
+    /// change unless a command asks otherwise.
+    pub fn diff_ignore_submodules(&self, repo: &Path) {
+        self.git(repo, &["config", "--local", "diff.ignoreSubmodules", "all"]);
+    }
+
     /// Sets `core.fsmonitor=true` in `repo`'s local config, overriding the scope's
     /// `core.fsmonitor=false`, until the returned guard is dropped. Meanwhile a git command that
     /// reads the index of `repo` may start git's filesystem monitor daemon (macOS and Windows),
