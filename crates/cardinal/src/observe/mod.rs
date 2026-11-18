@@ -1062,7 +1062,7 @@ impl<'a> Observer<'a> {
     /// dir or the common dir, or `core.splitIndex` set. Reads only files and configuration,
     /// never the index.
     fn split_index(&self, path: &Path) -> Result<bool, String> {
-        let git_dir = worktree_git_dir(path)
+        let git_dir = crate::config::git_dir(path)
             .ok_or_else(|| format!("cannot read the .git entry of {}", path.display()))?;
         let mut dirs = vec![git_dir];
         dirs.extend(crate::config::git_common_dir(path));
@@ -1235,19 +1235,6 @@ fn disabled_filters(drivers: &BTreeSet<String>) -> Vec<(OsString, OsString)> {
 struct Tracked {
     protected: bool,
     nested: bool,
-}
-
-/// The git dir of the worktree at `path`, read from its `.git` entry without running git:
-/// the `.git` directory itself, or the `gitdir:` a `.git` file names.
-fn worktree_git_dir(path: &Path) -> Option<PathBuf> {
-    let dot_git = path.join(".git");
-    let meta = std::fs::symlink_metadata(&dot_git).ok()?;
-    if meta.is_dir() {
-        return Some(dot_git);
-    }
-    let text = std::fs::read_to_string(&dot_git).ok()?;
-    let gitdir = text.strip_prefix("gitdir:")?.trim();
-    Some(path.join(gitdir))
 }
 
 /// The ignored entries of the worktree at `root`, classified, with sizes of regenerable ones
