@@ -93,6 +93,94 @@ pub fn snapshot(state: &StateDir, host: &HostConfig) -> Result<Vec<Reservation>,
     read_reservations(&guard, state)
 }
 
+/// Every reservation, and a message for each file `reservations/` lists that gave none: one
+/// that cannot be read (a missing one included), does not parse, or names another job. Both
+/// come from one listing under the admission lock, released before the caller evaluates
+/// them. For a reader that shows the store as it is (the snapshot, section 10.6), where
+/// [`snapshot`] stops at a file that cannot be read and skips the others.
+pub fn snapshot_with_unread(
+    state: &StateDir,
+    host: &HostConfig,
+) -> Result<(Vec<Reservation>, Vec<String>), AdmissionError> {
+    let guard = lock(state, lock_timeout(host))?;
+    let scan = scan_reservations(&guard, state)?;
+    drop(guard);
+    let unread = scan
+        .unread
+        .iter()
+        .map(|(path, why)| format!("{}: {why}", path.display()))
+        .collect();
+    Ok((scan.found, unread))
+}
+
+/// Why a file `reservations/` lists gave no reservation.
+enum Unread {
+    Listing(io::Error),
+    Read(io::Error),
+    Parse(serde_json::Error),
+    OtherJob,
+}
+
+impl std::fmt::Display for Unread {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Listing(err) | Self::Read(err) => err.fmt(f),
+            Self::Parse(err) => err.fmt(f),
+            Self::OtherJob => f.write_str("names another job"),
+        }
+    }
+}
+
+/// One listing of `reservations/`: every reservation, by creation, and each listed file that
+/// gave none, with why.
+struct Scan {
+    found: Vec<Reservation>,
+    unread: Vec<(PathBuf, Unread)>,
+}
+
+fn scan_reservations(_lock: &AdmissionLock, state: &StateDir) -> Result<Scan, AdmissionError> {
+    let dir = state.reservations_dir();
+    let entries =
+        std::fs::read_dir(&dir).map_err(|err| state_error(format!("{}: {err}", dir.display())))?;
+    let mut scan = Scan {
+        found: Vec::new(),
+        unread: Vec::new(),
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                scan.unread.push((dir.clone(), Unread::Listing(err)));
+                continue;
+            }
+        };
+        let path = entry.path();
+        if path.extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                scan.unread.push((path, Unread::Read(err)));
+                continue;
+            }
+        };
+        match serde_json::from_slice::<Reservation>(&bytes) {
+            Ok(reservation)
+                if path.file_stem().and_then(|s| s.to_str())
+                    == Some(reservation.job_id.as_str()) =>
+            {
+                scan.found.push(reservation);
+            }
+            Ok(_) => scan.unread.push((path, Unread::OtherJob)),
+            Err(err) => scan.unread.push((path, Unread::Parse(err))),
+        }
+    }
+    scan.found
+        .sort_by(|a, b| (a.created_ms, &a.job_id).cmp(&(b.created_ms, &b.job_id)));
+    Ok(scan)
+}
+
 /// One reservation file as read: the job ID from its name and the parsed document. A file
 /// that does not parse is kept (and counted by nobody) rather than deleted.
 fn read_reservations(
@@ -186,15 +274,21 @@ pub fn list_reservations(
     state: &StateDir,
     host: &HostConfig,
 ) -> Result<Vec<ReservationView>, Error> {
-    let reservations = snapshot(state, host)?;
+    Ok(views(state, snapshot(state, host)?))
+}
+
+/// Each reservation with its derived state, group members, and verification. It probes the
+/// live locks and reads the process table, so the caller holds no admission lock.
+#[must_use]
+pub fn views(state: &StateDir, reservations: Vec<Reservation>) -> Vec<ReservationView> {
     let facts = HostFacts::new();
-    Ok(reservations
+    reservations
         .into_iter()
         .map(|reservation| {
             let derived = derive(&reservation, probe_live(state, &reservation.job_id), &facts);
             view(reservation, derived, &facts)
         })
-        .collect())
+        .collect()
 }
 
 /// Whether a live or recovery-needed reservation names the worktree with key `worktree_key`,

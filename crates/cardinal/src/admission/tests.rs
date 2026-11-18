@@ -3,7 +3,10 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use super::{Admitter, Pass, ProcessFacts, lock, recover, resources, write_reservation};
+use super::{
+    Admitter, Pass, ProcessFacts, lock, recover, resources, snapshot, snapshot_with_unread,
+    write_reservation,
+};
 use crate::config::HostConfig;
 use crate::contract::{
     AdmissionResult, DerivedState, GroupIdentity, GroupMember, Priority, ProcessIdentity,
@@ -315,4 +318,60 @@ fn drops_without_the_admission_lock_delete_nothing() {
     assert!(read(&state, "eeee000000000002").is_none());
     assert!(!state.live_lock("eeee000000000002").exists());
     assert!(!state.live_lock("eeee000000000003").exists());
+}
+
+/// One listing gives the reservations together with every listed file that gave none: a
+/// directory, a document that does not parse, one naming another job, and (Unix) a link to
+/// nothing. `snapshot` skips the documents and fails on the files it cannot read.
+#[test]
+fn one_listing_gives_the_reservations_and_the_files_that_gave_none() {
+    let (_dir, state) = state();
+    let host = HostConfig::defaults();
+    write(&state, &reservation("0000000000000001", 4242, None, 1)).unwrap();
+    std::fs::create_dir(state.reservation("0000000000000002")).unwrap();
+    std::fs::write(state.reservation("0000000000000003"), b"{").unwrap();
+    std::fs::write(
+        state.reservation("0000000000000004"),
+        serde_json::to_vec(&reservation("0000000000000005", 4242, None, 1)).unwrap(),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(
+        state.root().join("nothing"),
+        state.reservation("0000000000000006"),
+    )
+    .unwrap();
+    let expected: &[&str] = if cfg!(unix) {
+        &[
+            "0000000000000002",
+            "0000000000000003",
+            "0000000000000004",
+            "0000000000000006",
+        ]
+    } else {
+        &["0000000000000002", "0000000000000003", "0000000000000004"]
+    };
+
+    let (found, unread) = snapshot_with_unread(&state, &host).unwrap();
+
+    let jobs: Vec<&str> = found.iter().map(|r| r.job_id.as_str()).collect();
+    assert_eq!(jobs, ["0000000000000001"]);
+    let mut named: Vec<&str> = unread
+        .iter()
+        .map(|message| {
+            let file = message.split(": ").next().unwrap();
+            let name = std::path::Path::new(file).file_stem().unwrap();
+            name.to_str().unwrap()
+        })
+        .collect();
+    named.sort_unstable();
+    assert_eq!(named, expected, "{unread:?}");
+    assert!(
+        unread.iter().any(|m| m.ends_with("names another job")),
+        "{unread:?}"
+    );
+    assert!(
+        snapshot(&state, &host).is_err(),
+        "the directory reads as nothing"
+    );
 }
