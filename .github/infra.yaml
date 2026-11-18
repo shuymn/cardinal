@@ -17,6 +17,12 @@ spec:
     - developer-tools
     - rust
   labels:
+    # release-please finds a merged release PR by `autorelease: pending` and marks
+    # it `autorelease: tagged` once released.
+    - name: "autorelease: pending"
+      color: ededed
+    - name: "autorelease: tagged"
+      color: ededed
     - name: dependencies
       color: ededed
   features:
@@ -35,7 +41,7 @@ spec:
     squash_merge_commit_message: COMMIT_MESSAGES
     merge_commit_title: MERGE_MESSAGE
     merge_commit_message: PR_TITLE
-  release_immutability: false
+  release_immutability: true
   security:
     vulnerability_alerts: true
     automated_security_fixes: true
@@ -91,6 +97,9 @@ spec:
         - actions/cache@*
         - actions/checkout@*
         - actions/create-github-app-token@*
+        - actions/download-artifact@*
+        - actions/upload-artifact@*
+        - googleapis/release-please-action@*
         - jdx/mise-action@*
         - oven-sh/setup-bun@*
         - shuymn/github-actions/.github/workflows/gha.yml@*
