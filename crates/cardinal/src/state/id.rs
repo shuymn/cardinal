@@ -135,15 +135,14 @@ mod tests {
     use std::collections::HashSet;
 
     use super::{
-        PrefixError, find_worktree_root, fnv1a64, is_id, key, new_id, resolve_prefix, worktree_key,
+        PrefixError, find_worktree_root, is_id, key, new_id, resolve_prefix, worktree_key,
     };
 
+    // The hash itself is checked against the FNV reference suite (`state/fnv_vectors.rs`).
     #[test]
-    fn fnv1a64_matches_reference_vectors() {
-        assert_eq!(fnv1a64(b""), 0xcbf2_9ce4_8422_2325);
-        assert_eq!(fnv1a64(b"a"), 0xaf63_dc4c_8601_ec8c);
-        assert_eq!(fnv1a64(b"foobar"), 0x8594_4171_f739_67e8);
+    fn a_key_is_the_hash_as_16_hex_characters() {
         assert_eq!(key(b"a"), "af63dc4c8601ec8c");
+        assert_eq!(key(b""), "cbf29ce484222325");
     }
 
     #[test]

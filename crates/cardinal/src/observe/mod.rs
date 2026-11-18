@@ -14,6 +14,8 @@
 mod data;
 mod gh;
 mod git;
+#[cfg(test)]
+mod ref_name_vectors;
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;

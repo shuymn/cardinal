@@ -1,6 +1,8 @@
 //! The state directory (`docs/architecture.md` section 4): paths, the layout, atomic writes,
 //! locks with deadlines, IDs and keys, and JSONL files.
 
+#[cfg(test)]
+mod fnv_vectors;
 mod fs;
 mod id;
 mod lock;

@@ -500,4 +500,6 @@ pub fn rules_could_match(stages: &[Stage], profiles: &[Profile]) -> bool {
 }
 
 #[cfg(test)]
+mod shlex_vectors;
+#[cfg(test)]
 mod tests;
