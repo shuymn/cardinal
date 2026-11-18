@@ -886,15 +886,16 @@ Items are raised through `inbox::raise`: by the refresh that `cardinal inbox` ru
 | `merge_undecided` | `merge_undecided:<worktree>@<head>` | Every invariant of a whole-worktree plan passes and `merge_evidence` fails (reconcile; evidence: `content_in_base` with `content_diff`, `closed_pr`, the plan ID) | The worktree is gone, its HEAD changed, or merge evidence appeared |
 | `closed_pr_dirty` | `closed_pr_dirty:<worktree>#<pr>` | The worktree is dirty and its branch's pull request was closed without merging (reconcile) | The worktree is gone or clean |
 | `managed_merged` | `managed_merged:<worktree>@<head>` | A managed worktree (section 8.4) has merge evidence, is clean, and is not in use; only its app or the owner can remove it (reconcile) | The worktree is gone or its HEAD changed |
+| `unclassifiable_data` | `unclassifiable:<worktree>:<set>`, `<set>` the FNV-1a of the sorted paths of its unclassifiable ignored entries | A worktree has unclassifiable ignored data, or part of its ignored-data walk failed (reconcile; evidence: up to 50 paths with their sizes when known, and the observation errors) | The worktree is gone or has no unclassifiable entry |
 | `disk_low` | `disk_low:<volume>:<since_ms>` | A watched volume leaves `ok`, entering `warning` or `critical` (reconcile; evidence: free space, lines, what `disk-reclaim` did or would do) | The volume is back to `ok` |
 | `disk_critical` | `disk_critical:<volume>:<since_ms>` | A watched volume enters `critical`, from `ok` or `warning` (reconcile) | The volume is back to `ok` |
 | `reclaim_leftover` | `reclaim_leftover:<plan>` | An execution left changed entries in the trash (act; evidence: the trash path and the entries) | `<trash>/<plan>` is gone |
 | `reclaim_interrupted` | `reclaim_interrupted:<plan>` | A moved target could not be renamed back (act or recovery; evidence: both paths) | `<trash>/<plan>` is gone |
 | `arbiter_failing` | `arbiter_failing:<pass>` | Three arbiter passes in a row failed, timed out, or were abandoned (launcher, trigger), or a session outlived its launcher past `timeout_s` (trigger; evidence: its PIDs) | A pass completes and no session outlives its launcher |
 
-Statuses are `open`, `escalated` (waiting for the owner), `resolved`, and `dismissed`. Raising a key that exists updates `seen` and evidence of an open or escalated item and leaves resolved and dismissed items alone (C19). A key names what makes a recurrence new (a worktree's HEAD, a pull request's number, a disk episode's start), so a resolved item never comes back while a new commit, pull request, or episode raises a new one. `<worktree>` is the worktree's path; `<volume>` is the key of section 10.4. Without `--status`, `cardinal inbox` lists open and escalated items. `cardinal inbox resolve` records the resolution with `by: "cli"`, cardinal's clearing with `by: "cardinal"`.
+Statuses are `open`, `escalated` (waiting for the owner), `resolved`, and `dismissed`. Raising a key that exists updates `seen` and evidence of an open or escalated item and leaves resolved and dismissed items alone (C19). A key names what makes a recurrence new (a worktree's HEAD, a pull request's number, a disk episode's start, a set of unclassifiable entries), so a resolved item never comes back while a new commit, pull request, or episode raises a new one. `<worktree>` is the worktree's path; `<volume>` is the key of section 10.4. Without `--status`, `cardinal inbox` lists open and escalated items. `cardinal inbox resolve` records the resolution with `by: "cli"`, cardinal's clearing with `by: "cardinal"`.
 
-The arbiter decides which items need the owner (section 14.3): it reclaims `reclaimable` items, judges `merge_undecided` items, and escalates what only the owner can decide, such as `closed_pr_dirty`, `managed_merged`, `disk_critical`, `reclaim_leftover`, and `reclaim_interrupted`. `arbiter_failing` is for the owner directly and never starts an arbiter (section 10.5).
+The arbiter decides which items need the owner (section 14.3): it reclaims `reclaimable` items, judges `merge_undecided` items, and escalates what only the owner can decide, such as `closed_pr_dirty`, `managed_merged`, `unclassifiable_data` (whether each entry is regenerable or protected, a line in the repository's profile), `disk_critical`, `reclaim_leftover`, and `reclaim_interrupted`. Unclassifiable data is never deleted (design §7), so without this item it would stay unreclaimable without anyone being asked. `arbiter_failing` is for the owner directly and never starts an arbiter (section 10.5).
 
 ### 10.2 explain
 
@@ -1151,7 +1152,7 @@ type Worktree = {
 // cardinal.inbox-item.v1
 { schema; key: string;
   kind: "recovery_needed" | "outlived_processes" | "reclaimable" | "merge_undecided" | "closed_pr_dirty"
-      | "managed_merged" | "disk_low" | "disk_critical" | "reclaim_leftover" | "reclaim_interrupted"
+      | "managed_merged" | "unclassifiable_data" | "disk_low" | "disk_critical" | "reclaim_leftover" | "reclaim_interrupted"
       | "arbiter_failing";
   status: "open" | "escalated" | "resolved" | "dismissed";
   subject: { job_id?: string; session_id?: string; worktree?: string };
@@ -1473,7 +1474,7 @@ The subagent runs headless, one at a time, and only through the CLI:
 1. `cardinal inbox`, then `cardinal explain inbox KEY` for each `open` item and `cardinal inventory` once.
 2. `cardinal plan`. A whole-worktree plan with `invariants_ok: true` and `approval: "none"`: `cardinal act PLAN --caller arbiter`. Never a `reclaim_dir` plan: regenerable data is reclaimed by `disk-reclaim` under disk pressure (section 10.4). A plan needing approval whose `merge_evidence` facts show `content_in_base: "yes"`: judge from the evidence (an empty `content_diff`, `closed_pr`, the branch and pull-request history in the item) whether HEAD was squash-merged, and if so run `cardinal act PLAN --caller arbiter --squash-merged`; otherwise, and for every other plan needing approval, report it for the owner.
 3. A `disk_low` or `disk_critical` item: `disk-reclaim` has already reclaimed what needs no judgment on that volume, in order. Judge the volume's `merge_undecided` items as in step 2, and report free space from the `volume` reading of each `act` result, which is fresh, never from `inventory`'s `disk`, which is as of the last pass. Escalate `disk_critical` with what was freed.
-4. Items: `reclaimable` by acting on its plan; `merge_undecided` as in step 2, resolved once its plan executed and escalated otherwise; `closed_pr_dirty`, `managed_merged` (to be removed in its app), `reclaim_leftover`, and `reclaim_interrupted` escalated with their paths; `recovery_needed` and `outlived_processes` as in v1. A verified `recovery_needed` stays open: cardinal releases its reservation once the group has ended, and nothing signals the group.
+4. Items: `reclaimable` by acting on its plan; `merge_undecided` as in step 2, resolved once its plan executed and escalated otherwise; `closed_pr_dirty`, `managed_merged` (to be removed in its app), `reclaim_leftover`, and `reclaim_interrupted` escalated with their paths; `unclassifiable_data` escalated with its paths and the question whether each is `regenerable` or `protected` in the repository's profile; `recovery_needed` and `outlived_processes` as in v1. A verified `recovery_needed` stays open: cardinal releases its reservation once the group has ended, and nothing signals the group.
 5. `act` results: `executed` and `partial` (with `skipped_changed`) are reclaimed; `dry_run` (while `[arbiter] act` is false) is "would reclaim"; `rejected`, `expired`, and `already_executed` are refused with their `reasons`; anything else goes under errors.
 6. Never `--owner-approved` or `--caller owner`; never `rm`, `git worktree remove`, `kill`, or edits in repositories.
 7. The report adds a "Reclaimed" section (executed and partial acts with freed bytes) to v1's sections.
@@ -1527,7 +1528,7 @@ Real-host checks run on macOS with Claude Code and the hook installed as in sect
 
 ## 16. Plan layer
 
-Claims from design §11 that phases 0 and 1 implement, restated, plus new claims A1–A30. EARS, one line each; test names in files that phase 1 adds are planned (section 14.2).
+Claims from design §11 that phases 0 and 1 implement, restated, plus new claims A1–A31. EARS, one line each; test names in files that phase 1 adds are planned (section 14.2).
 
 | ID | Claim (EARS) | Source | Test |
 | --- | --- | --- | --- |
@@ -1546,7 +1547,7 @@ Claims from design §11 that phases 0 and 1 implement, restated, plus new claims
 | C16 | While the `act` of a unit or of the arbiter is false, `act` called as that caller shall leave the target unchanged and record the planned operation. | G3 | `unit_dry_run::*`, `act_dry_run::*`, `disk_reclaim::planned_while_gated` |
 | C17 | The admission path shall not use the network. | G11 | `layering::admission_has_no_observe_dependency`, `admission_isolation::no_network` |
 | C18 | The admission path shall not call the arbiter or wait for it, and the runner's job-end disk check shall start a pass only detached, after the stage's status is fixed. | G1, G4 | `layering::admission_has_no_inbox_dependency`, `admission_isolation::no_arbiter`, `run_disk_trigger::*` |
-| C19 | When an item is raised, the inbox shall not duplicate an existing key and shall not reopen resolved or dismissed items, and every item a `reconcile` pass raises shall carry the observations behind it. | G8 | `inbox::*`, `inbox_raisers::*` |
+| C19 | When an item is raised, the inbox shall not duplicate an existing key and shall not reopen resolved or dismissed items, and every item a `reconcile` pass raises shall carry the observations behind it. | G8 | `inbox::*`, `inbox_raisers::*`, `inbox_raisers::unclassifiable_data_once_per_set` |
 | C20 | cardinal shall create no files inside target repositories. | G5 | `no_repo_writes::*`, `act_dry_run::repeated_dry_run_changes_nothing`, `act_execute::nothing_added_to_the_repository` |
 | A1 | When the wait reaches the wait cap, the runner shall start the stage once over budget and record `overflow`. | Interim rule until phase 2: G4, and the seam for C4 | `run_wait::overflow_runs_once` |
 | A2 | When cardinal runs git or gh, it shall pass a constructed environment from which repository-location variables inherited from the caller are absent. | G5 | `observe_env::inherited_git_vars_ignored` |
@@ -1578,6 +1579,7 @@ Claims from design §11 that phases 0 and 1 implement, restated, plus new claims
 | A28 | When `act` or `plan` evaluates `not_in_use`, it shall count every process other than the `act` that holds a working or root directory, an open descriptor, or its executable, and on Linux a mapping, on an entry of the target, and shall list without counting the processes it cannot inspect. | G6, G7 | `os::fds::tests::*`, `act_races::directory_opened_before_the_move`, `act_races::file_opened_before_the_move`, `plan_act::descriptor_holder_refused` |
 | A29 | `act` shall refuse a target on a network or FUSE file system. | G7 | `os::mount::tests::file_system_types` |
 | A30 | An executing `act` shall make its manifest, its plan, and its claim durable before it moves anything, make each move durable before writing the stage that relies on it, and write its result only after its trash changes are durable. | G7 | `act_durability::order_of_durable_writes` |
+| A31 | When observation finds unclassifiable ignored data in a worktree, or cannot read part of its ignored data, `reconcile` shall raise one item per worktree and set of entries, with the paths and the observation errors, and clear it when the worktree is gone or has none. | design §7, G8 | `inbox_raisers::unclassifiable_data_once_per_set`, `inbox_raisers::unclassifiable_data_cleared` |
 
 Out of scope for phases 0 and 1: C3 and C4 (phase 2, memory pressure and accepted jobs), C7 (phase 3, WSL), C21 (phase 2, measurement kinds).
 
