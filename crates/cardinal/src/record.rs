@@ -2,14 +2,18 @@
 //!
 //! One `cardinal.record.v1` object per line, appended with a single `write`. An appender
 //! holds `records/.lock` shared from opening the current file until its write is done, and
-//! rotation takes it exclusively, so no rename or removal happens while a descriptor is open:
-//! a delayed appender cannot write into a file a later rotation has replaced. When the
-//! current file exceeds the size limit, the appender that notices rotates it, or leaves it to
-//! the next append when the lock stays busy. Readers skip lines that do not parse. A record
+//! rotation takes it exclusively, so no rename or removal happens while an appender's
+//! descriptor is open: a delayed appender cannot write into a file a later rotation has
+//! replaced. When the current file exceeds the size limit, the appender that notices rotates
+//! it, or leaves it to the next append when the lock stays busy. A reader that must not read a
+//! record twice ([`open_files`]) holds the lock shared only while it opens the files and takes
+//! their lengths, and reads those lengths afterwards: an append lands past them, and a
+//! rotation renames a file without changing it. Readers skip lines that do not parse. A record
 //! failure is never surfaced to a command and never causes a rerun: callers ignore the
 //! returned error.
 
-use std::io;
+use std::fs::File;
+use std::io::{self, Read as _};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -102,7 +106,15 @@ impl Recorder {
         // Someone may have rotated between the size check and the lock.
         if self.over_limit()? {
             if self.keep == 1 {
-                std::fs::remove_file(&current)?;
+                // Moved out of the way first: Windows keeps a removed file's name while a reader
+                // still has it open, and no append could create the file meanwhile. `tmp/` is
+                // swept of a file whose removal never came.
+                let removed = self
+                    .state
+                    .tmp_dir()
+                    .join(format!("records.jsonl.{}", state::new_id()));
+                std::fs::rename(&current, &removed)?;
+                std::fs::remove_file(&removed)?;
             } else {
                 for n in (1..self.keep - 1).rev() {
                     rename_if_exists(
@@ -141,6 +153,58 @@ pub fn read_all(state: &StateDir) -> io::Result<Vec<Record>> {
         records.extend(state::read_jsonl::<Record>(&path)?);
     }
     Ok(records)
+}
+
+/// A record file [`open_files`] opened, with the length it had then.
+#[derive(Debug)]
+pub struct OpenFile {
+    pub path: PathBuf,
+    file: File,
+    len: u64,
+}
+
+impl OpenFile {
+    /// The file's content up to the length it had when it was opened, whatever has been
+    /// appended or rotated since.
+    pub fn read(&self) -> io::Result<Vec<u8>> {
+        let mut bytes = Vec::with_capacity(usize::try_from(self.len).unwrap_or_default());
+        (&self.file).take(self.len).read_to_end(&mut bytes)?;
+        Ok(bytes)
+    }
+}
+
+/// Opens the record files, newest first, and takes their lengths under `records/.lock`, held
+/// shared as an appender holds it until `deadline`, so no rotation renames a file meanwhile
+/// and no record is in two of them. The lock is released on return: reading the files, however
+/// slowly, keeps no appender or rotation waiting. A listed file that cannot be opened, a
+/// missing one included, comes with its error, so running out of descriptors costs the oldest
+/// files; a missing current file is left out.
+pub fn open_files(state: &StateDir, deadline: Instant) -> io::Result<Vec<io::Result<OpenFile>>> {
+    let _no_rotation =
+        state::lock(&state.records_lock(), LockMode::Shared, deadline).map_err(io::Error::other)?;
+    let current = state.records_file();
+    let listed = files(state).map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!("{}: {err}", state.records_dir().display()),
+        )
+    })?;
+    let mut opened = Vec::new();
+    for path in listed.into_iter().rev() {
+        let open = File::open(&path).and_then(|file| {
+            let len = file.metadata()?.len();
+            Ok((file, len))
+        });
+        opened.push(match open {
+            Ok((file, len)) => Ok(OpenFile { path, file, len }),
+            Err(err) if err.kind() == io::ErrorKind::NotFound && path == current => continue,
+            Err(err) => Err(io::Error::new(
+                err.kind(),
+                format!("{}: {err}", path.display()),
+            )),
+        });
+    }
+    Ok(opened)
 }
 
 /// The record files, oldest first: the rotated files `records/` holds, from the highest

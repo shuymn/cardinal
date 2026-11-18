@@ -13,15 +13,19 @@
 mod support;
 
 use std::path::Path;
+use std::time::Duration;
 
 use cardinal::config::Config;
 use cardinal::contract::{
     InboxItem, InboxKind, InboxStatus, Record, RecordKind, Snapshot, SnapshotItem,
 };
+use cardinal::record::Recorder;
 use cardinal::snapshot::{self, PageOptions};
 use cardinal::state::StateDir;
+use cardinal::testpoint::{SNAPSHOT_RECORDS_OPENED, SNAPSHOT_RESERVATIONS_READ};
 use serde_json::json;
 use support::cardinal::Dirs;
+use support::testpoints::TestPoints;
 
 /// The fixed snapshot's generation time: 2026-11-18T00:00:00Z.
 const GENERATED_MS: u64 = 1_794_960_000_000;
@@ -426,7 +430,6 @@ fn the_page_loads_and_sends_nothing() {
 fn cardinal_ui_runs_no_git_gh_or_network_call() {
     use std::net::TcpListener;
     use std::os::unix::fs::PermissionsExt as _;
-    use std::time::Duration;
 
     let dirs = Dirs::new();
     let scope = dirs.scope();
@@ -720,11 +723,11 @@ fn record_files_are_found_whatever_keep_is() {
     assert_eq!(times, [1, 2, 3]);
 }
 
-/// No rotation renames a record file while the snapshot reads them, so no record is read
-/// twice: the scan holds `records/.lock` shared, and while a rotation holds it exclusively
-/// the scan does not read, and the records show as not read rather than as none.
+/// No rotation renames a record file while the snapshot opens them, so no record is read
+/// twice: it opens them under `records/.lock`, held shared, and while a rotation holds the
+/// lock exclusively it reads none, and the records show as not read rather than as none.
 #[test]
-fn no_rotation_runs_during_the_record_scan() {
+fn the_record_files_are_opened_under_the_records_lock() {
     let env = env_with(HOST_TOML);
     std::fs::write(
         env.state.records_file(),
@@ -745,6 +748,167 @@ fn no_rotation_runs_during_the_record_scan() {
     assert_eq!(scopes, ["records"]);
     let records = text(section(&render(&built), "records"));
     assert!(records.contains("No record could be read."), "{records}");
+}
+
+/// The snapshot reads the record files after it releases `records/.lock`: paused there, a
+/// rotation takes the lock at once and renames every file, and the page still shows each
+/// record it opened once, and none appended since.
+#[test]
+fn a_rotation_while_the_records_are_read_waits_for_nothing() {
+    let dirs = Dirs::new();
+    std::fs::write(dirs.config().join("host.toml"), HOST_TOML).unwrap();
+    let state = StateDir::open(dirs.state()).unwrap();
+    let lines = |times: [u64; 2]| {
+        times
+            .map(|ts| record("act", ts).to_string() + "\n")
+            .concat()
+    };
+    std::fs::write(state.rotated_records(2), lines([1, 2])).unwrap();
+    std::fs::write(state.rotated_records(1), lines([3, 4])).unwrap();
+    std::fs::write(state.records_file(), lines([5, 6])).unwrap();
+    let points = TestPoints::new(dirs.scope());
+    let mut command = dirs.cmd();
+    command.arg("ui");
+    points.apply(&mut command, &[SNAPSHOT_RECORDS_OPENED], None);
+    let mut paused = command.spawn().unwrap();
+    points.wait_reached(
+        SNAPSHOT_RECORDS_OPENED,
+        paused.id(),
+        Duration::from_secs(30),
+    );
+
+    let rotation =
+        cardinal::state::try_lock(&state.records_lock(), cardinal::state::LockMode::Exclusive)
+            .unwrap();
+    assert!(rotation.is_some(), "the snapshot holds the records lock");
+    drop(rotation);
+    // Past the limit with three files kept: records.1 replaces records.2, and records.jsonl
+    // becomes records.1.
+    let recorder = Recorder::new(&state, 1, 3);
+    let mut late = recorder.record(RecordKind::Act);
+    late.ts_ms = 7;
+    recorder.append(&late).unwrap();
+    assert!(!state.records_file().exists(), "the append did not rotate");
+    points.release(SNAPSHOT_RECORDS_OPENED);
+    let status = paused.wait().unwrap();
+
+    assert!(status.success(), "{status}");
+    let written: Snapshot =
+        serde_json::from_slice(&std::fs::read(state.ui_snapshot()).unwrap()).unwrap();
+    let times: Vec<u64> = written.records.iter().map(|r| r.ts_ms).collect();
+    assert_eq!(times, [1, 2, 3, 4, 5, 6]);
+    assert_eq!(written.errors, []);
+}
+
+/// With one record file kept, a rotation while the snapshot has the file open moves it out of
+/// the way before removing it, so the next append creates `records.jsonl` at once (Windows
+/// keeps a removed file's name until its last handle closes), and the page shows the records
+/// the snapshot opened.
+#[test]
+fn with_one_file_kept_an_append_lands_while_the_records_are_read() {
+    let dirs = Dirs::new();
+    std::fs::write(dirs.config().join("host.toml"), HOST_TOML).unwrap();
+    let state = StateDir::open(dirs.state()).unwrap();
+    let line = |ts: u64| record("act", ts).to_string() + "\n";
+    std::fs::write(state.records_file(), line(1) + &line(2)).unwrap();
+    let points = TestPoints::new(dirs.scope());
+    let mut command = dirs.cmd();
+    command.arg("ui");
+    points.apply(&mut command, &[SNAPSHOT_RECORDS_OPENED], None);
+    let mut paused = command.spawn().unwrap();
+    points.wait_reached(
+        SNAPSHOT_RECORDS_OPENED,
+        paused.id(),
+        Duration::from_secs(30),
+    );
+
+    let rotating = Recorder::new(&state, 1, 1);
+    let mut late = rotating.record(RecordKind::Act);
+    late.ts_ms = 7;
+    rotating.append(&late).unwrap();
+    assert!(!state.records_file().exists(), "the append did not rotate");
+    late.ts_ms = 8;
+    Recorder::new(&state, 1 << 20, 1).append(&late).unwrap();
+    points.release(SNAPSHOT_RECORDS_OPENED);
+    let status = paused.wait().unwrap();
+
+    assert!(status.success(), "{status}");
+    let current = std::fs::read_to_string(state.records_file()).unwrap();
+    let current: Vec<Record> = current
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(current.iter().map(|r| r.ts_ms).collect::<Vec<_>>(), [8]);
+    let written: Snapshot =
+        serde_json::from_slice(&std::fs::read(state.ui_snapshot()).unwrap()).unwrap();
+    let times: Vec<u64> = written.records.iter().map(|r| r.ts_ms).collect();
+    assert_eq!(times, [1, 2]);
+}
+
+/// Out of file descriptors, the snapshot loses the oldest record files, never the current one:
+/// it opens them newest first, and each it could not open is an error of the part.
+#[cfg(unix)]
+#[test]
+fn out_of_descriptors_the_oldest_record_files_are_lost() {
+    let dirs = Dirs::new();
+    std::fs::write(dirs.config().join("host.toml"), HOST_TOML).unwrap();
+    let state = StateDir::open(dirs.state()).unwrap();
+    for n in 1..=64_u32 {
+        let ts = 100 - u64::from(n);
+        std::fs::write(
+            state.rotated_records(n),
+            record("act", ts).to_string() + "\n",
+        )
+        .unwrap();
+    }
+    std::fs::write(state.records_file(), record("act", 1000).to_string() + "\n").unwrap();
+    let mut command = dirs
+        .scope()
+        .shell(r#"ulimit -n 32 && exec "$0" ui"#, dirs.scope().root());
+    command
+        .arg(env!("CARGO_BIN_EXE_cardinal"))
+        .env("CARDINAL_STATE_DIR", dirs.state())
+        .env("CARDINAL_CONFIG_DIR", dirs.config());
+
+    let out = command.output().unwrap();
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let written: Snapshot =
+        serde_json::from_slice(&std::fs::read(state.ui_snapshot()).unwrap()).unwrap();
+    assert_eq!(written.records.last().map(|r| r.ts_ms), Some(1000));
+    let unopened = written
+        .errors
+        .iter()
+        .filter(|e| e.scope == "records" && e.message.contains("records.64.jsonl"))
+        .count();
+    assert_eq!(unopened, 1, "{:?}", written.errors);
+}
+
+/// A record file that could not be opened is an error of the part even when newer files
+/// already hold the 50 records shown, so the page never shows the records as read in full.
+#[cfg(unix)]
+#[test]
+fn an_unopened_record_file_past_the_records_shown_is_reported() {
+    let env = env_with(HOST_TOML);
+    let lines: String = (1..=50)
+        .map(|ts| record("act", ts).to_string() + "\n")
+        .collect();
+    std::fs::write(env.state.records_file(), lines).unwrap();
+    std::os::unix::fs::symlink(
+        env.state.root().join("nothing"),
+        env.state.rotated_records(1),
+    )
+    .unwrap();
+
+    let built = snapshot::build(&env.config, &env.state).unwrap();
+
+    assert_eq!(built.records.len(), 50);
+    let scopes: Vec<&str> = built.errors.iter().map(|e| e.scope.as_str()).collect();
+    assert_eq!(scopes, ["records"], "{:?}", built.errors);
 }
 
 /// A disk item whose evidence holds something shaped like a disk report that does not read
@@ -1000,8 +1164,9 @@ fn cardinal_ui_marks_the_parts_it_cannot_read() {
     }
 }
 
-/// A file a listing found but that does not read, here a link to nothing in `inbox/` and in
-/// `disk/`, is an error for its part, never an absent file.
+/// A file a listing found but that does not read, here a link to nothing in `inbox/`,
+/// `disk/`, `reservations/`, and as a rotated record file, is an error for its part, never an
+/// absent file.
 #[cfg(unix)]
 #[test]
 fn listed_entries_that_do_not_read_are_errors() {
@@ -1010,6 +1175,8 @@ fn listed_entries_that_do_not_read_are_errors() {
     for listed in [
         env.state.inbox_dir().join("0000000000000000.json"),
         env.state.disk_dir().join("0000000000000000.json"),
+        env.state.reservation("0000000000000000"),
+        env.state.rotated_records(1),
     ] {
         std::os::unix::fs::symlink(&nothing, listed).unwrap();
     }
@@ -1018,10 +1185,88 @@ fn listed_entries_that_do_not_read_are_errors() {
 
     let mut scopes: Vec<&str> = built.errors.iter().map(|e| e.scope.as_str()).collect();
     scopes.sort_unstable();
-    assert_eq!(scopes, ["disk", "inbox"], "{:?}", built.errors);
+    assert_eq!(
+        scopes,
+        ["disk", "inbox", "records", "reservations"],
+        "{:?}",
+        built.errors
+    );
     let page = render(&built);
     assert!(text(section(&page, "owner")).contains("No item that could be read waits"));
     assert!(text(section(&page, "disk")).contains("No disk state could be read."));
+    assert!(text(section(&page, "reservations")).contains("No reservation could be read."));
+    assert!(text(section(&page, "records")).contains("No record could be read."));
+}
+
+/// The reservations and the files among them that do not read come from one listing: a
+/// directory named like a reservation leaves the other reservations shown, with the directory
+/// as an error, and a file that did not parse when it was listed stays an error, its job not
+/// shown, when a writer replaces it with a reservation before the states are derived, taking
+/// the admission lock as a runner does, which the snapshot no longer holds.
+#[test]
+fn the_reservations_come_from_one_listing() {
+    let dirs = Dirs::new();
+    std::fs::write(dirs.config().join("host.toml"), HOST_TOML).unwrap();
+    let state = StateDir::open(dirs.state()).unwrap();
+    let mut reservation = serde_json::to_value(&fixed_snapshot().reservations.items[0]).unwrap();
+    for derived in ["derived", "members", "verified"] {
+        reservation.as_object_mut().unwrap().remove(derived);
+    }
+    let write = |job: &str| {
+        let mut doc = reservation.clone();
+        doc["job_id"] = json!(job);
+        let _admission = cardinal::admission::lock(&state, Duration::from_secs(1))
+            .expect("the admission lock is free");
+        state
+            .write_atomic(
+                &state.reservation(job),
+                &serde_json::to_vec(&doc).unwrap(),
+                cardinal::state::Durability::Volatile,
+            )
+            .unwrap();
+    };
+    write("f1f2f3f4f5f60718");
+    std::fs::create_dir(state.reservation("0000000000000001")).unwrap();
+    std::fs::write(state.reservation("0000000000000002"), b"{").unwrap();
+    let points = TestPoints::new(dirs.scope());
+    let mut command = dirs.cmd();
+    command.arg("ui");
+    points.apply(&mut command, &[SNAPSHOT_RESERVATIONS_READ], None);
+    let mut paused = command.spawn().unwrap();
+    points.wait_reached(
+        SNAPSHOT_RESERVATIONS_READ,
+        paused.id(),
+        Duration::from_secs(30),
+    );
+
+    write("0000000000000002");
+    points.release(SNAPSHOT_RESERVATIONS_READ);
+    let status = paused.wait().unwrap();
+
+    assert!(status.success(), "{status}");
+    let written: Snapshot =
+        serde_json::from_slice(&std::fs::read(state.ui_snapshot()).unwrap()).unwrap();
+    let jobs: Vec<&str> = written
+        .reservations
+        .items
+        .iter()
+        .map(|view| view.reservation.job_id.as_str())
+        .collect();
+    assert_eq!(jobs, ["f1f2f3f4f5f60718"]);
+    let mut unread: Vec<&str> = written
+        .errors
+        .iter()
+        .map(|e| {
+            assert_eq!(e.scope, "reservations", "{:?}", written.errors);
+            let file = e.message.split(": ").next().unwrap();
+            Path::new(file).file_stem().unwrap().to_str().unwrap()
+        })
+        .collect();
+    unread.sort_unstable();
+    assert_eq!(unread, ["0000000000000001", "0000000000000002"]);
+    let page = std::fs::read_to_string(state.ui_page()).unwrap();
+    let shown = text(section(&page, "reservations"));
+    assert!(shown.contains("f1f2f3f4f5f60718") && shown.contains("Not read in full"));
 }
 
 /// While another process holds the admission, inbox, or records lock past its deadline, the
@@ -1045,7 +1290,7 @@ fn busy_locks_mark_their_parts_not_read() {
     let mut scopes: Vec<&str> = built.errors.iter().map(|e| e.scope.as_str()).collect();
     scopes.dedup();
     assert_eq!(scopes, ["reservations", "inbox", "records"]);
-    // The reservations' own reading failed, not only the check of their files.
+    // The reservations' reading failed: they show as not read, never as none.
     assert!(
         built.errors.iter().any(|e| e.scope == "reservations"
             && e.message.starts_with("the reservations could not be read")),

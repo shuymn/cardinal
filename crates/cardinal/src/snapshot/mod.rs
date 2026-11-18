@@ -4,8 +4,8 @@
 //!
 //! The snapshot is read from the files a pass has already written: the disk states, the last
 //! full observation, the inbox, the records, and the last arbiter pass. Only the reservations
-//! are read again, under the admission lock with the process table (section 4.3), because
-//! their derived state is never stored. A part that cannot be read, or is read only in part,
+//! are read again, under the admission lock (section 4.3), with their states derived from the
+//! process table once it is released, because their derived state is never stored. A part that cannot be read, or is read only in part,
 //! is recorded in the snapshot's `errors` under the part's name and shown as incomplete; it
 //! never ends the snapshot. [`page`] renders it.
 
@@ -23,12 +23,13 @@ use crate::admission;
 use crate::config::Config;
 use crate::contract::{
     ArbiterPass, DiskState, Error, ErrorCode, InboxItem, InboxStatus, Inventory, Record,
-    RecordKind, Reservation, ScopedError, Snapshot, SnapshotItem, SnapshotObservation,
-    SnapshotReservations, SnapshotSchema,
+    RecordKind, ScopedError, Snapshot, SnapshotItem, SnapshotObservation, SnapshotReservations,
+    SnapshotSchema,
 };
 use crate::observe::Observer;
 use crate::record;
 use crate::state::{self, Durability, LockMode, StateDir};
+use crate::testpoint;
 
 /// How many `act`, `planned`, and `inbox_*` records the snapshot holds, the newest.
 pub const RECORDS_SHOWN: usize = 50;
@@ -125,46 +126,33 @@ fn disk_states(state: &StateDir, errors: &mut Errors) -> Vec<DiskState> {
     states
 }
 
-/// The reservations with their derived state. A reservation file that does not read is
-/// counted as an error, found by listing `reservations/` under the admission lock as every
-/// listing of it is (section 4.3).
+/// The reservations with their derived state, and each reservation file that does not read
+/// as an error, both from one listing of `reservations/` under the admission lock (section
+/// 4.3). The states are derived once the lock is released.
 fn reservations(config: &Config, state: &StateDir, errors: &mut Errors) -> SnapshotReservations {
     const SCOPE: &str = "reservations";
-    let items = match admission::list_reservations(state, &config.host) {
-        Ok(items) => items,
+    let read = admission::snapshot_with_unread(state, &config.host);
+    let observed_ms = state::now_ms();
+    let mut found = match read {
+        Ok((found, unread)) => {
+            for message in unread {
+                errors.add(SCOPE, message);
+            }
+            found
+        }
         Err(err) => {
             errors.add(SCOPE, format!("the reservations could not be read: {err}"));
             Vec::new()
         }
     };
-    let observed_ms = state::now_ms();
-    let timeout = Duration::from_millis(config.host.admission.lock_timeout_ms);
-    match admission::lock(state, timeout) {
-        Ok(_lock) => {
-            for path in json_files(&state.reservations_dir(), SCOPE, errors) {
-                let job = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or_default();
-                match std::fs::read(&path) {
-                    Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-                    Err(err) => errors.add(SCOPE, format!("{}: {err}", path.display())),
-                    Ok(bytes) => match serde_json::from_slice::<Reservation>(&bytes) {
-                        Ok(r) if r.job_id == job => {}
-                        Ok(_) => {
-                            errors.add(SCOPE, format!("{}: names another job", path.display()));
-                        }
-                        Err(err) => errors.add(SCOPE, format!("{}: {err}", path.display())),
-                    },
-                }
-            }
-        }
-        Err(err) => errors.add(
-            SCOPE,
-            format!("the reservation files could not be checked: {err}"),
-        ),
+    if let Err(err) = testpoint::hit(testpoint::SNAPSHOT_RESERVATIONS_READ) {
+        errors.add(SCOPE, err.to_string());
+        found.clear();
     }
-    SnapshotReservations { observed_ms, items }
+    SnapshotReservations {
+        observed_ms,
+        items: admission::views(state, found),
+    }
 }
 
 /// The open and escalated items, those for the owner first, then by creation. `inbox/` is
@@ -200,35 +188,37 @@ fn pending_items(config: &Config, state: &StateDir, errors: &mut Errors) -> Vec<
 
 /// The newest [`RECORDS_SHOWN`] `act`, `planned`, and `inbox_*` records, oldest first, from
 /// the record files `records/` holds, newest first; no older file is read once enough are
-/// found. `records/.lock` is held shared, as an appender holds it, so no rotation renames a
-/// file during the scan and no record is read twice. A line that does not read is counted.
+/// found. The files are opened with their lengths taken under `records/.lock`, held shared as
+/// an appender holds it, so no record is read twice, and read up to those lengths once it is
+/// released, so no appender or rotation waits for the scan. A listed file that cannot be read
+/// is an error, as is one that could not be opened past the newest records, and a line that
+/// does not read is counted.
 fn recent_records(state: &StateDir, errors: &mut Errors) -> Vec<Record> {
     const SCOPE: &str = "records";
-    let _no_rotation = match state::lock(
-        &state.records_lock(),
-        LockMode::Shared,
-        Instant::now() + RECORDS_WAIT,
-    ) {
-        Ok(lock) => lock,
+    let files = match record::open_files(state, Instant::now() + RECORDS_WAIT) {
+        Ok(files) => files,
         Err(err) => {
             errors.add(SCOPE, format!("the records could not be read: {err}"));
             return Vec::new();
         }
     };
-    let files = match record::files(state) {
-        Ok(files) => files,
-        Err(err) => {
-            errors.add(SCOPE, format!("{}: {err}", state.records_dir().display()));
-            return Vec::new();
-        }
-    };
+    if let Err(err) = testpoint::hit(testpoint::SNAPSHOT_RECORDS_OPENED) {
+        errors.add(SCOPE, err.to_string());
+        return Vec::new();
+    }
     let mut newest_first = Vec::with_capacity(RECORDS_SHOWN);
-    for path in files.iter().rev() {
-        let bytes = match std::fs::read(path) {
-            Ok(bytes) => bytes,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+    let mut files = files.iter();
+    for file in files.by_ref() {
+        let (path, bytes) = match file {
+            Ok(file) => match file.read() {
+                Ok(bytes) => (&file.path, bytes),
+                Err(err) => {
+                    errors.add(SCOPE, format!("{}: {err}", file.path.display()));
+                    continue;
+                }
+            },
             Err(err) => {
-                errors.add(SCOPE, format!("{}: {err}", path.display()));
+                errors.add(SCOPE, err.to_string());
                 continue;
             }
         };
@@ -256,6 +246,11 @@ fn recent_records(state: &StateDir, errors: &mut Errors) -> Vec<Record> {
         if newest_first.len() == RECORDS_SHOWN {
             break;
         }
+    }
+    // An older file is not read once enough records are found, but one that could not be
+    // opened is still known not to read.
+    for err in files.filter_map(|file| file.as_ref().err()) {
+        errors.add(SCOPE, err.to_string());
     }
     newest_first.reverse();
     newest_first
