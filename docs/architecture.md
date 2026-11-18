@@ -1418,33 +1418,53 @@ flowchart LR
   U -. "once decided" .-> W["W: Cloudflare push"]
 ```
 
-F1 declares every new public function with a body that returns `cardinal.error.v1` code `not_implemented`, every contract type and schema of section 11.3, the configuration of section 3.2 with its validation, the state paths of section 4.1, the CLI of section 11.2, the testpoints of section 13.1, the `reconcile` pass of section 10.3 as one stub call per step, `plan::merge` (the merge-evidence check moved out of `checks.rs` unchanged), and the module table of section 2.2 in `tests/layering.rs`. The other units then fill bodies in the modules they own.
+F1 makes the tree build with every phase 1 contract in place and every existing test passing. It declares every contract type and schema of section 11.3, the configuration of section 3.2 with its validation, the state paths of section 4.1, the CLI of section 11.2 with handlers that call the new modules, the testpoints of section 13.1, and the module table of section 2.2 in `tests/layering.rs`, and adds `objc2-core-foundation` to `Cargo.toml` and `Cargo.lock`. For each contract type it changes it migrates the producers, so nothing is left half-built: `PlanTarget.git_dir` in `src/plan/mod.rs`, the new `Worktree` facts in `src/observe/mod.rs` (`unknown` and `null` until I fills them), `ActResult` and `ActOptions.squash_merged` in `src/act/mod.rs`. New entry points get bodies that return `cardinal.error.v1` code `not_implemented`, or `unknown` for a fact: `os::disk`, `os::fds`, and `os::spawn_detached` in `src/os/mod.rs`, `observe::content_in_base`, the `reconcile` pass of section 10.3 as one stub call per step, and `src/snapshot/`. It adds `state::sync_dir`, a directory fsync (`F_FULLFSYNC` on macOS) that A's durable order uses, and moves the merge-evidence check from `src/plan/checks.rs` to `src/plan/merge.rs` unchanged. The other units then fill bodies in the files section 14.2 gives them.
 
 | Unit | Can start | Integration gate |
 | --- | --- | --- |
 | F1 | Immediately | — |
 | A | After F1 | — |
 | D | After F1 | After A: the real-volume tests execute; before A they assert the dry-run path |
-| I | After F1 | After A: skill v2's results and `--squash-merged` executions |
+| I | After F1 | After A: `--squash-merged` executions and skill v2's executed results (below) |
 | U | After F1 | After D and I: the page shows their real states |
 | R | After A, D, I, and U | — |
 | W | After U and the decision of section 14.5 | — |
 
-A unit is done when its own completion tests pass; its integration gate is a follow-up PR by the same unit once the dependency has merged.
+A unit is done when its own completion tests pass; its integration gate is a follow-up PR by the same unit once the dependency has merged. A and I depend on each other at one point: `act` (A) reads `content_in_base` inside its exclusion through `observe::content_in_base` (I). Until I merges, F1's stub returns `unknown`, so `act --squash-merged` is refused by `merge_evidence`; until A merges, a squash-merged worktree can only report `dry_run`. Whichever of the two merges second adds the executing cases of `tests/squash.rs`.
 
 ### 14.2 Work units
 
 | Unit | Owns | Completion tests |
 | --- | --- | --- |
-| **F1** foundation | `src/contract/`, `src/config/`, the paths in `src/state/`, `src/cli/mod.rs`, the names in `src/testpoint.rs`, skeletons of `src/reconcile/` and `src/snapshot/`, `src/plan/merge.rs` (moved), `tests/layering.rs` | `tests/contract.rs`, `tests/cli.rs` (`--owner-approved` only with `--caller owner`), configuration validation, `tests/layering.rs` |
-| **A** deletion | `src/act/`: execution, trash, comparison, deleter, recovery, administrative entry; the `not_in_use`, `plain_target`, and `trash_on_volume` checks in `src/plan/checks.rs` | `tests/act_execute.rs`, `tests/act_races.rs`, `tests/act_crash.rs`, `tests/act_fs.rs`, `tests/act_worktree.rs`, `tests/act_single.rs`, `tests/act_dry_run.rs` (from `act_report_only.rs`), `tests/unit_dry_run.rs`, `tests/plan_act.rs` |
-| **D** disk and reconcile | `src/sensor.rs`, `src/os/disk.rs`, `os::spawn_detached`, `src/reconcile/` but `raise.rs` and `arbiter.rs`, the job-end check in `src/run/`, `examples/launchd/`, `examples/systemd/`, `Scope::tmpfs` and `Scope::attach_image` in `crates/test-support`, the image in `scripts/test` | `tests/disk_state.rs`, `tests/disk_reclaim.rs`, `tests/disk_volume.rs`, `tests/reserve.rs`, `tests/reconcile.rs`, `tests/run_disk_trigger.rs`, `tests/timer_examples.rs`, `tests/admission_isolation.rs` |
-| **I** inbox, squash, arbiter | `src/observe/` (`content_in_base`, `closed_pr`, `git_dir`, `last_activity_ms`), `src/plan/merge.rs`, the kinds in `src/inbox/`, `src/reconcile/raise.rs`, `src/reconcile/arbiter.rs`, `integrations/claude-code/` (skill v2; README: the timer starts the arbiter), `tests/skill_commands.rs` | `tests/inbox_raisers.rs`, `tests/squash.rs`, `tests/arbiter_launch.rs`, `tests/observe_worktrees.rs`, `tests/skill_commands.rs` |
-| **U** web UI | `src/snapshot/`, the `ui` handler | `tests/ui.rs`: the page from a fixed snapshot, self-contained, written with no git, gh, or network call |
+| **F1** foundation | Section 14.1, and the F1 column below | `tests/contract.rs`, `tests/cli.rs` (`--owner-approved` only with `--caller owner`), configuration validation, `tests/layering.rs`, and every existing test |
+| **A** deletion | Execution, descriptor scan, trash, comparison, hold deleter, durable order, recovery, administrative entry | `tests/act_execute.rs`, `tests/act_races.rs`, `tests/act_crash.rs`, `tests/act_durability.rs`, `tests/act_fs.rs`, `tests/act_worktree.rs`, `tests/act_single.rs`, `tests/act_dry_run.rs` (from `act_report_only.rs`), `tests/unit_dry_run.rs`, `tests/plan_act.rs`, and the unit tests of `os::fds` |
+| **D** disk and reconcile | Disk states, `disk-reclaim`, the reserve file, the pass, timers, test volumes | `tests/disk_state.rs`, `tests/disk_reclaim.rs`, `tests/disk_volume.rs`, `tests/reserve.rs`, `tests/reconcile.rs`, `tests/run_disk_trigger.rs`, `tests/timer_examples.rs`, `tests/admission_isolation.rs` |
+| **I** inbox, squash, arbiter | Observed facts, squash evidence, raised items, the arbiter's trigger and launcher, skill v2 | `tests/inbox_raisers.rs`, `tests/squash.rs`, `tests/arbiter_launch.rs`, `tests/observe_worktrees.rs`, `tests/skill_commands.rs` |
+| **U** web UI | The snapshot and the page | `tests/ui.rs`: the page from a fixed snapshot, self-contained, written with no git, gh, or network call |
 | **R** real-data run | No code: section 14.4, run by hand on the development host | Section 14.4's evidence, reported on issue #9 as counts |
 | **W** Cloudflare push | `control-plane/` (Worker, Durable Object), `cardinal push` | Set with the decision of section 14.5 |
 
-Every work unit's completion command is `mise exec -- scripts/test`.
+Every file a unit changes has one owner at a time; a file F1 touches passes to the unit named after it:
+
+| File | F1 | Then |
+| --- | --- | --- |
+| `Cargo.toml`, `Cargo.lock` | The dependency of section 12 (`objc2-core-foundation`) | A unit that needs another dependency adds it in its own PR and says so |
+| `src/contract/`, `src/config/`, `src/state/mod.rs`, `src/cli/mod.rs`, `src/testpoint.rs` | All of phase 1's additions | Nobody; a contract change found later is a follow-up F PR |
+| `src/os/mod.rs` | The entry points and their stubs | A: `src/os/fds.rs`, and the rename helpers in `src/os/dir.rs`; D: `src/os/disk.rs` and `src/os/detached.rs` |
+| `src/plan/mod.rs` | The `PlanTarget` producer | A: the plan made durable at a claim, the retention rule of section 4.9 |
+| `src/plan/checks.rs`, `src/plan/walk.rs` | The merge-evidence check moved out | A: `not_in_use` with the descriptor scan, `plain_target`, `trash_on_volume`, `local_volume`, the identities the scan matches |
+| `src/plan/merge.rs` | Moved, unchanged | I: `--squash-merged` with `content_in_base` |
+| `src/act/` | `ActResult`, `ActOptions` | A |
+| `src/observe/` | The new facts as `unknown` and `null` | I |
+| `src/run/mod.rs`, `src/sensor.rs` | — | D: the job-end check, free space |
+| `src/reconcile/` | The pass as one stub call per step | D, except `raise.rs` and `arbiter.rs`: I |
+| `src/snapshot/` | The skeleton | U |
+| `crates/test-support/src/scope.rs`, `scope/mount.rs` | — | D: `Scope::tmpfs`, `Scope::attach_image` |
+| `scripts/test`, `.github/workflows/ci.yml` | — | D: the disk image and any CI setup the test volumes need; a new action also goes into `.github/infra.yaml` |
+| `examples/launchd/`, `examples/systemd/` | — | D |
+| `integrations/claude-code/` | — | I: skill v2; the README says the timer starts the arbiter |
+
+`src/inbox/mod.rs` keeps its raise and refresh; I raises the new kinds from `src/reconcile/raise.rs`. Every work unit's completion command is `mise exec -- scripts/test`.
 
 ### 14.3 Arbiter skill v2 contract
 
