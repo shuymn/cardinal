@@ -29,7 +29,7 @@ Phase 0 built the core (hook adapter, runner, admission and reservations, observ
 Phase 1 adds, accepted by G2, G6, G7, G8, and the report part of G3 (its execution part waits for whole-worktree execution, section 9.8):
 
 - **Deletion in `act` for regenerable directories** (`reclaim_dir`, section 9.5): the target moves out of its path into a trash directory with one rename, is checked again there, and is deleted only inside the trash. Unix only; on Windows `act` stays a report (phase 3). **Whole worktrees stay report-only:** `plan`, `inventory`, `reconcile`, and the arbiter identify reclaimable worktrees and raise inbox items, and `act` evaluates their checks and reports, never executes (section 9.3).
-- **`cardinal reconcile`** (section 10.3), started by an OS timer and at job ends: interrupted executions, the inbox refresh, inbox items raised from observation (section 10.1), disk states and the built-in `disk-reclaim` reconciler (section 10.4), the reserve file (section 4.12), starting the arbiter (section 10.5), and the read-only web UI page (section 10.6).
+- **`cardinal reconcile`** (section 10.3), started by an OS timer and at job ends: interrupted executions, the inbox refresh, inbox items raised from observation (section 10.1), disk states and the built-in `disk-reclaim` reconciler (section 10.4), the reserve files (section 4.12), starting the arbiter (section 10.5), and the read-only web UI page (section 10.6).
 - **The arbiter skill v2** (section 14.3) with squash-merge judgments, disk items, and the deletion of regenerable directories the owner asks for.
 
 Phase 1 first runs on macOS against real worktrees, report-only until the evidence of section 14.4 is in. Linux builds and tests everything; the real-data run is macOS only.
@@ -82,7 +82,7 @@ Everything lives in the single crate `crates/cardinal` (library plus the `cardin
 | `plan` | Plan generation, identity binding, the checks | `observe`, `admission`, `state`, `record`, `contract` |
 | `act` | Plan evaluation; execution of `reclaim_dir`: snapshot, claim, move into the trash, comparison, deletion, recovery of interrupted executions (sections 9.5–9.7) | `plan`, `observe`, `admission`, `inbox`, `state`, `record`, `contract`, `testpoint`, rustix |
 | `inbox` | Inbox store, dedup, refresh (recovery pass and outlived processes) | `admission`, `observe`, `state`, `record`, `contract` |
-| `reconcile` | `cardinal reconcile` and `cardinal arbiter run`: the pass order, disk states, the reserve file, the `disk-reclaim` reconciler, inbox items raised from observation, the arbiter's trigger and launcher (sections 10.3–10.5) | `act`, `plan`, `inbox`, `observe`, `sensor`, `snapshot`, `admission`, `record`, `state`, `config`, `os`, `contract` |
+| `reconcile` | `cardinal reconcile` and `cardinal arbiter run`: the pass order, disk states, the reserve files, the `disk-reclaim` reconciler, inbox items raised from observation, the arbiter's trigger and launcher (sections 10.3–10.5) | `act`, `plan`, `inbox`, `observe`, `sensor`, `snapshot`, `admission`, `record`, `state`, `config`, `os`, `contract` |
 | `snapshot` | `cardinal.snapshot.v1` and the static page of the read-only web UI (section 10.6) | `inbox`, `record`, `state`, `contract` |
 | `explain` | Explanation documents | `adapter::claude` (the hook's repository, origin, and timeout lookups for `explain command`), `classify`, `record`, `plan`, `inbox`, `admission` (the reservation snapshot of `explain job`), `state`, `contract` |
 | `cli` | clap definitions and thin handlers that print JSON | everything |
@@ -181,8 +181,8 @@ keep = 4
 [disk]                   # lines for every watched volume, in MiB of free space (section 10.4)
 warning_mib = 20480      # below: reclaim (C10)
 recovery_mib = 30720     # reclaim until free space is above this
-critical_mib = 5120      # below: the owner is told; on the state volume the reserve file goes
-reserve_mib = 64         # the reserve file on the state volume (section 4.12)
+critical_mib = 5120      # below: the owner is told and the volume's reserve file goes
+reserve_mib = 64         # each volume's reserve file (section 4.12)
 volumes = [{ mount = "/Volumes/Scratch", warning_mib = 600, recovery_mib = 900, critical_mib = 200 }]  # per-mount lines
 
 [act]
@@ -759,7 +759,7 @@ Each plan carries a list of checks. An **invariant** failing or being `unknown` 
 | `no_open_pr` | `reclaim_worktree` | invariant | `open_pr` is `no` |
 | `has_upstream` | `reclaim_worktree` | invariant | The branch has an upstream (G6). This also keeps freshly created worktrees, which start clean at the base, from being reclaimed before their first push |
 | `regenerable` | `reclaim_dir` | invariant | The target is a `regenerable` ignored entry of a worktree that observation listed |
-| `plain_target` | both | invariant | No entry in the target is a FIFO, a socket, or a device: processes meet at a FIFO or a socket by path, and a reader blocked opening a FIFO holds no descriptor the scan could see (probed on macOS), so deleting one can strand a process, while a device does not belong in build output; the detail names the entries, so the owner can remove a stale socket. The target is not a symbolic link, not a mount point, and on the same device and mount as its parent, and no directory below it is on another device or mount: renaming a directory carries the mounts below it along (probed on APFS and Linux), so deleting would leave a mounted volume in the trash. A bind mount on the same device counts as a mount point: the mount is told by its mount ID (`statx`) on Linux and by the path it is mounted on (`statfs`) on macOS; a mount that cannot be read is `unknown`. `plan`'s walk and `act`'s snapshot read mounts the same way (`os::mount`), for the target and every directory they would enter, and list a directory only after its mount is read. On Windows a folder a volume is mounted on is a reparse point, which both treat as a symbolic link |
+| `plain_target` | both | invariant | The target is not a symbolic link, not a mount point, and on the same device and mount as its parent, and no directory below it is on another device or mount: renaming a directory carries the mounts below it along (probed on APFS and Linux), so deleting would leave a mounted volume in the trash. A bind mount on the same device counts as a mount point: the mount is told by its mount ID (`statx`) on Linux and by the path it is mounted on (`statfs`) on macOS; a mount that cannot be read is `unknown`. `plan`'s walk and `act`'s snapshot read mounts the same way (`os::mount`), for the target and every directory they would enter, and list a directory only after its mount is read. On Windows a folder a volume is mounted on is a reparse point, which both treat as a symbolic link. No entry in the target is a FIFO, a socket, or a device: processes meet at a FIFO or a socket by path, and a reader blocked opening a FIFO holds no descriptor the scan could see (probed on macOS), so deleting one can strand a process, while a device does not belong in build output; the detail names the entries, so the owner can remove a stale socket |
 | `no_protected` | both | invariant | Nothing in the target, descendants included, is protected |
 | `no_unclassifiable` | both | invariant | Nothing in the target is unclassifiable ignored data |
 | `no_nested_repository` | both | invariant | No directory below the target's root has its own `.git` entry (another worktree, a submodule, a nested clone) |
@@ -837,7 +837,7 @@ An execution that died leaves a claim without a result and the plan's `act.lock`
 | Claim stage | Found | Recovery |
 | --- | --- | --- |
 | `claimed` | The target at its place (the claim's `dev` and `ino`), nothing in the trash | The move did not happen or did not persist: result `rejected` (`interrupted`); nothing was touched |
-| `claimed` | `<trash>/<plan>` | Moved, not committed: restore; result `rejected` (`interrupted`); a taken name raises `reclaim_interrupted` |
+| `claimed` | `<trash>/<plan>` | Moved, not committed: restore; result `rejected` (`interrupted`), with `restore_failed` and `reclaim_interrupted` when the name is taken or the chain changed |
 | `committed` | `<trash>/<plan>` | Delete as step 11 does, by the manifest, after a descriptor scan of the trash entry; then step 12 |
 | `committed` | Nothing in the trash, the target at its place | Someone put the target back after the commit: nothing is deleted; result `partial` (`restored_outside`) |
 | `committed` | Nothing in the trash, the target absent | Deletion had finished: step 12 |
@@ -928,7 +928,7 @@ A pass runs these steps in order; a failing step is recorded and the next one ru
 1. Take `reconcile.lock` exclusively with one try; when it is held, print `skipped: "busy"` and exit 0.
 2. Remove old temp files and recover interrupted executions (section 9.7).
 3. Run the inbox refresh (section 10.1).
-4. Read the free space of every watched volume and update its disk state, the reserve file, and the disk items (section 10.4).
+4. Read the free space of every watched volume and update its disk state, its reserve file, and the disk items (section 10.4).
 5. When the last full observation is older than `observe_every_s`, or a volume is under pressure (section 10.4), observe (`inventory` of section 8, with sizes only for the regenerable entries of worktrees on volumes under pressure), keep the result in `reconcile/observation.json`, build the plans from it, and raise and clear the worktree items of section 10.1.
 6. For each volume under pressure, run `disk-reclaim` (section 10.4).
 7. Run the arbiter trigger (section 10.5).
@@ -950,7 +950,7 @@ Watched volumes are the mounts of the state dir, of each trash directory, and of
 - `critical` → `warning` above the critical line;
 - `warning` or `critical` → `ok` only above the recovery line.
 
-A volume in `warning` or `critical` is **under pressure**: the pass observes and `disk-reclaim` runs in both, so falling below the critical line never stops reclamation. Leaving `ok` raises `disk_low` for the episode, each entry into `critical` raises `disk_critical`, and both are cleared when the volume is back to `ok`. On the state volume, below the critical line also removes the reserve file (section 4.12). Stopping heavy jobs below the critical line is admission's, phase 2.
+A volume in `warning` or `critical` is **under pressure**: the pass observes and `disk-reclaim` runs in both, so falling below the critical line never stops reclamation. Leaving `ok` raises `disk_low` for the episode, each entry into `critical` raises `disk_critical`, and both are cleared when the volume is back to `ok`. Below the critical line a volume's reserve file goes too (section 4.12). Stopping heavy jobs below the critical line is admission's, phase 2.
 
 **`disk-reclaim`** (C10) is built in and unit-shaped: it calls `plan` and `act` as `unit:disk-reclaim`, so with `[unit.disk-reclaim] act = false`, the default, it records `planned` operations and deletes nothing (C16). For a volume under pressure it takes the `reclaim_dir` plans of step 5 of the pass whose targets are on that volume and that pass every check without approval (`invariants_ok`, `approval: "none"`), and acts on them in design §7's reclamation order after its first tier, which is whole worktrees and waits for their execution (section 17 item 18): worktrees by `last_activity_ms`, oldest first, and within a worktree the most exclusive bytes first (`allocated_bytes` less `aliased_bytes`, section 8.5); a target whose bytes are all aliased frees nothing and is skipped. After each act that moved anything (`executed` or `partial`) it reads the volume's free space again through `os::disk`, not from the pass's state, so space that other acts on the volume freed meanwhile (the owner's, or the arbiter's on the owner's request) counts too, and it stops above the recovery line. Two acts never delete the same target: each takes the worktree's in-use lock exclusively with a single try, and a target that has moved is gone from its path. Data in use and protected data are skipped because their plans fail `not_in_use` or `no_protected`; the regenerable bytes on the volume whose plans failed are reported per check, with the aliased bytes, in `reconcile`'s `blocked` and the `disk_low` evidence, so the owner sees how much space is held and by what. Caches outside worktrees and old toolchain outputs have no plan kind yet.
 
@@ -1460,7 +1460,7 @@ Every file a unit changes has one owner at a time; a file F1 touches passes to t
 | `examples/launchd/`, `examples/systemd/` | — | D |
 | `integrations/claude-code/` | — | I: skill v2; the README says the timer starts the arbiter |
 
-`src/inbox/mod.rs` keeps its raise and refresh; I raises the new kinds from `src/reconcile/raise.rs`. Every work unit's completion command is `mise exec -- scripts/test`.
+`src/inbox/mod.rs` keeps its raise and refresh; I raises the new kinds from `src/reconcile/raise.rs` and adds the due rule of section 10.5, which the trigger and `cardinal inbox --due` share, in `src/inbox/due.rs`. Every work unit's completion command is `mise exec -- scripts/test`.
 
 ### 14.3 Arbiter skill v2 contract
 
@@ -1502,7 +1502,7 @@ Each row is decided outside this document: it involves an account, money, behavi
 | Enabling deletion | `[arbiter] act` and `[unit.disk-reclaim] act`; enabling accepts that a process the descriptor scan cannot see may lose a regenerable directory while using it and must rebuild it (section 9.5) | After section 14.4's evidence |
 | Worktrees that containers or VMs use (section 9.5, section 17 item 17) | cardinal cannot tell them apart: a VirtioFS share or a bind mount is the host's own file system, so `local_volume` passes, and the guest's processes are invisible to the descriptor scan. List every directory they mount under `[observe] managed` (a parent when the mounts are broad), which `not_managed` enforces for every caller, the owner included; or enable deletion as elsewhere and accept that a guest may lose a regenerable directory while using it | List them as managed, before enabling deletion on such a host |
 | Unattended model usage | Each arbiter pass costs model usage. Passes run only for due items, at most one per `min_interval_s`; an item is tried again only after `retry_s`, so items left open or failing cost at most one pass per `retry_s`; only a new disk episode or an entry into critical starts one at once | `min_interval_s` 30 minutes, `retry_s` 2 hours |
-| Disk lines, the timer interval, and the reserve files (section 4.12, section 10.4) | Defaults: warning, recovery, and critical at 20, 30, and 5 GiB; 5 minutes; a 64 MiB reserve file on each volume `act` writes to. The warning line must leave room for the growth over one interval plus one pass under pressure, and each reserve must hold its volume's largest manifest (about 75 bytes per entry) or the space a rename into its trash needs on a full volume; section 14.4 measures both, and neither is derived here | Set per host from section 14.4's measurements |
+| Disk lines, the timer interval, and the reserve files (section 4.12, section 10.4) | Defaults: warning, recovery, and critical at 20, 30, and 5 GiB; 5 minutes; a 64 MiB reserve file on each volume `act` writes to. The warning line must leave room for the growth over one interval plus one pass under pressure; the state volume's reserve must hold the largest manifest an execution writes (about 75 bytes per entry), and every reserve the space a rename into its volume's trash needs on a full volume. Section 14.4 measures these; none is derived here | Set per host from section 14.4's measurements |
 | C11 on APFS volumes with local snapshots (section 17 item 15) | Accept it as an owner exception: on a full volume whose local snapshot holds the reserve's blocks, minimal reclamation is not guaranteed, and the owner thins snapshots by hand; or let cardinal thin local snapshots (`tmutil thinlocalsnapshots`), which deletes backup data | Owner exception; snapshots are thinned by hand |
 | Installing the timer | cardinal installs its launchd agent or systemd timer; or it is copied by hand from `examples/` | By hand: cardinal writes nothing to the user's service configuration |
 
