@@ -27,7 +27,8 @@ pub struct Entry {
     /// The path relative to the worktree root (empty for the worktree root itself).
     pub rel: PathBuf,
     pub kind: EntryKind,
-    /// Device and inode on Unix; 0 on Windows.
+    /// Device and inode on Unix. On Windows the device is 0, and the inode is a regular file's
+    /// file index (0 for other entries).
     pub dev: u64,
     pub ino: u64,
     pub size: u64,
@@ -35,6 +36,9 @@ pub struct Entry {
     pub mtime_ns: i128,
     /// Bytes allocated on disk: blocks × 512 on Unix, the length on Windows.
     pub allocated: u64,
+    /// The number of names the entry has, here and elsewhere (on Windows read for regular
+    /// files, 1 for other entries).
+    pub nlink: u64,
 }
 
 impl Entry {
@@ -68,6 +72,7 @@ impl Entry {
                 size: meta.size(),
                 mtime_ns: i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec()),
                 allocated: meta.blocks().saturating_mul(512),
+                nlink: meta.nlink(),
             }
         }
         #[cfg(not(unix))]
@@ -85,6 +90,7 @@ impl Entry {
                 size: meta.len(),
                 mtime_ns,
                 allocated: meta.len(),
+                nlink: 1,
             }
         }
     }
@@ -106,6 +112,7 @@ impl Entry {
             size: st.size,
             mtime_ns: st.mtime_ns,
             allocated: st.blocks.saturating_mul(512),
+            nlink: st.nlink,
         }
     }
 }
@@ -159,6 +166,9 @@ pub struct Walk {
     /// or mount than the root is recorded but not entered; nothing below a root that is not on
     /// its parent's mount is read.
     pub entries: Vec<Entry>,
+    /// The directories below the root on another device or mount than the root, recorded and
+    /// not entered, which fail `plain_target` (section 9.2).
+    pub boundaries: Vec<PathBuf>,
 }
 
 impl Walk {
@@ -167,11 +177,88 @@ impl Walk {
         std::iter::once(&self.root).chain(&self.entries)
     }
 
-    /// The bytes allocated by the root and everything below it.
+    /// The bytes allocated by the root and everything below it, each file counted once
+    /// however many of its names the walk found.
     #[must_use]
     pub fn allocated(&self) -> u64 {
-        self.all().map(|e| e.allocated).sum()
+        self.sizes().allocated
     }
+
+    /// The part of [`Walk::allocated`] held by files with names outside the target (a link
+    /// count above the names the walk found), which removing the target does not free
+    /// (section 8.5).
+    #[must_use]
+    pub fn aliased(&self) -> u64 {
+        self.sizes().aliased
+    }
+
+    /// The bytes of the regular files with no name outside the target, each counted once:
+    /// what removing the target frees of its files, its directories' blocks aside.
+    #[must_use]
+    pub fn own_file_bytes(&self) -> u64 {
+        self.sizes().own_files
+    }
+
+    /// The sizes of the walk, files with several names counted once.
+    fn sizes(&self) -> Sizes {
+        // (device, inode) → (link count, names found, bytes allocated, a regular file)
+        let mut linked: std::collections::HashMap<(u64, u64), (u64, u64, u64, bool)> =
+            std::collections::HashMap::new();
+        let mut sizes = Sizes::default();
+        for entry in self.all() {
+            let file = entry.kind == EntryKind::File;
+            if entry.kind == EntryKind::Dir || entry.nlink <= 1 {
+                sizes.allocated = sizes.allocated.saturating_add(entry.allocated);
+                if file {
+                    sizes.own_files = sizes.own_files.saturating_add(entry.allocated);
+                }
+                continue;
+            }
+            let slot = linked.entry((entry.dev, entry.ino)).or_insert((
+                entry.nlink,
+                0,
+                entry.allocated,
+                file,
+            ));
+            if slot.1 == 0 {
+                sizes.allocated = sizes.allocated.saturating_add(entry.allocated);
+            }
+            slot.1 += 1;
+        }
+        for &(nlink, names, bytes, file) in linked.values() {
+            if nlink > names {
+                sizes.aliased = sizes.aliased.saturating_add(bytes);
+            } else if file {
+                sizes.own_files = sizes.own_files.saturating_add(bytes);
+            }
+        }
+        sizes
+    }
+}
+
+/// What [`Walk::sizes`] adds up.
+#[derive(Clone, Copy, Debug, Default)]
+struct Sizes {
+    allocated: u64,
+    aliased: u64,
+    own_files: u64,
+}
+
+/// An entry read from `path` without following a final symbolic link. On Windows a regular
+/// file's file index and link count are read too (`os::file_links`), which `std` metadata
+/// leaves out, so a file with several names is told apart as on Unix.
+fn lstat(rel: PathBuf, path: &Path) -> io::Result<Entry> {
+    let entry = Entry::from_metadata(rel, &std::fs::symlink_metadata(path)?);
+    #[cfg(windows)]
+    if entry.kind == EntryKind::File {
+        let (ino, nlink) = crate::os::file_links(path)?;
+        return Ok(Entry {
+            ino,
+            nlink,
+            ..entry
+        });
+    }
+    Ok(entry)
 }
 
 /// Walks `target`, which is `worktree` or a path inside it, without following symbolic links
@@ -202,10 +289,11 @@ pub fn walk(worktree: &Path, target: &Path) -> io::Result<Walk> {
     }
     let parent = target.parent().unwrap_or(target);
     let parent_dev = Entry::from_metadata(PathBuf::new(), &std::fs::symlink_metadata(parent)?).dev;
-    let root = Entry::from_metadata(rel, &std::fs::symlink_metadata(target)?);
+    let root = lstat(rel, target)?;
     let root_mount = mount_id(target);
     let mut mount = Mount::between(parent_dev, root.dev, &mount_id(parent), &root_mount);
     let mut entries = Vec::new();
+    let mut boundaries = Vec::new();
     // A target that is not on its parent's mount is refused, so nothing below it is read.
     let listable = root.kind == EntryKind::Dir && link_in_path.is_none() && mount == Mount::Same;
     if let (true, Ok(on_mount)) = (listable, &root_mount) {
@@ -215,10 +303,9 @@ pub fn walk(worktree: &Path, target: &Path) -> io::Result<Walk> {
                 walk_dir(
                     worktree,
                     listing,
-                    &root.rel,
-                    root.dev,
-                    on_mount,
+                    (&root.rel, root.dev, on_mount),
                     &mut entries,
+                    &mut boundaries,
                 )?;
             }
             None => mount = Mount::Boundary,
@@ -229,6 +316,7 @@ pub fn walk(worktree: &Path, target: &Path) -> io::Result<Walk> {
         mount,
         link_in_path,
         entries,
+        boundaries,
     })
 }
 
@@ -265,14 +353,14 @@ fn mount_id(_path: &Path) -> Result<MountKey, String> {
 /// the descriptor it is listed through: one on another device or mount, or replaced since its
 /// entry was read, is recorded but never listed, and a mount that cannot be read fails the
 /// walk. Each directory is listed in full and closed before anything below it is opened, so
-/// one directory is open at a time.
+/// one directory is open at a time. A directory found on another device or mount by its path
+/// goes into `boundaries` too.
 fn walk_dir(
     worktree: &Path,
     listing: Listing,
-    rel: &Path,
-    dev: u64,
-    on_mount: &MountKey,
+    (rel, dev, on_mount): (&Path, u64, &MountKey),
     out: &mut Vec<Entry>,
+    boundaries: &mut Vec<PathBuf>,
 ) -> io::Result<()> {
     // The remaining entries of each directory being walked, innermost last.
     let mut pending = vec![listing.entries(rel)?.into_iter()];
@@ -281,6 +369,9 @@ fn walk_dir(
             pending.pop();
             continue;
         };
+        if entry.kind == EntryKind::Dir && entry.dev != dev {
+            boundaries.push(entry.rel.clone());
+        }
         if entry.kind == EntryKind::Dir && entry.dev == dev {
             let path = worktree.join(&entry.rel);
             let enter = match mount_id(&path) {
@@ -289,6 +380,9 @@ fn walk_dir(
                 Err(_) if gone(&path) => false,
                 Err(err) => return Err(io::Error::other(err)),
             };
+            if !enter && !gone(&path) {
+                boundaries.push(entry.rel.clone());
+            }
             if enter {
                 testpoint::hit(testpoint::WALK_DIR_CHECKED).map_err(io::Error::other)?;
                 let listed = Listing::open(&path, &entry, on_mount)
@@ -384,8 +478,8 @@ impl Listing {
             // entry's attributes in its parent directory's index (`FindNextFileW`), which NTFS
             // updates lazily, so a directory's mtime there can predate an entry created below
             // it.
-            match std::fs::symlink_metadata(&path) {
-                Ok(meta) => entries.push(Entry::from_metadata(rel.join(name), &meta)),
+            match lstat(rel.join(&name), &path) {
+                Ok(entry) => entries.push(entry),
                 Err(err) if err.kind() == io::ErrorKind::NotFound => {}
                 Err(err) => return Err(err),
             }
@@ -440,6 +534,37 @@ mod tests {
         );
     }
 
+    /// A file with a name outside the target is aliased and none of the target's own files;
+    /// a file whose names are all inside counts once among them; directories count in
+    /// neither.
+    #[test]
+    fn own_file_bytes_leave_out_aliased_files_and_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = dunce::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir_all(wt.join("t/sub")).unwrap();
+        std::fs::create_dir_all(wt.join("only/pkg")).unwrap();
+        let bytes = vec![7u8; 64 * 1024];
+        for file in ["outside", "t/own", "t/twice"] {
+            std::fs::write(wt.join(file), &bytes).unwrap();
+        }
+        std::fs::hard_link(wt.join("outside"), wt.join("t/linked")).unwrap();
+        std::fs::hard_link(wt.join("t/twice"), wt.join("t/sub/twice")).unwrap();
+        std::fs::hard_link(wt.join("outside"), wt.join("only/pkg/linked")).unwrap();
+        let size = |rel: &str| {
+            let walk = super::walk(&wt, &wt.join(rel)).unwrap();
+            (walk.own_file_bytes(), walk.aliased(), walk.allocated())
+        };
+        let file = super::walk(&wt, &wt.join("outside"))
+            .unwrap()
+            .root
+            .allocated;
+        let (own, aliased, allocated) = size("t");
+        assert_eq!((own, aliased), (2 * file, file));
+        assert!(allocated >= 3 * file, "{allocated}");
+        let (own, aliased, _) = size("only");
+        assert_eq!((own, aliased), (0, file));
+    }
+
     #[test]
     fn entries_come_parents_first_in_name_order() {
         let tmp = tempfile::tempdir().unwrap();
@@ -458,10 +583,9 @@ mod tests {
             .collect();
         assert_eq!(rels, expected);
         for entry in &walk.entries {
-            let meta = std::fs::symlink_metadata(wt.join(&entry.rel)).unwrap();
             assert_eq!(
                 *entry,
-                super::Entry::from_metadata(entry.rel.clone(), &meta),
+                super::lstat(entry.rel.clone(), &wt.join(&entry.rel)).unwrap(),
                 "recorded from lstat"
             );
         }

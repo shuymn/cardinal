@@ -202,6 +202,7 @@ fn observation(inventory: Inventory, plans: Vec<Plan>) -> Observation {
         inventory,
         plans,
         checks_ms,
+        own_file_bytes: std::collections::BTreeMap::default(),
     }
 }
 
@@ -885,6 +886,7 @@ fn report(at_ms: u64, free_bytes: u64) -> DiskReport {
             check: "not_in_use".into(),
             bytes: 300 * MIB,
         }],
+        incomplete: vec![],
     }
 }
 

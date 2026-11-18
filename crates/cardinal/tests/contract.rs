@@ -162,7 +162,9 @@ fn disk_report() -> Value {
         "shortfall_bytes": 30,
         "blocked": [{"worktree": "/w2", "target": "/w2/node_modules", "check": "not_in_use",
                      "bytes": 80},
-                    {"worktree": "/w", "target": "/w/.pnpm", "check": "aliased", "bytes": 9}]
+                    {"worktree": "/w", "target": "/w/.pnpm", "check": "aliased", "bytes": 9}],
+        "incomplete": [{"worktree": "/w3",
+                        "reason": "git status is incomplete: warning: could not open directory 'private/': Permission denied"}]
     })
 }
 
@@ -363,6 +365,20 @@ fn reconcile_documents() {
             .as_object_mut()
             .unwrap()
             .remove("shortfall_bytes");
+    });
+    // `incomplete` is additive: a report made before it reads as having none.
+    let mut before = doc.clone();
+    before["disk_reports"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("incomplete");
+    let parsed: Reconcile = serde_json::from_value(before).unwrap();
+    assert_eq!(parsed.disk_reports[0].incomplete, Vec::new());
+    rejects::<Reconcile>(&doc, "an incomplete worktree without its reason", |d| {
+        d["disk_reports"][0]["incomplete"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("reason");
     });
 
     let state = json!({"schema": "cardinal.reconcile-state.v1", "last_pass_ms": 7,

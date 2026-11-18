@@ -3,25 +3,39 @@
 //!
 //! [`run`] calls one function per step of section 10.3, in order. A step that fails is
 //! recorded in the pass's `errors` and the next one runs; only step 1, which takes
-//! `reconcile.lock`, ends the pass. The steps' bodies come with their work units
-//! (`docs/architecture.md` section 14.2): the disk states, the observation, `disk-reclaim`,
-//! and the state file here, the items raised from observation and disk states in
-//! [`raise`], and the arbiter's trigger and launcher in [`arbiter`]. Until then a step returns
-//! `not_implemented`.
+//! `reconcile.lock`, ends the pass. The disk states are in `disk.rs`, `disk-reclaim`'s
+//! listing in `reclaim.rs`, the items raised from observation and disk states in [`raise`],
+//! and the arbiter's trigger and launcher in `arbiter.rs` (`docs/architecture.md` section
+//! 14.2). Everything a pass writes under the state dir is written under `reconcile.lock`.
 
 mod arbiter;
+mod disk;
 pub mod raise;
+mod reclaim;
 
 pub use arbiter::run as run_arbiter;
+pub use disk::TIMER_INTERVAL_MS;
 
+use std::collections::BTreeMap;
+use std::path::Path;
+
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+
+use crate::admission;
 use crate::config::Config;
 use crate::contract::{
-    ArbiterStart, DiskReport, DiskState, Error, InboxChanges, Inventory, Plan, Reconcile,
-    ReconcileSchema, ScopedError, Skipped, Trigger,
+    ArbiterStart, DiskState, Error, ErrorCode, InboxChanges, Inventory, Plan, PlanKind, Reconcile,
+    ReconcileSchema, ReconcileState, ReconcileStateSchema, ScopedError, Skipped, Trigger,
 };
+use crate::inbox;
+use crate::observe::{self, InventoryOptions};
+use crate::plan;
 use crate::snapshot;
-use crate::state::{FileLock, StateDir};
+use crate::state::{self, Durability, FileLock, LockMode, StateDir};
 use crate::testpoint;
+
+use disk::Watched;
 
 /// What step 5 of a pass observed: the full observation, kept in
 /// `reconcile/observation.json`, and the plans built from it, whose checks and exclusive
@@ -31,6 +45,9 @@ pub struct Observation {
     pub inventory: Inventory,
     pub plans: Vec<Plan>,
     pub checks_ms: u64,
+    /// By plan ID, the bytes of each walked target's regular files with no name outside it
+    /// (`plan::Built`).
+    pub own_file_bytes: BTreeMap<String, u64>,
 }
 
 /// `cardinal reconcile [--trigger …]`: one pass (section 10.3).
@@ -52,13 +69,9 @@ pub fn run(config: &Config, state: &StateDir, trigger: Trigger) -> Result<Reconc
     let before = pass
         .step("inbox_before", raise::snapshot(state))
         .unwrap_or_default();
-    let mut disks = pass
-        .step("disk", read_volumes(config, state))
-        .unwrap_or_default();
+    let mut watched = disk::read_watched(config, state, &mut pass.errors);
     // 5.
-    let observation = pass
-        .step("observe", observe(config, state, &disks))
-        .flatten();
+    let observation = observe(config, state, &watched, &mut pass.errors);
     if let Some(observation) = &observation {
         pass.observed = true;
         if let Err(err) = testpoint::hit(testpoint::RECONCILE_OBSERVED) {
@@ -72,21 +85,30 @@ pub fn run(config: &Config, state: &StateDir, trigger: Trigger) -> Result<Reconc
         }
     }
     // 6. Read the volumes under pressure again, report on them, then raise, update, and end
-    // the disk items of every watched volume with those reports.
-    pass.step("disk", reread_volumes(config, state, &mut disks));
-    let reports = pass
-        .step(
-            "disk_reclaim",
-            disk_reclaim(config, state, &disks, observation.as_ref()),
-        )
-        .unwrap_or_default();
+    // the disk items of every watched volume this pass read, with those reports. A volume
+    // whose readings all failed is left out: a level carried from an earlier pass ends no
+    // item (A16).
+    reread_volumes(config, state, &mut watched, &mut pass.errors);
+    let reports = reclaim::reports(
+        config,
+        state,
+        &watched,
+        observation.as_ref(),
+        &mut pass.errors,
+    );
+    let disks: Vec<DiskState> = watched
+        .iter()
+        .filter(|d| d.reading.is_some())
+        .map(|d| d.state.clone())
+        .collect();
+
     if let Some(changes) = pass.step(
         "disk_items",
         raise::disk_items(config, state, &before, &disks, &reports),
     ) {
         pass.add(changes);
     }
-    pass.disk = disks;
+    pass.disk = watched.into_iter().map(|d| d.state).collect();
     pass.disk_reports = reports;
     // 7.
     if let Some(start) = pass.step("arbiter", arbiter::trigger(config, state)) {
@@ -136,62 +158,183 @@ impl Reconcile {
 
 /// Step 1: `reconcile.lock` taken exclusively with one try; `None` when another pass holds
 /// it.
-fn lock(_state: &StateDir) -> Result<Option<FileLock>, Error> {
-    Err(Error::not_implemented("reconcile: taking reconcile.lock"))
+fn lock(state: &StateDir) -> Result<Option<FileLock>, Error> {
+    Ok(state::try_lock(
+        &state.reconcile_lock(),
+        LockMode::Exclusive,
+    )?)
 }
 
 /// Step 2: temp files older than one hour removed.
-fn remove_temp_files(_state: &StateDir) -> Result<(), Error> {
-    Err(Error::not_implemented("reconcile: removing temp files"))
+fn remove_temp_files(state: &StateDir) -> Result<(), Error> {
+    state.gc_tmp().map(drop).map_err(Error::from)
 }
 
 /// Step 3: the inbox refresh of section 10.1, with the keys it raised and cleared.
-fn refresh_inbox(_config: &Config, _state: &StateDir) -> Result<InboxChanges, Error> {
-    Err(Error::not_implemented("reconcile: the inbox refresh"))
-}
-
-/// Step 4: the free space of every watched volume read and its disk state updated
-/// (section 10.4).
-fn read_volumes(_config: &Config, _state: &StateDir) -> Result<Vec<DiskState>, Error> {
-    Err(Error::not_implemented("reconcile: reading the volumes"))
+fn refresh_inbox(config: &Config, state: &StateDir) -> Result<InboxChanges, Error> {
+    inbox::refresh_with(config, state, &admission::recovery_pass)
 }
 
 /// Step 5: the full observation and its plans, when the last one is older than
-/// `observe_every_s` or a volume is under pressure; `None` when none was due.
+/// `observe_every_s` or a volume is under pressure; `None` when none was due or it failed,
+/// which is reported in `errors`. Entries matching a regenerable pattern in worktrees on a
+/// volume under pressure get `reclaim_dir` plans, whose walks give the observation their sizes,
+/// so each target is walked once and the sizes and the checks are one set.
 fn observe(
-    _config: &Config,
-    _state: &StateDir,
-    _disks: &[DiskState],
-) -> Result<Option<Observation>, Error> {
-    Err(Error::not_implemented("reconcile: the full observation"))
+    config: &Config,
+    state: &StateDir,
+    disks: &[Watched],
+    errors: &mut Vec<ScopedError>,
+) -> Option<Observation> {
+    let pressured: Vec<&str> = disks
+        .iter()
+        .filter(|d| d.under_pressure())
+        .map(|d| d.state.volume.as_str())
+        .collect();
+    if pressured.is_empty() && !observation_due(config, state, errors) {
+        return None;
+    }
+    let options = InventoryOptions {
+        repos: Vec::new(),
+        sizes: false,
+    };
+    let mut inventory = match observe::inventory(config, state, &options) {
+        Ok(inventory) => inventory,
+        Err(err) => {
+            errors.push(scoped("observe", err.message));
+            return None;
+        }
+    };
+    let checks_ms = state::now_ms();
+    let on_pressure = |worktree: &crate::contract::Worktree| {
+        disk::key_of(Path::new(&worktree.path)).is_some_and(|key| pressured.contains(&key.as_str()))
+    };
+    let built = plan::create_from(config, state, &inventory, &on_pressure, errors);
+    let own_file_bytes = built
+        .iter()
+        .filter_map(|b| Some((b.plan.id.clone(), b.own_file_bytes?)))
+        .collect();
+    let plans: Vec<Plan> = built.into_iter().map(|b| b.plan).collect();
+    fill_sizes(&mut inventory, &plans);
+    write_json(
+        state,
+        &state.reconcile_observation(),
+        &inventory,
+        "observe",
+        errors,
+    );
+    Some(Observation {
+        inventory,
+        plans,
+        checks_ms,
+        own_file_bytes,
+    })
 }
 
-/// Step 6, first part: each volume under pressure read again; the pass's last successful
-/// reading updates its disk state.
+/// Whether the last full observation is older than `observe_every_s`, or there is none.
+fn observation_due(config: &Config, state: &StateDir, errors: &mut Vec<ScopedError>) -> bool {
+    let last = read_state(state, errors).and_then(|s| s.last_observation_ms);
+    let every_ms = config.host.reconcile.observe_every_s.saturating_mul(1000);
+    last.is_none_or(|last| state::now_ms().saturating_sub(last) >= every_ms)
+}
+
+/// The sizes of the `reclaim_dir` plans' walks, in the observation's ignored entries.
+fn fill_sizes(inventory: &mut Inventory, plans: &[Plan]) {
+    let entries = inventory
+        .repos
+        .iter_mut()
+        .flat_map(|r| &mut r.worktrees)
+        .flat_map(|w| &mut w.ignored);
+    for entry in entries {
+        if let Some(plan) = plans
+            .iter()
+            .find(|p| p.kind == PlanKind::ReclaimDir && p.target.path == entry.path)
+        {
+            entry.allocated_bytes = plan.allocated_bytes;
+            entry.aliased_bytes = plan.aliased_bytes;
+        }
+    }
+}
+
+/// Step 6, first part: each volume under pressure at step 4 read again; a successful reading
+/// updates its disk state and becomes the pass's last successful reading.
 fn reread_volumes(
-    _config: &Config,
-    _state: &StateDir,
-    _disks: &mut [DiskState],
-) -> Result<(), Error> {
-    Err(Error::not_implemented(
-        "reconcile: reading the volumes again",
-    ))
+    config: &Config,
+    state: &StateDir,
+    disks: &mut [Watched],
+    errors: &mut Vec<ScopedError>,
+) {
+    for volume in disks.iter_mut().filter(|d| d.under_pressure()) {
+        disk::read(config, state, volume, errors);
+    }
 }
 
-/// Step 6, second part: `disk-reclaim`'s report on every volume under pressure, from the
-/// plans of step 5 and the pass's last successful reading.
-fn disk_reclaim(
-    _config: &Config,
-    _state: &StateDir,
-    _disks: &[DiskState],
-    _observation: Option<&Observation>,
-) -> Result<Vec<DiskReport>, Error> {
-    Err(Error::not_implemented("reconcile: disk-reclaim"))
+/// `reconcile/state.json`, if there is one; one that cannot be read is reported in `errors`.
+fn read_state(state: &StateDir, errors: &mut Vec<ScopedError>) -> Option<ReconcileState> {
+    read_json(&state.reconcile_state(), "state", errors)
 }
 
-/// Step 8, second part: `reconcile/state.json`.
-fn write_state(_state: &StateDir, _observation: Option<&Observation>) -> Result<(), Error> {
-    Err(Error::not_implemented(
-        "reconcile: writing reconcile/state.json",
-    ))
+/// Step 8, second part: `reconcile/state.json`, with this pass's time and the time of the
+/// last full observation.
+fn write_state(state: &StateDir, observation: Option<&Observation>) -> Result<(), Error> {
+    let last_observation_ms = match observation {
+        Some(observation) => Some(observation.inventory.observed_ms),
+        None => read_state(state, &mut Vec::new()).and_then(|s| s.last_observation_ms),
+    };
+    let file = ReconcileState {
+        schema: ReconcileStateSchema,
+        last_pass_ms: state::now_ms(),
+        last_observation_ms,
+    };
+    let bytes = serde_json::to_vec(&file)
+        .map_err(|err| Error::new(ErrorCode::Internal, err.to_string()))?;
+    state.write_atomic(&state.reconcile_state(), &bytes, Durability::Volatile)?;
+    Ok(())
+}
+
+/// The JSON document at `path`; `None` when there is none, or when it cannot be read or
+/// parsed, which is reported in `errors` under `scope`.
+fn read_json<T: DeserializeOwned>(
+    path: &Path,
+    scope: &str,
+    errors: &mut Vec<ScopedError>,
+) -> Option<T> {
+    let failed = |err: &dyn std::fmt::Display| scoped(scope, format!("{}: {err}", path.display()));
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|err| errors.push(failed(&err)))
+            .ok(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => {
+            errors.push(failed(&err));
+            None
+        }
+    }
+}
+
+/// Writes `value` to `path` atomically, a failure reported in `errors` under `scope`.
+fn write_json<T: Serialize>(
+    state: &StateDir,
+    path: &Path,
+    value: &T,
+    scope: &str,
+    errors: &mut Vec<ScopedError>,
+) {
+    let written = serde_json::to_vec(value)
+        .map_err(|err| err.to_string())
+        .and_then(|bytes| {
+            state
+                .write_atomic(path, &bytes, Durability::Volatile)
+                .map_err(|err| err.to_string())
+        });
+    if let Err(message) = written {
+        errors.push(scoped(scope, message));
+    }
+}
+
+fn scoped(scope: &str, message: String) -> ScopedError {
+    ScopedError {
+        scope: scope.to_owned(),
+        message,
+    }
 }

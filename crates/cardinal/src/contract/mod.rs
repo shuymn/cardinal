@@ -34,7 +34,7 @@ pub use classify::{
 };
 pub use disk::{
     DiskLevel, DiskLines, DiskMeasure, DiskReading, DiskReport, DiskState, ReportBlocked,
-    ReportReading, ReportTarget,
+    ReportIncomplete, ReportReading, ReportTarget,
 };
 pub use error::{Error, ErrorBody, ErrorCode, ErrorDoc};
 pub use execution::{

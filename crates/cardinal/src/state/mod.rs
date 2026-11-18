@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 pub use fs::{
     Durability, append_line, create_new_durable, open_append, parse_jsonl, read_jsonl,
-    remove_older_than, sync_parent, write_atomic,
+    remove_temp_files_older_than, sync_parent, write_atomic,
 };
 pub use id::{
     PrefixError, find_worktree_root, fnv1a64, is_id, key, new_id, now_ms, resolve_prefix,
@@ -412,10 +412,12 @@ impl StateDir {
         write_atomic(&self.tmp_dir(), target, bytes, durability).map_err(io_err(target))
     }
 
-    /// Removes files in `tmp/` older than one hour (run by `plan` and `inbox`).
+    /// Removes the temporary files of [`write_atomic`] in `tmp/` older than one hour, and no
+    /// other file (run by `plan`, `inbox`, and `reconcile`).
     pub fn gc_tmp(&self) -> Result<usize, StateError> {
         let dir = self.tmp_dir();
-        remove_older_than(&dir, std::time::Duration::from_secs(3600)).map_err(io_err(&dir))
+        remove_temp_files_older_than(&dir, std::time::Duration::from_secs(3600))
+            .map_err(io_err(&dir))
     }
 }
 
@@ -450,12 +452,18 @@ fn create_once(
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
         Err(source) => return Err(io_err(path)(source)),
     }
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
-    let tmp = tmp_dir.join(format!("{name}.{}.{}", std::process::id(), new_id()));
-    std::fs::write(&tmp, contents()).map_err(io_err(&tmp))?;
-    let linked = std::fs::hard_link(&tmp, path);
+    let tmp = tmp_dir.join(fs::temp_name(path.file_name().unwrap_or_default()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .map_err(io_err(&tmp))?;
+    let written = std::io::Write::write_all(&mut file, contents().as_bytes());
+    drop(file);
+    let linked = written.map(|()| std::fs::hard_link(&tmp, path));
+    // The file created above, which no other writer has.
     let _ = std::fs::remove_file(&tmp);
-    match linked {
+    match linked.map_err(io_err(&tmp))? {
         Ok(()) => {}
         Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
         Err(source) => return Err(io_err(path)(source)),

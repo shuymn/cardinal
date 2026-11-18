@@ -503,3 +503,286 @@ fn a_failed_git_step_fails_observed() {
         assert_eq!(reclaim(w), (false, vec!["observed"], vec![]), "{name}");
     }
 }
+
+/// `git_dir` is the worktree's administrative entry, and `last_activity_ms` the modification
+/// time of its index, which a commit moves forward (section 8.2).
+#[test]
+fn git_dir_and_last_activity_are_read() {
+    let scene = Scene::new();
+    let wt = scene.worktree("feat", "feat");
+    let w = worktree(&scene.inventory(), &wt).clone();
+    let admin = dunce::canonicalize(scene.repo.join(".git/worktrees/feat")).unwrap();
+    assert_eq!(w.git_dir.as_deref(), Some(admin.to_str().unwrap()));
+    let index_ms = |path: &std::path::Path| {
+        let modified = std::fs::metadata(path).unwrap().modified().unwrap();
+        u64::try_from(
+            modified
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap()
+    };
+    assert_eq!(w.last_activity_ms, Some(index_ms(&admin.join("index"))));
+    let main = worktree(&scene.inventory(), &scene.repo).clone();
+    assert_eq!(
+        main.last_activity_ms,
+        Some(index_ms(&scene.repo.join(".git/index")))
+    );
+}
+
+/// `closed_pr` (section 8.2): for a dirty worktree, the newest pull request of its branch
+/// closed without merging whose head is HEAD or an ancestor of it; a merged one, one whose
+/// head is not an ancestor, and one whose head is missing locally do not count. A clean
+/// worktree with merge evidence does not ask.
+#[test]
+fn closed_pull_requests_are_read_for_dirty_or_unmerged_worktrees() {
+    let (scene, wt, head) = merged_scene();
+    let missing = "0123456789abcdef0123456789abcdef01234567";
+    let other = scene.commit(&scene.repo, "elsewhere.txt");
+    let entry = |number: u64, state: &str, oid: &str| {
+        format!(
+            r#"{{"number":{number},"state":"{state}","headRefOid":"{oid}","url":"https://github.com/acme/app/pull/{number}"}}"#
+        )
+    };
+    scene.set_closed(&format!(
+        "[{},{},{},{},{}]",
+        entry(9, "MERGED", &head),
+        entry(8, "CLOSED", missing),
+        entry(7, "CLOSED", &other),
+        entry(6, "CLOSED", &head),
+        entry(5, "CLOSED", &head),
+    ));
+    let w = worktree(&scene.inventory(), &wt).clone();
+    assert_eq!(w.facts.closed_pr, None, "clean and merged: not asked");
+    assert!(
+        !scene
+            .gh_calls()
+            .iter()
+            .any(|c| c.contains("--state closed --head feat")),
+        "{:?}",
+        scene.gh_calls()
+    );
+
+    std::fs::write(wt.join("feature.txt"), "changed\n").unwrap();
+    let w = worktree(&scene.inventory(), &wt).clone();
+    assert_eq!(w.facts.dirty, Tri::Yes);
+    let closed = w.facts.closed_pr.as_ref().expect("a closed pull request");
+    assert_eq!(
+        closed.number, 6,
+        "the newest whose head is HEAD or below it"
+    );
+    assert!(
+        scene
+            .gh_calls()
+            .iter()
+            .any(|c| c.contains("--state closed") && c.contains("--head feat")),
+        "{:?}",
+        scene.gh_calls()
+    );
+    assert_eq!(reclaim(&w), (false, vec!["clean"], vec![]));
+}
+
+/// A full page of closed pull requests cannot tell "none" from "beyond the limit": the
+/// lookup is a failed gh step (section 8.1).
+#[test]
+fn a_full_closed_page_is_unknown() {
+    let (scene, wt, head) = merged_scene();
+    let page: Vec<String> = (0..20)
+        .map(|n| format!(r#"{{"number":{n},"state":"CLOSED","headRefOid":"{head}","url":"u{n}"}}"#))
+        .collect();
+    scene.set_closed(&format!("[{}]", page.join(",")));
+    std::fs::write(wt.join("feature.txt"), "changed\n").unwrap();
+    let inv = scene.inventory();
+    let w = worktree(&inv, &wt);
+    assert_eq!(w.facts.closed_pr, None);
+    assert_eq!(inv.repos[0].gh, GhStatus::Unknown);
+    assert!(w.reclaim.failed.contains(&"observed".to_owned()), "{w:#?}");
+}
+
+/// `content_in_base` (section 8.2): a branch whose changed files the base holds with the
+/// same content, as after a squash merge, is `yes`; once the base changes one of them, `no`
+/// with that path. It is read only without merge evidence.
+#[test]
+fn content_in_base_follows_a_squash_merge() {
+    let scene = Scene::new();
+    let wt = scene.worktree("feat", "feat");
+    scene
+        .fx
+        .commit_file(&wt, "feature.txt", "the feature\n", "feature");
+    scene.fx.commit_file(&wt, "notes.txt", "notes\n", "notes");
+    scene.push(&wt, "feat");
+    let w = worktree(&scene.inventory(), &wt).clone();
+    assert_eq!(w.facts.merge_evidence, MergeEvidence::None);
+    assert_eq!(w.facts.content_in_base, Tri::No);
+    assert_eq!(w.facts.content_diff, ["feature.txt", "notes.txt"]);
+
+    // The squash commit on the base, with an unrelated change after it.
+    scene
+        .fx
+        .commit_file(&scene.repo, "feature.txt", "the feature\n", "squash");
+    scene
+        .fx
+        .commit_file(&scene.repo, "notes.txt", "notes\n", "squash 2");
+    let base = scene
+        .fx
+        .commit_file(&scene.repo, "other.txt", "other\n", "later");
+    scene.merge_into_base(&base);
+    let w = worktree(&scene.inventory(), &wt).clone();
+    assert_eq!(w.facts.merge_evidence, MergeEvidence::None);
+    assert_eq!(w.facts.content_in_base, Tri::Yes);
+    assert_eq!(w.facts.content_diff, Vec::<String>::new());
+    assert_eq!(reclaim(&w), (false, vec!["merge_evidence"], vec![]));
+
+    let base = scene
+        .fx
+        .commit_file(&scene.repo, "notes.txt", "rewritten\n", "rewrite");
+    scene.merge_into_base(&base);
+    let w = worktree(&scene.inventory(), &wt).clone();
+    assert_eq!(w.facts.content_in_base, Tri::No);
+    assert_eq!(w.facts.content_diff, ["notes.txt"]);
+
+    let (scene, wt, _) = merged_scene();
+    let w = worktree(&scene.inventory(), &wt).clone();
+    assert_eq!(w.facts.content_in_base, Tri::Unknown, "merged: not read");
+}
+
+/// `content_in_base` compares a gitlink as any path, also where `diff.ignoreSubmodules` hides
+/// gitlinks from diffs: a branch that records an unpopulated gitlink at one commit, where the
+/// base records another, is `no` with that path.
+#[test]
+fn a_gitlink_counts_in_content_in_base() {
+    let scene = Scene::new();
+    let wt = scene.worktree("feat", "feat");
+    let start = scene.head(&scene.repo);
+    scene.fx.stage_gitlink(&wt, "sub", &start);
+    let head = scene.fx.commit(&wt, "record sub");
+    scene.push(&wt, "feat");
+    scene.fx.stage_gitlink(&scene.repo, "sub", &head);
+    let base = scene.fx.commit(&scene.repo, "record sub elsewhere");
+    scene.merge_into_base(&base);
+    let w = worktree(&scene.inventory(), &wt).clone();
+    assert_eq!(w.facts.merge_evidence, MergeEvidence::None);
+    assert_eq!(w.facts.content_in_base, Tri::No);
+    assert_eq!(w.facts.content_diff, ["sub"]);
+
+    scene.fx.diff_ignore_submodules(&scene.repo);
+    let w = worktree(&scene.inventory(), &wt).clone();
+    assert_eq!(w.facts.content_in_base, Tri::No, "{w:#?}");
+    assert_eq!(w.facts.content_diff, ["sub"]);
+}
+
+/// Removing the only gitlink from the index is a staged change, although status, which
+/// ignores submodules, reports nothing, and the index then holds no gitlink.
+#[test]
+fn removing_the_only_gitlink_is_dirty() {
+    let (scene, wt, head) = merged_scene();
+    scene.fx.stage_gitlink(&wt, "sub", &head);
+    let head = scene.fx.commit(&wt, "record sub");
+    scene.push(&wt, "feat");
+    scene.merge_into_base(&head);
+    let w = worktree(&scene.inventory(), &wt).clone();
+    assert_eq!(w.facts.dirty, Tri::No, "{w:#?}");
+
+    scene.fx.rm_cached(&wt, "sub");
+    let w = worktree(&scene.inventory(), &wt).clone();
+    assert_eq!(w.facts.dirty, Tri::Yes, "{w:#?}");
+    assert!(w.reclaim.failed.contains(&"clean".to_owned()), "{w:#?}");
+}
+
+/// A staged gitlink change is an uncommitted change, although status, which never enters a
+/// submodule, does not report it (section 8.2); a submodule whose HEAD moved without being
+/// staged is not this worktree's change.
+#[test]
+fn a_staged_gitlink_change_is_dirty() {
+    let (scene, wt, _) = merged_scene();
+    let sub = scene.fx.init("feat/sub");
+    scene.fx.commit_file(&sub, "a.txt", "a\n", "a");
+    scene.fx.add(&wt, "sub");
+    scene.fx.commit(&wt, "add a gitlink");
+    scene.push(&wt, "feat");
+    scene.merge_into_base(&scene.head(&wt));
+    let w = worktree(&scene.inventory(), &wt).clone();
+    assert_eq!(w.facts.dirty, Tri::No, "{w:#?}");
+
+    scene.fx.commit_file(&sub, "b.txt", "b\n", "b");
+    let w = worktree(&scene.inventory(), &wt).clone();
+    assert_eq!(
+        w.facts.dirty,
+        Tri::No,
+        "a submodule's own commit is not staged"
+    );
+
+    scene.fx.add(&wt, "sub");
+    let w = worktree(&scene.inventory(), &wt).clone();
+    assert_eq!(w.facts.dirty, Tri::Yes, "the staged gitlink");
+    assert!(w.reclaim.failed.contains(&"clean".to_owned()), "{w:#?}");
+}
+
+/// A directory status cannot open: git exits 0, warns on stderr (`could not open directory
+/// 'private/': Permission denied`), and leaves out what is below it. The status is then
+/// incomplete, so `dirty` and the ignored data are unknown and the failure is reported; an
+/// empty ignored list is never taken as complete. The control, readable, lists the file.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_directory_makes_the_status_unknown() {
+    use std::os::unix::fs::PermissionsExt;
+
+    /// Gives the directory its permissions back, so the scene can be removed.
+    struct Readable(std::path::PathBuf);
+    impl Drop for Readable {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    let (scene, wt, _) = merged_scene();
+    let info = scene.repo.join(".git/info");
+    std::fs::create_dir_all(&info).unwrap();
+    std::fs::write(info.join("exclude"), "*.log\n").unwrap();
+    let private = wt.join("private");
+    std::fs::create_dir(&private).unwrap();
+    std::fs::write(private.join("notes.log"), "notes").unwrap();
+    let notes = private.join("notes.log").display().to_string();
+
+    let control = scene.inventory();
+    let w = worktree(&control, &wt);
+    assert!(
+        w.ignored.iter().any(|e| e.path == notes),
+        "{:#?}",
+        w.ignored
+    );
+    assert_eq!(w.facts.dirty, Tri::No);
+    // No profile classifies the file, so it fails `no_unclassifiable` while it is seen.
+    assert_eq!(reclaim(w), (false, vec!["no_unclassifiable"], vec![]));
+
+    std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let _readable = Readable(private.clone());
+    if std::fs::read_dir(&private).is_ok() {
+        let _ = std::io::Write::write_all(
+            &mut std::io::stderr(),
+            b"skipped an_unreadable_directory_makes_the_status_unknown: the directory stays readable (root)\n",
+        );
+        return;
+    }
+    let inv = scene.inventory();
+    let w = worktree(&inv, &wt);
+    assert_eq!(w.facts.dirty, Tri::Unknown);
+    assert_eq!(w.facts.dirty_unknown, None);
+    assert!(w.ignored.is_empty(), "{:#?}", w.ignored);
+    let (candidate, failed, unknown) = reclaim(w);
+    assert!(!candidate);
+    assert!(failed.contains(&"observed"), "{failed:?}");
+    for check in ["no_protected", "no_unclassifiable", "no_nested_repository"] {
+        assert!(unknown.contains(&check), "{check}: {unknown:?}");
+    }
+    // The worktree's error, with git's diagnostic: the reason is visible.
+    let scope = format!("worktree:{}", std::fs::canonicalize(&wt).unwrap().display());
+    assert!(
+        inv.errors.iter().any(|e| e.scope == scope
+            && e.message.contains("git status is incomplete")
+            && e.message.contains("could not open directory 'private/'")),
+        "{:?}",
+        inv.errors
+    );
+}

@@ -13,6 +13,9 @@ pub const OPEN_LIMIT: usize = 500;
 /// `gh pr list` limit for merged pull requests found by a head object ID.
 pub const MERGED_LIMIT: usize = 20;
 
+/// The closed pull requests asked for per branch.
+pub const CLOSED_LIMIT: usize = 20;
+
 /// A GitHub repository: its host and `owner/name`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GithubRepo {
@@ -62,6 +65,51 @@ pub struct MergedPr {
     pub head_ref_oid: String,
     pub merged_at: Option<String>,
     pub url: String,
+}
+
+/// One pull request of a branch, from the closed pull request query.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClosedPr {
+    pub number: u64,
+    /// `CLOSED` for one closed without merging, `MERGED` for a merged one.
+    pub state: String,
+    pub head_ref_oid: String,
+    pub url: String,
+}
+
+/// The arguments of the closed pull request query for a branch.
+#[must_use]
+pub fn closed_args(repo: &str, branch: &str) -> Vec<OsString> {
+    [
+        "pr",
+        "list",
+        "--repo",
+        repo,
+        "--state",
+        "closed",
+        "--head",
+        branch,
+        "--json",
+        "number,state,headRefOid,url",
+        "--limit",
+        &CLOSED_LIMIT.to_string(),
+    ]
+    .map(OsString::from)
+    .to_vec()
+}
+
+/// Parses the closed pull request list, newest first as gh lists it, keeping those closed
+/// without merging; a full page cannot be told from a truncated one and is refused.
+pub fn parse_closed(bytes: &[u8]) -> Result<Vec<ClosedPr>, String> {
+    let prs: Vec<ClosedPr> =
+        serde_json::from_slice(bytes).map_err(|err| format!("unexpected gh output: {err}"))?;
+    if prs.len() >= CLOSED_LIMIT {
+        return Err(format!(
+            "gh returned {CLOSED_LIMIT} closed pull requests, the query limit; the list may be incomplete"
+        ));
+    }
+    Ok(prs.into_iter().filter(|pr| pr.state == "CLOSED").collect())
 }
 
 /// The arguments of the open pull request query.
@@ -154,7 +202,26 @@ pub fn merged_pr_for<'a>(prs: &'a [MergedPr], head: &str) -> Result<Option<&'a M
 
 #[cfg(test)]
 mod tests {
-    use super::{github_repo, merged_pr_for, open_pr_for, parse_merged, parse_open};
+    use super::{github_repo, merged_pr_for, open_pr_for, parse_closed, parse_merged, parse_open};
+
+    #[test]
+    fn closed_pull_requests_keep_those_closed_without_merging() {
+        let prs = parse_closed(
+            br#"[{"number":3,"state":"MERGED","headRefOid":"a","url":"u3"},
+                 {"number":2,"state":"CLOSED","headRefOid":"b","url":"u2"}]"#,
+        )
+        .unwrap();
+        assert_eq!(prs.iter().map(|pr| pr.number).collect::<Vec<_>>(), [2]);
+        let full = format!(
+            "[{}]",
+            vec![r#"{"number":1,"state":"CLOSED","headRefOid":"a","url":"u"}"#; 20].join(",")
+        );
+        assert!(
+            parse_closed(full.as_bytes()).is_err(),
+            "a full page is unknown"
+        );
+        assert!(parse_closed(b"{}").is_err());
+    }
 
     #[test]
     fn github_remotes() {

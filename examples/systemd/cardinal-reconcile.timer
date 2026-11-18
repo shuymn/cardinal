@@ -1,0 +1,11 @@
+# Starts cardinal-reconcile.service a minute after the timer starts, then 5 minutes after
+# each pass started (docs/architecture.md section 10.3).
+[Unit]
+Description=cardinal reconcile pass every 5 minutes
+
+[Timer]
+OnActiveSec=1min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target

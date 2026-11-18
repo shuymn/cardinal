@@ -102,8 +102,9 @@ fn gated_unit_reports_refusals() {
     let plan = s.plan(PlanKind::ReclaimDir, &wt.join("target"));
     let result = s.act(&plan.id, &unit("disk-reclaim")).unwrap();
     assert_eq!(result.status, ActStatus::Rejected);
-    // Observation classifies `target`, which holds protected data, as protected.
-    assert_eq!(result.reasons, ["regenerable", "no_protected"]);
+    // Observation classifies `target`, which holds protected data, as protected; it still
+    // matches a regenerable pattern, so `no_protected` alone refuses it (section 9.2).
+    assert_eq!(result.reasons, ["no_protected"]);
     assert!(!s.state.execution_claim(&plan.id).exists());
     assert_eq!(records_of(&s, &plan.id, RecordKind::Planned).len(), 1);
 }
