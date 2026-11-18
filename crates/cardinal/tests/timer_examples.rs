@@ -185,6 +185,8 @@ fn the_systemd_units_run_only_the_timer_pass() {
     let timer = unit(&example("systemd/cardinal-reconcile.timer"));
     let run = &service["Service"];
     assert_eq!(get(run, "Type"), ["oneshot"]);
+    // The detached arbiter launcher outlives the pass (section 10.5).
+    assert_eq!(get(run, "KillMode"), ["process"]);
     let exec: Vec<&(String, String)> = service
         .values()
         .flatten()
