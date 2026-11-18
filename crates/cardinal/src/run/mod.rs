@@ -13,6 +13,7 @@
 use std::ffi::OsString;
 use std::io::{IsTerminal as _, Write as _};
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -203,6 +204,8 @@ struct Stage {
 struct Context {
     state: StateDir,
     host: HostConfig,
+    /// Whether `host` was read from `host.toml`; until then it holds the defaults.
+    host_read: bool,
     recorder: Recorder,
 }
 
@@ -362,6 +365,7 @@ impl Runner {
             recorder: Recorder::new(&state, defaults.records.max_bytes, defaults.records.keep),
             state,
             host: defaults,
+            host_read: false,
         });
         let host = config::config_dir()
             .and_then(|dir| HostConfig::load(&dir))
@@ -369,6 +373,7 @@ impl Runner {
         let ctx = self.ctx.as_mut().expect("set above");
         ctx.recorder = Recorder::new(&ctx.state, host.records.max_bytes, host.records.keep);
         ctx.host = host;
+        ctx.host_read = true;
         self.spec = spec_b64
             .map(RunSpec::decode_b64)
             .transpose()
@@ -713,10 +718,29 @@ impl Runner {
             }),
         );
         drop(self.inuse.take());
+        self.disk_check();
         if let Some(pgid) = kill {
             kill_group(pgid);
         }
         exit_with(outcome)
+    }
+
+    /// The job-end disk check (section 5.2), once the stage's status is read and recorded and
+    /// the locks are dropped: below the warning line of the volume holding the worktree (or the
+    /// cwd), and when no pass ran in the last 60 s, it starts `cardinal reconcile --trigger
+    /// job-end` detached and does not wait. Every failure, a panic included, is ignored and
+    /// prints nothing, so the stage's output and status are as without the check (C18). A
+    /// runner that could not read `host.toml` has no line, and a pass could not read it
+    /// either, so it starts none.
+    fn disk_check(&self) {
+        let Some(ctx) = self.ctx.as_ref().filter(|ctx| ctx.host_read) else {
+            return;
+        };
+        let worktree = self.worktree.as_ref().map(|w| PathBuf::from(&w.path));
+        let checked = catch_unwind(AssertUnwindSafe(|| start_pass_if_low(ctx, worktree)));
+        if checked.is_err() {
+            let _ = panic_message();
+        }
     }
 
     /// The parent exited or a signal arrived before the spawn: release everything and stop
@@ -784,6 +808,45 @@ impl Runner {
             ctx.recorder.append(&record)
         }));
     }
+}
+
+/// How recent a pass keeps the job-end check from starting another.
+const RECENT_PASS_MS: u64 = 60_000;
+
+/// The job-end check's reading and, below the warning line with no recent pass, the start of
+/// `cardinal reconcile`; the PID of the pass started, if any.
+fn start_pass_if_low(ctx: &Context, worktree: Option<PathBuf>) -> Option<u32> {
+    testpoint::hit(testpoint::RUN_FINISHED).ok()?;
+    let path = worktree.or_else(|| std::env::current_dir().ok())?;
+    let volume = os::volume(&path).ok()?;
+    // `statfs`/`statvfs`, never the slower measure a pass reads (section 10.4).
+    let space = os::disk(&path, os::Measure::Statfs).ok()?;
+    let warning = ctx
+        .host
+        .disk
+        .lines_for(&volume.mount)
+        .to_bytes()
+        .warning_bytes;
+    if space.free_bytes >= warning || pass_ran_within(&ctx.state, RECENT_PASS_MS) {
+        return None;
+    }
+    testpoint::hit(testpoint::RUN_RECONCILE_SPAWNING).ok()?;
+    let program = std::env::current_exe().ok()?;
+    let args: Vec<OsString> = ["reconcile", "--trigger", "job-end"]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+    os::spawn_detached(&program, &args).ok()
+}
+
+/// Whether `reconcile/state.json`, which every pass writes, was written within `ms`; its file
+/// time is all the check reads. A file that is missing or cannot be read records no pass.
+fn pass_ran_within(state: &StateDir, ms: u64) -> bool {
+    std::fs::metadata(state.reconcile_state())
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|written| written.elapsed().ok())
+        .is_some_and(|age| age < Duration::from_millis(ms))
 }
 
 /// Exits as the stage did (section 5.6).

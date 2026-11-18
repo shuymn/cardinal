@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  The timer of `cardinal reconcile` (docs/architecture.md section 10.3): one pass every
+  5 minutes, and one when the agent loads. Copy it to ~/Library/LaunchAgents/, replace
+  /usr/local/bin/cardinal with the absolute path of your cardinal, make PATH find git, gh, and
+  claude, then run `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.cardinal.reconcile.plist`.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>dev.cardinal.reconcile</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/local/bin/cardinal</string>
+		<string>reconcile</string>
+		<string>--trigger</string>
+		<string>timer</string>
+	</array>
+	<key>StartInterval</key>
+	<integer>300</integer>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>LowPriorityIO</key>
+	<true/>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+	</dict>
+	<key>StandardOutPath</key>
+	<string>/dev/null</string>
+	<key>StandardErrorPath</key>
+	<string>/dev/null</string>
+</dict>
+</plist>

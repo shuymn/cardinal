@@ -44,10 +44,14 @@ commands = ["make"]
 class = "build"
 "#;
 
-/// `host.toml` with `runner`, a generous deadline (tests start many processes at once), and
-/// `extra` appended.
+/// `host.toml` with `runner`, a generous deadline (tests start many processes at once),
+/// disk lines below any free space, so a runner's job-end check never starts a `reconcile`
+/// pass (`docs/architecture.md` section 5.2), and `extra` appended.
 pub fn host(runner: &str, extra: &str) -> String {
-    format!("[budget]\ncpu = 8\n[hook]\nrunner = \"{runner}\"\ndeadline_ms = 10000\n{extra}")
+    format!(
+        "[budget]\ncpu = 8\n[disk]\nwarning_mib = 1\nrecovery_mib = 2\ncritical_mib = 0\n\
+         [hook]\nrunner = \"{runner}\"\ndeadline_ms = 10000\n{extra}"
+    )
 }
 
 /// Writes `host.toml` and `repos/<name>.toml` files into the config dir.

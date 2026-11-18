@@ -259,10 +259,13 @@ fn ignored_entries_are_classified_and_sized() {
     let inv = scene.inventory_with(true);
     let sized = class_of(&inv, "node_modules").allocated_bytes.unwrap();
     assert!(sized >= 5000, "{sized}");
+    // Entries matching a regenerable pattern are sized whatever their class, so the disk
+    // report can count a protected `target/` as blocked (sections 8.3 and 10.4).
+    assert!(class_of(&inv, "target").allocated_bytes.unwrap() > 0);
     assert_eq!(
-        class_of(&inv, "target").allocated_bytes,
+        class_of(&inv, "notes.log").allocated_bytes,
         None,
-        "only regenerable entries are sized"
+        "only entries matching a regenerable pattern are sized"
     );
     assert!(worktree(&inv, &wt).allocated_bytes.unwrap() >= sized);
 }
