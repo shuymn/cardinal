@@ -427,33 +427,52 @@ pub enum DataList {
 /// `list`. Components are compared exactly; a component that is not UTF-8 matches nothing.
 #[must_use]
 pub fn data_pattern_covers(list: DataList, pattern: &str, rel: &Path) -> bool {
-    let words = pattern.split('/').filter(|w| !w.is_empty());
-    if words.clone().next().is_none() {
-        return false;
-    }
-    let mut parts = rel.components().filter_map(|c| match c {
-        std::path::Component::Normal(name) => Some(name.to_str()),
-        _ => None,
-    });
-    match list {
-        DataList::Regenerable if words.clone().nth(1).is_some() => begins_with(parts, words),
-        _ => loop {
-            if begins_with(parts.clone(), words.clone()) {
-                break true;
-            }
-            if parts.next().is_none() {
-                break false;
-            }
-        },
-    }
+    covers_parts(list, pattern, &parts(rel))
 }
 
-/// Whether `parts` (components, `None` when not UTF-8) begin with every one of `words`.
-fn begins_with<'a>(
-    mut parts: impl Iterator<Item = Option<&'a str>>,
-    mut words: impl Iterator<Item = &'a str>,
-) -> bool {
-    words.all(|word| parts.next() == Some(Some(word)))
+/// Whether `rel` is, or is inside, a match of any of `patterns` from `list`, each matched as
+/// [`data_pattern_covers`] matches it; `rel` is split into its components once.
+#[must_use]
+pub fn data_patterns_cover<S: AsRef<str>>(list: DataList, patterns: &[S], rel: &Path) -> bool {
+    if patterns.is_empty() {
+        return false;
+    }
+    let parts = parts(rel);
+    patterns
+        .iter()
+        .any(|pattern| covers_parts(list, pattern.as_ref(), &parts))
+}
+
+/// The components of `rel` that are names, each `None` when it is not UTF-8.
+fn parts(rel: &Path) -> Vec<Option<&str>> {
+    rel.components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(name) => Some(name.to_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// [`data_pattern_covers`] of the components `parts`.
+fn covers_parts(list: DataList, pattern: &str, parts: &[Option<&str>]) -> bool {
+    let words = pattern.split('/').filter(|w| !w.is_empty());
+    let count = words.clone().count();
+    if count == 0 {
+        return false;
+    }
+    // Whether the components from `start` on begin with every one of the words.
+    let at = |start: usize| {
+        parts.get(start..start + count).is_some_and(|window| {
+            words
+                .clone()
+                .zip(window)
+                .all(|(word, part)| *part == Some(word))
+        })
+    };
+    match list {
+        DataList::Regenerable if count > 1 => at(0),
+        _ => (0..parts.len()).any(at),
+    }
 }
 
 #[cfg(test)]
@@ -660,5 +679,28 @@ mod tests {
             "crate/proptest-regressions/x.txt"
         ));
         assert!(!covers(p, "target", "targets"));
+        assert!(
+            !covers(p, "", "a") && !covers(p, "/", "a"),
+            "an empty pattern"
+        );
+        assert!(covers(p, "/a//b/", "x/a/b"), "empty words are left out");
+        assert!(
+            !covers(p, "a/b", "x/a"),
+            "a match cut off by the path's end"
+        );
+        assert!(!covers(r, "a/b/c", "a/b"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let rel = Path::new(std::ffi::OsStr::from_bytes(b"\xff/node_modules"));
+            assert!(data_pattern_covers(r, "node_modules", rel));
+            assert!(!data_pattern_covers(r, "\u{fffd}", rel), "not UTF-8");
+        }
+        let all = |list, patterns: &[&str], rel: &str| {
+            super::data_patterns_cover(list, patterns, Path::new(rel))
+        };
+        assert!(all(p, &["x", "fuzz/corpus"], "a/fuzz/corpus/b"));
+        assert!(!all(p, &["x", "fuzz/corpus"], "a/fuzz/b"));
+        assert!(!all(p, &[] as &[&str], "a"));
     }
 }

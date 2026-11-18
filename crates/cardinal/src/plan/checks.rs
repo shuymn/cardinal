@@ -7,7 +7,7 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use crate::config::{Config, DataList, Managed, Selection, data_pattern_covers};
+use crate::config::{Config, DataList, Managed, Selection, data_patterns_cover};
 use crate::contract::{
     Approval, Check, CheckFact, CheckResult, CheckRole, ConfigKey, IgnoredClass, InUse,
     MergeEvidence, ObservedError, PlanKind, Provenance, Tri,
@@ -48,7 +48,7 @@ pub struct Inspection<'a> {
 }
 
 /// The `[data]` lists that apply to one repository, matched with
-/// [`data_pattern_covers`].
+/// [`data_patterns_cover`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DataLists {
     pub protected: Vec<String>,
@@ -74,9 +74,7 @@ impl DataLists {
             DataList::Protected => &self.protected,
             DataList::Regenerable => &self.regenerable,
         };
-        patterns
-            .iter()
-            .any(|pattern| data_pattern_covers(list, pattern, rel))
+        data_patterns_cover(list, patterns, rel)
     }
 }
 
