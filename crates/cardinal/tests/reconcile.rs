@@ -1,22 +1,26 @@
 //! The `reconcile` pass (`docs/architecture.md` sections 10.3 and 13.6): one at a time
-//! (A19), and the inbox refresh at step 3, which raises processes that outlived their session
-//! and clears them once they are gone (C9). The readings fake keeps every volume above its
-//! lines unless a test says otherwise.
+//! (A19), the inbox refresh at step 3, which raises processes that outlived their session
+//! and clears them once they are gone (C9), and the handoff of the disk items after the
+//! observation. The readings fake keeps every volume above its lines unless a test says
+//! otherwise.
 
 mod disk_support;
 mod observe_common;
 mod plan_support;
 mod support;
 
+use std::process::Stdio;
 use std::time::Duration;
 
 use cardinal::contract::{
-    InboxStatus, SessionProcess, SessionSnapshot, SessionSnapshotSchema, Skipped, SnapshotAgent,
+    DiskLevel, InboxKind, InboxStatus, ResolutionOutcome, SessionProcess, SessionSnapshot,
+    SessionSnapshotSchema, Skipped, SnapshotAgent,
 };
 use cardinal::inbox::{self, StatusFilter};
-use cardinal::testpoint::RECONCILE_OBSERVED;
+use cardinal::testpoint::{RECONCILE_OBSERVED, release_file};
+use cardinal_test_support::Child;
 use cardinal_test_support::process::wait_for;
-use disk_support::{Disk, MIB, own_errors, pass};
+use disk_support::{Disk, MIB, carried_report, own_errors, pass};
 use support::helper::{self, Mode};
 
 #[test]
@@ -73,6 +77,93 @@ fn one_pass_at_a_time() {
     let next = d.reconcile();
     assert_eq!(next.skipped, None);
     assert_eq!(d.state().readings.len(), 2);
+}
+
+/// A pass started paused at `reconcile.observed`, once it is there.
+fn paused_pass(d: &Disk) -> Child {
+    match std::fs::remove_file(release_file(d.points.dir(), RECONCILE_OBSERVED)) {
+        Err(err) if err.kind() != std::io::ErrorKind::NotFound => panic!("{err}"),
+        _ => {}
+    }
+    let mut command = d.reconcile_command();
+    d.points.apply(&mut command, &[RECONCILE_OBSERVED], None);
+    let child = command.stdout(Stdio::piped()).spawn().unwrap();
+    d.points
+        .wait_reached(RECONCILE_OBSERVED, child.id(), Duration::from_secs(30));
+    child
+}
+
+/// Section 13.6, the handoff: paused at `reconcile.observed`, a pass under pressure has
+/// written no disk item; released, its `disk_low` and `disk_critical` items carry its disk
+/// report. The pass ends only the items it read before step 4: `disk_critical`, escalated by
+/// the owner while the next pass observes, keeps the escalation although that pass left
+/// `critical`; the pass after it ends the item, and `disk_low` stays until the recovery line.
+#[test]
+fn disk_items_follow_the_observation() {
+    let d = Disk::new(LINES);
+    let critical = MIB;
+    d.fixture_reads(&[
+        Some(critical / 2),
+        Some(critical / 2),
+        Some(critical + 1),
+        Some(critical + 1),
+        Some(critical + 1),
+        Some(critical + 1),
+        Some(3 * MIB + 1),
+    ]);
+    let first = paused_pass(&d);
+    assert_eq!(d.disk_items(), Vec::new());
+    d.points.release(RECONCILE_OBSERVED);
+    let first = pass(&first.wait_with_output().unwrap());
+    assert_eq!(own_errors(&first), Vec::<String>::new());
+    assert_eq!(first.disk[0].state, DiskLevel::Critical);
+    let items = d.disk_items();
+    let kinds: Vec<_> = items.iter().map(|i| (i.kind, i.status)).collect();
+    assert_eq!(
+        kinds,
+        [
+            (InboxKind::DiskLow, InboxStatus::Open),
+            (InboxKind::DiskCritical, InboxStatus::Open),
+        ]
+    );
+    for item in &items {
+        assert_eq!(
+            carried_report(item).as_ref(),
+            Some(disk_support::report(&first))
+        );
+        assert!(first.inbox.raised.contains(&item.key), "{first:#?}");
+    }
+
+    let second = paused_pass(&d);
+    inbox::resolve(
+        &d.s.config(),
+        &d.s.state,
+        &items[1].key,
+        ResolutionOutcome::Escalated,
+        None,
+    )
+    .unwrap();
+    d.points.release(RECONCILE_OBSERVED);
+    let second = pass(&second.wait_with_output().unwrap());
+    assert_eq!(own_errors(&second), Vec::<String>::new());
+    assert_eq!(second.disk[0].state, DiskLevel::Warning);
+    let (open, escalated, resolved) = (
+        Some(InboxStatus::Open),
+        Some(InboxStatus::Escalated),
+        Some(InboxStatus::Resolved),
+    );
+    assert_eq!(d.disk_statuses(), (open, escalated));
+    assert_eq!(d.disk_items()[1].ended_ms, None);
+
+    d.reconcile();
+    assert_eq!(d.disk_statuses(), (open, resolved));
+    assert_eq!(
+        d.disk_items()[1].resolution.as_ref().unwrap().by,
+        "cardinal"
+    );
+    let last = d.reconcile();
+    assert_eq!(last.disk[0].state, DiskLevel::Ok);
+    assert_eq!(d.disk_statuses(), (resolved, resolved));
 }
 
 /// C9: a process listed in a session snapshot that is alive after the session's agent ended
