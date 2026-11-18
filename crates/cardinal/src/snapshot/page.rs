@@ -13,8 +13,8 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 
 use crate::contract::{
-    ArbiterPass, DiskReport, DiskState, Error, ErrorCode, InboxItem, InboxStatus, InboxSubject,
-    ItemArbiter, Repo, ScopedError, Snapshot, Worktree,
+    ArbiterPass, DiskReport, DiskState, Error, ErrorCode, InboxItem, InboxKind, InboxStatus,
+    InboxSubject, ItemArbiter, Repo, ScopedError, Snapshot, Worktree,
 };
 
 /// The page's content security policy: its own inline style and script, nothing loaded or
@@ -401,7 +401,7 @@ impl Page<'_> {
     fn item(&mut self, item: &InboxItem, for_owner: bool) {
         let id = self.id("item");
         let class = if for_owner { "item owner" } else { "item" };
-        let report = find_report(&item.evidence);
+        let report = find_report(item);
         self.el(
             "article",
             &[("class", class), ("aria-labelledby", &id)],
@@ -433,16 +433,18 @@ impl Page<'_> {
                         p.text(&format!(", {} times", item.seen));
                     });
                     p.pair("Arbiter", |p| p.item_arbiter(item.arbiter.as_ref()));
-                    if !matches!(report, Found::Whole(_)) {
-                        p.scalars(&item.evidence);
-                    }
+                    p.scalars(&item.evidence);
                 });
                 match &report {
-                    Found::Whole(report) | Found::Nested(report) => p.disk_report(report),
+                    Found::Report(report) => p.disk_report(report),
                     Found::Unreadable(why) => p.notice(&format!(
                         "The evidence holds a disk report that could not be read ({why}); \
                      the evidence is shown as it is stored."
                     )),
+                    Found::Null => p.notice(
+                        "No disk report came with this item: the pass that raised it made none \
+                         for the volume.",
+                    ),
                     Found::None => {}
                 }
                 p.json("Evidence", &Value::Object(item.evidence.clone()));
@@ -527,7 +529,7 @@ impl Page<'_> {
         if let Some(Value::String(plan)) = item.evidence.get("plan_id") {
             plans.push(plan);
         }
-        if let Found::Whole(report) | Found::Nested(report) = report {
+        if let Found::Report(report) = report {
             plans.extend(report.targets.iter().map(|t| t.plan_id.as_str()));
         }
         plans.dedup();
@@ -571,8 +573,24 @@ impl Page<'_> {
                 }
             });
         });
+        let unseen = !report.incomplete.is_empty();
+        if unseen {
+            self.notice(&format!(
+                "The pass could not see {} of the volume's worktrees in full: what they hold is \
+                 not listed, so more may be reclaimable than the targets show.",
+                report.incomplete.len()
+            ));
+        }
         if report.targets.is_empty() {
-            self.el_text("p", &[], "No target listed.");
+            self.el_text(
+                "p",
+                &[],
+                if unseen {
+                    "No target listed among what the pass could see."
+                } else {
+                    "No target listed."
+                },
+            );
         } else {
             self.table(
                 "Targets, in reclamation order",
@@ -623,6 +641,13 @@ impl Page<'_> {
                     }
                 },
             );
+        }
+        if unseen {
+            self.table("Could not see", &["Worktree", "Why"], |p| {
+                for i in &report.incomplete {
+                    p.row(|p| p.code(&i.worktree), |p| p.td_text(&i.reason));
+                }
+            });
         }
     }
 
@@ -1102,37 +1127,28 @@ impl Page<'_> {
     }
 }
 
-/// A disk report in an item's evidence: the evidence itself, or an object in it (up to two
-/// levels down) that has a disk report's `reading` and `targets`.
+/// The disk report a `disk_low` or `disk_critical` item carries as its evidence's `report`
+/// (section 10.1).
 enum Found {
+    /// Not a disk item, or one whose evidence has no `report`.
     None,
-    Whole(DiskReport),
-    Nested(DiskReport),
-    /// Something shaped like a report that does not read as one, with why.
+    /// `report` is null: the pass that raised the item made none for the volume.
+    Null,
+    Report(DiskReport),
+    /// A `report` that does not read as one, with why.
     Unreadable(String),
 }
 
-fn find_report(evidence: &Map<String, Value>) -> Found {
-    let looks_like =
-        |m: &Map<String, Value>| m.contains_key("reading") && m.contains_key("targets");
-    let read = |m: &Map<String, Value>| {
-        serde_json::from_value::<DiskReport>(Value::Object(m.clone())).map_err(|e| e.to_string())
-    };
-    if looks_like(evidence) {
-        return read(evidence).map_or_else(Found::Unreadable, Found::Whole);
+fn find_report(item: &InboxItem) -> Found {
+    if !matches!(item.kind, InboxKind::DiskLow | InboxKind::DiskCritical) {
+        return Found::None;
     }
-    let objects = |m: &Map<String, Value>| -> Vec<Map<String, Value>> {
-        m.values().filter_map(|v| v.as_object().cloned()).collect()
-    };
-    for inner in objects(evidence) {
-        let candidates = std::iter::once(inner.clone()).chain(objects(&inner));
-        for candidate in candidates {
-            if looks_like(&candidate) {
-                return read(&candidate).map_or_else(Found::Unreadable, Found::Nested);
-            }
-        }
+    match item.evidence.get("report") {
+        None => Found::None,
+        Some(Value::Null) => Found::Null,
+        Some(report) => serde_json::from_value::<DiskReport>(report.clone())
+            .map_or_else(|err| Found::Unreadable(err.to_string()), Found::Report),
     }
-    Found::None
 }
 
 fn escape_into(out: &mut String, text: &str) {

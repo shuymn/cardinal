@@ -10,6 +10,9 @@
 //! options: the record files kept, the full-observation interval the page's stale marks come
 //! from, and the admission lock's deadline for the reservations it reads.
 
+mod disk_support;
+mod observe_common;
+mod plan_support;
 mod support;
 
 use std::path::Path;
@@ -121,6 +124,21 @@ fn record(kind: &str, ts_ms: u64) -> serde_json::Value {
 /// A branch name that would close the snapshot's script element if embedded unescaped.
 const HOSTILE_BRANCH: &str = "feat/</script><script>document.title='x'</script>";
 
+/// A watched volume's disk state, its last reading `free`.
+fn volume(volume: &str, mount: &str, state: &str, free: u64) -> serde_json::Value {
+    json!({
+        "schema": "cardinal.disk-state.v1", "volume": volume, "mount": mount,
+        "measure": "important_usage", "state": state, "since_ms": GENERATED_MS - 30 * MINUTE_MS,
+        "lines": { "warning_bytes": 21_474_836_480_u64, "recovery_bytes": 32_212_254_720_u64,
+                   "critical_bytes": 5_368_709_120_u64 },
+        "readings": [
+            { "at_ms": GENERATED_MS - 5 * MINUTE_MS, "free_bytes": free + 1_073_741_824,
+              "total_bytes": 994_662_584_320_u64 },
+            { "at_ms": GENERATED_MS - 10_000, "free_bytes": free, "total_bytes": 994_662_584_320_u64 }
+        ]
+    })
+}
+
 /// The fixed snapshot's items, as the snapshot lists them: those for the owner first (an
 /// escalated item whose note would open a comment, a stranded execution, and a disk item with
 /// its disk report), then an item for the arbiter, each group by creation.
@@ -131,7 +149,11 @@ fn fixed_inbox() -> Vec<serde_json::Value> {
         "open",
         GENERATED_MS - 30 * MINUTE_MS,
     );
-    disk_low["evidence"] = disk_report();
+    disk_low["evidence"] = json!({
+        "volume": "9f3c1e2d4b5a6978", "mount": "/",
+        "disk": volume("9f3c1e2d4b5a6978", "/", "warning", 12_884_901_888),
+        "report": disk_report(),
+    });
     let mut escalated = inbox_item(
         "merge_undecided:/src/app/wt/it's@0123456789ab@1794950000000",
         "merge_undecided",
@@ -184,19 +206,6 @@ fn fixed_inbox() -> Vec<serde_json::Value> {
 /// note, and a key with a quote.
 fn fixed_snapshot() -> Snapshot {
     let inbox = fixed_inbox();
-    let volume = |volume: &str, mount: &str, state: &str, free: u64| {
-        json!({
-            "schema": "cardinal.disk-state.v1", "volume": volume, "mount": mount,
-            "measure": "important_usage", "state": state, "since_ms": GENERATED_MS - 30 * MINUTE_MS,
-            "lines": { "warning_bytes": 21_474_836_480_u64, "recovery_bytes": 32_212_254_720_u64,
-                       "critical_bytes": 5_368_709_120_u64 },
-            "readings": [
-                { "at_ms": GENERATED_MS - 5 * MINUTE_MS, "free_bytes": free + 1_073_741_824,
-                  "total_bytes": 994_662_584_320_u64 },
-                { "at_ms": GENERATED_MS - 10_000, "free_bytes": free, "total_bytes": 994_662_584_320_u64 }
-            ]
-        })
-    };
     serde_json::from_value(json!({
         "schema": "cardinal.snapshot.v1",
         "generated_ms": GENERATED_MS,
@@ -911,16 +920,14 @@ fn an_unopened_record_file_past_the_records_shown_is_reported() {
     assert_eq!(scopes, ["records"], "{:?}", built.errors);
 }
 
-/// A disk item whose evidence holds something shaped like a disk report that does not read
-/// as one shows the evidence as it is stored, with a note, and the rest of the page as
-/// usual.
+/// A disk item whose evidence holds a report that does not read as a disk report shows the
+/// evidence as it is stored, with a note, and the rest of the page as usual.
 #[test]
 fn an_unreadable_disk_report_shows_the_evidence_as_stored() {
     let mut snapshot = fixed_snapshot();
     let item = &mut snapshot.inbox[2].item;
     assert_eq!(item.kind, InboxKind::DiskLow);
-    item.evidence
-        .insert("reading".into(), serde_json::Value::Null);
+    item.evidence.get_mut("report").unwrap()["reading"] = serde_json::Value::Null;
 
     let page = render(&snapshot);
 
@@ -933,6 +940,117 @@ fn an_unreadable_disk_report_shows_the_evidence_as_stored() {
     assert!(text(article).contains(r#""reading": null"#));
     assert!(!article.contains("Disk report"));
     assert_every_section(&page);
+}
+
+/// A disk report that names worktrees its pass could not see in full lists them under "Could
+/// not see" with why, and with no target among what the pass saw it never reads as nothing
+/// reclaimable; an item whose pass made no report says so.
+#[test]
+fn a_disk_report_shows_what_its_pass_could_not_see() {
+    let mut snapshot = fixed_snapshot();
+    let report = &mut snapshot.inbox[2].item.evidence["report"];
+    report["targets"] = json!([]);
+    report["incomplete"] = json!([{ "worktree": "/src/app/wt/hidden",
+                                    "reason": "could not open directory 'private/'" }]);
+    let open = r#"<article class="item owner" aria-labelledby="item-3">"#;
+
+    let page = render(&snapshot);
+
+    let article = element(section(&page, "owner"), open, "</article>");
+    let shown = text(article);
+    assert!(
+        shown.contains("could not see 1 of the volume's worktrees in full"),
+        "{shown}"
+    );
+    assert!(shown.contains("No target listed among what the pass could see."));
+    assert!(!shown.contains("No target listed."), "{shown}");
+    let unseen = text(element(article, ">Could not see</caption>", "</table>"));
+    assert!(unseen.contains("/src/app/wt/hidden"), "{unseen}");
+    assert!(
+        unseen.contains("could not open directory 'private/'"),
+        "{unseen}"
+    );
+
+    snapshot.inbox[2].item.evidence["report"] = serde_json::Value::Null;
+    let page = render(&snapshot);
+    let shown = text(element(section(&page, "owner"), open, "</article>"));
+    assert!(
+        shown.contains("No disk report came with this item"),
+        "{shown}"
+    );
+}
+
+/// On a real pass under pressure, step 8 writes the page with the `disk_low` item the pass
+/// raised: the disk report from the item's evidence, with its final reading, its target, and
+/// the worktree observation read only in part (a directory git status cannot open) under
+/// "Could not see", never as nothing reclaimable.
+#[cfg(unix)]
+#[test]
+fn a_real_pass_writes_the_disk_report_and_what_it_could_not_see() {
+    use std::os::unix::fs::PermissionsExt;
+
+    use disk_support::{Disk, MIB, carried_report, fill, own_errors};
+
+    /// Gives the directory its permissions back, so the setup can be removed.
+    struct Readable(std::path::PathBuf);
+    impl Drop for Readable {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    let d = Disk::new((1, 2, 3));
+    let hidden = d.s.worktree("hidden");
+    let seen = d.s.worktree("seen");
+    for wt in [&hidden, &seen] {
+        fill(wt, "target/out.bin", 128 * 1024);
+    }
+    let private = hidden.join("private");
+    std::fs::create_dir(&private).unwrap();
+    std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let _readable = Readable(private.clone());
+    if std::fs::read_dir(&private).is_ok() {
+        let _ = std::io::Write::write_all(
+            &mut std::io::stderr(),
+            b"skipped a_real_pass_writes_the_disk_report_and_what_it_could_not_see: \
+              the directory stays readable (root)\n",
+        );
+        return;
+    }
+    d.fixture_reads(&[Some(3 * MIB / 2)]);
+
+    let pass = d.reconcile();
+
+    assert_eq!(own_errors(&pass), Vec::<String>::new());
+    let report = disk_support::report(&pass);
+    assert_eq!(
+        (report.targets.len(), report.incomplete.len()),
+        (1, 1),
+        "{report:#?}"
+    );
+    let written: Snapshot =
+        serde_json::from_slice(&std::fs::read(d.s.state.ui_snapshot()).unwrap()).unwrap();
+    let item = written
+        .inbox
+        .iter()
+        .find(|i| i.item.kind == InboxKind::DiskLow)
+        .expect("the disk_low item");
+    assert_eq!(carried_report(&item.item).as_ref(), Some(report));
+    let page = std::fs::read_to_string(d.s.state.ui_page()).unwrap();
+    let owner = text(section(&page, "owner"));
+    assert!(owner.contains("1.5 MiB free at"), "{owner}");
+    assert!(owner.contains(&report.targets[0].target), "{owner}");
+    let unseen = text(element(
+        section(&page, "owner"),
+        ">Could not see</caption>",
+        "</table>",
+    ));
+    assert!(unseen.contains(&report.incomplete[0].worktree), "{unseen}");
+    assert!(
+        unseen.contains("could not open directory 'private/'"),
+        "{unseen}"
+    );
+    assert!(!owner.contains("No target listed"), "{owner}");
 }
 
 /// A time past what a date can show (here past JavaScript's last date) is shown as unknown,
@@ -964,7 +1082,7 @@ fn stale_marks_follow_each_parts_observation_time() {
     if let Some(arbiter) = &mut snapshot.arbiter {
         arbiter.ended_ms = Some(hours(3));
     }
-    snapshot.inbox[2].item.evidence["checks_ms"] = json!(hours(3));
+    snapshot.inbox[2].item.evidence["report"]["checks_ms"] = json!(hours(3));
     snapshot.records[0].ts_ms = hours(5);
     let stale = r#"<span class="badge stale">stale</span>"#;
 
