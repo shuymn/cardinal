@@ -179,7 +179,7 @@ impl Walk {
     /// however many of its names the walk found.
     #[must_use]
     pub fn allocated(&self) -> u64 {
-        self.sizes().0
+        self.sizes().allocated
     }
 
     /// The part of [`Walk::allocated`] held by files with names outside the target (a link
@@ -187,36 +187,59 @@ impl Walk {
     /// (section 8.5); `None` on Windows, where link counts are not read.
     #[must_use]
     pub fn aliased(&self) -> Option<u64> {
-        cfg!(unix).then(|| self.sizes().1)
+        cfg!(unix).then(|| self.sizes().aliased)
     }
 
-    /// Allocated and aliased bytes, files with several names counted once.
-    fn sizes(&self) -> (u64, u64) {
-        // (device, inode) → (link count, names found, bytes allocated)
-        let mut linked: std::collections::HashMap<(u64, u64), (u64, u64, u64)> =
+    /// The bytes of the regular files with no name outside the target, each counted once:
+    /// what removing the target frees of its files, its directories' blocks aside.
+    #[must_use]
+    pub fn own_file_bytes(&self) -> u64 {
+        self.sizes().own_files
+    }
+
+    /// The sizes of the walk, files with several names counted once.
+    fn sizes(&self) -> Sizes {
+        // (device, inode) → (link count, names found, bytes allocated, a regular file)
+        let mut linked: std::collections::HashMap<(u64, u64), (u64, u64, u64, bool)> =
             std::collections::HashMap::new();
-        let mut allocated = 0u64;
+        let mut sizes = Sizes::default();
         for entry in self.all() {
+            let file = entry.kind == EntryKind::File;
             if entry.kind == EntryKind::Dir || entry.nlink <= 1 {
-                allocated = allocated.saturating_add(entry.allocated);
+                sizes.allocated = sizes.allocated.saturating_add(entry.allocated);
+                if file {
+                    sizes.own_files = sizes.own_files.saturating_add(entry.allocated);
+                }
                 continue;
             }
-            let slot =
-                linked
-                    .entry((entry.dev, entry.ino))
-                    .or_insert((entry.nlink, 0, entry.allocated));
+            let slot = linked.entry((entry.dev, entry.ino)).or_insert((
+                entry.nlink,
+                0,
+                entry.allocated,
+                file,
+            ));
             if slot.1 == 0 {
-                allocated = allocated.saturating_add(entry.allocated);
+                sizes.allocated = sizes.allocated.saturating_add(entry.allocated);
             }
             slot.1 += 1;
         }
-        let aliased = linked
-            .values()
-            .filter(|(nlink, names, _)| nlink > names)
-            .map(|(_, _, bytes)| bytes)
-            .sum();
-        (allocated, aliased)
+        for &(nlink, names, bytes, file) in linked.values() {
+            if nlink > names {
+                sizes.aliased = sizes.aliased.saturating_add(bytes);
+            } else if file {
+                sizes.own_files = sizes.own_files.saturating_add(bytes);
+            }
+        }
+        sizes
     }
+}
+
+/// What [`Walk::sizes`] adds up.
+#[derive(Clone, Copy, Debug, Default)]
+struct Sizes {
+    allocated: u64,
+    aliased: u64,
+    own_files: u64,
 }
 
 /// Walks `target`, which is `worktree` or a path inside it, without following symbolic links
@@ -490,6 +513,41 @@ mod tests {
             Mount::between(1, 1, &unknown, &same),
             Mount::Unknown("statx: no mount ID".into())
         );
+    }
+
+    /// A file with a name outside the target is aliased and none of the target's own files;
+    /// a file whose names are all inside counts once among them; directories count in
+    /// neither.
+    #[cfg(unix)]
+    #[test]
+    fn own_file_bytes_leave_out_aliased_files_and_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = dunce::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir_all(wt.join("t/sub")).unwrap();
+        std::fs::create_dir_all(wt.join("only/pkg")).unwrap();
+        let bytes = vec![7u8; 64 * 1024];
+        for file in ["outside", "t/own", "t/twice"] {
+            std::fs::write(wt.join(file), &bytes).unwrap();
+        }
+        std::fs::hard_link(wt.join("outside"), wt.join("t/linked")).unwrap();
+        std::fs::hard_link(wt.join("t/twice"), wt.join("t/sub/twice")).unwrap();
+        std::fs::hard_link(wt.join("outside"), wt.join("only/pkg/linked")).unwrap();
+        let size = |rel: &str| {
+            let walk = super::walk(&wt, &wt.join(rel)).unwrap();
+            (
+                walk.own_file_bytes(),
+                walk.aliased().unwrap(),
+                walk.allocated(),
+            )
+        };
+        let file =
+            std::os::unix::fs::MetadataExt::blocks(&std::fs::metadata(wt.join("outside")).unwrap())
+                * 512;
+        let (own, aliased, allocated) = size("t");
+        assert_eq!((own, aliased), (2 * file, file));
+        assert!(allocated >= 3 * file, "{allocated}");
+        let (own, aliased, _) = size("only");
+        assert_eq!((own, aliased), (0, file));
     }
 
     #[test]

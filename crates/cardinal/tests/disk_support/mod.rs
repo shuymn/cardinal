@@ -1,0 +1,198 @@
+//! The reconcile and disk tests' setup (`docs/architecture.md` sections 10.3, 10.4, and
+//! 13.6): the plan tests' repository, configured as the one `reconcile` observes, disk lines
+//! in MiB, and the readings fake in a test directory of the setup's own, which also holds the
+//! pause points.
+
+#![allow(
+    dead_code,
+    reason = "each test crate uses a different subset of the helpers"
+)]
+
+use std::path::{Path, PathBuf};
+use std::process::Output;
+use std::time::{Duration, SystemTime};
+
+use cardinal::contract::{DiskReport, DiskState, Reconcile, Record, RecordKind};
+use cardinal_test_support::Command;
+
+use crate::plan_support::Setup;
+use crate::support::testpoints::TestPoints;
+
+pub const MIB: u64 = 1024 * 1024;
+
+/// The total size the readings fake reports.
+const TOTAL: u64 = 64 * MIB;
+
+/// Scopes of the pass's steps whose bodies other units write (`docs/architecture.md` section
+/// 14.2): their errors say nothing about the steps these tests check.
+const OTHER_UNITS: &[&str] = &[
+    "inbox_before",
+    "worktree_items",
+    "disk_items",
+    "arbiter",
+    "ui",
+];
+
+pub struct Disk {
+    pub s: Setup,
+    pub points: TestPoints,
+}
+
+impl Disk {
+    /// Lines in MiB as `(critical, warning, recovery)`.
+    pub fn new(lines: (u64, u64, u64)) -> Self {
+        Self::with_host(lines, "")
+    }
+
+    /// [`Disk::new`] with more `host.toml` after the `[disk]` table: other tables.
+    pub fn with_host(lines: (u64, u64, u64), extra: &str) -> Self {
+        let mut s = Setup::new();
+        let (critical, warning, recovery) = lines;
+        let main = s.main.display().to_string();
+        // The arbiter's command does nothing should a pass start one.
+        s.scene.observe_config(&format!(
+            "repos = ['{main}']\n[disk]\ncritical_mib = {critical}\nwarning_mib = {warning}\n\
+             recovery_mib = {recovery}\n[arbiter]\ncommand = ['true']\n{extra}"
+        ));
+        let points = TestPoints::new(s.fx.scope());
+        Self { s, points }
+    }
+
+    /// Makes every path under `prefix` a volume of its own whose reads take `free` in turn,
+    /// the last one repeating; a `None` is a read that fails.
+    pub fn readings(&self, volumes: &[(&Path, &[Option<u64>])]) {
+        let volumes: Vec<serde_json::Value> = volumes
+            .iter()
+            .map(|(prefix, free)| {
+                serde_json::json!({ "prefix": prefix, "free": free, "total": TOTAL })
+            })
+            .collect();
+        std::fs::write(
+            self.points.dir().join("disk-readings.json"),
+            serde_json::to_vec(&serde_json::json!({ "volumes": volumes })).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// [`Disk::readings`] with the whole fixture, the state dir included, as one volume.
+    pub fn fixture_reads(&self, free: &[Option<u64>]) {
+        self.readings(&[(self.s.fx.root(), free)]);
+    }
+
+    /// `cardinal reconcile --trigger manual` with the test directory set.
+    pub fn reconcile_command(&self) -> Command {
+        let mut command = self.s.cardinal();
+        command.args(["reconcile", "--trigger", "manual"]);
+        self.points.apply(&mut command, &[], None);
+        command
+    }
+
+    /// One pass, which must succeed.
+    pub fn reconcile(&self) -> Reconcile {
+        pass(
+            &self
+                .reconcile_command()
+                .output()
+                .expect("run cardinal reconcile"),
+        )
+    }
+
+    /// The disk state files, in file name order.
+    pub fn states(&self) -> Vec<DiskState> {
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(self.s.state.disk_dir())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        paths.sort();
+        paths
+            .iter()
+            .map(|p| serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap())
+            .collect()
+    }
+
+    /// The one disk state file.
+    pub fn state(&self) -> DiskState {
+        let states = self.states();
+        assert_eq!(states.len(), 1, "{states:#?}");
+        states.into_iter().next().unwrap()
+    }
+
+    pub fn records(&self, kind: RecordKind) -> Vec<Record> {
+        cardinal::record::read_all(&self.s.state)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.kind == kind)
+            .collect()
+    }
+}
+
+/// The pass `output` printed, which must have exited 0; the errors of the steps these tests
+/// check must be `allowed`.
+pub fn pass(output: &Output) -> Reconcile {
+    assert!(output.status.success(), "{output:?}");
+    serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|err| panic!("{err}: {}", String::from_utf8_lossy(&output.stdout)))
+}
+
+/// The errors of `pass` from the steps of this unit (not [`OTHER_UNITS`]).
+pub fn own_errors(pass: &Reconcile) -> Vec<String> {
+    pass.errors
+        .iter()
+        .filter(|e| !OTHER_UNITS.contains(&e.scope.as_str()))
+        .map(|e| format!("{}: {}", e.scope, e.message))
+        .collect()
+}
+
+/// The one report of `pass`.
+pub fn report(pass: &Reconcile) -> &DiskReport {
+    assert_eq!(pass.disk_reports.len(), 1, "{pass:#?}");
+    &pass.disk_reports[0]
+}
+
+/// The targets of `report`, as paths relative to `root`.
+pub fn targets(report: &DiskReport, root: &Path) -> Vec<String> {
+    report
+        .targets
+        .iter()
+        .map(|t| relative(&t.target, root))
+        .collect()
+}
+
+/// The blocked entries of `report` as `(path relative to root, check)`.
+pub fn blocked(report: &DiskReport, root: &Path) -> Vec<(String, String)> {
+    report
+        .blocked
+        .iter()
+        .map(|b| (relative(&b.target, root), b.check.clone()))
+        .collect()
+}
+
+/// `path` relative to `root`, its components joined with `/` on every platform.
+fn relative(path: &str, root: &Path) -> String {
+    Path::new(path)
+        .strip_prefix(root)
+        .unwrap_or_else(|_| panic!("{path} is not under {}", root.display()))
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Writes `bytes` bytes to `root/rel`, creating its directories.
+pub fn fill(root: &Path, rel: &str, bytes: u64) {
+    let path = root.join(rel);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, vec![7u8; usize::try_from(bytes).unwrap()]).unwrap();
+}
+
+/// Moves the last activity of the worktree at `wt` (its index's modification time)
+/// `ago` into the past.
+pub fn age(wt: &Path, ago: Duration) {
+    let git = std::fs::read_to_string(wt.join(".git")).unwrap();
+    let admin = PathBuf::from(git.trim().strip_prefix("gitdir: ").unwrap());
+    let index = std::fs::File::options()
+        .write(true)
+        .open(admin.join("index"))
+        .unwrap();
+    index.set_modified(SystemTime::now() - ago).unwrap();
+}

@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 
 use sysinfo::{Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System, UpdateKind};
 
-pub use disk::{Volume, volume};
+pub use disk::{Volume, entry_volume, volume};
 
 /// One process.
 #[derive(Clone, Debug, PartialEq, Eq)]

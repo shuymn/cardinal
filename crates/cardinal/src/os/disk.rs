@@ -7,8 +7,9 @@
 //! included), falling back to the available capacity when that is missing or zero, and
 //! `statfs` for [`Measure::Statfs`]; on Linux `statvfs` (`f_bavail × f_frsize`) for both.
 //! Both resolve symbolic links first, so a path's identity and its readings are of the same
-//! file system. Windows reads neither: every read is unavailable, which changes no disk
-//! state.
+//! file system; [`entry_volume`] resolves all but the final component, giving the volume of
+//! an entry itself, a link included. Windows reads neither: every read is unavailable, which
+//! changes no disk state.
 
 use std::path::{Path, PathBuf};
 
@@ -25,6 +26,16 @@ pub struct Volume {
 /// The volume holding `path`, symbolic links resolved.
 pub fn volume(path: &Path) -> Result<Volume, Unavailable> {
     imp::volume(&resolved(path)?)
+}
+
+/// The volume holding the entry at `path` itself: the directory that holds it resolved, a
+/// final symbolic link not followed, so a link, dangling or not, is on its directory's
+/// volume.
+pub fn entry_volume(path: &Path) -> Result<Volume, Unavailable> {
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => imp::volume(&resolved(parent)?.join(name)),
+        _ => volume(path),
+    }
 }
 
 /// The free and total bytes of the volume holding `path`, symbolic links resolved.
@@ -268,7 +279,8 @@ mod tests {
     /// A symbolic link to a directory on another volume is that volume: its identity and its
     /// readings both (section 10.4), the link resolved as `statvfs` and `CFURL` resolve it.
     /// `CFURL` reads the volume of an unresolved link itself, so on macOS the `Usable`
-    /// reading fails without the resolution; Linux's `statvfs` follows links either way.
+    /// reading fails without the resolution; Linux's `statvfs` follows links either way. As an
+    /// entry, the link is on its directory's volume, dangling or not.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn a_link_is_the_volume_it_points_to() {
@@ -293,6 +305,17 @@ mod tests {
         let there = volume(&target).unwrap();
         assert_ne!(volume(scope.root()).unwrap(), there, "two volumes");
         assert_eq!(volume(&link).unwrap(), there);
+        let here = volume(scope.root()).unwrap();
+        let dangling = scope.path("dangling");
+        std::os::unix::fs::symlink(target.join("gone"), &dangling).unwrap();
+        for entry in [&link, &dangling] {
+            assert_eq!(
+                super::entry_volume(entry).unwrap(),
+                here,
+                "{}",
+                entry.display()
+            );
+        }
         for measure in [Measure::Statfs, Measure::Usable] {
             assert_eq!(
                 space(&link, measure).unwrap().total_bytes,

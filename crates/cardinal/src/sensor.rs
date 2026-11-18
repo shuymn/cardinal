@@ -59,18 +59,28 @@ pub fn free_space(path: &Path, measure: Measure) -> Result<Space, String> {
 
 /// The volume holding `path`, or the readings fake's volume for it.
 pub fn volume(path: &Path) -> Result<Volume, String> {
-    if let Some(fake) = Fake::load()
-        && let Some(index) = fake.find(path)
-    {
-        let prefix = &fake.file.volumes[index].prefix;
-        let mut id = b"fake:".to_vec();
-        id.extend_from_slice(prefix.as_os_str().as_encoded_bytes());
-        return Ok(Volume {
-            id,
-            mount: prefix.clone(),
-        });
-    }
-    crate::os::volume(path).map_err(|err| err.to_string())
+    fake_volume(path).map_or_else(|| crate::os::volume(path).map_err(|e| e.to_string()), Ok)
+}
+
+/// The volume holding the entry at `path` itself, a final symbolic link not followed
+/// (`os::entry_volume`), or the readings fake's volume for it.
+pub fn entry_volume(path: &Path) -> Result<Volume, String> {
+    fake_volume(path).map_or_else(
+        || crate::os::entry_volume(path).map_err(|e| e.to_string()),
+        Ok,
+    )
+}
+
+/// The readings fake's volume for `path`, if it makes one.
+fn fake_volume(path: &Path) -> Option<Volume> {
+    let fake = Fake::load()?;
+    let prefix = &fake.file.volumes[fake.find(path)?].prefix;
+    let mut id = b"fake:".to_vec();
+    id.extend_from_slice(prefix.as_os_str().as_encoded_bytes());
+    Some(Volume {
+        id,
+        mount: prefix.clone(),
+    })
 }
 
 /// The file of the readings fake.

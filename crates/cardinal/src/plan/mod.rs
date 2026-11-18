@@ -22,7 +22,7 @@ use crate::admission;
 use crate::config::Config;
 use crate::contract::{
     Error, ErrorCode, InUse, Inventory, Plan, PlanKind, PlanList, PlanListSchema, PlanSchema,
-    PlanTarget, Record, RecordKind, Repo, ScopedError,
+    PlanTarget, Record, RecordKind, Repo, ScopedError, Worktree,
 };
 use crate::observe::{self, InventoryOptions, WorktreeObservation};
 use crate::record::Recorder;
@@ -102,8 +102,8 @@ pub fn create(
         }
         _ => {}
     }
-    let plan = build(config, state, &sources, kind, &target, &observation);
-    store(config, state, plan)
+    let built = build(config, state, &sources, kind, &target, &observation);
+    store(config, state, built.plan)
 }
 
 /// `cardinal plan [--repo PATH]...`: a plan for every linked worktree and for every ignored
@@ -112,8 +112,39 @@ pub fn create_all(config: &Config, state: &StateDir, repos: &[PathBuf]) -> Resul
     let sources = Real { config, state };
     housekeeping(state);
     let inventory = sources.inventory(repos)?;
-    let mut plans = Vec::new();
     let mut errors = inventory.errors.clone();
+    let plans = create_from(config, state, &inventory, &|_| true, &mut errors)
+        .into_iter()
+        .map(|built| built.plan)
+        .collect();
+    Ok(PlanList {
+        schema: PlanListSchema,
+        plans,
+        errors,
+    })
+}
+
+/// A plan, with what its walk measured that the plan does not keep.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Built {
+    pub plan: Plan,
+    /// [`Walk::own_file_bytes`]; `None` when the walk failed.
+    pub own_file_bytes: Option<u64>,
+}
+
+/// Plans, stored and recorded, for every linked worktree of `inventory` and for every ignored
+/// entry matching a regenerable pattern in the worktrees `entries_in` picks, whatever their
+/// checks find; a plan that cannot be stored is reported in `errors` (section 9.2). `reconcile`
+/// builds its plans with this from the observation it holds (section 10.3).
+pub fn create_from(
+    config: &Config,
+    state: &StateDir,
+    inventory: &Inventory,
+    entries_in: &dyn Fn(&Worktree) -> bool,
+    errors: &mut Vec<ScopedError>,
+) -> Vec<Built> {
+    let sources = Real { config, state };
+    let mut plans = Vec::new();
     for repo in &inventory.repos {
         let bare = Repo {
             worktrees: Vec::new(),
@@ -129,7 +160,7 @@ pub fn create_all(config: &Config, state: &StateDir, repos: &[PathBuf]) -> Resul
             let entries = worktree
                 .ignored
                 .iter()
-                .filter(|e| e.regenerable_match)
+                .filter(|e| e.regenerable_match && entries_in(worktree))
                 .map(|e| {
                     (
                         PlanKind::ReclaimDir,
@@ -138,9 +169,9 @@ pub fn create_all(config: &Config, state: &StateDir, repos: &[PathBuf]) -> Resul
                 });
             let targets: Vec<(PlanKind, PathBuf)> = whole.into_iter().chain(entries).collect();
             for (kind, target) in targets {
-                let plan = build(config, state, &sources, kind, &target, &observation);
-                match store(config, state, plan) {
-                    Ok(plan) => plans.push(plan),
+                let built = build(config, state, &sources, kind, &target, &observation);
+                match store(config, state, built.plan) {
+                    Ok(plan) => plans.push(Built { plan, ..built }),
                     Err(err) => errors.push(ScopedError {
                         scope: target.display().to_string(),
                         message: err.message,
@@ -149,11 +180,7 @@ pub fn create_all(config: &Config, state: &StateDir, repos: &[PathBuf]) -> Resul
             }
         }
     }
-    Ok(PlanList {
-        schema: PlanListSchema,
-        plans,
-        errors,
-    })
+    plans
 }
 
 /// Loads the plan whose ID starts with `prefix` (at least 4 characters, unique).
@@ -202,7 +229,7 @@ fn build(
     kind: PlanKind,
     target: &Path,
     observation: &WorktreeObservation,
-) -> Plan {
+) -> Built {
     let worktree = PathBuf::from(&observation.worktree.path);
     let walked = walk(&worktree, target).map_err(|err| format!("{}: {err}", target.display()));
     let (root_id, root_created_ms) = root_identity(&worktree).unwrap_or((None, None));
@@ -221,7 +248,7 @@ fn build(
     };
     let checks = evaluate(&inspection);
     let provenance = provenance(config, &inspection);
-    Plan {
+    let plan = Plan {
         schema: PlanSchema,
         id: String::new(),
         created_ms: state::now_ms(),
@@ -243,6 +270,10 @@ fn build(
         approval: approval(&checks),
         checks,
         provenance,
+    };
+    Built {
+        plan,
+        own_file_bytes: walked.as_ref().ok().map(Walk::own_file_bytes),
     }
 }
 
