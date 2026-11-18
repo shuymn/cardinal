@@ -155,9 +155,7 @@ fn owner_approved_needs_the_owner() {
 fn unbuilt_entry_points_answer_not_implemented() {
     let dirs = Dirs::new();
     for args in [
-        &["reconcile"][..],
-        &["reconcile", "--trigger", "job-end"],
-        &["arbiter", "run"],
+        &["arbiter", "run"][..],
         &["ui"],
         &["inbox", "--assigned"],
         &[

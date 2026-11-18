@@ -68,9 +68,11 @@ fn env() -> Env {
     env_with("")
 }
 
-/// An environment whose `host.toml` is `host`.
+/// An environment whose `host.toml` is `host`, with disk lines below any free space, so a
+/// runner's job-end check never starts a `reconcile` pass.
 fn env_with(host: &str) -> Env {
     let dirs = Dirs::new();
+    let host = format!("[disk]\nwarning_mib = 1\nrecovery_mib = 2\ncritical_mib = 0\n{host}");
     std::fs::write(dirs.config().join("host.toml"), host).unwrap();
     let config = Config::load(dirs.config()).unwrap();
     let state = StateDir::open(dirs.state()).unwrap();

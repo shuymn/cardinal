@@ -34,6 +34,8 @@ pub struct Stat {
     pub mtime_ns: i128,
     /// 512-byte blocks allocated.
     pub blocks: u64,
+    /// The number of names the entry has, here and elsewhere.
+    pub nlink: u64,
 }
 
 /// Opens the directory at `path` without following a final symbolic link (`O_DIRECTORY |
@@ -99,6 +101,7 @@ pub(crate) fn stat(st: &rustix::fs::Stat) -> Stat {
         size: u64::try_from(st.st_size).unwrap_or_default(),
         mtime_ns: i128::from(st.st_mtime) * 1_000_000_000 + i128::from(st.st_mtime_nsec),
         blocks: u64::try_from(st.st_blocks).unwrap_or_default(),
+        nlink: u64::try_from(st.st_nlink).unwrap_or_default(),
     }
 }
 

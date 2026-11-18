@@ -9,10 +9,22 @@ use crate::state::StateDir;
 
 use super::Observation;
 
+/// The items as they were before the pass observed anything: the raisers end only these.
+#[derive(Clone, Debug, Default)]
+pub struct Before;
+
+/// The items before step 4.
+pub fn snapshot(_state: &StateDir) -> Result<Before, Error> {
+    Err(Error::not_implemented(
+        "reconcile: reading the items before the pass",
+    ))
+}
+
 /// Raises and ends the worktree items of section 10.1 from step 5's observation and plans.
 pub fn worktree_items(
     _config: &Config,
     _state: &StateDir,
+    _before: &Before,
     _observation: &Observation,
 ) -> Result<InboxChanges, Error> {
     Err(Error::not_implemented("reconcile: raising worktree items"))
@@ -23,6 +35,7 @@ pub fn worktree_items(
 pub fn disk_items(
     _config: &Config,
     _state: &StateDir,
+    _before: &Before,
     _disks: &[DiskState],
     _reports: &[DiskReport],
 ) -> Result<InboxChanges, Error> {
