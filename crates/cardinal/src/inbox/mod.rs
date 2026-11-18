@@ -36,9 +36,7 @@ use crate::record::Recorder;
 use crate::state::{self, Durability, LockMode, StateDir};
 use crate::testpoint;
 
-pub use assign::{
-    assign, due, list_assigned, read_last, reconcile_failing, record_outcome, resolve_assigned,
-};
+pub use assign::{assign, due, list_assigned, read_last, record_outcome, resolve_assigned};
 
 /// How long an upsert waits for `inbox/.lock`.
 const LOCK_WAIT: Duration = Duration::from_secs(5);

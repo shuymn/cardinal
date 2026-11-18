@@ -23,7 +23,7 @@ use crate::contract::{
     ArbiterPass, ArbiterPassSchema, ArbiterStart, Error, ErrorCode, InboxKind, InboxSubject,
     PassOutcome, RecordKind,
 };
-use crate::inbox::{self, NewItem};
+use crate::inbox::{self, NewItem, Occurrence};
 use crate::os::{self, child};
 use crate::record::{self, Recorder};
 use crate::state::{self, Durability, LockError, LockMode, StateDir};
@@ -260,16 +260,50 @@ fn finish(
 
 /// Brings `arbiter_failing` in line with the recorded end of `last`: the occurrence of its run
 /// of failures, or none after a completed pass (section 10.5).
+///
+/// The changes go through the inbox's occurrences, applied under one hold of `inbox/.lock`:
+/// after a completed pass, each occurrence that has not ended ends, as it was read (its
+/// `before`); while `last` ends a run of three or more failures and none has not ended, the
+/// run's occurrence is raised. Every caller holds `arbiter/.lock`, and nothing else raises or
+/// ends `arbiter_failing`, so no change to it falls between the read and the apply.
 fn failing(config: &Config, state: &StateDir, last: &ArbiterPass) -> Result<(), Error> {
-    inbox::reconcile_failing(config, state, last, streak(state, last).as_ref())
+    let Some(ended_ms) = last.ended_ms else {
+        return Ok(());
+    };
+    let completed = last.outcome == Some(PassOutcome::Completed);
+    if !completed && last.failures_in_a_row < FAILING_AFTER {
+        return Ok(());
+    }
+    let open: Vec<_> = inbox::latest(state)?
+        .into_iter()
+        .filter(|(_, item)| item.kind == InboxKind::ArbiterFailing && item.ended_ms.is_none())
+        .collect();
+    let changes: Vec<Occurrence> = if completed {
+        open.into_iter()
+            .map(|(condition, item)| Occurrence::End {
+                key: condition,
+                before: Some(Box::new(item)),
+                ended_ms,
+                note: format!("arbiter pass {} completed", last.id),
+            })
+            .collect()
+    } else if open.is_empty() {
+        streak(state, last).into_iter().collect()
+    } else {
+        Vec::new()
+    };
+    if !changes.is_empty() {
+        inbox::apply_recorded(config, state, &changes)?;
+    }
+    Ok(())
 }
 
-/// The `arbiter_failing` occurrence for the run of failures `last` ends, when it is at least
-/// three long: keyed by the run's first failing pass and the time it ended (section 10.1),
-/// with the run's passes and their logs as evidence. The run is the last
-/// `failures_in_a_row` passes of the `arbiter_pass` records and `last`, as far as the records
-/// still hold them.
-fn streak(state: &StateDir, last: &ArbiterPass) -> Option<NewItem> {
+/// The raise of the `arbiter_failing` occurrence for the run of failures `last` ends, when it
+/// is at least three long: the condition `arbiter_failing:<pass>` of the run's first failing
+/// pass, found when that pass ended (section 10.1), with the run's passes and their logs as
+/// evidence. The run is the last `failures_in_a_row` passes of the `arbiter_pass` records and
+/// `last`, as far as the records still hold them.
+fn streak(state: &StateDir, last: &ArbiterPass) -> Option<Occurrence> {
     if last.ended_ms.is_none() || last.failures_in_a_row < FAILING_AFTER {
         return None;
     }
@@ -290,18 +324,18 @@ fn streak(state: &StateDir, last: &ArbiterPass) -> Option<NewItem> {
         run.drain(..=completed);
     }
     let first = run.first()?;
-    let key = format!(
-        "arbiter_failing:{}@{}",
-        first.id,
-        first.ended_ms.unwrap_or_default()
-    );
+    let condition = format!("arbiter_failing:{}", first.id);
+    let since_ms = first.ended_ms.unwrap_or_default();
     let logs: Vec<&str> = run.iter().map(|failed| failed.log.as_str()).collect();
     let evidence = serde_json::json!({ "passes": run, "logs": logs });
-    Some(NewItem {
-        key,
-        kind: InboxKind::ArbiterFailing,
-        subject: InboxSubject::default(),
-        evidence: evidence.as_object().cloned().unwrap_or_default(),
+    Some(Occurrence::Raise {
+        item: NewItem {
+            key: condition,
+            kind: InboxKind::ArbiterFailing,
+            subject: InboxSubject::default(),
+            evidence: evidence.as_object().cloned().unwrap_or_default(),
+        },
+        since_ms,
     })
 }
 

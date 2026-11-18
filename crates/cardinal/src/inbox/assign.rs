@@ -12,11 +12,10 @@
 
 use std::cmp::Ordering;
 
-use super::NewItem;
 use crate::config::{Arbiter, Config};
 use crate::contract::{
-    ArbiterPass, Error, ErrorCode, Inbox, InboxItem, InboxItemSchema, InboxKind, InboxSchema,
-    InboxStatus, ItemArbiter, PassOutcome, RecordKind, ResolutionOutcome,
+    ArbiterPass, Error, ErrorCode, Inbox, InboxItem, InboxSchema, InboxStatus, ItemArbiter,
+    PassOutcome, ResolutionOutcome,
 };
 use crate::state::{self, StateDir};
 use crate::testpoint;
@@ -143,86 +142,6 @@ fn write_outcomes(
             assigned.ended_ms = Some(ended_ms);
             super::write(state, &path, &item)?;
         }
-    }
-    Ok(())
-}
-
-/// Brings `arbiter_failing` in line with the recorded end of `last` (section 10.5), holding
-/// `inbox/.lock` from the check to the write: while `last` ends a run of three or more
-/// failures an occurrence is open, `streak` raised when none is; once `last` completed none
-/// is, each open one ended and resolved by cardinal. The launcher and the trigger call this
-/// after every end they record and again for the end `last.json` holds, so what a launcher
-/// died before writing is written then.
-pub fn reconcile_failing(
-    config: &Config,
-    state: &StateDir,
-    last: &ArbiterPass,
-    streak: Option<&NewItem>,
-) -> Result<(), Error> {
-    let Some(ended_ms) = last.ended_ms else {
-        return Ok(());
-    };
-    let completed = last.outcome == Some(PassOutcome::Completed);
-    if !completed && streak.is_none() {
-        return Ok(());
-    }
-    let mut cleared = Vec::new();
-    let mut raised = None;
-    {
-        let _lock = super::lock(state)?;
-        let open: Vec<_> = super::read_all(state)?
-            .into_iter()
-            .filter(|(_, item)| item.kind == InboxKind::ArbiterFailing && item.ended_ms.is_none())
-            .collect();
-        if completed {
-            for (path, mut item) in open {
-                item.ended_ms = Some(ended_ms);
-                if matches!(item.status, InboxStatus::Open | InboxStatus::Escalated) {
-                    super::set_resolution(
-                        &mut item,
-                        ResolutionOutcome::Resolved,
-                        super::BY_CARDINAL,
-                        &format!("arbiter pass {} completed", last.id),
-                        ended_ms,
-                    );
-                    cleared.push(item.clone());
-                }
-                super::write(state, &path, &item)?;
-            }
-        } else if let Some(streak) = streak
-            && open.is_empty()
-            && let (path, None) = super::find(state, &streak.key)?
-        {
-            let item = InboxItem {
-                schema: InboxItemSchema,
-                key: streak.key.clone(),
-                kind: streak.kind,
-                status: InboxStatus::Open,
-                subject: streak.subject.clone(),
-                evidence: streak.evidence.clone(),
-                created_ms: ended_ms,
-                updated_ms: ended_ms,
-                seen: 1,
-                ended_ms: None,
-                arbiter: None,
-                resolution: None,
-            };
-            super::write(state, &path, &item)?;
-            raised = Some(item);
-        }
-    }
-    for item in &cleared {
-        super::record_resolution(config, state, item);
-    }
-    if let Some(item) = raised {
-        let recorder = super::recorder(config, state);
-        let mut record = recorder.record(RecordKind::InboxRaised);
-        record.inbox_key = Some(item.key);
-        record.data = serde_json::json!({ "kind": item.kind })
-            .as_object()
-            .cloned()
-            .unwrap_or_default();
-        let _ = recorder.append(&record);
     }
     Ok(())
 }
