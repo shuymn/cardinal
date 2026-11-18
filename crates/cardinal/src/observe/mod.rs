@@ -479,7 +479,9 @@ impl<'a> Observer<'a> {
         }
     }
 
-    fn host_info(state: &StateDir, errors: &mut Vec<ScopedError>) -> HostInfo {
+    /// This host as `inventory` reports it; a boot time that cannot be read is 0, with an
+    /// error under the scope `host`.
+    pub fn host_info(state: &StateDir, errors: &mut Vec<ScopedError>) -> HostInfo {
         let boot_s = crate::os::boot_time_s()
             .map_err(|err| errors.push(scoped("host", err.to_string())))
             .unwrap_or(0);

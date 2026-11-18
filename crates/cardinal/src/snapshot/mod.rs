@@ -20,12 +20,11 @@ use serde::de::DeserializeOwned;
 use crate::admission;
 use crate::config::Config;
 use crate::contract::{
-    ArbiterPass, DiskState, Error, ErrorCode, HostInfo, InboxItem, InboxStatus, Inventory, Os,
-    Record, RecordKind, Snapshot, SnapshotItem, SnapshotObservation, SnapshotReservations,
-    SnapshotSchema,
+    ArbiterPass, DiskState, Error, ErrorCode, InboxItem, InboxStatus, Inventory, Record,
+    RecordKind, Snapshot, SnapshotItem, SnapshotObservation, SnapshotReservations, SnapshotSchema,
 };
 use crate::inbox;
-use crate::os;
+use crate::observe::Observer;
 use crate::record;
 use crate::state::{self, Durability, LockMode, StateDir};
 
@@ -71,7 +70,7 @@ pub fn build(config: &Config, state: &StateDir) -> Result<Snapshot, Error> {
     Ok(Snapshot {
         schema: SnapshotSchema,
         generated_ms: state::now_ms(),
-        host: host_info(state),
+        host: Observer::host_info(state, &mut Vec::new()),
         disk,
         observation,
         reservations,
@@ -178,24 +177,6 @@ fn recent_records(state: &StateDir) -> Result<Vec<Record>, Error> {
     }
     newest_first.reverse();
     Ok(newest_first)
-}
-
-/// This host, as `inventory` reports it; a boot time that cannot be read is 0.
-fn host_info(state: &StateDir) -> HostInfo {
-    let os = if cfg!(target_os = "macos") {
-        Os::Macos
-    } else if cfg!(windows) {
-        Os::Windows
-    } else {
-        Os::Linux
-    };
-    HostInfo {
-        id: state.host_id().to_owned(),
-        hostname: os::hostname().unwrap_or_default(),
-        os,
-        arch: std::env::consts::ARCH.to_owned(),
-        boot_s: os::boot_time_s().unwrap_or(0),
-    }
 }
 
 /// A document of the state directory: `None` when it is missing or does not parse, as
