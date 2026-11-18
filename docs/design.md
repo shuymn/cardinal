@@ -252,7 +252,7 @@ Disk is a resource on par with CPU and memory. When it runs out, `cardinal` itse
 
 A whole worktree becomes a reclamation candidate only when all of the following hold. If any condition fails or cannot be determined, only its known regenerable directories are candidates.
 
-- There is evidence that the current HEAD has been merged: it is an ancestor of the base, or the head of a merged PR equals the current HEAD. Inferring a squash merge from identical diffs is left to the arbiter.
+- There is evidence that the current HEAD has been merged: it is an ancestor of the base, the head of a merged PR equals the current HEAD, or the arbiter judged a squash merge and every file the branch changed is identical in the base.
 - No uncommitted changes, no unpushed commits, no open PR.
 - Not in use (no in-use lock held by an accepted, running, or recovery-needed job).
 - The worktree contains no protected data and no unclassifiable ignored data.
