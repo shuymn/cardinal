@@ -10,7 +10,7 @@
 //! `not_implemented`.
 
 mod arbiter;
-mod raise;
+pub mod raise;
 
 pub use arbiter::run as run_arbiter;
 
