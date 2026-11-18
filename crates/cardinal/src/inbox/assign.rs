@@ -12,10 +12,11 @@
 
 use std::cmp::Ordering;
 
+use super::NewItem;
 use crate::config::{Arbiter, Config};
 use crate::contract::{
-    ArbiterPass, Error, ErrorCode, Inbox, InboxItem, InboxKind, InboxSchema, InboxStatus,
-    ItemArbiter, PassOutcome, ResolutionOutcome,
+    ArbiterPass, Error, ErrorCode, Inbox, InboxItem, InboxItemSchema, InboxKind, InboxSchema,
+    InboxStatus, ItemArbiter, PassOutcome, RecordKind, ResolutionOutcome,
 };
 use crate::state::{self, StateDir};
 
@@ -105,57 +106,107 @@ pub fn assign(
 }
 
 /// Writes how `pass` ended into each item assigned to it that has no outcome yet, and into no
-/// other, under `inbox/.lock`; returns their keys. A completed pass also ends every
-/// `arbiter_failing` occurrence (section 10.1): each gets `ended_ms`, and an open or
-/// escalated one is resolved by cardinal.
+/// other, under `inbox/.lock`; returns their keys.
 pub fn record_outcome(
-    config: &Config,
     state: &StateDir,
     pass: &str,
     outcome: &PassOutcome,
     ended_ms: u64,
 ) -> Result<Vec<String>, Error> {
+    let _lock = super::lock(state)?;
     let mut written = Vec::new();
+    for (path, mut item) in super::read_all(state)? {
+        if let Some(assigned) = &mut item.arbiter
+            && assigned.pass == pass
+            && assigned.outcome.is_none()
+        {
+            assigned.outcome = Some(outcome.clone());
+            assigned.ended_ms = Some(ended_ms);
+            super::write(state, &path, &item)?;
+            written.push(item.key);
+        }
+    }
+    Ok(written)
+}
+
+/// Brings `arbiter_failing` in line with the recorded end of `last` (section 10.5), holding
+/// `inbox/.lock` from the check to the write: while `last` ends a run of three or more
+/// failures an occurrence is open, `streak` raised when none is; once `last` completed none
+/// is, each open one ended and resolved by cardinal. The launcher and the trigger call this
+/// after every end they record and again for the end `last.json` holds, so what a launcher
+/// died before writing is written then.
+pub fn reconcile_failing(
+    config: &Config,
+    state: &StateDir,
+    last: &ArbiterPass,
+    streak: Option<&NewItem>,
+) -> Result<(), Error> {
+    let Some(ended_ms) = last.ended_ms else {
+        return Ok(());
+    };
+    let completed = last.outcome == Some(PassOutcome::Completed);
+    if !completed && streak.is_none() {
+        return Ok(());
+    }
     let mut cleared = Vec::new();
+    let mut raised = None;
     {
         let _lock = super::lock(state)?;
-        for (path, mut item) in super::read_all(state)? {
-            let mut changed = false;
-            if let Some(assigned) = &mut item.arbiter
-                && assigned.pass == pass
-                && assigned.outcome.is_none()
-            {
-                assigned.outcome = Some(outcome.clone());
-                assigned.ended_ms = Some(ended_ms);
-                written.push(item.key.clone());
-                changed = true;
-            }
-            if *outcome == PassOutcome::Completed
-                && item.kind == InboxKind::ArbiterFailing
-                && item.ended_ms.is_none()
-            {
+        let open: Vec<_> = super::read_all(state)?
+            .into_iter()
+            .filter(|(_, item)| item.kind == InboxKind::ArbiterFailing && item.ended_ms.is_none())
+            .collect();
+        if completed {
+            for (path, mut item) in open {
                 item.ended_ms = Some(ended_ms);
                 if matches!(item.status, InboxStatus::Open | InboxStatus::Escalated) {
                     super::set_resolution(
                         &mut item,
                         ResolutionOutcome::Resolved,
                         super::BY_CARDINAL,
-                        &format!("arbiter pass {pass} completed"),
+                        &format!("arbiter pass {} completed", last.id),
                         ended_ms,
                     );
                     cleared.push(item.clone());
                 }
-                changed = true;
-            }
-            if changed {
                 super::write(state, &path, &item)?;
             }
+        } else if let Some(streak) = streak
+            && open.is_empty()
+            && let (path, None) = super::find(state, &streak.key)?
+        {
+            let item = InboxItem {
+                schema: InboxItemSchema,
+                key: streak.key.clone(),
+                kind: streak.kind,
+                status: InboxStatus::Open,
+                subject: streak.subject.clone(),
+                evidence: streak.evidence.clone(),
+                created_ms: ended_ms,
+                updated_ms: ended_ms,
+                seen: 1,
+                ended_ms: None,
+                arbiter: None,
+                resolution: None,
+            };
+            super::write(state, &path, &item)?;
+            raised = Some(item);
         }
     }
     for item in &cleared {
         super::record_resolution(config, state, item);
     }
-    Ok(written)
+    if let Some(item) = raised {
+        let recorder = super::recorder(config, state);
+        let mut record = recorder.record(RecordKind::InboxRaised);
+        record.inbox_key = Some(item.key);
+        record.data = serde_json::json!({ "kind": item.kind })
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        let _ = recorder.append(&record);
+    }
+    Ok(())
 }
 
 /// `cardinal inbox --assigned`: the open and escalated items assigned to `pass`, the pass

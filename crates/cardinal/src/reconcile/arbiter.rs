@@ -10,8 +10,8 @@
 //! records it `abandoned`, signalling nothing. A pass whose due items were all closed before
 //! the launcher assigned them runs no session: the launcher puts the previous `last.json`
 //! back. Both read `last.json` under `arbiter/.lock`, and refuse to start a pass when it
-//! exists but cannot be read; both also raise `arbiter_failing` a launcher that died after
-//! recording the third failure in a row did not.
+//! exists but cannot be read; both also bring `arbiter_failing` in line with the end it
+//! records, so an alert or its end that a launcher died before writing is written then.
 
 use std::ffi::OsString;
 use std::io::Write as _;
@@ -23,7 +23,7 @@ use crate::contract::{
     ArbiterPass, ArbiterPassSchema, ArbiterStart, Error, ErrorCode, InboxKind, InboxSubject,
     PassOutcome, RecordKind,
 };
-use crate::inbox::{self, NewItem, Raised};
+use crate::inbox::{self, NewItem};
 use crate::os::{self, child};
 use crate::record::{self, Recorder};
 use crate::state::{self, Durability, LockMode, StateDir};
@@ -158,7 +158,7 @@ pub fn run(config: &Config, state: &StateDir) -> Result<ArbiterPass, Error> {
         }
     };
     let ended = state::now_ms();
-    if let Err(err) = inbox::record_outcome(config, state, &pass.id, &outcome, ended) {
+    if let Err(err) = inbox::record_outcome(state, &pass.id, &outcome, ended) {
         // Each item of the pass still ends when `last.json` records the end (section 10.5).
         notes.push(format!(
             "writing the outcome into the items failed: {}",
@@ -183,14 +183,14 @@ enum Last {
 /// Reads `last.json`, holding `arbiter/.lock`; a pass recorded without an end belongs to a
 /// launcher that died, and once `timeout_s` has passed since it started it is recorded
 /// `abandoned`: in those of its items that have no outcome, with one end time, then in
-/// `last.json`. A pass recorded with an end gets the `arbiter_failing` its launcher died
-/// before raising.
+/// `last.json`. For a pass recorded with an end, `arbiter_failing` is brought in line with
+/// it, in case its launcher died before it did.
 fn settle(config: &Config, state: &StateDir, now: u64) -> Result<Last, Error> {
     let Some(mut last) = inbox::read_last(state)? else {
         return Ok(Last::Settled(None));
     };
     if last.ended_ms.is_some() {
-        alert(config, state, &last)?;
+        failing(config, state, &last)?;
         return Ok(Last::Settled(Some(last)));
     }
     let ended = deadline_ms(config, &last);
@@ -198,13 +198,13 @@ fn settle(config: &Config, state: &StateDir, now: u64) -> Result<Last, Error> {
         return Ok(Last::Running(last));
     }
     // Items that already have an outcome keep it.
-    inbox::record_outcome(config, state, &last.id, &PassOutcome::Abandoned, ended)?;
+    inbox::record_outcome(state, &last.id, &PassOutcome::Abandoned, ended)?;
     finish(config, state, &mut last, PassOutcome::Abandoned, ended)?;
     Ok(Last::Settled(Some(last)))
 }
 
-/// Records how `pass` ended in `last.json` and an `arbiter_pass` record, then raises
-/// `arbiter_failing` as [`alert`] does.
+/// Records how `pass` ended in `last.json` and an `arbiter_pass` record, then brings
+/// `arbiter_failing` in line with it.
 fn finish(
     config: &Config,
     state: &StateDir,
@@ -224,65 +224,54 @@ fn finish(
     let mut entry = recorder.record(RecordKind::ArbiterPass);
     entry.data = as_object(&pass);
     let _ = recorder.append(&entry);
-    alert(config, state, pass)
+    failing(config, state, pass)
 }
 
-/// Raises `arbiter_failing` when the ended pass `last` makes at least three failures in a
-/// row and no occurrence is open (one without `ended_ms`): an alert a launcher died before
-/// raising is raised once, under the same key, and a failure after the third raises none.
-fn alert(config: &Config, state: &StateDir, last: &ArbiterPass) -> Result<(), Error> {
-    let Some(ended) = last.ended_ms else {
-        return Ok(());
-    };
-    if last.failures_in_a_row < FAILING_AFTER {
-        return Ok(());
-    }
-    let open = inbox::read_all(state)?
-        .into_iter()
-        .any(|(_, item)| item.kind == InboxKind::ArbiterFailing && item.ended_ms.is_none());
-    if open {
-        return Ok(());
-    }
-    raise_failing(config, state, last, ended)
+/// Brings `arbiter_failing` in line with the recorded end of `last`: the occurrence of its run
+/// of failures, or none after a completed pass (section 10.5).
+fn failing(config: &Config, state: &StateDir, last: &ArbiterPass) -> Result<(), Error> {
+    inbox::reconcile_failing(config, state, last, streak(state, last).as_ref())
 }
 
-/// Raises `arbiter_failing` for the pass that made it three or more in a row, with the
-/// failed passes and their logs as evidence.
-fn raise_failing(
-    config: &Config,
-    state: &StateDir,
-    pass: &ArbiterPass,
-    since_ms: u64,
-) -> Result<(), Error> {
-    let mut passes: Vec<ArbiterPass> = record::read_all(state)
+/// The `arbiter_failing` occurrence for the run of failures `last` ends, when it is at least
+/// three long: keyed by the run's first failing pass and the time it ended (section 10.1),
+/// with the run's passes and their logs as evidence. The run is the last
+/// `failures_in_a_row` passes of the `arbiter_pass` records and `last`, as far as the records
+/// still hold them.
+fn streak(state: &StateDir, last: &ArbiterPass) -> Option<NewItem> {
+    if last.ended_ms.is_none() || last.failures_in_a_row < FAILING_AFTER {
+        return None;
+    }
+    let mut run: Vec<ArbiterPass> = record::read_all(state)
         .unwrap_or_default()
         .into_iter()
         .filter(|entry| entry.kind == RecordKind::ArbiterPass)
         .filter_map(|entry| serde_json::from_value(entry.data.into()).ok())
-        .filter(|recorded: &ArbiterPass| recorded.id != pass.id)
+        .filter(|recorded: &ArbiterPass| recorded.id != last.id)
         .collect();
-    let earlier = usize::try_from(FAILING_AFTER - 1).unwrap_or(usize::MAX);
-    passes = passes.split_off(passes.len().saturating_sub(earlier));
-    passes.push(pass.clone());
-    let logs: Vec<&str> = passes.iter().map(|failed| failed.log.as_str()).collect();
-    let evidence = serde_json::json!({ "passes": passes, "logs": logs });
-    let item = NewItem {
-        // One occurrence of the condition (section 10.1): the pass that raised it, and the
-        // time it ended.
-        key: format!("arbiter_failing:{}@{since_ms}", pass.id),
+    run.push(last.clone());
+    let len = usize::try_from(last.failures_in_a_row).unwrap_or(usize::MAX);
+    run = run.split_off(run.len().saturating_sub(len));
+    if let Some(completed) = run
+        .iter()
+        .rposition(|pass| pass.outcome == Some(PassOutcome::Completed))
+    {
+        run.drain(..=completed);
+    }
+    let first = run.first()?;
+    let key = format!(
+        "arbiter_failing:{}@{}",
+        first.id,
+        first.ended_ms.unwrap_or_default()
+    );
+    let logs: Vec<&str> = run.iter().map(|failed| failed.log.as_str()).collect();
+    let evidence = serde_json::json!({ "passes": run, "logs": logs });
+    Some(NewItem {
+        key,
         kind: InboxKind::ArbiterFailing,
         subject: InboxSubject::default(),
         evidence: evidence.as_object().cloned().unwrap_or_default(),
-    };
-    let (stored, raised) = inbox::raise_item(state, &item)?;
-    if raised == Raised::New {
-        let recorder = recorder(config, state);
-        let mut entry = recorder.record(RecordKind::InboxRaised);
-        entry.inbox_key = Some(stored.key);
-        entry.data = as_object(&serde_json::json!({ "kind": stored.kind }));
-        let _ = recorder.append(&entry);
-    }
-    Ok(())
+    })
 }
 
 /// Runs `[arbiter] command` for `pass` through `os::child`: in a process group of its own,

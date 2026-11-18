@@ -4,7 +4,8 @@
 //! runs, and answers each once; a launcher that dies strands no item; a pass none of whose
 //! items is left to assign runs no session; a `last.json` that cannot be read starts nothing;
 //! a session is killed at `timeout_s`; three failures in a row raise `arbiter_failing`, once
-//! per run of failures, also when the launcher died before raising it.
+//! per run of failures, also when the launcher died before raising it, and a recorded
+//! completed pass ends it.
 //!
 //! Every pass runs through the binary (`cardinal arbiter run`), which re-checks the trigger
 //! from the items it lists. `[arbiter] command` names a fake session: this test binary re-run
@@ -317,12 +318,22 @@ impl Env {
 
     /// `cardinal arbiter run` in the background, paused at `pause` when given.
     fn spawn_launcher(&self, points: &TestPoints, pause: &[&str]) -> Child {
+        self.spawn_launcher_with(points, pause, None)
+    }
+
+    /// [`Env::spawn_launcher`], also failing at `fail` when given.
+    fn spawn_launcher_with(
+        &self,
+        points: &TestPoints,
+        pause: &[&str],
+        fail: Option<&str>,
+    ) -> Child {
         let mut command = self.dirs.cmd();
         command
             .args(["arbiter", "run"])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
-        points.apply(&mut command, pause, None);
+        points.apply(&mut command, pause, fail);
         command.spawn().expect("start the launcher")
     }
 
@@ -437,7 +448,7 @@ fn due_items_only() {
     e.raise(recent, InboxKind::UnclassifiableData);
     let now = state::now_ms();
     inbox::assign(&e.state, "p0", &[recent.to_owned()], now).unwrap();
-    inbox::record_outcome(&e.config(), &e.state, "p0", &PassOutcome::Completed, now).unwrap();
+    inbox::record_outcome(&e.state, "p0", &PassOutcome::Completed, now).unwrap();
 
     let (code, doc) = e.arbiter_run();
     assert_eq!(code, Some(0), "{doc}");
@@ -923,8 +934,8 @@ fn launcher_killed() {
     e.signal("release");
 }
 
-/// A20: the third failed pass in a row raises `arbiter_failing`, which is never assigned to a
-/// pass, and a completed pass ends it.
+/// A20: the third failed pass in a row raises `arbiter_failing`, keyed by the first failed pass
+/// of the run, which is never assigned to a pass, and a completed pass ends it.
 #[test]
 fn failing_raised() {
     let pinned = Pinned {
@@ -950,8 +961,7 @@ fn failing_raised() {
         assert_eq!(pass.failures_in_a_row, round);
         failed.push(pass);
     }
-    let third = failed.last().unwrap();
-    let key = format!("arbiter_failing:{}@{}", third.id, third.ended_ms.unwrap());
+    let key = failing_key(&failed[0]);
     let item = e.item(&key);
     assert_eq!(item.status, InboxStatus::Open);
     let evidence: Vec<ArbiterPass> =
@@ -990,6 +1000,16 @@ fn answer(key: &str, outcome: &str, note: &str) -> Step {
         .map(String::from)
         .to_vec(),
     )
+}
+
+/// The key of the `arbiter_failing` occurrence of the run of failures `first` starts.
+fn failing_key(first: &ArbiterPass) -> String {
+    format!("arbiter_failing:{}@{}", first.id, first.ended_ms.unwrap())
+}
+
+/// The keys of the `arbiter_failing` items, oldest first.
+fn failing_keys(e: &Env) -> Vec<String> {
+    failing(e).into_iter().map(|item| item.key).collect()
 }
 
 /// The `arbiter_failing` items, oldest first.
@@ -1266,9 +1286,9 @@ fn late_answer_refused() {
 }
 
 /// A20: a launcher killed after it recorded the third failure in a row and before it raised
-/// `arbiter_failing` leaves it to the next launcher, which raises it once, under the key the
-/// killed one would have used; a fourth failure raises none, a completed pass ends it, and the
-/// next run of three failures raises a new one.
+/// `arbiter_failing` leaves it to the next launcher, which raises it once, keyed by the run's
+/// first failed pass; a fourth failure raises none, a completed pass ends it, and the next run
+/// of three failures raises a new one.
 #[test]
 fn failing_raised_once() {
     let pinned = Pinned {
@@ -1304,7 +1324,8 @@ fn failing_raised_once() {
     let (code, doc) = e.arbiter_run();
     assert_eq!(code, Some(0), "{doc}");
     assert_eq!(pass_of(&doc).failures_in_a_row, 4);
-    let key = format!("arbiter_failing:{}@{}", third.id, third.ended_ms.unwrap());
+    let first = pass_of(&e.records(RecordKind::ArbiterPass)[0].data.clone().into());
+    let key = failing_key(&first);
     let raised = failing(&e);
     assert_eq!(
         raised.iter().map(|item| &item.key).collect::<Vec<_>>(),
@@ -1329,8 +1350,7 @@ fn failing_raised_once() {
         assert_eq!(code, Some(0), "{doc}");
         streak.push(pass_of(&doc));
     }
-    let last = streak.last().unwrap();
-    let second = format!("arbiter_failing:{}@{}", last.id, last.ended_ms.unwrap());
+    let second = failing_key(&streak[0]);
     let raised = failing(&e);
     assert_eq!(
         raised.iter().map(|item| &item.key).collect::<Vec<_>>(),
@@ -1338,4 +1358,122 @@ fn failing_raised_once() {
         "a new occurrence for the second run of failures"
     );
     assert_eq!(raised[1].status, InboxStatus::Open);
+}
+
+/// A20: a completed pass whose launcher exits after it wrote the outcome into its items and
+/// before it recorded the end in `last.json` is recorded `abandoned`, so the run of failures
+/// goes on, under the one `arbiter_failing` it raised.
+#[test]
+fn one_alert_per_run_of_failures() {
+    let pinned = Pinned {
+        timeout_s: KILLED_TIMEOUT_S,
+        min_interval_s: 0,
+        retry_s: 0,
+    };
+    let e = Env::new(pinned, &[Step::Exit(2)]);
+    e.raise("reclaimable:/a@h@1", InboxKind::Reclaimable);
+    let mut failed = Vec::new();
+    for _ in 0..3 {
+        let (code, doc) = e.arbiter_run();
+        assert_eq!(code, Some(0), "{doc}");
+        failed.push(pass_of(&doc));
+    }
+    let key = failing_key(&failed[0]);
+    assert_eq!(failing_keys(&e), std::slice::from_ref(&key));
+
+    e.configure(pinned, &[]);
+    let points = TestPoints::new(e.dirs.scope());
+    let mut launcher = e.spawn_launcher_with(&points, &[], Some(ARBITER_OUTCOMES));
+    assert_eq!(
+        launcher.wait().unwrap().code(),
+        Some(1),
+        "exits at arbiter.outcomes"
+    );
+    let exited = e.last().unwrap();
+    assert_eq!(exited.ended_ms, None, "no end recorded");
+    let a = e.item("reclaimable:/a@h@1").arbiter.unwrap();
+    assert_eq!(
+        (a.pass, a.outcome),
+        (exited.id.clone(), Some(PassOutcome::Completed))
+    );
+    assert_eq!(
+        failing_keys(&e),
+        std::slice::from_ref(&key),
+        "the alert is still open"
+    );
+
+    sleep_until(exited.started_ms + KILLED_TIMEOUT_MS);
+    e.configure(pinned, &[Step::Exit(2)]);
+    let (code, doc) = e.arbiter_run();
+    assert_eq!(code, Some(0), "{doc}");
+    assert_eq!(
+        pass_of(&doc).failures_in_a_row,
+        5,
+        "the abandoned pass and this one"
+    );
+    assert_eq!(
+        failing_keys(&e),
+        std::slice::from_ref(&key),
+        "no second alert"
+    );
+    assert_eq!(e.item(&key).status, InboxStatus::Open);
+}
+
+/// A20: a pass recorded `completed` ends the open `arbiter_failing` also when its outcome could
+/// not be written into its items (`inbox/.lock` held until the write timed out), so the next
+/// run of three failures raises a new one.
+#[test]
+fn a_completed_pass_ends_the_alert() {
+    let pinned = Pinned {
+        timeout_s: 60,
+        min_interval_s: 0,
+        retry_s: 0,
+    };
+    let e = Env::new(pinned, &[Step::Exit(2)]);
+    e.raise("reclaimable:/a@h@1", InboxKind::Reclaimable);
+    let mut failed = Vec::new();
+    for _ in 0..3 {
+        let (code, doc) = e.arbiter_run();
+        assert_eq!(code, Some(0), "{doc}");
+        failed.push(pass_of(&doc));
+    }
+    let key = failing_key(&failed[0]);
+    assert_eq!(failing_keys(&e), std::slice::from_ref(&key));
+
+    e.configure(pinned, &[Step::Wait("go".into())]);
+    let points = TestPoints::new(e.dirs.scope());
+    let mut launcher = e.spawn_launcher(&points, &[ARBITER_OUTCOMES]);
+    let pass = wait_for("the fourth pass in last.json", WAIT, || {
+        e.last().filter(|last| last.ended_ms.is_none())
+    });
+    e.session(&pass.id);
+    let held = state::lock(
+        &e.state.inbox_lock(),
+        LockMode::Exclusive,
+        Instant::now() + WAIT,
+    )
+    .unwrap();
+    e.signal("go");
+    // Reached once writing the outcome into the items has timed out.
+    points.wait_reached(ARBITER_OUTCOMES, launcher.id(), WAIT);
+    drop(held);
+    points.release(ARBITER_OUTCOMES);
+    assert!(launcher.wait().unwrap().success());
+    let completed = e.last().unwrap();
+    assert_eq!(completed.outcome, Some(PassOutcome::Completed));
+    assert_eq!(e.item("reclaimable:/a@h@1").arbiter.unwrap().outcome, None);
+    let ended = e.item(&key);
+    assert_eq!(ended.status, InboxStatus::Resolved);
+    assert_eq!(ended.ended_ms, completed.ended_ms);
+
+    e.configure(pinned, &[Step::Exit(2)]);
+    let mut run = Vec::new();
+    for _ in 0..3 {
+        let (code, doc) = e.arbiter_run();
+        assert_eq!(code, Some(0), "{doc}");
+        run.push(pass_of(&doc));
+    }
+    let second = failing_key(&run[0]);
+    assert_eq!(failing_keys(&e), [key, second.clone()]);
+    assert_eq!(e.item(&second).status, InboxStatus::Open);
 }
