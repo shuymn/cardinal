@@ -122,7 +122,7 @@ mod tests {
         let env = super::super::git_env(std::env::vars_os());
         let args: [std::ffi::OsString; 3] = ["-n", "31", "127.0.0.1"].map(Into::into);
         for assigned in [false, true] {
-            let command = super::super::command("ping".as_ref(), &args, &env, scope.root());
+            let command = super::super::command("ping".as_ref(), None, &args, &env, scope.root());
             let mut started = None;
             let err = spawn_with(command, |job, child| {
                 started = crate::os::start_time_s(child.id()).map(|s| (child.id(), s));

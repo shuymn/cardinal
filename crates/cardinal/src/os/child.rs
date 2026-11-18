@@ -238,10 +238,54 @@ enum Stream {
     Failed(std::io::Error),
 }
 
-/// The command that runs `program` with `args` and exactly `env` in `cwd`, stdin closed,
+/// Where the child's `execvp` would find `program`, a name without a `/`, when that is known
+/// without trying it: the first directory of the `PATH` in `env` that holds an executable
+/// regular file of that name, every directory before it absolute and without the name
+/// (`ENOENT` or `ENOTDIR`). `None`, which leaves the name to `execvp`, when `program` has a
+/// `/`, `env` has no `PATH`, no directory holds such a file, or a directory up to the file is
+/// empty or relative (taken in the child's working directory), ends in `/` (to which `execvp`
+/// adds another, as a script then sees in `$0`), or answers anything else: a
+/// name `exec` refuses (`EACCES`, which `execvp` passes over to the next directory), a loop of
+/// symbolic links (which glibc's `execvp` stops at and Apple's passes over), or another error.
+///
+/// A child started by such a path is spawned with `posix_spawn`. Started by a name that the
+/// `PATH` of its own environment must resolve, std forks this process instead, and the forks
+/// of a process with many threads and much memory, as an observation running git for several
+/// worktrees at a time is, are slow and wait for each other in the kernel (section 8.1).
+#[cfg(unix)]
+fn on_path(program: &OsStr, env: &[(OsString, OsString)]) -> Option<std::path::PathBuf> {
+    use rustix::fs::{Access, FileType};
+    use rustix::io::Errno;
+    use std::os::unix::ffi::OsStrExt;
+
+    if program.is_empty() || program.as_bytes().contains(&b'/') {
+        return None;
+    }
+    for dir in std::env::split_paths(lookup(env, "PATH")?) {
+        if !dir.is_absolute() || dir.as_os_str().as_bytes().ends_with(b"/") {
+            return None;
+        }
+        let candidate = dir.join(program);
+        match rustix::fs::stat(&candidate) {
+            Err(Errno::NOENT | Errno::NOTDIR) => {}
+            Ok(st)
+                if FileType::from_raw_mode(st.st_mode) == FileType::RegularFile
+                    && rustix::fs::access(&candidate, Access::EXEC_OK).is_ok() =>
+            {
+                return Some(candidate);
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// The command that runs `program`, found at `found` when that is given (with `program` as its
+/// `argv[0]`, as `execvp` passes it), with `args` and exactly `env` in `cwd`, stdin closed,
 /// stdout and stderr piped.
 fn command(
     program: &OsStr,
+    found: Option<&Path>,
     args: &[OsString],
     env: &[(OsString, OsString)],
     cwd: &Path,
@@ -250,7 +294,11 @@ fn command(
         clippy::disallowed_methods,
         reason = "os::child's spawn site: a bounded child in a constructed environment"
     )]
-    let mut command = Command::new(program);
+    let mut command = Command::new(found.map_or(program, Path::as_os_str));
+    #[cfg(unix)]
+    if found.is_some() {
+        std::os::unix::process::CommandExt::arg0(&mut command, program);
+    }
     command
         .args(args)
         .env_clear()
@@ -468,10 +516,31 @@ fn run_guarded(
         program: name(),
         source,
     })?;
-    let command = command(program, args, env, cwd);
+    #[cfg(unix)]
+    let found = on_path(program, env);
+    #[cfg(not(unix))]
+    let found: Option<std::path::PathBuf> = None;
     #[cfg(unix)]
     let mut live = live();
-    let mut child = spawn(command).map_err(|source| ChildError::Spawn {
+    // Nothing starts once the deadline has passed, which the lookup and the wait for `LIVE`
+    // can reach. The lookup has no deadline of its own, as `execvp`'s had none.
+    let past = || Instant::now() >= limits.deadline;
+    if past() {
+        return Err(ChildError::Timeout { program: name() });
+    }
+    let started = match &found {
+        // What `execvp` does beyond finding the file (`sh` running a script without a `#!`
+        // line, the next directory tried when an `exec` fails) is left to it: the name is
+        // started again the way it was before it was looked up, unless the deadline has
+        // passed meanwhile.
+        Some(path) => match spawn(command(program, Some(path), args, env, cwd)) {
+            Err(_) if past() => return Err(ChildError::Timeout { program: name() }),
+            Err(_) => spawn(command(program, None, args, env, cwd)),
+            started => started,
+        },
+        None => spawn(command(program, None, args, env, cwd)),
+    };
+    let mut child = started.map_err(|source| ChildError::Spawn {
         program: name(),
         source,
     })?;
@@ -629,6 +698,191 @@ mod tests {
         ] {
             assert!(names.contains(&present), "{present} missing: {names:?}");
         }
+    }
+
+    /// `scope`'s environment with `PATH` set to `dirs`.
+    #[cfg(unix)]
+    fn with_path(scope: &Scope, dirs: &[std::path::PathBuf]) -> Vec<(OsString, OsString)> {
+        let mut env = scope.env();
+        env.retain(|(name, _)| name != "PATH");
+        env.push(("PATH".into(), std::env::join_paths(dirs).unwrap()));
+        env
+    }
+
+    /// The child's standard output, trimmed.
+    #[cfg(unix)]
+    fn text(out: &super::Output) -> String {
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    }
+
+    /// Writes `body` to `<dir>/tool` in `scope` with the permission bits `mode`.
+    #[cfg(unix)]
+    fn tool(scope: &Scope, dir: &str, body: &str, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        let path = scope.path(dir).join("tool");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// A program named without a path runs from where the child's `execvp` would find it: the
+    /// first directory of the child's `PATH` holding an executable file of that name, a file
+    /// without the execute permission and a directory of that name passed over, and an empty
+    /// directory standing for the child's working directory.
+    #[cfg(unix)]
+    #[test]
+    fn a_name_runs_from_the_first_match_on_the_childs_path() {
+        let scope = Scope::new();
+        tool(&scope, "plain", "#!/bin/sh\necho plain\n", 0o644);
+        std::fs::create_dir_all(scope.path("dir/tool")).unwrap();
+        tool(&scope, "first", "#!/bin/sh\necho \"$0\"\n", 0o755);
+        tool(&scope, "second", "#!/bin/sh\necho second\n", 0o755);
+        tool(&scope, "cwd", "#!/bin/sh\necho cwd\n", 0o755);
+        let dirs = ["missing", "plain", "dir", "first", "second"].map(|d| scope.path(d));
+        let limits = || limits(Duration::from_secs(10), 1024);
+        let out = run(
+            "tool",
+            &[],
+            &with_path(&scope, &dirs),
+            scope.root(),
+            limits(),
+        )
+        .unwrap();
+        assert_eq!(text(&out), scope.path("first/tool").display().to_string());
+        let dirs = [std::path::PathBuf::new(), scope.path("second")];
+        let out = run(
+            "tool",
+            &[],
+            &with_path(&scope, &dirs),
+            &scope.path("cwd"),
+            limits(),
+        );
+        assert_eq!(text(&out.unwrap()), "cwd");
+    }
+
+    /// What `execvp` does beyond finding the file still happens: a script without a `#!` line
+    /// is run by `sh`.
+    #[cfg(unix)]
+    #[test]
+    fn a_found_script_without_an_interpreter_line_runs_in_sh() {
+        let scope = Scope::new();
+        tool(&scope, "bin", "echo \"run by sh\"\n", 0o755);
+        let env = with_path(&scope, &[scope.path("bin")]);
+        let out = run(
+            "tool",
+            &[],
+            &env,
+            scope.root(),
+            limits(Duration::from_secs(10), 1024),
+        )
+        .unwrap();
+        assert_eq!(text(&out), "run by sh");
+    }
+
+    /// A name is taken from the child's `PATH` only where `execvp` would surely find the same
+    /// file: every directory up to it absolute and without the name. A relative or empty
+    /// directory, a file `exec` refuses, a directory of that name, a directory that cannot be
+    /// searched, or a loop of symbolic links on the way leaves the name to `execvp`.
+    #[cfg(unix)]
+    #[test]
+    fn a_name_is_taken_from_the_path_only_where_execvp_would_surely_find_it() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::path::PathBuf;
+
+        let scope = Scope::new();
+        tool(&scope, "bin", "#!/bin/sh\n", 0o755);
+        tool(&scope, "plain", "#!/bin/sh\n", 0o644);
+        tool(&scope, "locked", "#!/bin/sh\n", 0o755);
+        std::fs::create_dir_all(scope.path("dir/tool")).unwrap();
+        std::fs::write(scope.path("file"), b"").unwrap();
+        std::os::unix::fs::symlink("loop", scope.path("loop")).unwrap();
+        let bin = scope.path("bin");
+        let found = |before: PathBuf| {
+            super::on_path("tool".as_ref(), &with_path(&scope, &[before, bin.clone()]))
+        };
+        assert_eq!(found(scope.path("missing")), Some(bin.join("tool")));
+        assert_eq!(found(scope.path("file")), Some(bin.join("tool")));
+        let taken: Vec<_> = [
+            PathBuf::from("bin"),
+            PathBuf::new(),
+            scope.path("plain"),
+            scope.path("dir"),
+            scope.path("loop"),
+        ]
+        .into_iter()
+        .filter_map(|before| Some((found(before.clone())?, before)))
+        .collect();
+        assert_eq!(taken, []);
+        let locked = scope.path("locked");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let through_locked = found(locked.clone());
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Root searches any directory, and so does its `execvp`.
+        let searchable = rustix::process::geteuid().is_root();
+        assert_eq!(through_locked, searchable.then(|| locked.join("tool")));
+    }
+
+    /// A directory of the child's `PATH` that ends in `/` is left to `execvp`, which joins it to
+    /// the name with another `/`: the path a script sees as `$0` keeps both.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_ending_in_a_slash_is_left_to_execvp() {
+        let scope = Scope::new();
+        tool(&scope, "bin", "#!/bin/sh\necho \"$0\"\n", 0o755);
+        let mut dir = scope.path("bin").into_os_string();
+        dir.push("/");
+        let env = with_path(&scope, &[dir.into()]);
+        let out = run(
+            "tool",
+            &[],
+            &env,
+            scope.root(),
+            limits(Duration::from_secs(10), 1024),
+        )
+        .unwrap();
+        let doubled = format!("{}//tool", scope.path("bin").display());
+        assert_eq!(text(&out), doubled);
+    }
+
+    /// A found file that fails to start is started again by name, so `execvp` goes on to the
+    /// next directory, but not once the deadline has passed: that run ends as a timeout.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_start_by_path_is_retried_by_name_only_before_the_deadline() {
+        let scope = Scope::new();
+        tool(&scope, "broken", "#!/nonexistent/interpreter\n", 0o755);
+        tool(&scope, "next", "#!/bin/sh\necho next\n", 0o755);
+        let env = with_path(&scope, &[scope.path("broken"), scope.path("next")]);
+        let out = run(
+            "tool",
+            &[],
+            &env,
+            scope.root(),
+            limits(Duration::from_secs(10), 1024),
+        )
+        .unwrap();
+        assert_eq!(text(&out), "next");
+        // Started again by name, it would fail to start: its `execvp` finds nothing else.
+        let env = with_path(&scope, &[scope.path("broken")]);
+        let passed = Limits {
+            deadline: Instant::now(),
+            max_output: 1024,
+        };
+        let err = run("tool", &[], &env, scope.root(), passed).unwrap_err();
+        assert!(matches!(err, ChildError::Timeout { .. }), "{err}");
+    }
+
+    /// A run whose deadline has passed by the time it would start the child starts nothing
+    /// and ends as a timeout: a program that cannot be started is not even tried.
+    #[test]
+    fn a_run_past_its_deadline_starts_nothing() {
+        let scope = Scope::new();
+        let passed = Limits {
+            deadline: Instant::now(),
+            max_output: 1024,
+        };
+        let err = run("cardinal-no-such-program", &[], &[], scope.root(), passed).unwrap_err();
+        assert!(matches!(err, ChildError::Timeout { .. }), "{err}");
     }
 
     #[test]
