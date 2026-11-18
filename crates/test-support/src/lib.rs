@@ -17,4 +17,8 @@ pub mod process;
 pub mod pty;
 mod scope;
 
+#[cfg(target_os = "linux")]
+pub use scope::TMPFS_VAR;
 pub use scope::{Child, Command, RUN_MARKER, Scope};
+#[cfg(target_os = "macos")]
+pub use scope::{IMAGE_VAR, Image};

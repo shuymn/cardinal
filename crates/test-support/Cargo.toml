@@ -23,10 +23,11 @@ rustix = { workspace = true, features = ["pty"] }
 
 # pidfd polling for the process sweep (src/bin/run-processes.rs); `close_range` for a child's
 # descriptors (src/scope.rs), which rustix does not offer; namespaces and bind mounts for
-# children in a mount namespace of their own (src/scope/mount.rs).
+# children in a mount namespace of their own (src/scope/mount.rs); `statfs` of the harness's
+# tmpfs volume (src/scope/tmpfs.rs).
 [target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true
-rustix = { workspace = true, features = ["event", "mount", "thread"] }
+rustix = { workspace = true, features = ["event", "fs", "mount", "thread"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc.workspace = true
