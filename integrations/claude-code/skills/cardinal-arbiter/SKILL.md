@@ -29,8 +29,8 @@ In phase 0, `act` only reports: it evaluates a plan and returns `dry_run` when i
 
 | Kind and evidence | Decision |
 | --- | --- |
-| `recovery_needed`, `verified: true` | Leave open. The recovery pass stops the group, and cardinal resolves the item itself once the reservation is gone |
-| `recovery_needed`, `verified: false` | Escalate: the owner decides about the listed group members, which cardinal never signals while unverified. Note the job ID and each member's PID and name |
+| `recovery_needed`, `verified: true` | Leave open. cardinal never signals the group; once its members have all exited, the recovery pass releases the reservation and cardinal resolves the item itself |
+| `recovery_needed`, `verified: false` | Escalate: the owner decides about the listed group members, which cardinal never signals. Note the job ID and each member's PID and name |
 | `outlived_processes` | Escalate: the owner decides whether the processes may keep running. Note the session ID and each process's PID, name, and command |
 | Any item whose evidence shows nothing left to decide (the reservation or the processes are gone) | Resolve, noting what you saw |
 | Any item you cannot decide from its evidence | Escalate with what is unknown |
