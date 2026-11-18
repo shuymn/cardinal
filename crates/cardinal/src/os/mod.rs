@@ -227,6 +227,13 @@ fn exited(_pid: u32) -> bool {
     false
 }
 
+/// The file index and the link count of the entry at `path` (Windows), not following a final
+/// reparse point.
+#[cfg(windows)]
+pub fn file_links(path: &Path) -> std::io::Result<(u64, u64)> {
+    windows::file_links(path)
+}
+
 /// Reads one process. `None` if it does not exist or cannot be read.
 #[must_use]
 pub fn process(pid: u32, detail: Detail) -> Option<ProcessInfo> {

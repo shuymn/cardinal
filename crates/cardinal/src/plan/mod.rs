@@ -273,7 +273,7 @@ fn build(
             root_created_ms,
         },
         allocated_bytes: walked.as_ref().ok().map(Walk::allocated),
-        aliased_bytes: walked.as_ref().ok().and_then(Walk::aliased),
+        aliased_bytes: walked.as_ref().ok().map(Walk::aliased),
         invariants_ok: invariants_ok(&checks),
         approval: approval(&checks),
         checks,

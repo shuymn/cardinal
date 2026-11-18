@@ -27,7 +27,8 @@ pub struct Entry {
     /// The path relative to the worktree root (empty for the worktree root itself).
     pub rel: PathBuf,
     pub kind: EntryKind,
-    /// Device and inode on Unix; 0 on Windows.
+    /// Device and inode on Unix. On Windows the device is 0, and the inode is a regular file's
+    /// file index (0 for other entries).
     pub dev: u64,
     pub ino: u64,
     pub size: u64,
@@ -35,7 +36,8 @@ pub struct Entry {
     pub mtime_ns: i128,
     /// Bytes allocated on disk: blocks × 512 on Unix, the length on Windows.
     pub allocated: u64,
-    /// The number of names the entry has, here and elsewhere (1 on Windows).
+    /// The number of names the entry has, here and elsewhere (on Windows read for regular
+    /// files, 1 for other entries).
     pub nlink: u64,
 }
 
@@ -184,10 +186,10 @@ impl Walk {
 
     /// The part of [`Walk::allocated`] held by files with names outside the target (a link
     /// count above the names the walk found), which removing the target does not free
-    /// (section 8.5); `None` on Windows, where link counts are not read.
+    /// (section 8.5).
     #[must_use]
-    pub fn aliased(&self) -> Option<u64> {
-        cfg!(unix).then(|| self.sizes().aliased)
+    pub fn aliased(&self) -> u64 {
+        self.sizes().aliased
     }
 
     /// The bytes of the regular files with no name outside the target, each counted once:
@@ -242,6 +244,23 @@ struct Sizes {
     own_files: u64,
 }
 
+/// An entry read from `path` without following a final symbolic link. On Windows a regular
+/// file's file index and link count are read too (`os::file_links`), which `std` metadata
+/// leaves out, so a file with several names is told apart as on Unix.
+fn lstat(rel: PathBuf, path: &Path) -> io::Result<Entry> {
+    let entry = Entry::from_metadata(rel, &std::fs::symlink_metadata(path)?);
+    #[cfg(windows)]
+    if entry.kind == EntryKind::File {
+        let (ino, nlink) = crate::os::file_links(path)?;
+        return Ok(Entry {
+            ino,
+            nlink,
+            ..entry
+        });
+    }
+    Ok(entry)
+}
+
 /// Walks `target`, which is `worktree` or a path inside it, without following symbolic links
 /// or entering another device or mount. Plans use it; `act` uses its own descriptor-based
 /// snapshot on Unix and this walk on Windows. Mounts are told by [`mount_id`], as `act` tells
@@ -270,7 +289,7 @@ pub fn walk(worktree: &Path, target: &Path) -> io::Result<Walk> {
     }
     let parent = target.parent().unwrap_or(target);
     let parent_dev = Entry::from_metadata(PathBuf::new(), &std::fs::symlink_metadata(parent)?).dev;
-    let root = Entry::from_metadata(rel, &std::fs::symlink_metadata(target)?);
+    let root = lstat(rel, target)?;
     let root_mount = mount_id(target);
     let mut mount = Mount::between(parent_dev, root.dev, &mount_id(parent), &root_mount);
     let mut entries = Vec::new();
@@ -459,8 +478,8 @@ impl Listing {
             // entry's attributes in its parent directory's index (`FindNextFileW`), which NTFS
             // updates lazily, so a directory's mtime there can predate an entry created below
             // it.
-            match std::fs::symlink_metadata(&path) {
-                Ok(meta) => entries.push(Entry::from_metadata(rel.join(name), &meta)),
+            match lstat(rel.join(&name), &path) {
+                Ok(entry) => entries.push(entry),
                 Err(err) if err.kind() == io::ErrorKind::NotFound => {}
                 Err(err) => return Err(err),
             }
@@ -518,7 +537,6 @@ mod tests {
     /// A file with a name outside the target is aliased and none of the target's own files;
     /// a file whose names are all inside counts once among them; directories count in
     /// neither.
-    #[cfg(unix)]
     #[test]
     fn own_file_bytes_leave_out_aliased_files_and_directories() {
         let tmp = tempfile::tempdir().unwrap();
@@ -534,15 +552,12 @@ mod tests {
         std::fs::hard_link(wt.join("outside"), wt.join("only/pkg/linked")).unwrap();
         let size = |rel: &str| {
             let walk = super::walk(&wt, &wt.join(rel)).unwrap();
-            (
-                walk.own_file_bytes(),
-                walk.aliased().unwrap(),
-                walk.allocated(),
-            )
+            (walk.own_file_bytes(), walk.aliased(), walk.allocated())
         };
-        let file =
-            std::os::unix::fs::MetadataExt::blocks(&std::fs::metadata(wt.join("outside")).unwrap())
-                * 512;
+        let file = super::walk(&wt, &wt.join("outside"))
+            .unwrap()
+            .root
+            .allocated;
         let (own, aliased, allocated) = size("t");
         assert_eq!((own, aliased), (2 * file, file));
         assert!(allocated >= 3 * file, "{allocated}");
@@ -568,10 +583,9 @@ mod tests {
             .collect();
         assert_eq!(rels, expected);
         for entry in &walk.entries {
-            let meta = std::fs::symlink_metadata(wt.join(&entry.rel)).unwrap();
             assert_eq!(
                 *entry,
-                super::Entry::from_metadata(entry.rel.clone(), &meta),
+                super::lstat(entry.rel.clone(), &wt.join(&entry.rel)).unwrap(),
                 "recorded from lstat"
             );
         }
