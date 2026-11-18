@@ -703,6 +703,8 @@ Each `!` entry from `git status` is classified with the profile's `[data]` patte
 3. else `regenerable` if the entry is, or is inside, a regenerable match (a regenerable pattern with `/` is worktree-relative);
 4. else `unclassifiable`, also when the walk could not read part of the entry.
 
+An entry that matches a regenerable pattern keeps that match (`regenerable_match`) whatever its class, so a `target/` holding `fuzz/corpus` is `protected` and still gets a plan, which its failing check keeps ineligible and names (section 9.2), and which the disk report counts as blocked (section 10.4).
+
 Walks never follow symbolic links and never cross into a directory that contains its own `.git` entry.
 
 ### 8.4 Managed worktrees
@@ -724,7 +726,7 @@ A worktree is managed by another app when its path is under a `[observe] managed
 | Kind | Target |
 | --- | --- |
 | `reclaim_worktree` | A linked worktree (never a main worktree) |
-| `reclaim_dir` | A regenerable ignored entry inside an observed worktree |
+| `reclaim_dir` | An ignored entry inside an observed worktree that matches a regenerable pattern (section 8.3) |
 
 Phase 1 executes neither: `act` evaluates a plan and reports it (section 9.3), and section 9.7 lists what executing either kind requires. Caches outside worktrees (the pnpm store, sccache), process stops for outlived processes, and branch deletion are not plan kinds. A recovery-needed reservation is never released by a plan; it is released only when its group is empty (section 4.5).
 
@@ -741,14 +743,14 @@ Each plan carries a list of checks. An **invariant** failing or being `unknown` 
 | `no_unpushed` | `reclaim_worktree` | invariant | `unpushed` is `no` |
 | `no_open_pr` | `reclaim_worktree` | invariant | `open_pr` is `no` |
 | `has_upstream` | `reclaim_worktree` | invariant | The branch has an upstream (G6). This also keeps freshly created worktrees, which start clean at the base, from being reclaimed before their first push |
-| `regenerable` | `reclaim_dir` | invariant | The target is a `regenerable` ignored entry of a worktree that observation listed |
+| `regenerable` | `reclaim_dir` | invariant | The target is an ignored entry of a worktree that observation listed and matches a regenerable pattern; whether everything in it is regenerable is for `no_protected`, `no_unclassifiable`, and `no_nested_repository` |
 | `plain_target` | both | invariant | The target is not a symbolic link, not a mount point, and on the same device and mount as its parent, and no directory below it is on another device or mount, so the walk classified and measured all of it. A bind mount on the same device counts as a mount point: the mount is told by its mount ID (`statx`) on Linux and by the path it is mounted on (`statfs`) on macOS; a mount that cannot be read is `unknown`. `plan`'s walk and `act`'s snapshot read mounts the same way (`os::mount`), for the target and every directory they would enter, and list a directory only after its mount is read. On Windows a folder a volume is mounted on is a reparse point, which both treat as a symbolic link |
 | `no_protected` | both | invariant | Nothing in the target, descendants included, is protected |
 | `no_unclassifiable` | both | invariant | Nothing in the target is unclassifiable ignored data |
 | `no_nested_repository` | both | invariant | No directory below the target's root has its own `.git` entry (another worktree, a submodule, a nested clone) |
 | `merge_evidence` | `reclaim_worktree` | condition | `base_ancestor` or `merged_pr` is `yes`, or the caller passed `--squash-merged` and `content_in_base` is `yes` (section 9.3) |
 
-`plan` evaluates every check on the target; `act` evaluates them again at run time, walking the whole target (section 9.5). Plans are created even when invariants fail, with `invariants_ok: false`, so the arbiter sees the reason and an `act` on them demonstrates the refusal (G10). A `merge_evidence` that fails while `content_in_base` is `yes` says so in its detail and facts, which is how the arbiter finds the plans it may judge.
+Bulk `cardinal plan` and step 5 of a `reconcile` pass make a plan for every linked worktree that observation lists and for every ignored entry of every worktree that matches a regenerable pattern, whether or not its checks pass: a failing plan carries its reason (G6, G7, G10), and a worktree without merge evidence has the plan `merge_undecided` needs (G8). `plan` evaluates every check on the target; `act` evaluates them again at run time, walking the whole target (section 9.5). Plans are created even when invariants fail, with `invariants_ok: false`, so the arbiter sees the reason and an `act` on them demonstrates the refusal (G10). A `merge_evidence` that fails while `content_in_base` is `yes` says so in its detail and facts, which is how the arbiter finds the plans it may judge.
 
 `plan`'s walk records the target and every entry below it, parents before children in name order, without following symbolic links, with one directory open at a time. A directory whose recorded device is another than the target's is recorded and never listed. Otherwise the walk reads the directory's mount by path: on Linux by `statx` of the path, which does not open the directory, and on macOS by opening it (`O_NOFOLLOW`) for `fstatfs`, which identifies it without reading any of its entries. A directory on another mount than the target is recorded and never listed; such a directory, or one on another device, fails `plain_target`. To list a directory, the target included, the walk opens it with `O_DIRECTORY | O_NOFOLLOW` and lists it only when that descriptor has the `dev` and `ino` the walk recorded for the directory and the target's mount, read from the descriptor (`statx` with `AT_EMPTY_PATH` on Linux, `fstatfs` on macOS); it then lists through that descriptor and reads each entry's metadata relative to it (`fstatat` without following links). Every directory the walk lists is therefore the one it recorded, on the target's mount, and every entry below the target is read from a directory so listed: a directory replaced by a symbolic link, by another directory, or by a mount after the walk recorded it is not listed. A target that fails this is reported as a mount boundary, which fails `plain_target`; a directory below the target that fails it stays recorded as the walk saw it, with nothing below it. An entry removed before the walk reads its metadata is left out, and a directory removed after that stays recorded as the walk saw it, with nothing below it. The target itself is reached by path, so a directory above it replaced after the walk checked the path for symbolic links is not detected by the walk; `act` reaches the target through descriptors from the worktree root (section 9.5). On Windows the walk lists by path.
 
@@ -899,7 +901,7 @@ Watched volumes are the mounts of the state dir and of each worktree in the last
 
 A volume in `warning` or `critical` is **under pressure**: the pass observes and `disk-reclaim` runs in both, so falling below the critical line never stops the report. Leaving `ok` raises `disk_low` for the episode and each entry into `critical` raises `disk_critical`, both at step 6 of the pass, after `disk-reclaim`, with the pass's final reading, the targets `disk-reclaim` would reclaim with their exclusive bytes, and the bytes it found blocked; every later pass under pressure updates that evidence. `disk_critical` ends when the volume leaves `critical` and `disk_low` when it is back to `ok`, so a volume that has recovered is never shown as critical. Both go to the owner directly (section 10.1). Stopping heavy jobs below the critical line is admission's, phase 2.
 
-**`disk-reclaim`** (C10) is built in and unit-shaped: it calls `act` as `unit:disk-reclaim`, so its runs are `planned` records while `[unit.disk-reclaim] act` is false, the default, and `act` records otherwise; in phase 1 both report (section 9.3). For a volume under pressure it takes the `reclaim_dir` plans of step 5 of the pass whose targets are on that volume and that pass every check without approval (`invariants_ok`, `approval: "none"`), in design §7's reclamation order after its first tier, which is whole worktrees and waits for their execution (section 17 item 17): worktrees by `last_activity_ms`, oldest first, and within a worktree the most exclusive bytes first (`allocated_bytes` less `aliased_bytes`, section 8.5); a target whose bytes are all aliased frees nothing and is skipped. It runs `act` on them in that order until their exclusive bytes would lift the volume above the recovery line, so its records name what reclamation would delete, and in which order. Data in use and protected data are skipped because their plans fail `not_in_use` or `no_protected`; the regenerable bytes on the volume whose plans failed are reported per check, with the aliased bytes, in `reconcile`'s `blocked` and the `disk_low` evidence, so the owner sees how much space is held and by what. Caches outside worktrees and old toolchain outputs have no plan kind yet.
+**`disk-reclaim`** (C10) is built in and unit-shaped: it calls `act` as `unit:disk-reclaim`, so its runs are `planned` records while `[unit.disk-reclaim] act` is false, the default, and `act` records otherwise; in phase 1 both report (section 9.3). For a volume under pressure it takes the `reclaim_dir` plans of step 5 of the pass whose targets are on that volume and that pass every check without approval (`invariants_ok`, `approval: "none"`), in design §7's reclamation order after its first tier, which is whole worktrees and waits for their execution (section 17 item 17): worktrees by `last_activity_ms`, oldest first, and within a worktree the most exclusive bytes first (`allocated_bytes` less `aliased_bytes`, section 8.5); a target whose bytes are all aliased frees nothing and is skipped. It runs `act` on them in that order until their exclusive bytes would lift the volume above the recovery line, so its records name what reclamation would delete, and in which order. Data in use and protected data are skipped because their plans fail `not_in_use` or `no_protected`; the bytes of entries on the volume that match a regenerable pattern but whose plans failed are reported under their first failed check, with the aliased bytes, in `reconcile`'s `blocked` and the `disk_low` evidence, so the owner sees how much space is held and by what. Caches outside worktrees and old toolchain outputs have no plan kind yet.
 
 **One order.** Only `disk-reclaim` evaluates `reclaim_dir` plans for disk pressure. The arbiter never acts on them on its own (section 14.3): a live worktree's regenerable data is reclaimable only when its volume is under pressure, in the order above, because outside pressure no goal needs it gone and each deletion costs a reinstall or a rebuild.
 
@@ -966,7 +968,7 @@ Phase 1 builds A, which needs no account and no decision, and B once the Cloudfl
 | `cardinal inventory [--repo PATH]... [--sizes]` | `cardinal.inventory.v1` |
 | `cardinal inbox [--status open\|escalated\|resolved\|dismissed\|all] [--assigned] [--no-refresh]` | `cardinal.inbox.v1`; `--assigned`: the open and escalated items assigned to the pass `CARDINAL_ARBITER_PASS` names (section 10.5) |
 | `cardinal inbox resolve KEY --outcome resolved\|escalated\|dismissed [--note TEXT] [--assigned]` | `cardinal.inbox-item.v1`; with `--assigned`, an item not assigned to the pass `CARDINAL_ARBITER_PASS` names, or any item once that pass has ended, is refused (`not_assigned`) and left unchanged |
-| `cardinal plan [--repo PATH]...` | `cardinal.plan-list.v1`: plans for every whole-worktree candidate and every regenerable entry of every worktree (section 9.1) |
+| `cardinal plan [--repo PATH]...` | `cardinal.plan-list.v1`: plans for every linked worktree and every ignored entry matching a regenerable pattern, failing ones included (section 9.2) |
 | `cardinal plan reclaim-worktree PATH \| reclaim-dir PATH` | `cardinal.plan.v1` |
 | `cardinal act PLAN [--dry-run] [--owner-approved] [--squash-merged] [--caller arbiter\|owner\|unit:NAME]` | `cardinal.act-result.v1` (default caller `arbiter`) |
 | `cardinal reconcile [--trigger timer\|job-end\|manual]` | `cardinal.reconcile.v1` (section 10.3) |
@@ -1047,7 +1049,7 @@ type Worktree = {
            content_in_base: Tri; content_diff: string[];   // "unknown" unless merge_evidence is "none"
            closed_pr: null | { number: number; url: string };
            in_use: { value: boolean; jobs: string[] } };
-  ignored: { path: string; class: "regenerable" | "protected" | "unclassifiable" | "nested_repository";
+  ignored: { path: string; class: "regenerable" | "protected" | "unclassifiable" | "nested_repository"; regenerable_match: boolean;
              allocated_bytes: number | null; aliased_bytes: number | null }[];
   reclaim: { candidate: boolean; failed: string[]; unknown: string[] };  // check names
   allocated_bytes: number | null };
@@ -1126,7 +1128,7 @@ type DiskState = { schema; volume: string; mount: string;
 { schema; trigger: "timer" | "job-end" | "manual"; skipped: null | "busy";
   disk: DiskState[]; observed: boolean;
   reclaimable: { plan_id: string; target: string; status: string; freed_bytes: number | null }[];  // disk-reclaim's acts, in order
-  blocked: { volume: string; check: string; bytes: number }[];  // regenerable bytes under pressure left by a failed check, or "aliased"
+  blocked: { volume: string; check: string; bytes: number }[];  // bytes matching a regenerable pattern, by first failed check, or "aliased"
   inbox: { raised: string[]; cleared: string[] };
   arbiter: "started" | "running" | "not_needed" | "interval";
   errors: { scope: string; message: string }[] }
@@ -1346,8 +1348,8 @@ Every file a unit changes has one owner at a time; a file F1 touches passes to t
 | `Cargo.toml`, `Cargo.lock` | The dependency of section 12 (`objc2-core-foundation`) | A unit that needs another dependency adds it in its own PR and says so |
 | `src/contract/`, `src/config/`, `src/state/mod.rs`, `src/cli/mod.rs`, `src/testpoint.rs` | All of phase 1's additions | Nobody; a contract change found later is a follow-up F PR |
 | `src/os/mod.rs` | The entry points and their stubs | D: `src/os/disk.rs` and `src/os/detached.rs` |
-| `src/plan/mod.rs` | The `PlanTarget` producer | D |
-| `src/plan/checks.rs`, `src/plan/walk.rs` | The merge-evidence check moved out | D: `not_in_use` over the whole worktree, `plain_target`'s mount reads |
+| `src/plan/mod.rs` | The `PlanTarget` producer | D: plans for every linked worktree and every entry matching a regenerable pattern (section 9.2), where phase 0's producer plans a whole worktree only when it is a candidate |
+| `src/plan/checks.rs`, `src/plan/walk.rs` | The merge-evidence check moved out | D: `not_in_use` over the whole worktree, `plain_target`'s mount reads, `regenerable` as a pattern match |
 | `src/plan/merge.rs` | Moved, unchanged | D: `--squash-merged` with `content_in_base` |
 | `src/act/` | `ActResult`, `ActOptions` | D: `execution_not_designed` |
 | `src/observe/` | The new facts as `unknown` and `null`; filter drivers disabled (section 8.1) | D |
@@ -1419,7 +1421,7 @@ Real-host checks run on macOS with Claude Code and the hook installed as in sect
 
 ## 16. Plan layer
 
-Claims from design §11 that phases 0 and 1 implement, restated, plus new claims A1–A23. EARS, one line each; test names in files that phase 1 adds are planned (section 14.2).
+Claims from design §11 that phases 0 and 1 implement, restated, plus new claims A1–A24. EARS, one line each; test names in files that phase 1 adds are planned (section 14.2).
 
 | ID | Claim (EARS) | Source | Test |
 | --- | --- | --- | --- |
@@ -1462,6 +1464,7 @@ Claims from design §11 that phases 0 and 1 implement, restated, plus new claims
 | A21 | The web UI page shall be written from the state cardinal already holds, without git, gh, or network calls, and shall open with no network. | design §12 | `ui::*` |
 | A22 | When observation finds unclassifiable ignored data in a worktree, or cannot read part of its ignored data, `reconcile` shall raise one item per worktree, set of entries, and occurrence, with the paths and the observation errors, and end it when the worktree is gone or its set has changed; a set found again after its occurrence ended shall raise a new item and leave the old one as it was. | design §7, G8 | `inbox_raisers::unclassifiable_data_once_per_set`, `inbox_raisers::unclassifiable_data_cleared`, `inbox_raisers::unclassifiable_data_superseded`, `inbox_raisers::unclassifiable_data_set_returns` (sets A, B, A: three items, a dismissal of the first kept) |
 | A23 | When a `reconcile` pass finds a watched volume under pressure, it shall write that volume's disk items with the pass's final reading, the targets `disk-reclaim` would reclaim, and the blocked bytes before it runs the arbiter trigger or writes the page; disk items shall go to the owner and start no arbiter pass, and `disk_critical` shall end when the volume leaves `critical`. | G2, G8 | `reconcile::disk_items_complete_before_the_trigger`, `arbiter_launch::disk_items_start_no_pass`, `disk_state::critical_ends_above_the_critical_line` |
+| A24 | When `cardinal plan` runs without a target, or a `reconcile` pass builds its plans, it shall make a plan for every linked worktree and every ignored entry matching a regenerable pattern, whatever its checks find. | G6, G7, G8 | `plan_act::bulk_plans_every_worktree`, `plan_act::protected_target_dir_planned_and_refused` (refused by `no_protected` alone) |
 
 Out of scope for phases 0 and 1: C3 and C4 (phase 2, memory pressure and accepted jobs), C7 (phase 3, WSL), C11 (with executing reclamation, section 9.7), C21 (phase 2, measurement kinds).
 
