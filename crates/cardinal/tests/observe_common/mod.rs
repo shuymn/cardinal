@@ -23,6 +23,9 @@ use cardinal_test_support::fixture::Fixture;
 
 pub const GITHUB: &str = "acme/app";
 
+/// Disk lines below any free space (`docs/architecture.md` section 5.2).
+pub const QUIET_DISK: &str = "[disk]\nwarning_mib = 1\nrecovery_mib = 2\ncritical_mib = 0\n";
+
 pub struct Scene {
     pub fx: Fixture,
     pub repo: PathBuf,
@@ -231,10 +234,17 @@ exit "$code"
         .unwrap();
     }
 
-    /// Writes `host.toml` and loads the configuration.
+    /// Writes `host.toml` and loads the configuration. Without a `[disk]` table of the
+    /// test's own, the disk lines sit below any free space, so a runner's job-end check never
+    /// starts a `reconcile` pass.
     pub fn config(&self) -> Config {
+        let disk = if self.observe_extra.contains("[disk]") {
+            ""
+        } else {
+            QUIET_DISK
+        };
         let host = format!(
-            "[observe]\ngh = '{}'\ngh_timeout_ms = {}\ngit_timeout_ms = {}\n{}",
+            "{disk}[observe]\ngh = '{}'\ngh_timeout_ms = {}\ngit_timeout_ms = {}\n{}",
             self.gh_program().display(),
             self.gh_timeout_ms,
             self.git_timeout_ms,
