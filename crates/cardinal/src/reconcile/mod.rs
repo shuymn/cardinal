@@ -172,7 +172,7 @@ fn remove_temp_files(state: &StateDir) -> Result<(), Error> {
 
 /// Step 3: the inbox refresh of section 10.1, with the keys it raised and cleared.
 fn refresh_inbox(config: &Config, state: &StateDir) -> Result<InboxChanges, Error> {
-    inbox::refresh_with(config, state, &admission::recovery_pass).map(|()| InboxChanges::default())
+    inbox::refresh_with(config, state, &admission::recovery_pass)
 }
 
 /// Step 5: the full observation and its plans, when the last one is older than

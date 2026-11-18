@@ -8,8 +8,8 @@ mod observe_common;
 mod plan_support;
 mod support;
 
-use cardinal::contract::{DiskLevel, RecordKind};
-use disk_support::{Disk, MIB, own_errors, report};
+use cardinal::contract::{DiskLevel, InboxStatus, RecordKind};
+use disk_support::{Disk, MIB, carried_report, own_errors, report};
 
 const LINES: (u64, u64, u64) = (1, 2, 3);
 
@@ -128,7 +128,9 @@ fn first_reading_below_critical() {
 }
 
 /// `critical` ends only above the critical line, into `warning`, and pressure only above the
-/// recovery line; a reading on the critical line stays `critical`.
+/// recovery line; a reading on the critical line stays `critical`. Its items follow: cardinal
+/// ends `disk_critical` at the first pass above the critical line, while `disk_low` stays
+/// until the recovery line.
 #[test]
 fn critical_ends_above_the_critical_line() {
     let d = Disk::new(LINES);
@@ -142,21 +144,26 @@ fn critical_ends_above_the_critical_line() {
         Some(critical + 1),
         Some(3 * MIB + 1),
     ]);
+    let passes: Vec<_> = (0..4)
+        .map(|_| (levels(&d, 1)[0], d.disk_statuses()))
+        .collect();
+    let (open, resolved) = (Some(InboxStatus::Open), Some(InboxStatus::Resolved));
     assert_eq!(
-        levels(&d, 4),
+        passes,
         [
-            DiskLevel::Critical,
-            DiskLevel::Critical,
-            DiskLevel::Warning,
-            DiskLevel::Ok
+            (DiskLevel::Critical, (open, open)),
+            (DiskLevel::Critical, (open, open)),
+            (DiskLevel::Warning, (open, resolved)),
+            (DiskLevel::Ok, (resolved, resolved)),
         ]
     );
 }
 
 /// A16: a failed reading changes no state. When step 6's reading fails, step 4's is the
-/// pass's last successful one, and the report uses it; a pass whose readings all fail keeps
-/// the state and its time, reports nothing on the volume, and records the failure. The
-/// readings keep the failed read without sizes.
+/// pass's last successful one, and the report uses it, as does the `disk_low` item; a pass
+/// whose readings all fail keeps the state and its time, reports nothing on the volume,
+/// leaves the item as it was, and records the failure. The readings keep the failed read
+/// without sizes.
 #[test]
 fn failed_final_reading_keeps_the_state() {
     let d = Disk::new(LINES);
@@ -166,6 +173,10 @@ fn failed_final_reading_keeps_the_state() {
     assert_eq!(state.state, DiskLevel::Warning);
     assert_eq!(report(&first).reading.free_bytes, mib(15));
     assert_eq!(report(&first).reading.at_ms, state.readings[0].at_ms);
+    let items = d.disk_items();
+    assert_eq!(items.len(), 1, "{items:#?}");
+    assert_eq!(items[0].status, InboxStatus::Open);
+    assert_eq!(carried_report(&items[0]).as_ref(), Some(report(&first)));
     assert_eq!(state.readings[1].free_bytes, None);
     assert!(
         own_errors(&first)
@@ -181,6 +192,7 @@ fn failed_final_reading_keeps_the_state() {
     assert!(second.disk_reports.is_empty(), "{second:#?}");
     assert_eq!(second.disk[0].state, DiskLevel::Warning);
     assert_eq!(after.readings.len(), 4);
+    assert_eq!(d.disk_items(), items);
     assert!(after.readings[2..].iter().all(|r| r.free_bytes.is_none()));
     let failures: Vec<_> = d
         .records(RecordKind::DiskState)

@@ -12,7 +12,10 @@ use std::path::{Path, PathBuf};
 use std::process::Output;
 use std::time::{Duration, SystemTime};
 
-use cardinal::contract::{DiskReport, DiskState, Reconcile, Record, RecordKind};
+use cardinal::contract::{
+    DiskReport, DiskState, InboxItem, InboxKind, InboxStatus, Reconcile, Record, RecordKind,
+};
+use cardinal::inbox::StatusFilter;
 use cardinal_test_support::Command;
 
 use crate::plan_support::{RUN_LIMIT, Setup};
@@ -25,13 +28,7 @@ const TOTAL: u64 = 64 * MIB;
 
 /// Scopes of the pass's steps whose bodies other units write (`docs/architecture.md` section
 /// 14.2): their errors say nothing about the steps these tests check.
-const OTHER_UNITS: &[&str] = &[
-    "inbox_before",
-    "worktree_items",
-    "disk_items",
-    "arbiter",
-    "ui",
-];
+const OTHER_UNITS: &[&str] = &["arbiter", "ui"];
 
 pub struct Disk {
     pub s: Setup,
@@ -117,6 +114,31 @@ impl Disk {
         states.into_iter().next().unwrap()
     }
 
+    /// Every `disk_low` and `disk_critical` item, each occurrence its own, `disk_low` first.
+    pub fn disk_items(&self) -> Vec<InboxItem> {
+        let mut items: Vec<InboxItem> = cardinal::inbox::list(
+            &self.s.config(),
+            &self.s.state,
+            Some(StatusFilter::All),
+            false,
+        )
+        .unwrap()
+        .items
+        .into_iter()
+        .filter(|i| matches!(i.kind, InboxKind::DiskLow | InboxKind::DiskCritical))
+        .collect();
+        items.sort_by_key(|i| (i.kind == InboxKind::DiskCritical, i.created_ms));
+        items
+    }
+
+    /// The status of the latest `disk_low` and `disk_critical` occurrence, `None` for one
+    /// never raised.
+    pub fn disk_statuses(&self) -> (Option<InboxStatus>, Option<InboxStatus>) {
+        let items = self.disk_items();
+        let latest = |kind: InboxKind| items.iter().rfind(|i| i.kind == kind).map(|i| i.status);
+        (latest(InboxKind::DiskLow), latest(InboxKind::DiskCritical))
+    }
+
     pub fn records(&self, kind: RecordKind) -> Vec<Record> {
         cardinal::record::read_all(&self.s.state)
             .unwrap()
@@ -141,6 +163,11 @@ pub fn own_errors(pass: &Reconcile) -> Vec<String> {
         .filter(|e| !OTHER_UNITS.contains(&e.scope.as_str()))
         .map(|e| format!("{}: {}", e.scope, e.message))
         .collect()
+}
+
+/// The disk report `item` carries in its evidence.
+pub fn carried_report(item: &InboxItem) -> Option<DiskReport> {
+    serde_json::from_value(item.evidence["report"].clone()).unwrap()
 }
 
 /// The one report of `pass`.

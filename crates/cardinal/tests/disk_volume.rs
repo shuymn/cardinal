@@ -15,7 +15,7 @@ mod support;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use cardinal::contract::DiskLevel;
+use cardinal::contract::{DiskLevel, DiskReport, InboxItem, InboxKind, InboxStatus};
 use cardinal::os::Measure;
 use disk_support::{Disk, MIB, blocked, fill, own_errors, targets};
 
@@ -38,10 +38,21 @@ fn worktree_at(d: &Disk, path: &Path, name: &str) -> PathBuf {
     path.to_path_buf()
 }
 
+/// The one disk item, which must be a `disk_low` one with `status` carrying `report`.
+fn low_item(d: &Disk, status: InboxStatus, report: &DiskReport) -> InboxItem {
+    let items = d.disk_items();
+    assert_eq!(items.len(), 1, "{items:#?}");
+    let item = items.into_iter().next().unwrap();
+    assert_eq!((item.kind, item.status), (InboxKind::DiskLow, status));
+    assert_eq!(disk_support::carried_report(&item).as_ref(), Some(report));
+    item
+}
+
 /// The pass finds the volume under pressure before it is full and reports its eligible
 /// targets in order, the in-use worktree's entry and the protected `target/` in `blocked`,
-/// and the shortfall against its own reading; once the writer's file is gone, the volume is
-/// back to `ok` and nothing is reported.
+/// and the shortfall against its own reading, and the volume's `disk_low` item carries that
+/// report; once the writer's file is gone, the volume is back to `ok`, nothing is reported,
+/// and cardinal ends the item.
 #[test]
 fn reported_before_full() {
     // Lines below any free space for every other volume (the state dir's).
@@ -134,6 +145,7 @@ fn reported_before_full() {
     assert_eq!(report.shortfall_bytes, recovery * MIB - reading - exclusive);
     assert!(old.join("target/debug/app").exists());
     assert!(fuzzing.join("target/a/b/fuzz/corpus/seed").exists());
+    low_item(&d, InboxStatus::Open, report);
 
     std::fs::remove_file(root.join("writer.bin")).unwrap();
     let after = d.reconcile();
@@ -144,6 +156,8 @@ fn reported_before_full() {
         .unwrap();
     assert_eq!(state.state, DiskLevel::Ok, "{state:#?}");
     assert!(after.disk_reports.is_empty(), "{after:#?}");
+    let low = low_item(&d, InboxStatus::Resolved, report);
+    assert_eq!(low.resolution.unwrap().by, "cardinal");
     drop(job);
 }
 
