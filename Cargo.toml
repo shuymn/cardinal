@@ -18,6 +18,7 @@ dunce = "1.0.5"
 libc = "0.2.191"
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFURL", "CFString", "CFNumber", "CFDictionary", "CFArray", "CFError"] }
 proptest = "1.12.0"
+pulldown-cmark = { version = "0.13.6", default-features = false }
 process-wrap = { version = "10.0.1", default-features = false, features = ["std", "job-object"] }
 rustix = { version = "1.1.6", features = ["process"] }
 serde = { version = "1.0.229", features = ["derive"] }

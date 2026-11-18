@@ -39,6 +39,7 @@ windows-sys.workspace = true
 assert_cmd.workspace = true
 cardinal-test-support.workspace = true
 proptest.workspace = true
+pulldown-cmark.workspace = true
 tempfile.workspace = true
 
 [target.'cfg(unix)'.dev-dependencies]
