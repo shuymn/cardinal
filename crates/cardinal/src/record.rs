@@ -107,8 +107,7 @@ impl Recorder {
         if self.over_limit()? {
             if self.keep == 1 {
                 // Moved out of the way first: Windows keeps a removed file's name while a reader
-                // still has it open, and no append could create the file meanwhile. `tmp/` is
-                // swept of a file whose removal never came.
+                // still has it open, and no append could create the file meanwhile.
                 let removed = self
                     .state
                     .tmp_dir()
