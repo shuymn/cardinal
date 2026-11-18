@@ -13,8 +13,8 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use cardinal::contract::{
-    DiskLevel, InboxKind, InboxStatus, ResolutionOutcome, SessionProcess, SessionSnapshot,
-    SessionSnapshotSchema, Skipped, SnapshotAgent,
+    DiskLevel, InboxItem, InboxKind, InboxStatus, ResolutionOutcome, SessionProcess,
+    SessionSnapshot, SessionSnapshotSchema, Skipped, Snapshot, SnapshotAgent,
 };
 use cardinal::inbox::{self, StatusFilter};
 use cardinal::testpoint::{RECONCILE_OBSERVED, release_file};
@@ -95,7 +95,8 @@ fn paused_pass(d: &Disk) -> Child {
 
 /// Section 13.6, the handoff: paused at `reconcile.observed`, a pass under pressure has
 /// written no disk item; released, its `disk_low` and `disk_critical` items carry its disk
-/// report. The pass ends only the items it read before step 4: `disk_critical`, escalated by
+/// report, and so do they on the page the pass wrote. The pass ends only the items it read
+/// before step 4: `disk_critical`, escalated by
 /// the owner while the next pass observes, keeps the escalation although that pass left
 /// `critical`; the pass after it ends the item, and `disk_low` stays until the recovery line.
 #[test]
@@ -133,6 +134,17 @@ fn disk_items_follow_the_observation() {
         );
         assert!(first.inbox.raised.contains(&item.key), "{first:#?}");
     }
+    // The page the pass wrote at step 8 read the items as complete as the store holds them.
+    let page: Snapshot =
+        serde_json::from_slice(&std::fs::read(d.s.state.ui_snapshot()).unwrap()).unwrap();
+    let mut shown: Vec<&InboxItem> = page
+        .inbox
+        .iter()
+        .map(|i| &i.item)
+        .filter(|i| matches!(i.kind, InboxKind::DiskLow | InboxKind::DiskCritical))
+        .collect();
+    shown.sort_by_key(|i| i.kind == InboxKind::DiskCritical);
+    assert_eq!(shown, items.iter().collect::<Vec<_>>());
 
     let second = paused_pass(&d);
     inbox::resolve(
