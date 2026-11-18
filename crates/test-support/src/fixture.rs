@@ -65,7 +65,7 @@ pub struct Fsmonitor<'a> {
 
 impl Drop for Fsmonitor<'_> {
     fn drop(&mut self) {
-        if self.fixture.git_dirs(&self.repo).as_ref() != Some(&self.dirs) {
+        if self.fixture.git_dirs(&self.repo).as_ref() != Ok(&self.dirs) {
             return;
         }
         self.fixture
@@ -533,29 +533,9 @@ impl Fixture {
         }
     }
 
-    /// The git dir and common dir git would use in `dir`, or `None` when it cannot resolve
-    /// them. Never panics for a directory inside the root.
-    fn git_dirs(&self, dir: &Path) -> Option<Vec<PathBuf>> {
-        let output = self.output(
-            dir,
-            &[
-                "rev-parse",
-                "--path-format=absolute",
-                "--absolute-git-dir",
-                "--git-common-dir",
-            ],
-        );
-        output.status.success().then(|| {
-            String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .map(|line| PathBuf::from(line.trim()))
-                .collect()
-        })
-    }
-
-    /// Asks git which git dir and common dir it would use in `dir`, and refuses any outside
-    /// the root. Panics on any failure other than "not a git repository".
-    fn resolve(&self, dir: &Path) -> Resolution {
+    /// The git dir and common dir git would use in `dir`, or git's stderr when it cannot
+    /// resolve them. Never panics for a directory inside the root.
+    fn git_dirs(&self, dir: &Path) -> Result<Vec<PathBuf>, String> {
         let output = self.output(
             dir,
             &[
@@ -566,18 +546,33 @@ impl Fixture {
             ],
         );
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            assert!(
-                stderr.starts_with("fatal: not a git repository (or any"),
-                "git cannot resolve the repository at {}: {stderr}",
-                dir.display()
-            );
-            return Resolution::NotARepository;
+            return Err(String::from_utf8_lossy(&output.stderr).into_owned());
         }
-        for line in String::from_utf8_lossy(&output.stdout).lines() {
-            self.assert_inside(Path::new(line.trim()), "git dir");
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(|line| PathBuf::from(line.trim()))
+            .collect())
+    }
+
+    /// Asks git which git dir and common dir it would use in `dir`, and refuses any outside
+    /// the root. Panics on any failure other than "not a git repository".
+    fn resolve(&self, dir: &Path) -> Resolution {
+        match self.git_dirs(dir) {
+            Ok(dirs) => {
+                for dir in &dirs {
+                    self.assert_inside(dir, "git dir");
+                }
+                Resolution::Repository
+            }
+            Err(stderr) => {
+                assert!(
+                    stderr.starts_with("fatal: not a git repository (or any"),
+                    "git cannot resolve the repository at {}: {stderr}",
+                    dir.display()
+                );
+                Resolution::NotARepository
+            }
         }
-        Resolution::Repository
     }
 
     fn assert_inside(&self, path: &Path, what: &str) {
