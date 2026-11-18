@@ -11,7 +11,7 @@ mod support;
 
 use std::time::Duration;
 
-use cardinal::contract::{DiskLevel, RecordKind};
+use cardinal::contract::{DiskLevel, PlanKind, RecordKind};
 use cardinal::state::LockMode;
 use disk_support::{Disk, MIB, blocked, fill, own_errors, report, targets};
 
@@ -353,6 +353,42 @@ fn a_worktree_observed_in_part_is_named() {
             .reason
             .contains("could not open directory 'private/'"),
         "{report:#?}"
+    );
+}
+
+/// A repository's error (a base that is not a ref name) leaves each of its worktrees read in
+/// part: a linked worktree on a volume of its own is named in that volume's report, and a
+/// plan made for it alone carries the error in its provenance.
+#[test]
+fn a_repository_error_names_each_worktree() {
+    let d = Disk::new(LINES);
+    let away = d.s.worktree("away");
+    d.s.profile("base", "[git]\nbase = ':missing'\n");
+    // The linked worktree is a volume of its own under pressure, watched once a first pass
+    // has observed it; the main worktree's volume is not.
+    d.readings(&[
+        (d.s.fx.root(), &[Some(10 * MIB)]),
+        (&away, &[Some(3 * MIB / 2)]),
+    ]);
+    d.reconcile();
+
+    let pass = d.reconcile();
+    let report = report(&pass);
+    let named: Vec<(&str, bool)> = report
+        .incomplete
+        .iter()
+        .map(|i| (i.worktree.as_str(), i.reason.contains("not a ref name")))
+        .collect();
+    assert_eq!(named, [(away.to_str().unwrap(), true)], "{report:#?}");
+
+    let plan = d.s.try_plan(PlanKind::ReclaimWorktree, &away).unwrap();
+    assert!(
+        plan.provenance
+            .errors
+            .iter()
+            .any(|e| e.message.contains("not a ref name")),
+        "{:#?}",
+        plan.provenance
     );
 }
 

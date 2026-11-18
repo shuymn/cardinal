@@ -55,6 +55,8 @@ pub struct InventoryOptions {
 pub struct WorktreeObservation {
     pub repo: Repo,
     pub worktree: Worktree,
+    /// What observation of the worktree, or of its repository, could not read.
+    pub errors: Vec<ScopedError>,
 }
 
 /// `cardinal inventory`. Read-only: never deletes or signals anything.
@@ -221,6 +223,16 @@ struct RepoContext {
     patterns: DataPatterns,
     /// `None` when the open pull requests are unknown.
     open_prs: Option<Vec<gh::OpenPr>>,
+}
+
+impl RepoContext {
+    /// The repository-level step that failed, as an error scoped to the repository.
+    fn failure_error(&self) -> Option<ScopedError> {
+        let scope = format!("repo:{}", self.repo.main_worktree);
+        self.failure
+            .as_ref()
+            .map(|message| scoped(&scope, message.clone()))
+    }
 }
 
 /// The history facts of one worktree.
@@ -482,6 +494,8 @@ impl<'a> Observer<'a> {
             })?;
         let shared = self.shared(state, false, &mut Vec::new());
         let result = self.observe_one(&ctx, index, &shared);
+        let mut errors: Vec<_> = ctx.failure_error().into_iter().collect();
+        errors.extend(result.errors);
         let mut repo = ctx.repo;
         if let Some(message) = result.gh_error {
             repo.gh = GhStatus::Unknown;
@@ -490,6 +504,7 @@ impl<'a> Observer<'a> {
         Ok(WorktreeObservation {
             repo,
             worktree: result.worktree,
+            errors,
         })
     }
 
@@ -737,13 +752,7 @@ impl<'a> Observer<'a> {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         results.sort_by_key(|(index, _)| *index);
 
-        let mut errors = Vec::new();
-        if let Some(message) = &ctx.failure {
-            errors.push(scoped(
-                &format!("repo:{}", ctx.repo.main_worktree),
-                message.clone(),
-            ));
-        }
+        let mut errors: Vec<_> = ctx.failure_error().into_iter().collect();
         let mut repo = ctx.repo;
         for (_, result) in results {
             if let Some(message) = result.gh_error {

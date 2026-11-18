@@ -150,10 +150,18 @@ pub fn create_from(
             worktrees: Vec::new(),
             ..repo.clone()
         };
+        let repo_scope = format!("repo:{}", repo.main_worktree);
         for worktree in &repo.worktrees {
+            let scope = format!("worktree:{}", worktree.path);
             let observation = WorktreeObservation {
                 repo: bare.clone(),
                 worktree: worktree.clone(),
+                errors: inventory
+                    .errors
+                    .iter()
+                    .filter(|e| e.scope == scope || e.scope == repo_scope)
+                    .cloned()
+                    .collect(),
             };
             let whole = (!worktree.main)
                 .then(|| (PlanKind::ReclaimWorktree, PathBuf::from(&worktree.path)));

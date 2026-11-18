@@ -824,6 +824,47 @@ fn the_planning_process_is_not_in_use() {
     assert!(plan.invariants_ok, "{plan:#?}");
 }
 
+/// What observation of the worktree could not read is in its plans' provenance: a directory
+/// git status cannot open leaves the worktree's ignored data unknown, and the plan says why.
+#[cfg(unix)]
+#[test]
+fn a_plan_says_what_observation_could_not_read() {
+    use std::os::unix::fs::PermissionsExt;
+
+    /// Gives the directory its permissions back, so the setup can be removed.
+    struct Readable(std::path::PathBuf);
+    impl Drop for Readable {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    let s = Setup::new();
+    let wt = s.worktree("hidden");
+    write(&wt, "target/x", "x");
+    let private = wt.join("private");
+    std::fs::create_dir(&private).unwrap();
+    std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let _readable = Readable(private.clone());
+    if std::fs::read_dir(&private).is_ok() {
+        let _ = std::io::Write::write_all(
+            &mut std::io::stderr(),
+            b"skipped a_plan_says_what_observation_could_not_read: the directory stays readable (root)\n",
+        );
+        return;
+    }
+    let plan = s.plan(PlanKind::ReclaimDir, &wt.join("target"));
+    assert!(
+        plan.provenance
+            .errors
+            .iter()
+            .any(|e| e.source == "observation"
+                && e.message.contains("git status is incomplete")
+                && e.message.contains("could not open directory 'private/'")),
+        "{plan:#?}"
+    );
+}
+
 /// A git directory (`HEAD`, `objects/`, `refs/`) below a regenerable entry.
 #[cfg(unix)]
 fn bare_repository(at: &Path) {

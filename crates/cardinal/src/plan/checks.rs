@@ -271,6 +271,7 @@ pub fn provenance(config: &Config, i: &Inspection<'_>) -> Provenance {
     match i.observation {
         Err(err) => errors.push(error("observation", err)),
         Ok(o) => {
+            errors.extend(o.errors.iter().map(|e| error("observation", &e.message)));
             if let Some(err) = &o.repo.gh_error {
                 errors.push(error("gh", err));
             }
