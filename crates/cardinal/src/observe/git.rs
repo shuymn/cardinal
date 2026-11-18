@@ -320,7 +320,7 @@ fn path_ref_from_bytes(bytes: &[u8]) -> Result<&Path, String> {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{ListedWorktree, is_oid, parse_status, parse_worktree_list};
+    use super::{ListedWorktree, is_oid, is_ref_name, parse_status, parse_worktree_list};
 
     const A: &str = "1111111111111111111111111111111111111111";
 
@@ -516,5 +516,25 @@ mod tests {
         assert!(is_oid(A));
         assert!(!is_oid("main"));
         assert!(!is_oid(&A[1..]));
+    }
+
+    /// Where a configured base is held stricter than `git check-ref-format`, which accepts all
+    /// of the refused names below: a component ending in `.lock` in any case is refused, since
+    /// on a case-insensitive file system `main.LOCK` is the lock file git takes for `main`, and
+    /// so is any Unicode control character, where git refuses only ASCII ones.
+    #[test]
+    fn ref_names_are_stricter_than_git() {
+        for name in [
+            "main.LOCK",
+            "a/b.Lock",
+            "release.lOcK/x",
+            "a\u{85}b",
+            "a\u{9f}b",
+        ] {
+            assert!(!is_ref_name(name), "{name:?} is not a ref name");
+        }
+        for name in ["main.locked", "lock", "a/lock.b", "a\u{a0}b"] {
+            assert!(is_ref_name(name), "{name:?} is a ref name");
+        }
     }
 }

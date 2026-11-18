@@ -237,34 +237,44 @@ mod tests {
 
     use super::POINTS;
 
-    /// The points `docs/architecture.md` section 13.1 lists: each backticked name of its
-    /// "Points:" paragraph outside the parenthesized descriptions.
+    /// The points `docs/architecture.md` section 13.1 lists: each code span of the paragraph
+    /// that starts with "Points: ", outside the parenthesized descriptions and before the bold
+    /// sentence that follows the list.
     fn documented() -> BTreeSet<String> {
+        use pulldown_cmark::{Event, Parser, Tag, TagEnd};
+
         let doc = std::fs::read_to_string(
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/architecture.md"),
         )
         .unwrap();
-        let start = doc.find("Points: ").expect("the Points paragraph");
-        let paragraph = &doc[start..];
-        let paragraph = &paragraph[..paragraph.find("**Every contended").unwrap()];
-        let mut depth = 0_u32;
-        let outside: String = paragraph
-            .chars()
-            .filter(|&c| {
-                match c {
-                    '(' => depth += 1,
-                    ')' => depth = depth.saturating_sub(1),
-                    _ => return depth == 0,
+        let (mut points, mut at_start, mut in_points, mut depth) =
+            (BTreeSet::new(), false, false, 0_u32);
+        for event in Parser::new(&doc) {
+            match event {
+                Event::Start(Tag::Paragraph) => at_start = true,
+                Event::Text(text) if at_start => {
+                    at_start = false;
+                    in_points = text.starts_with("Points: ");
                 }
-                false
-            })
-            .collect();
-        outside
-            .split('`')
-            .skip(1)
-            .step_by(2)
-            .map(str::to_owned)
-            .collect()
+                Event::Text(text) if in_points => {
+                    for c in text.chars() {
+                        match c {
+                            '(' => depth += 1,
+                            ')' => depth = depth.saturating_sub(1),
+                            _ => {}
+                        }
+                    }
+                }
+                Event::Code(code) if in_points && depth == 0 => {
+                    points.insert(code.into_string());
+                }
+                Event::Start(Tag::Strong) | Event::End(TagEnd::Paragraph) if in_points => {
+                    return points;
+                }
+                _ => at_start = false,
+            }
+        }
+        panic!("no paragraph starts with \"Points: \"");
     }
 
     #[test]

@@ -23,6 +23,7 @@ mise exec -- scripts/test
 
 - Commit messages follow Conventional Commits.
 - `docs/architecture.md` fixes the module layout, contracts, and test strategy; `tests/layering.rs` enforces its module dependency table.
+- `docs/prior-art.md` records, per module and harness piece, the prior art compared, the decision, and the checks borrowed; a new module or mechanism gets its row there, and `tests/prior_art.rs` requires a row for every module.
 - Tests start processes and run git only through `crates/test-support` (`Scope::command`, typed `Fixture` operations); `clippy.toml` rejects any other spawn, and a product spawn site carries `#[expect(clippy::disallowed_methods, reason = "…")]`.
 - Pin every GitHub Action by full commit SHA with a version comment, and add any new action or reusable workflow to `selected_actions.patterns_allowed` in `.github/infra.yaml`.
 - `mise.lock` is updated by `.github/workflows/mise-update.yml`, not by Renovate.
