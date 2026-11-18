@@ -149,35 +149,6 @@ fn owner_approved_needs_the_owner() {
     );
 }
 
-/// The phase 1 entry points whose bodies later units write answer `not_implemented` as a
-/// `cardinal.error.v1` document with exit 1.
-#[test]
-fn unbuilt_entry_points_answer_not_implemented() {
-    let dirs = Dirs::new();
-    for args in [
-        &["arbiter", "run"][..],
-        &["inbox", "--assigned"],
-        &[
-            "inbox",
-            "resolve",
-            "k",
-            "--outcome",
-            "resolved",
-            "--assigned",
-        ],
-    ] {
-        let assert = dirs
-            .cmd()
-            .env("CARDINAL_ARBITER_PASS", "0123456789abcdef")
-            .args(args)
-            .assert()
-            .code(1);
-        let doc = json(&assert.get_output().stdout);
-        assert_eq!(doc["schema"], "cardinal.error.v1", "{args:?}");
-        assert_eq!(doc["error"]["code"], "not_implemented", "{args:?}");
-    }
-}
-
 #[test]
 fn invalid_config_is_config_invalid() {
     let dirs = Dirs::new();

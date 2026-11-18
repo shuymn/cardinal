@@ -8,6 +8,9 @@ Description=cardinal reconcile pass
 
 [Service]
 Type=oneshot
+# The pass starts the arbiter launcher detached; without this, systemd kills it with the
+# service's control group when the pass exits.
+KillMode=process
 ExecStart=%h/.local/bin/cardinal reconcile --trigger timer
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 Nice=10
