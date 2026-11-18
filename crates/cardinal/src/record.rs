@@ -108,10 +108,7 @@ impl Recorder {
             if self.keep == 1 {
                 // Moved out of the way first: Windows keeps a removed file's name while a reader
                 // still has it open, and no append could create the file meanwhile.
-                let removed = self
-                    .state
-                    .tmp_dir()
-                    .join(format!("records.jsonl.{}", state::new_id()));
+                let removed = set_aside(&self.state);
                 std::fs::rename(&current, &removed)?;
                 std::fs::remove_file(&removed)?;
             } else {
@@ -135,6 +132,16 @@ impl Recorder {
             Err(err) => Err(err),
         }
     }
+}
+
+/// Where a rotation that keeps one file moves `records.jsonl` before it removes it: a new
+/// temporary name in `tmp/`, which the cleanup of `tmp/` sweeps should the removal never come
+/// (a crash between the two).
+#[must_use]
+pub fn set_aside(state: &StateDir) -> PathBuf {
+    state
+        .tmp_dir()
+        .join(state::temp_name(std::ffi::OsStr::new("records.jsonl")))
 }
 
 fn rename_if_exists(from: &std::path::Path, to: &std::path::Path) -> io::Result<()> {

@@ -185,6 +185,34 @@ fn disk_items_follow_the_observation() {
     assert_eq!(d.disk_statuses(), (resolved, resolved));
 }
 
+/// A records file that a rotation keeping one file set aside in `tmp/` and never removed (a
+/// crash between the two) is removed by a pass once it is older than the cleanup's hour; a
+/// younger one stays.
+#[test]
+fn a_pass_removes_a_records_file_a_rotation_left_behind() {
+    let d = Disk::new(LINES);
+    d.fixture_reads(&[Some(10 * MIB)]);
+    let (old, young) = (
+        cardinal::record::set_aside(&d.s.state),
+        cardinal::record::set_aside(&d.s.state),
+    );
+    for path in [&old, &young] {
+        std::fs::write(path, b"{}\n").unwrap();
+    }
+    std::fs::File::options()
+        .write(true)
+        .open(&old)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - Duration::from_hours(2))
+        .unwrap();
+
+    let pass = d.reconcile();
+
+    assert_eq!(own_errors(&pass), Vec::<String>::new());
+    assert!(!old.exists(), "{} is left", old.display());
+    assert!(young.exists(), "{} was removed", young.display());
+}
+
 /// C9: a process listed in a session snapshot that is alive after the session's agent ended
 /// is raised at the next pass, and cleared by cardinal at the first pass after it ended.
 #[test]
