@@ -19,6 +19,7 @@ use crate::contract::{
     InboxStatus, ItemArbiter, PassOutcome, RecordKind, ResolutionOutcome,
 };
 use crate::state::{self, StateDir};
+use crate::testpoint;
 
 /// The open items due for a pass at `now_ms`, given `last`, the pass `arbiter/last.json`
 /// records: never assigned, or `[arbiter] retry_s` past the end of the pass they were
@@ -106,15 +107,33 @@ pub fn assign(
 }
 
 /// Writes how `pass` ended into each item assigned to it that has no outcome yet, and into no
-/// other, under `inbox/.lock`; returns their keys.
+/// other, then runs `publish`, which records the end in `last.json`, still holding
+/// `inbox/.lock`, so an `--assigned` answer waiting for the lock finds the pass ended.
+/// `publish` runs also when an item could not be written, and without the lock when it
+/// cannot be taken. Returns how the item writes went, and `publish`'s result.
 pub fn record_outcome(
     state: &StateDir,
     pass: &str,
     outcome: &PassOutcome,
     ended_ms: u64,
-) -> Result<Vec<String>, Error> {
-    let _lock = super::lock(state)?;
-    let mut written = Vec::new();
+    publish: impl FnOnce() -> Result<(), Error>,
+) -> (Result<(), Error>, Result<(), Error>) {
+    let (written, lock) = match super::lock(state) {
+        Ok(lock) => (write_outcomes(state, pass, outcome, ended_ms), Some(lock)),
+        Err(err) => (Err(err), None),
+    };
+    let published = publish();
+    drop(lock);
+    (written, published)
+}
+
+/// The item writes of [`record_outcome`], holding `inbox/.lock`.
+fn write_outcomes(
+    state: &StateDir,
+    pass: &str,
+    outcome: &PassOutcome,
+    ended_ms: u64,
+) -> Result<(), Error> {
     for (path, mut item) in super::read_all(state)? {
         if let Some(assigned) = &mut item.arbiter
             && assigned.pass == pass
@@ -123,10 +142,9 @@ pub fn record_outcome(
             assigned.outcome = Some(outcome.clone());
             assigned.ended_ms = Some(ended_ms);
             super::write(state, &path, &item)?;
-            written.push(item.key);
         }
     }
-    Ok(written)
+    Ok(())
 }
 
 /// Brings `arbiter_failing` in line with the recorded end of `last` (section 10.5), holding
@@ -242,8 +260,9 @@ pub fn list_assigned(
 /// pass `pass`, once; any other item, and every item once that pass has ended or been
 /// recorded `abandoned`, is refused with `not_assigned`, and an item the pass already
 /// answered with `invalid_argument`, each left unchanged. The pass and its deadline are
-/// checked under `inbox/.lock`, right before the write, so an answer that waited for the
-/// lock past the deadline is refused.
+/// checked under `inbox/.lock`, after the lookup and right before the write, so an answer
+/// that waited for the lock past the deadline, or until the launcher recorded the end, is
+/// refused.
 pub fn resolve_assigned(
     config: &Config,
     state: &StateDir,
@@ -253,17 +272,11 @@ pub fn resolve_assigned(
     note: Option<&str>,
 ) -> Result<InboxItem, Error> {
     let pass = named(pass)?;
+    testpoint::hit(testpoint::ARBITER_ANSWERING)
+        .map_err(|err| Error::new(ErrorCode::Internal, err.to_string()))?;
     let item = {
         let _lock = super::lock(state)?;
-        let now = state::now_ms();
-        if !running(config, state, pass, now)? {
-            return Err(not_assigned(format!(
-                "the arbiter pass {pass} is not running"
-            )));
-        }
         let (path, existing) = super::find(state, key)?;
-        // The launcher writes the pass's outcome into its items under this lock before it
-        // records the end, so an item read here with no outcome belongs to a running pass.
         let Some(mut item) = existing.filter(|item| assigned_to(item, pass)) else {
             return Err(not_assigned(format!(
                 "the inbox item `{key}` is not assigned to the arbiter pass {pass}"
@@ -275,6 +288,14 @@ pub fn resolve_assigned(
                 ErrorCode::InvalidArgument,
                 format!("the inbox item `{key}` was already answered"),
             ));
+        }
+        // The launcher records the pass's end under this lock, also when it could not write
+        // the outcome into this item.
+        let now = state::now_ms();
+        if !running(config, state, pass, now)? {
+            return Err(not_assigned(format!(
+                "the arbiter pass {pass} is not running"
+            )));
         }
         super::set_resolution(
             &mut item,

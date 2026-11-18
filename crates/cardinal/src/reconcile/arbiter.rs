@@ -158,15 +158,7 @@ pub fn run(config: &Config, state: &StateDir) -> Result<ArbiterPass, Error> {
         }
     };
     let ended = state::now_ms();
-    if let Err(err) = inbox::record_outcome(state, &pass.id, &outcome, ended) {
-        // Each item of the pass still ends when `last.json` records the end (section 10.5).
-        notes.push(format!(
-            "writing the outcome into the items failed: {}",
-            err.message
-        ));
-    }
-    injected(testpoint::hit(testpoint::ARBITER_OUTCOMES))?;
-    finish(config, state, &mut pass, outcome, ended)?;
+    finish(config, state, &mut pass, &outcome, ended, &mut notes)?;
     append_log(&log, &notes);
     drop(lock);
     Ok(pass)
@@ -198,28 +190,51 @@ fn settle(config: &Config, state: &StateDir, now: u64) -> Result<Last, Error> {
         return Ok(Last::Running(last));
     }
     // Items that already have an outcome keep it.
-    inbox::record_outcome(state, &last.id, &PassOutcome::Abandoned, ended)?;
-    finish(config, state, &mut last, PassOutcome::Abandoned, ended)?;
+    let mut notes = Vec::new();
+    finish(
+        config,
+        state,
+        &mut last,
+        &PassOutcome::Abandoned,
+        ended,
+        &mut notes,
+    )?;
+    append_log(Path::new(&last.log), &notes);
     Ok(Last::Settled(Some(last)))
 }
 
-/// Records how `pass` ended in `last.json` and an `arbiter_pass` record, then brings
-/// `arbiter_failing` in line with it.
+/// Records how `pass` ended: in its items without an outcome and in `last.json`, together
+/// under `inbox/.lock` (section 10.5), the end also when the items could not be written
+/// (noted in `notes`); then in an `arbiter_pass` record, and brings `arbiter_failing` in line
+/// with it.
 fn finish(
     config: &Config,
     state: &StateDir,
     pass: &mut ArbiterPass,
-    outcome: PassOutcome,
+    outcome: &PassOutcome,
     ended: u64,
+    notes: &mut Vec<String>,
 ) -> Result<(), Error> {
-    pass.failures_in_a_row = if outcome == PassOutcome::Completed {
-        0
-    } else {
-        pass.failures_in_a_row.saturating_add(1)
-    };
-    pass.ended_ms = Some(ended);
-    pass.outcome = Some(outcome);
-    write_last(state, pass)?;
+    let id = pass.id.clone();
+    let (written, published) = inbox::record_outcome(state, &id, outcome, ended, || {
+        injected(testpoint::hit(testpoint::ARBITER_OUTCOMES))?;
+        pass.failures_in_a_row = if *outcome == PassOutcome::Completed {
+            0
+        } else {
+            pass.failures_in_a_row.saturating_add(1)
+        };
+        pass.ended_ms = Some(ended);
+        pass.outcome = Some(outcome.clone());
+        write_last(state, pass)
+    });
+    if let Err(err) = written {
+        // Each item of the pass still ends when `last.json` records the end (section 10.5).
+        notes.push(format!(
+            "writing the outcome into the items failed: {}",
+            err.message
+        ));
+    }
+    published?;
     let recorder = recorder(config, state);
     let mut entry = recorder.record(RecordKind::ArbiterPass);
     entry.data = as_object(&pass);

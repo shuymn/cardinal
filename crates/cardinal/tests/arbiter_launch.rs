@@ -29,7 +29,7 @@ use cardinal::contract::{
 };
 use cardinal::inbox::{self, NewItem};
 use cardinal::state::{self, LockMode, StateDir};
-use cardinal::testpoint::{ARBITER_OUTCOMES, ARBITER_RECORDED};
+use cardinal::testpoint::{ARBITER_ANSWERING, ARBITER_OUTCOMES, ARBITER_RECORDED};
 use cardinal_test_support::process::wait_for;
 use cardinal_test_support::{Child, Scope};
 use serde::{Deserialize, Serialize};
@@ -337,6 +337,27 @@ impl Env {
         command.spawn().expect("start the launcher")
     }
 
+    /// `cardinal inbox resolve KEY --outcome resolved --assigned` for `pass` in the background,
+    /// its stdout piped; it marks `arbiter.answering` as it starts to wait for `inbox/.lock`.
+    fn spawn_answer(&self, points: &TestPoints, pass: &str, key: &str) -> Child {
+        let mut command = self.dirs.cmd();
+        command
+            .args([
+                "inbox",
+                "resolve",
+                key,
+                "--outcome",
+                "resolved",
+                "--assigned",
+            ])
+            .env("CARDINAL_ARBITER_PASS", pass)
+            .stdout(std::process::Stdio::piped());
+        // Marked, not held.
+        points.release(ARBITER_ANSWERING);
+        points.apply(&mut command, &[ARBITER_ANSWERING], None);
+        command.spawn().expect("start the answer")
+    }
+
     /// What the fake session of `pass` recorded, once it has.
     fn session(&self, pass: &str) -> Recorded {
         let file = self.sessions.join(format!("{pass}.json"));
@@ -448,7 +469,10 @@ fn due_items_only() {
     e.raise(recent, InboxKind::UnclassifiableData);
     let now = state::now_ms();
     inbox::assign(&e.state, "p0", &[recent.to_owned()], now).unwrap();
-    inbox::record_outcome(&e.state, "p0", &PassOutcome::Completed, now).unwrap();
+    let (written, published) =
+        inbox::record_outcome(&e.state, "p0", &PassOutcome::Completed, now, || Ok(()));
+    written.unwrap();
+    published.unwrap();
 
     let (code, doc) = e.arbiter_run();
     assert_eq!(code, Some(0), "{doc}");
@@ -1035,6 +1059,11 @@ fn unreadable_history_starts_nothing() {
     };
     let e = Env::new(pinned, &[]);
     e.raise("reclaimable:/a@h@1", InboxKind::Reclaimable);
+    // Assigned to the pass `p`, as far as the item says.
+    e.raise("reclaimable:/b@h@1", InboxKind::Reclaimable);
+    let b_key = ["reclaimable:/b@h@1".to_owned()];
+    inbox::assign(&e.state, "p", &b_key, state::now_ms()).unwrap();
+    let b_before = e.item(&b_key[0]);
     let garbage = b"{\"schema\":\"cardinal.arbiter-pass.v1\",";
     std::fs::write(e.state.arbiter_last(), garbage).unwrap();
     let (code, doc) = e.arbiter_run();
@@ -1044,13 +1073,14 @@ fn unreadable_history_starts_nothing() {
     let resolve = [
         "inbox",
         "resolve",
-        "reclaimable:/a@h@1",
+        "reclaimable:/b@h@1",
         "--outcome",
         "resolved",
         "--assigned",
     ];
     let (code, doc) = e.cardinal(&resolve, Some("p"));
     assert_eq!((code, error_code(&doc)), (Some(1), "state_unavailable"));
+    assert_eq!(e.item(&b_key[0]), b_before, "unchanged");
     assert_eq!(std::fs::read(e.state.arbiter_last()).unwrap(), garbage);
     assert_eq!(
         std::fs::read_dir(&e.sessions).unwrap().count(),
@@ -1230,7 +1260,8 @@ fn answered_once() {
 }
 
 /// An `--assigned` answer that waited for `inbox/.lock` until after its pass's deadline is
-/// refused with `not_assigned` and changes nothing: the pass is checked again under the lock.
+/// refused with `not_assigned` and changes nothing: the pass is checked under the lock, right
+/// before the write.
 #[test]
 fn late_answer_refused() {
     let pinned = Pinned {
@@ -1255,22 +1286,11 @@ fn late_answer_refused() {
         Instant::now() + WAIT,
     )
     .unwrap();
-    let mut command = e.dirs.cmd();
-    command
-        .args([
-            "inbox",
-            "resolve",
-            "reclaimable:/a@h@1",
-            "--outcome",
-            "resolved",
-            "--assigned",
-        ])
-        .env("CARDINAL_ARBITER_PASS", &pass.id)
-        .stdout(std::process::Stdio::piped());
-    let resolve = command.spawn().expect("start the resolve");
+    let resolve = e.spawn_answer(&points, &pass.id, "reclaimable:/a@h@1");
+    points.wait_reached(ARBITER_ANSWERING, resolve.id(), WAIT);
     assert!(
-        state::now_ms() + 1000 < deadline,
-        "the resolve starts well within timeout_s"
+        state::now_ms() < deadline,
+        "the answer waits for the lock within timeout_s"
     );
     sleep_until(deadline + 200);
     drop(held);
@@ -1302,22 +1322,28 @@ fn failing_raised_once() {
         let (code, doc) = e.arbiter_run();
         assert_eq!(code, Some(0), "{doc}");
     }
+    e.configure(pinned, &[Step::Wait("go".into()), Step::Exit(2)]);
     let points = TestPoints::new(e.dirs.scope());
-    let mut launcher = e.spawn_launcher(&points, &[ARBITER_OUTCOMES]);
-    points.wait_reached(ARBITER_OUTCOMES, launcher.id(), WAIT);
-    // The launcher records the end, then waits for this lock to raise the item: killed there.
+    let mut launcher = e.spawn_launcher(&points, &[]);
+    let pass = wait_for("the third pass in last.json", WAIT, || {
+        e.last().filter(|last| last.ended_ms.is_none())
+    });
+    e.session(&pass.id);
+    // With this lock held, the launcher records the end without the outcomes, then waits for
+    // the lock to raise the item: killed there.
     let held = state::lock(
         &e.state.inbox_lock(),
         LockMode::Exclusive,
         Instant::now() + WAIT,
     )
     .unwrap();
-    points.release(ARBITER_OUTCOMES);
+    e.signal("go");
     let third = wait_for("the third failure in last.json", WAIT, || {
         e.last().filter(|last| last.ended_ms.is_some())
     });
     launcher.kill();
     drop(held);
+    e.configure(pinned, &[Step::Exit(2)]);
     assert_eq!(third.failures_in_a_row, 3);
     assert!(failing(&e).is_empty(), "the killed launcher raised nothing");
 
@@ -1476,4 +1502,53 @@ fn a_completed_pass_ends_the_alert() {
     let second = failing_key(&run[0]);
     assert_eq!(failing_keys(&e), [key, second.clone()]);
     assert_eq!(e.item(&second).status, InboxStatus::Open);
+}
+
+/// An `--assigned` answer waiting for `inbox/.lock` while the launcher ends its pass is refused,
+/// also when the launcher could not write the outcome into the item: the launcher records the
+/// end in `last.json` before it releases the lock.
+#[cfg(unix)]
+#[test]
+fn an_ending_pass_takes_no_answer() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let pinned = Pinned {
+        timeout_s: 60,
+        min_interval_s: 0,
+        retry_s: 3600,
+    };
+    let e = Env::new(pinned, &[Step::Wait("go".into())]);
+    e.raise("reclaimable:/a@h@1", InboxKind::Reclaimable);
+    let points = TestPoints::new(e.dirs.scope());
+    let mut launcher = e.spawn_launcher(&points, &[ARBITER_OUTCOMES]);
+    let pass = wait_for("the pass in last.json", WAIT, || e.last());
+    e.session(&pass.id);
+    // No item can be written: the launcher's outcome write fails.
+    let inbox_dir = e.state.inbox_dir();
+    let mode = |bits| std::fs::Permissions::from_mode(bits);
+    std::fs::set_permissions(&inbox_dir, mode(0o555)).unwrap();
+    let probe = inbox_dir.join("probe");
+    let unwritable = std::fs::write(&probe, b"").is_err();
+    e.signal("go");
+    points.wait_reached(ARBITER_OUTCOMES, launcher.id(), WAIT);
+    let answer = e.spawn_answer(&points, &pass.id, "reclaimable:/a@h@1");
+    points.wait_reached(ARBITER_ANSWERING, answer.id(), WAIT);
+    points.release(ARBITER_OUTCOMES);
+    assert!(launcher.wait().unwrap().success());
+    let output = answer.wait_with_output().unwrap();
+    std::fs::set_permissions(&inbox_dir, mode(0o755)).unwrap();
+    // A user who writes there anyway (root) has nothing to check here.
+    if !unwritable {
+        std::fs::remove_file(&probe).unwrap();
+        return;
+    }
+    let doc: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        (output.status.code(), error_code(&doc)),
+        (Some(1), "not_assigned")
+    );
+    let a = e.item("reclaimable:/a@h@1");
+    assert_eq!((a.status, a.resolution), (InboxStatus::Open, None));
+    assert_eq!(a.arbiter.unwrap().outcome, None, "the outcome write failed");
+    assert_eq!(e.last().unwrap().outcome, Some(PassOutcome::Completed));
 }
