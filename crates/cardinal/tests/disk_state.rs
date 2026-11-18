@@ -116,6 +116,13 @@ fn first_reading_below_critical() {
     assert_eq!(own_errors(&pass), Vec::<String>::new());
     assert_eq!(d.state().state, DiskLevel::Critical);
     assert_eq!(pass.disk[0].state, DiskLevel::Critical);
+    // At step 4's reading, not by way of `warning` at step 6's.
+    let transitions: Vec<(String, String)> = d
+        .records(RecordKind::DiskState)
+        .iter()
+        .map(|r| (r.data["from"].to_string(), r.data["to"].to_string()))
+        .collect();
+    assert_eq!(transitions, [("\"unknown\"".into(), "\"critical\"".into())]);
     assert!(pass.observed);
     assert_eq!(report(&pass).reading.free_bytes, mib(5));
 }
