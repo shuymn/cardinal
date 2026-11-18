@@ -120,7 +120,7 @@ pub fn evaluate(i: &Inspection<'_>) -> Vec<Check> {
     checks.push(no_unclassifiable(i));
     checks.push(no_nested_repository(i));
     if worktree {
-        checks.push(merge_evidence(i));
+        checks.push(super::merge::merge_evidence(i));
     }
     for check in &mut checks {
         check.facts = facts(&check.name, i);
@@ -331,7 +331,12 @@ pub fn processes_inside(target: &Path) -> Result<Vec<u32>, String> {
         .collect())
 }
 
-fn check(name: &str, role: CheckRole, result: CheckResult, detail: impl Into<String>) -> Check {
+pub(super) fn check(
+    name: &str,
+    role: CheckRole,
+    result: CheckResult,
+    detail: impl Into<String>,
+) -> Check {
     Check {
         name: name.to_owned(),
         role,
@@ -680,22 +685,5 @@ fn no_nested_repository(i: &Inspection<'_>) -> Check {
             CheckResult::Fail,
             format!("repositories inside: {}", list(&found)),
         )
-    }
-}
-
-fn merge_evidence(i: &Inspection<'_>) -> Check {
-    let condition =
-        |result, detail: &str| check("merge_evidence", CheckRole::Condition, result, detail);
-    match i.observation.map(|o| o.worktree.facts.merge_evidence) {
-        Err(_) => condition(CheckResult::Unknown, "not observed"),
-        Ok(MergeEvidence::BaseAncestor) => {
-            condition(CheckResult::Pass, "HEAD is an ancestor of the base")
-        }
-        Ok(MergeEvidence::MergedPr) => condition(
-            CheckResult::Pass,
-            "HEAD is the head of a merged pull request",
-        ),
-        Ok(MergeEvidence::None) => condition(CheckResult::Fail, "no evidence that HEAD was merged"),
-        Ok(MergeEvidence::Unknown) => condition(CheckResult::Unknown, "unknown"),
     }
 }

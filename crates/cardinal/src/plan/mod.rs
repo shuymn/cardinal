@@ -6,6 +6,7 @@
 //! reached through [`Real`], which calls the `observe` and `admission` modules.
 
 mod checks;
+mod merge;
 mod walk;
 
 use std::path::{Path, PathBuf};
