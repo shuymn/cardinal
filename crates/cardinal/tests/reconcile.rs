@@ -134,3 +134,31 @@ fn refresh_raises_and_clears() {
     assert_eq!(cleared[0].resolution.as_ref().unwrap().by, "cardinal");
     assert!(!d.s.state.session("s1").exists());
 }
+
+/// Step 2 removes only the temporary files cardinal's atomic writes leave: a state dir that
+/// overlaps other files (`CARDINAL_STATE_DIR` pointing into a worktree) keeps them, however
+/// old. The control, a leftover temporary file as old, is removed.
+#[test]
+fn temp_cleanup_keeps_other_files() {
+    let d = Disk::new(LINES);
+    d.fixture_reads(&[Some(8 * MIB)]);
+    let tmp = d.s.state.tmp_dir();
+    let two_hours_ago = std::time::SystemTime::now() - Duration::from_hours(2);
+    let names = [
+        "notes.txt",
+        "build.log.1.2",
+        ".cardinal-tmp.",
+        ".cardinal-tmp.state.json.12.3",
+    ];
+    for name in names {
+        let file = std::fs::File::create(tmp.join(name)).unwrap();
+        file.set_modified(two_hours_ago).unwrap();
+    }
+
+    let pass = d.reconcile();
+    assert_eq!(own_errors(&pass), Vec::<String>::new());
+    for name in &names[..3] {
+        assert!(tmp.join(name).exists(), "{name} was removed");
+    }
+    assert!(!tmp.join(names[3]).exists(), "the leftover temp file stays");
+}

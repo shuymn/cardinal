@@ -1,5 +1,6 @@
 //! Write discipline (`docs/architecture.md` section 4.2) and JSONL files (section 4.7).
 
+use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
@@ -18,43 +19,52 @@ pub enum Durability {
     Durable,
 }
 
-/// Writes `bytes` to `target` atomically: a temporary file in `tmp_dir` (same file system),
-/// flushed, then renamed over the target. Readers see the old or the new file, never a mix.
+/// The prefix of the temporary files [`write_atomic`] and the state dir's create-once writes
+/// create, the only files [`remove_temp_files_older_than`] removes.
+pub const TEMP_PREFIX: &str = ".cardinal-tmp.";
+
+/// Writes `bytes` to `target` atomically: a temporary file `<TEMP_PREFIX><name>.<pid>.<n>` in
+/// `tmp_dir` (same file system), flushed, then renamed over the target. Readers see the old
+/// or the new file, never a mix.
 pub fn write_atomic(
     tmp_dir: &Path,
     target: &Path,
     bytes: &[u8],
     durability: Durability,
 ) -> io::Result<()> {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
     let name = target
         .file_name()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "target has no file name"))?;
-    let mut tmp_name = name.to_os_string();
-    tmp_name.push(format!(
-        ".{}.{}",
-        std::process::id(),
-        COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
-    let tmp = tmp_dir.join(tmp_name);
-    let result = (|| {
-        let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+    write_through(&tmp_dir.join(temp_name(name)), target, bytes, durability)
+}
+
+/// [`write_atomic`] through the temporary file `tmp`. A `tmp` that exists already is
+/// another writer's and fails the write untouched; the file this write created is removed
+/// when the write fails before its rename, and never after it.
+fn write_through(
+    tmp: &Path,
+    target: &Path,
+    bytes: &[u8],
+    durability: Durability,
+) -> io::Result<()> {
+    let mut file = OpenOptions::new().write(true).create_new(true).open(tmp)?;
+    let written = (|| {
         file.write_all(bytes)?;
         file.flush()?;
         if durability == Durability::Durable {
             file.sync_all()?;
         }
-        drop(file);
-        std::fs::rename(&tmp, target)?;
-        if durability == Durability::Durable {
-            sync_parent(target)?;
-        }
         Ok(())
     })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
+    drop(file);
+    if let Err(err) = written.and_then(|()| std::fs::rename(tmp, target)) {
+        let _ = std::fs::remove_file(tmp);
+        return Err(err);
     }
-    result
+    if durability == Durability::Durable {
+        sync_parent(target)?;
+    }
+    Ok(())
 }
 
 /// Creates `path` with `create_new`, writes `bytes`, and fsyncs file and parent: the
@@ -83,13 +93,19 @@ pub fn sync_parent(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Removes regular files in `dir` last modified more than `max_age` ago. Returns how many
-/// were removed. Errors on single entries are skipped.
-pub fn remove_older_than(dir: &Path, max_age: Duration) -> io::Result<usize> {
+/// Removes the temporary files of [`write_atomic`] in `dir` last modified more than `max_age`
+/// ago: regular files whose names it creates, and nothing else, so a state dir that overlaps
+/// another directory loses none of its files. Returns how many were removed. Errors on single
+/// entries are skipped.
+pub fn remove_temp_files_older_than(dir: &Path, max_age: Duration) -> io::Result<usize> {
     let now = SystemTime::now();
     let mut removed = 0;
     for entry in std::fs::read_dir(dir)? {
         let Ok(entry) = entry else { continue };
+        if !is_temp_name(&entry.file_name()) {
+            continue;
+        }
+        // Not following a symbolic link: `write_atomic` creates none.
         let Ok(meta) = entry.metadata() else { continue };
         let old = meta
             .modified()
@@ -101,6 +117,32 @@ pub fn remove_older_than(dir: &Path, max_age: Duration) -> io::Result<usize> {
         }
     }
     Ok(removed)
+}
+
+/// A new temporary file name for the target `name`: [`TEMP_PREFIX`], the name, this
+/// process's ID, and a counter.
+pub(super) fn temp_name(name: &OsStr) -> OsString {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let mut temp = OsString::from(TEMP_PREFIX);
+    temp.push(name);
+    temp.push(format!(
+        ".{}.{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    temp
+}
+
+/// Whether `name` is one [`temp_name`] gives: [`TEMP_PREFIX`], a name, a PID, and a counter.
+fn is_temp_name(name: &OsStr) -> bool {
+    let Some(rest) = name.to_str().and_then(|n| n.strip_prefix(TEMP_PREFIX)) else {
+        return false;
+    };
+    let mut parts = rest.rsplitn(3, '.');
+    let digits = |part: Option<&str>| {
+        part.is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+    };
+    digits(parts.next()) && digits(parts.next()) && parts.next().is_some_and(|n| !n.is_empty())
 }
 
 /// Opens `path` in append mode for [`append_line`], creating it if needed.
@@ -189,9 +231,29 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        Durability, append_line, create_new_durable, open_append, read_jsonl, remove_older_than,
-        write_atomic,
+        Durability, append_line, create_new_durable, open_append, read_jsonl,
+        remove_temp_files_older_than, temp_name, write_atomic, write_through,
     };
+
+    /// A file at the temporary name fails the write and is left as it was; the write's own
+    /// temporary file is removed when its rename fails.
+    #[test]
+    fn a_write_removes_only_its_own_temp_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target");
+        let taken = tmp.path().join(temp_name("target".as_ref()));
+        std::fs::write(&taken, "another's").unwrap();
+        let err = write_through(&taken, &target, b"new", Durability::Durable).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists, "{err}");
+        assert_eq!(std::fs::read_to_string(&taken).unwrap(), "another's");
+        assert!(!target.exists());
+
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("inside"), "x").unwrap();
+        let own = tmp.path().join(temp_name("target".as_ref()));
+        write_through(&own, &target, b"new", Durability::Volatile).unwrap_err();
+        assert!(!own.exists());
+    }
 
     #[test]
     fn atomic_write_replaces_and_leaves_no_temp_file() {
@@ -239,18 +301,49 @@ mod tests {
         );
     }
 
+    /// Old temporary files of `write_atomic` are removed, and only those: files of other
+    /// names, a name with the prefix alone, and a link stay however old.
     #[test]
-    fn old_files_are_removed() {
+    fn old_temp_files_are_removed() {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("fresh"), b"").unwrap();
+        let own = ".cardinal-tmp.state.json.123.4";
+        let others = [
+            "notes.txt",
+            "state.json.123.4",
+            ".cardinal-tmp.",
+            ".cardinal-tmp.state.json",
+            ".cardinal-tmp.state.json.x.4",
+        ];
+        for name in std::iter::once(own).chain(others) {
+            std::fs::write(tmp.path().join(name), b"").unwrap();
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            tmp.path().join("notes.txt"),
+            tmp.path().join(".cardinal-tmp.link.1.2"),
+        )
+        .unwrap();
         assert_eq!(
-            remove_older_than(tmp.path(), Duration::from_secs(3600)).unwrap(),
+            remove_temp_files_older_than(tmp.path(), Duration::from_secs(3600)).unwrap(),
             0
         );
         std::thread::sleep(Duration::from_millis(20));
         assert_eq!(
-            remove_older_than(tmp.path(), Duration::from_millis(1)).unwrap(),
+            remove_temp_files_older_than(tmp.path(), Duration::from_millis(1)).unwrap(),
             1
         );
+        assert!(!tmp.path().join(own).exists());
+        for name in others {
+            assert!(tmp.path().join(name).exists(), "{name}");
+        }
+    }
+
+    /// The names `write_atomic` writes through are the ones the cleanup removes.
+    #[test]
+    fn the_cleanup_matches_the_names_written() {
+        for target in ["state.json", "a.b.c", "1.2"] {
+            let name = super::temp_name(std::ffi::OsStr::new(target));
+            assert!(super::is_temp_name(&name), "{name:?}");
+        }
     }
 }
