@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     ArbiterPass, DiskState, InventorySchema, ReservationView, Resources, ScopedError,
-    SessionProcess, Tri,
+    SessionProcess, Tri, WorktreeSchema,
 };
 
 /// `cardinal.inventory.v1`
@@ -20,6 +20,25 @@ pub struct Inventory {
     /// The disk states of `disk/`, read, not measured (section 8.5).
     pub disk: Vec<DiskState>,
     pub arbiter: ArbiterView,
+    pub errors: Vec<ScopedError>,
+}
+
+/// `cardinal.worktree.v1` (`cardinal inventory --worktree PATH`): one worktree observed from
+/// scratch, in a bounded size whatever the host holds (section 11.2).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeView {
+    pub schema: WorktreeSchema,
+    pub observed_ms: u64,
+    /// The worktree's repository, its `worktrees` empty.
+    pub repo: Repo,
+    /// The worktree, its `ignored` cut to its first entries in path order.
+    pub worktree: Worktree,
+    /// How many ignored entries the worktree has, before the cut.
+    pub ignored_entries: u64,
+    /// The `<set>` an `unclassifiable_data` item for the worktree's unclassifiable entries has
+    /// in its key (section 10.1); null when it has none or they were not listed.
+    pub unclassifiable_set: Option<String>,
+    /// What observation of the worktree, or of its repository, could not read.
     pub errors: Vec<ScopedError>,
 }
 

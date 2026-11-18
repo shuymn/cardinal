@@ -43,13 +43,13 @@ pub use execution::{
 };
 pub use explain::{Explain, ExplainKind, ExplainSource, ExplainSubject};
 pub use inbox::{
-    Inbox, InboxItem, InboxKind, InboxStatus, InboxSubject, ItemArbiter, Resolution,
-    ResolutionOutcome,
+    AnswerOutcome, BriefItem, Inbox, InboxBrief, InboxItem, InboxKind, InboxStatus, InboxSubject,
+    ItemAnswer, ItemArbiter, Resolution, ResolutionOutcome,
 };
 pub use inventory::{
     ArbiterView, BaseRef, DirtyUnknown, DirtyUnknownReason, Facts, GhStatus, HostInfo,
     IgnoredClass, IgnoredEntry, InUse, Inventory, MergeEvidence, Os, Outlived, PrRef,
-    ReclaimSummary, Repo, Worktree,
+    ReclaimSummary, Repo, Worktree, WorktreeView,
 };
 pub use plan::{
     Approval, ConfigKey, ObservedError, Plan, PlanKind, PlanList, PlanTarget, Provenance, RootId,
@@ -148,6 +148,14 @@ schema_marker!(
 schema_marker!(
     /// `cardinal.inbox.v1`
     InboxSchema = "cardinal.inbox.v1"
+);
+schema_marker!(
+    /// `cardinal.inbox-brief.v1`
+    InboxBriefSchema = "cardinal.inbox-brief.v1"
+);
+schema_marker!(
+    /// `cardinal.worktree.v1`
+    WorktreeSchema = "cardinal.worktree.v1"
 );
 schema_marker!(
     /// `cardinal.explain.v1`
@@ -249,6 +257,10 @@ pub struct CheckFact {
     pub value: serde_json::Value,
     /// What produced it: the tool behind the observation (`git`, `gh`) or the local read.
     pub source: String,
+    /// For a list `value` printed cut to its first entries (`plan reclaim-worktree`, `act`),
+    /// how many entries were left out; absent when nothing was, and in every stored plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub omitted: Option<u64>,
 }
 
 /// The process group a job runs in. The leader is the runner. Phase 3 adds a Job Object kind.

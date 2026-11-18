@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use super::{InboxItemSchema, InboxSchema, PassOutcome, present};
+use super::{InboxBriefSchema, InboxItemSchema, InboxSchema, PassOutcome, present};
 
 /// The item kinds of `docs/architecture.md` section 10.1.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,12 +82,34 @@ pub struct Resolution {
     pub at_ms: u64,
 }
 
-/// The last arbiter pass an item was assigned to (section 10.5); `outcome` and `ended_ms`
-/// are set when that pass ends.
+/// How an arbiter pass answered an item assigned to it (section 10.5): one of the outcomes
+/// that close it, or `deferred`, which leaves it open until `retry_s` after the pass ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnswerOutcome {
+    Resolved,
+    Escalated,
+    Dismissed,
+    Deferred,
+}
+
+/// The answer an arbiter pass gave an item assigned to it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ItemAnswer {
+    pub outcome: AnswerOutcome,
+    pub note: String,
+    pub at_ms: u64,
+}
+
+/// The last arbiter pass an item was assigned to (section 10.5); `answer` is set when that
+/// pass answers it, `outcome` and `ended_ms` when that pass ends.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ItemArbiter {
     pub pass: String,
     pub assigned_ms: u64,
+    /// Absent in items assigned before passes answered, which read as null.
+    #[serde(default)]
+    pub answer: Option<ItemAnswer>,
     pub outcome: Option<PassOutcome>,
     pub ended_ms: Option<u64>,
 }
@@ -120,6 +142,33 @@ pub struct InboxItem {
 pub struct Inbox {
     pub schema: InboxSchema,
     pub items: Vec<InboxItem>,
+}
+
+/// An item in a bounded size (section 11.3): the fields of [`InboxItem`] an answer needs,
+/// its evidence cut to what its kind's decision reads, every list in them cut by count, and
+/// free text cut to a preview; identities are never cut.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BriefItem {
+    pub key: String,
+    pub kind: InboxKind,
+    pub status: InboxStatus,
+    pub subject: InboxSubject,
+    pub evidence: serde_json::Map<String, serde_json::Value>,
+    /// For each list of `evidence` cut to its first entries, its JSON pointer within the item
+    /// and how many entries were left out.
+    pub omitted: std::collections::BTreeMap<String, u64>,
+    /// For each free-text string cut to a preview (evidence, the answer's note, the
+    /// resolution's note), its JSON pointer within the item and its full length in characters.
+    pub truncated: std::collections::BTreeMap<String, u64>,
+    pub arbiter: Option<ItemArbiter>,
+    pub resolution: Option<Resolution>,
+}
+
+/// `cardinal.inbox-brief.v1`
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct InboxBrief {
+    pub schema: InboxBriefSchema,
+    pub items: Vec<BriefItem>,
 }
 
 #[cfg(test)]

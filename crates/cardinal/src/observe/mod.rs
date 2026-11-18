@@ -33,7 +33,7 @@ use crate::contract::{
     ArbiterView, BaseRef, CheckResult, DerivedState, DirtyUnknown, DirtyUnknownReason, DiskState,
     Error, ErrorCode, Facts, GhStatus, HostInfo, IgnoredClass, IgnoredEntry, InUse, Inventory,
     InventorySchema, MergeEvidence, Os, Outlived, PrRef, ReclaimSummary, Repo, ReservationView,
-    Resources, ScopedError, SessionSnapshot, Tri, Worktree,
+    Resources, ScopedError, SessionSnapshot, Tri, Worktree, WorktreeSchema, WorktreeView,
 };
 use crate::os::child;
 use crate::os::{Detail, ProcessTable};
@@ -128,6 +128,49 @@ pub fn content_in_base(
 
 /// How many paths `content_diff` lists.
 const CONTENT_DIFF_PATHS: usize = 20;
+
+/// How many ignored entries `cardinal inventory --worktree` lists.
+const VIEW_IGNORED: usize = 10;
+
+/// `cardinal inventory --worktree PATH` (section 11.2).
+pub fn worktree_view(
+    config: &Config,
+    state: &StateDir,
+    path: &Path,
+) -> Result<WorktreeView, Error> {
+    Observer::new(config).worktree_view(state, path)
+}
+
+/// The `<set>` of the `unclassifiable_data` condition of `worktree` (section 10.1), with its
+/// unclassifiable ignored entries in path order: the FNV-1a of their sorted paths, each
+/// followed by a NUL. `None` when it has none, or its ignored entries were not listed (the
+/// check `no_unclassifiable` is unknown).
+#[must_use]
+pub fn unclassifiable_set(worktree: &Worktree) -> Option<(String, Vec<&IgnoredEntry>)> {
+    if worktree
+        .reclaim
+        .unknown
+        .iter()
+        .any(|name| name == "no_unclassifiable")
+    {
+        return None;
+    }
+    let mut entries: Vec<_> = worktree
+        .ignored
+        .iter()
+        .filter(|entry| entry.class == IgnoredClass::Unclassifiable)
+        .collect();
+    if entries.is_empty() {
+        return None;
+    }
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    let mut bytes = Vec::new();
+    for entry in &entries {
+        bytes.extend_from_slice(entry.path.as_bytes());
+        bytes.push(0);
+    }
+    Some((crate::state::key(&bytes), entries))
+}
 
 /// The disk states of `disk/`, as the last `reconcile` pass left them (section 8.5), in file
 /// name order; a file that cannot be read is reported in `errors`.
@@ -475,6 +518,38 @@ impl<'a> Observer<'a> {
         state: &StateDir,
         path: &Path,
     ) -> Result<WorktreeObservation, Error> {
+        self.observe_worktree_with(state, path, &mut Vec::new())
+    }
+
+    /// `cardinal inventory --worktree PATH`: the worktree containing `path`, observed from
+    /// scratch, in a size that does not grow with the host (section 11.2).
+    pub fn worktree_view(&self, state: &StateDir, path: &Path) -> Result<WorktreeView, Error> {
+        let mut errors = Vec::new();
+        let observation = self.observe_worktree_with(state, path, &mut errors)?;
+        errors.extend(observation.errors);
+        let mut worktree = observation.worktree;
+        let unclassifiable_set = unclassifiable_set(&worktree).map(|(set, _)| set);
+        let ignored_entries = worktree.ignored.len() as u64;
+        worktree.ignored.truncate(VIEW_IGNORED);
+        Ok(WorktreeView {
+            schema: WorktreeSchema,
+            observed_ms: now_ms(),
+            repo: observation.repo,
+            worktree,
+            ignored_entries,
+            unclassifiable_set,
+            errors,
+        })
+    }
+
+    /// [`Observer::observe_worktree`], adding what the process table and the reservations
+    /// could not read to `errors`.
+    fn observe_worktree_with(
+        &self,
+        state: &StateDir,
+        path: &Path,
+        shared_errors: &mut Vec<ScopedError>,
+    ) -> Result<WorktreeObservation, Error> {
         let root = find_worktree_root(path).ok_or_else(|| {
             Error::new(
                 ErrorCode::NotFound,
@@ -494,7 +569,7 @@ impl<'a> Observer<'a> {
                     format!("git does not list {} as a worktree", root.display()),
                 )
             })?;
-        let shared = self.shared(state, false, &mut Vec::new());
+        let shared = self.shared(state, false, shared_errors);
         let result = self.observe_one(&ctx, index, &shared);
         let mut errors: Vec<_> = ctx.failure_error().into_iter().collect();
         errors.extend(result.errors);

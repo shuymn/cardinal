@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub use checks::{
-    DataLists, InUseFacts, Inspection, approval, evaluate, invariants_ok, processes_inside,
-    provenance,
+    DataLists, FACT_ENTRIES, InUseFacts, Inspection, approval, bound_facts, evaluate,
+    invariants_ok, processes_inside, provenance,
 };
 pub use walk::{Entry, EntryKind, Mount, Walk, root_identity, walk};
 

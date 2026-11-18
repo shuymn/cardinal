@@ -83,6 +83,9 @@ impl DataLists {
 /// How many paths a check detail names before it summarizes the rest.
 const DETAIL_PATHS: usize = 5;
 
+/// How many entries a list fact keeps where a command prints it bounded.
+pub const FACT_ENTRIES: usize = 10;
+
 /// Every check for the plan kind, in the order of section 9.2.
 #[must_use]
 pub fn evaluate(i: &Inspection<'_>) -> Vec<Check> {
@@ -125,7 +128,9 @@ pub fn evaluate(i: &Inspection<'_>) -> Vec<Check> {
     checks
 }
 
-/// One fact a check read, with what produced it; null when it was not read.
+/// One fact a check read, with what produced it; null when it was not read. Kept whole: plans,
+/// `act` records, and `explain` hold every entry, and only a command a timer pass runs prints
+/// it cut ([`bound_facts`]).
 fn fact(name: &str, value: Option<impl serde::Serialize>, source: &str) -> CheckFact {
     CheckFact {
         name: name.to_owned(),
@@ -133,6 +138,21 @@ fn fact(name: &str, value: Option<impl serde::Serialize>, source: &str) -> Check
             .and_then(|v| serde_json::to_value(v).ok())
             .unwrap_or_default(),
         source: source.to_owned(),
+        omitted: None,
+    }
+}
+
+/// Cuts every list fact of `checks` to its first [`FACT_ENTRIES`] entries, counting the rest
+/// in `omitted`, for the commands a timer pass runs, whose output must not grow with the
+/// worktree (section 10.5): `plan reclaim-worktree` and `act` print their checks so.
+pub fn bound_facts(checks: &mut [Check]) {
+    for fact in checks.iter_mut().flat_map(|check| &mut check.facts) {
+        if let serde_json::Value::Array(entries) = &mut fact.value
+            && entries.len() > FACT_ENTRIES
+        {
+            fact.omitted = Some((entries.len() - FACT_ENTRIES) as u64);
+            entries.truncate(FACT_ENTRIES);
+        }
     }
 }
 
@@ -491,7 +511,7 @@ fn not_in_use(i: &Inspection<'_>) -> Check {
     }
     match &i.in_use.reservations {
         Ok(in_use) if in_use.value => {
-            failed.push(format!("reserved by jobs {}", in_use.jobs.join(", ")));
+            failed.push(format!("reserved by jobs {}", list(&in_use.jobs)));
         }
         Ok(_) => {}
         Err(err) => unknown.push(format!("reservations: {err}")),
@@ -501,7 +521,7 @@ fn not_in_use(i: &Inspection<'_>) -> Check {
             let pids: Vec<String> = pids.iter().map(u32::to_string).collect();
             failed.push(format!(
                 "processes with their working directory inside: {}",
-                pids.join(", ")
+                list(&pids)
             ));
         }
         Ok(_) => {}

@@ -133,6 +133,9 @@ pub struct Arbiter {
     pub min_interval_s: u64,
     /// An item is due again this long after its pass ended.
     pub retry_s: u64,
+    /// The most due items one pass is assigned, longest due first, as many as its brief listing
+    /// holds (section 10.5); the rest wait for later passes.
+    pub max_items: usize,
 }
 
 /// `[reconcile]` (section 10.3).
@@ -156,6 +159,11 @@ const ARBITER_PROMPT: &str = "Start the cardinal-arbiter subagent for one arbite
 
 /// The allow list of the default `[arbiter] command`: the five subcommands the skill uses.
 const ARBITER_TOOLS: &str = "Bash(cardinal inventory:*),Bash(cardinal inbox:*),Bash(cardinal explain:*),Bash(cardinal plan:*),Bash(cardinal act:*)";
+
+/// The default `[arbiter] max_items`: the work of one pass. The bound of section 10.5 on what
+/// `cardinal inbox --assigned --brief` lists is kept by the bytes of the listing, which stop a
+/// batch of large items earlier.
+pub const MAX_ITEMS: usize = 10;
 
 impl HostConfig {
     /// The configuration of a host without `host.toml`.
@@ -375,6 +383,7 @@ struct RawArbiter {
     timeout_s: u64,
     min_interval_s: u64,
     retry_s: u64,
+    max_items: usize,
 }
 
 impl Default for RawArbiter {
@@ -390,6 +399,7 @@ impl Default for RawArbiter {
             timeout_s: 1200,
             min_interval_s: 1800,
             retry_s: 7200,
+            max_items: MAX_ITEMS,
         }
     }
 }
@@ -569,11 +579,15 @@ impl RawArbiter {
         if self.timeout_s == 0 {
             return Err("arbiter.timeout_s must be positive".into());
         }
+        if self.max_items == 0 {
+            return Err("arbiter.max_items must be positive".into());
+        }
         Ok(Arbiter {
             command: self.command,
             timeout_s: self.timeout_s,
             min_interval_s: self.min_interval_s,
             retry_s: self.retry_s,
+            max_items: self.max_items,
         })
     }
 }
@@ -621,7 +635,7 @@ mod tests {
     use std::num::NonZeroU64;
     use std::path::{Path, PathBuf};
 
-    use super::{DiskLines, HostConfig, validate_runner};
+    use super::{DiskLines, HostConfig, MAX_ITEMS, validate_runner};
 
     /// An absolute home directory on every OS.
     fn home() -> PathBuf {
@@ -668,6 +682,7 @@ mod tests {
         assert_eq!(host.arbiter.timeout_s, 1200);
         assert_eq!(host.arbiter.min_interval_s, 1800);
         assert_eq!(host.arbiter.retry_s, 7200);
+        assert_eq!(host.arbiter.max_items, MAX_ITEMS);
         assert_eq!(host.reconcile.observe_every_s, 3600);
         assert!(!host.unit_may_act("anything"));
     }
@@ -769,6 +784,7 @@ mod tests {
             ("[arbiter]\ncommand = [\"\", \"-p\"]", "first word"),
             ("[arbiter]\ncommand = \"claude -p x\"", "invalid type"),
             ("[arbiter]\ntimeout_s = 0", "must be positive"),
+            ("[arbiter]\nmax_items = 0", "must be positive"),
             ("[arbiter]\ninterval = 1", "unknown field"),
             ("[reconcile]\nobserve_every = 1", "unknown field"),
         ] {

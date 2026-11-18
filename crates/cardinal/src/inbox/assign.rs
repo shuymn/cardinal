@@ -3,19 +3,21 @@
 //! --assigned` lists and resolves. The launcher and the session's commands share these.
 //!
 //! An item records the last pass it was assigned to in its `arbiter` entry, written durably
-//! under `inbox/.lock`: `{pass, assigned_ms}` when the launcher assigns it, then the pass's
-//! `outcome` and `ended_ms` when the pass ends. A pass that `arbiter/last.json` records without
-//! an end is running until `timeout_s` after it started; an item whose pass `last.json` no
-//! longer names counts as ended `timeout_s` after its `assigned_ms`. So an item never assigned
-//! is due at once, and every assigned one is due `retry_s` after its pass ended, however it
-//! ended, and never strands.
+//! under `inbox/.lock`: `{pass, assigned_ms}` when the launcher assigns it, the pass's
+//! `answer` when the session answers it, then the pass's `outcome` and `ended_ms` when the pass
+//! ends; a pass that completes without answering an item it could ends `failed:no_answer`, and
+//! one whose answers cannot be read back `failed:unverified`. A pass that `arbiter/last.json`
+//! records without an end is running until `timeout_s` after it started; an item whose pass
+//! `last.json` no longer names counts as ended `timeout_s` after its `assigned_ms`. So an item
+//! never assigned is due when it is raised, and every assigned one `retry_s` after its pass
+//! ended, however it ended; passes take them in that order, so none strands or starves.
 
 use std::cmp::Ordering;
 
 use crate::config::{Arbiter, Config};
 use crate::contract::{
-    ArbiterPass, Error, ErrorCode, Inbox, InboxItem, InboxSchema, InboxStatus, ItemArbiter,
-    PassOutcome, ResolutionOutcome,
+    AnswerOutcome, ArbiterPass, Error, ErrorCode, Inbox, InboxItem, InboxSchema, InboxStatus,
+    ItemAnswer, ItemArbiter, PassOutcome, ResolutionOutcome,
 };
 use crate::state::{self, StateDir};
 use crate::testpoint;
@@ -24,7 +26,10 @@ use crate::testpoint;
 /// records: never assigned, or `[arbiter] retry_s` past the end of the pass they were
 /// assigned to. Items only the owner can act on are never due, and neither is an item of a
 /// pass `last` records without an end: the caller records an abandoned pass before it asks.
-/// Read under `inbox/.lock`, oldest first.
+/// Read under `inbox/.lock`, in the order they became due: an item never assigned when it was
+/// raised (`created_ms`), an assigned one when its cooldown ran out, ties by key. So an item
+/// a pass left open waits behind every item that was due before it, and none starves however
+/// many passes leave theirs open.
 pub fn due(
     config: &Config,
     state: &StateDir,
@@ -36,25 +41,30 @@ pub fn due(
         let _lock = super::lock(state)?;
         super::read_all(state)?
     };
-    let mut due: Vec<InboxItem> = items
+    let mut due: Vec<(u64, InboxItem)> = items
         .into_iter()
-        .map(|(_, item)| item)
-        .filter(|item| is_due(item, last, arbiter, now_ms))
+        .filter_map(|(_, item)| {
+            due_since(&item, last, arbiter)
+                .filter(|since| now_ms >= *since)
+                .map(|since| (since, item))
+        })
         .collect();
-    due.sort_by(oldest_first);
-    Ok(due)
+    due.sort_by(|(a_since, a), (b_since, b)| (a_since, &a.key).cmp(&(b_since, &b.key)));
+    Ok(due.into_iter().map(|(_, item)| item).collect())
 }
 
-/// Whether `item` is due at `now_ms` (section 10.5).
-fn is_due(item: &InboxItem, last: Option<&ArbiterPass>, arbiter: &Arbiter, now_ms: u64) -> bool {
+/// When `item`'s current attempt becomes due: when it was raised if no pass was assigned it,
+/// else `retry_s` after that pass ended; `None` for an item no pass may take, or whose pass
+/// `last.json` records without an end.
+fn due_since(item: &InboxItem, last: Option<&ArbiterPass>, arbiter: &Arbiter) -> Option<u64> {
     if item.status != InboxStatus::Open || item.kind.is_owners() {
-        return false;
+        return None;
     }
     let Some(assigned) = &item.arbiter else {
-        return true;
+        return Some(item.created_ms);
     };
     pass_end(assigned, last, arbiter)
-        .is_some_and(|ended_ms| now_ms >= ended_ms.saturating_add(secs_ms(arbiter.retry_s)))
+        .map(|ended_ms| ended_ms.saturating_add(secs_ms(arbiter.retry_s)))
 }
 
 /// When the pass `assigned` names ended, as far as the item and `last.json` tell; `None`
@@ -96,6 +106,7 @@ pub fn assign(
         item.arbiter = Some(ItemArbiter {
             pass: pass.to_owned(),
             assigned_ms,
+            answer: None,
             outcome: None,
             ended_ms: None,
         });
@@ -105,45 +116,102 @@ pub fn assign(
     Ok(assigned)
 }
 
-/// Writes how `pass` ended into each item assigned to it that has no outcome yet, and into no
-/// other, then runs `publish`, which records the end in `last.json`, still holding
-/// `inbox/.lock`, so an `--assigned` answer waiting for the lock finds the pass ended.
-/// `publish` runs also when an item could not be written, and without the lock when it
-/// cannot be taken. Returns how the item writes went, and `publish`'s result.
+/// The outcome of a pass whose session exited 0 having answered none of its items while at
+/// least one was still open (section 10.5).
+pub const NO_ANSWER: &str = "no_answer";
+
+/// The outcome of a pass whose session exited 0 but whose answers could not be checked, the
+/// launcher having failed to take `inbox/.lock` in time or to read one of the pass's items
+/// (section 10.5).
+pub const UNVERIFIED: &str = "unverified";
+
+/// Reads each of `keys`, the items `last.json` records for `pass`, and writes how the pass
+/// ended into each of them still assigned to it without an outcome, and into no other, then
+/// runs `publish` with that outcome, which records the end in `last.json`, still holding
+/// `inbox/.lock`, so an `--assigned` answer waiting for the lock finds the pass ended. A
+/// `completed` pass that answered none of its items while one of them is still open ends
+/// `failed:no_answer` instead, and one of whose items one could not be read or parsed, or
+/// whose lock could not be taken, `failed:unverified` (section 10.5); any other outcome is
+/// kept. `publish` runs also when an item could not be read or written, and without the lock
+/// when it cannot be taken. Returns how reading and writing the items went, `publish`'s
+/// result, and the outcome recorded.
 pub fn record_outcome(
     state: &StateDir,
     pass: &str,
+    keys: &[String],
     outcome: &PassOutcome,
     ended_ms: u64,
-    publish: impl FnOnce() -> Result<(), Error>,
-) -> (Result<(), Error>, Result<(), Error>) {
+    publish: impl FnOnce(&PassOutcome) -> Result<(), Error>,
+) -> (Result<(), Error>, Result<(), Error>, PassOutcome) {
+    let mut recorded = outcome.clone();
     let (written, lock) = match super::lock(state) {
-        Ok(lock) => (write_outcomes(state, pass, outcome, ended_ms), Some(lock)),
-        Err(err) => (Err(err), None),
+        Ok(lock) => (
+            write_outcomes(state, pass, keys, &mut recorded, ended_ms),
+            Some(lock),
+        ),
+        Err(err) => {
+            unverified(&mut recorded);
+            (Err(err), None)
+        }
     };
-    let published = publish();
+    let published = publish(&recorded);
     drop(lock);
-    (written, published)
+    (written, published, recorded)
 }
 
-/// The item writes of [`record_outcome`], holding `inbox/.lock`.
+/// The item reads and writes of [`record_outcome`], holding `inbox/.lock`; turns `outcome`
+/// into `failed:unverified` first when one of `keys` cannot be read or parsed, its answer then
+/// unknown, and into `failed:no_answer` when the pass completed without answering an item it
+/// could. The outcome is written into the items read either way; the first read error is
+/// returned.
 fn write_outcomes(
     state: &StateDir,
     pass: &str,
-    outcome: &PassOutcome,
+    keys: &[String],
+    outcome: &mut PassOutcome,
     ended_ms: u64,
 ) -> Result<(), Error> {
-    for (path, mut item) in super::read_all(state)? {
-        if let Some(assigned) = &mut item.arbiter
-            && assigned.pass == pass
-            && assigned.outcome.is_none()
-        {
+    let mut items = Vec::new();
+    let mut unread = None;
+    for key in keys {
+        match super::read_strictly(state, key) {
+            // An item closed before it was assigned stays another pass's or none's.
+            Ok((path, item)) => {
+                if assigned_to(&item, pass) {
+                    items.push((path, item));
+                }
+            }
+            Err(err) => {
+                unverified(outcome);
+                unread.get_or_insert(err);
+            }
+        }
+    }
+    let answered_any = items.iter().any(|(_, item)| answered(item));
+    let open = items
+        .iter()
+        .any(|(_, item)| item.status == InboxStatus::Open);
+    if *outcome == PassOutcome::Completed && !answered_any && open {
+        *outcome = PassOutcome::Failed(NO_ANSWER.into());
+    }
+    testpoint::hit(testpoint::ARBITER_ITEMS_WRITING)
+        .map_err(|err| Error::new(ErrorCode::Internal, err.to_string()))?;
+    for (path, mut item) in items {
+        if let Some(assigned) = &mut item.arbiter {
             assigned.outcome = Some(outcome.clone());
             assigned.ended_ms = Some(ended_ms);
             super::write(state, &path, &item)?;
         }
     }
-    Ok(())
+    unread.map_or(Ok(()), Err)
+}
+
+/// Turns a `completed` outcome into `failed:unverified`: the pass's answers could not be
+/// checked.
+fn unverified(outcome: &mut PassOutcome) {
+    if *outcome == PassOutcome::Completed {
+        *outcome = PassOutcome::Failed(UNVERIFIED.into());
+    }
 }
 
 /// `cardinal inbox --assigned`: the open and escalated items assigned to `pass`, the pass
@@ -176,24 +244,25 @@ pub fn list_assigned(
 }
 
 /// `cardinal inbox resolve KEY … --assigned`: answers an open item assigned to the running
-/// pass `pass`, once; any other item, and every item once that pass has ended or been
-/// recorded `abandoned`, is refused with `not_assigned`, and an item the pass already
-/// answered with `invalid_argument`, each left unchanged. The pass and its deadline are
-/// checked under `inbox/.lock`, after the lookup and right before the write, so an answer
-/// that waited for the lock past the deadline, or until the launcher recorded the end, is
-/// refused.
+/// pass `pass`, once, recording the answer in the item's `arbiter` entry: `resolved`,
+/// `escalated`, and `dismissed` close it as `cardinal inbox resolve` does, and `deferred`
+/// leaves it open. Any other item, and every item once that pass has ended or been recorded
+/// `abandoned`, is refused with `not_assigned`, and an item the pass already answered with
+/// `invalid_argument`, each left unchanged. The pass and its deadline are checked under
+/// `inbox/.lock`, after the lookup and right before the write, so an answer that waited for
+/// the lock past the deadline, or until the launcher recorded the end, is refused.
 pub fn resolve_assigned(
     config: &Config,
     state: &StateDir,
     pass: Option<&str>,
     key: &str,
-    outcome: ResolutionOutcome,
+    outcome: AnswerOutcome,
     note: Option<&str>,
 ) -> Result<InboxItem, Error> {
     let pass = named(pass)?;
     testpoint::hit(testpoint::ARBITER_ANSWERING)
         .map_err(|err| Error::new(ErrorCode::Internal, err.to_string()))?;
-    let item = {
+    let (item, closed) = {
         let _lock = super::lock(state)?;
         let (path, existing) = super::find(state, key)?;
         let Some(mut item) = existing.filter(|item| assigned_to(item, pass)) else {
@@ -201,8 +270,8 @@ pub fn resolve_assigned(
                 "the inbox item `{key}` is not assigned to the arbiter pass {pass}"
             )));
         };
-        // One answer per assigned item: an escalation is not answered again.
-        if item.status != InboxStatus::Open {
+        // One answer per assigned item: an escalation or a deferral is not answered again.
+        if item.status != InboxStatus::Open || answered(&item) {
             return Err(Error::new(
                 ErrorCode::InvalidArgument,
                 format!("the inbox item `{key}` was already answered"),
@@ -216,18 +285,36 @@ pub fn resolve_assigned(
                 "the arbiter pass {pass} is not running"
             )));
         }
-        super::set_resolution(
-            &mut item,
-            outcome,
-            super::BY_CLI,
-            note.unwrap_or_default(),
-            now,
-        );
+        let note = note.unwrap_or_default();
+        let resolution = closing(outcome);
+        if let Some(resolution) = resolution {
+            super::set_resolution(&mut item, resolution, super::BY_CLI, note, now);
+        }
+        if let Some(assigned) = &mut item.arbiter {
+            assigned.answer = Some(ItemAnswer {
+                outcome,
+                note: note.to_owned(),
+                at_ms: now,
+            });
+        }
         super::write(state, &path, &item)?;
-        item
+        (item, resolution.is_some())
     };
-    super::record_resolution(config, state, &item);
+    if closed {
+        super::record_resolution(config, state, &item);
+    }
     Ok(item)
+}
+
+/// The resolution an answer closes its item with; `None` for `deferred`, which leaves it open.
+#[must_use]
+pub fn closing(answer: AnswerOutcome) -> Option<ResolutionOutcome> {
+    match answer {
+        AnswerOutcome::Resolved => Some(ResolutionOutcome::Resolved),
+        AnswerOutcome::Escalated => Some(ResolutionOutcome::Escalated),
+        AnswerOutcome::Dismissed => Some(ResolutionOutcome::Dismissed),
+        AnswerOutcome::Deferred => None,
+    }
 }
 
 /// The pass `CARDINAL_ARBITER_PASS` names, or `not_assigned`.
@@ -260,6 +347,13 @@ fn assigned_to(item: &InboxItem, pass: &str) -> bool {
     item.arbiter
         .as_ref()
         .is_some_and(|assigned| assigned.pass == pass && assigned.outcome.is_none())
+}
+
+/// Whether the pass `item` is assigned to has answered it.
+fn answered(item: &InboxItem) -> bool {
+    item.arbiter
+        .as_ref()
+        .is_some_and(|assigned| assigned.answer.is_some())
 }
 
 /// The pass `arbiter/last.json` records: `None` when no pass ever ran, an error when the file
@@ -297,7 +391,7 @@ fn secs_ms(seconds: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_due, pass_end};
+    use super::{due_since, pass_end};
     use crate::config::Arbiter;
     use crate::contract::{
         ArbiterPass, ArbiterPassSchema, InboxItem, InboxItemSchema, InboxKind, InboxStatus,
@@ -309,7 +403,18 @@ mod tests {
         timeout_s: 10,
         min_interval_s: 0,
         retry_s: 100,
+        max_items: 10,
     };
+
+    /// Whether `item` is due at `now_ms` (section 10.5).
+    fn is_due(
+        item: &InboxItem,
+        last: Option<&ArbiterPass>,
+        arbiter: &Arbiter,
+        now_ms: u64,
+    ) -> bool {
+        due_since(item, last, arbiter).is_some_and(|since| now_ms >= since)
+    }
 
     fn item(kind: InboxKind, arbiter: Option<ItemArbiter>) -> InboxItem {
         InboxItem {
@@ -332,6 +437,7 @@ mod tests {
         ItemArbiter {
             pass: pass.into(),
             assigned_ms: 1_000,
+            answer: None,
             outcome: ended_ms.map(|_| PassOutcome::Completed),
             ended_ms,
         }

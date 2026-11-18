@@ -19,6 +19,7 @@
 //! occurrences.
 
 mod assign;
+mod brief;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -36,7 +37,11 @@ use crate::record::Recorder;
 use crate::state::{self, Durability, LockMode, StateDir};
 use crate::testpoint;
 
-pub use assign::{assign, due, list_assigned, read_last, record_outcome, resolve_assigned};
+pub use assign::{
+    NO_ANSWER, UNVERIFIED, assign, closing, due, list_assigned, read_last, record_outcome,
+    resolve_assigned,
+};
+pub use brief::{LIST_ENTRIES, LISTING_BYTES, TEXT_CHARS, batch, brief};
 
 /// How long an upsert waits for `inbox/.lock`.
 const LOCK_WAIT: Duration = Duration::from_secs(5);
@@ -721,6 +726,34 @@ fn find(state: &StateDir, key: &str) -> Result<(PathBuf, Option<InboxItem>), Err
     Err(Error::new(
         ErrorCode::StateUnavailable,
         format!("no free inbox slot for `{key}`"),
+    ))
+}
+
+/// The item `key` and its file, read strictly: an error when it is not there, when a file in
+/// its probe sequence cannot be read, or when one does not parse, which may be it.
+fn read_strictly(state: &StateDir, key: &str) -> Result<(PathBuf, InboxItem), Error> {
+    for probe in 0..MAX_PROBES {
+        let path = state.inbox_item(key, probe);
+        let bytes = std::fs::read(&path).map_err(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                Error::new(ErrorCode::NotFound, format!("no inbox item `{key}`"))
+            } else {
+                state_error(&path, &err)
+            }
+        })?;
+        let item: InboxItem = serde_json::from_slice(&bytes).map_err(|err| {
+            Error::new(
+                ErrorCode::StateUnavailable,
+                format!("{}: {err}", path.display()),
+            )
+        })?;
+        if item.key == key {
+            return Ok((path, item));
+        }
+    }
+    Err(Error::new(
+        ErrorCode::NotFound,
+        format!("no inbox item `{key}`"),
     ))
 }
 

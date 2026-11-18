@@ -19,7 +19,8 @@ use crate::act::{self, ActOptions};
 use crate::adapter::claude;
 use crate::config::{self, Config};
 use crate::contract::{
-    Caller, Error, ErrorCode, InboxStatus, PlanKind, ResolutionOutcome, Trigger,
+    AnswerOutcome, Caller, Error, ErrorCode, Inbox, InboxBrief, InboxBriefSchema, InboxItem,
+    InboxSchema, InboxStatus, PlanKind, Trigger,
 };
 use crate::explain::{self, Subject};
 use crate::inbox::{self, StatusFilter};
@@ -109,6 +110,9 @@ pub struct InventoryArgs {
     /// Walk worktrees to report allocated bytes
     #[arg(long)]
     pub sizes: bool,
+    /// Observe only the worktree at PATH and print it as cardinal.worktree.v1
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["repos", "sizes"])]
+    pub worktree: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -125,6 +129,9 @@ pub struct InboxArgs {
     /// List the items assigned to the arbiter pass `CARDINAL_ARBITER_PASS` names
     #[arg(long)]
     pub assigned: bool,
+    /// Print each item in a bounded size, as cardinal.inbox-brief.v1
+    #[arg(long)]
+    pub brief: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -155,6 +162,9 @@ pub struct ResolveArgs {
     /// Refuse an item not assigned to the running arbiter pass `CARDINAL_ARBITER_PASS` names
     #[arg(long)]
     pub assigned: bool,
+    /// Print the item in a bounded size, as cardinal.inbox-brief.v1
+    #[arg(long)]
+    pub brief: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -162,6 +172,8 @@ pub enum OutcomeArg {
     Resolved,
     Escalated,
     Dismissed,
+    /// Leave the item open, answered by the arbiter pass (only with --assigned)
+    Deferred,
 }
 
 #[derive(Debug, Args)]
@@ -284,8 +296,26 @@ pub fn main_with(args: &[OsString]) -> ExitCode {
 }
 
 /// The rules clap's definitions do not express, as usage errors: `--owner-approved` only with
-/// `--caller owner` (section 9.3).
+/// `--caller owner` (section 9.3), and `--outcome deferred` only with `--assigned`, an answer
+/// of an arbiter pass (section 10.5).
 fn validate(cli: Cli) -> Result<Cli, clap::Error> {
+    if let Command::Inbox(InboxArgs {
+        command: Some(InboxCommand::Resolve(args)),
+        ..
+    }) = &cli.command
+        && args.outcome == OutcomeArg::Deferred
+        && !args.assigned
+    {
+        let mut command = Cli::command();
+        let resolve = command
+            .find_subcommand_mut("inbox")
+            .and_then(|inbox| inbox.find_subcommand_mut("resolve"))
+            .expect("inbox resolve is defined");
+        return Err(resolve.error(
+            ErrorKind::ArgumentConflict,
+            "--outcome deferred is accepted only with --assigned: only an arbiter pass defers",
+        ));
+    }
     if let Command::Act(args) = &cli.command
         && args.owner_approved
         && args.caller != Caller::Owner
@@ -311,13 +341,19 @@ fn dispatch(command: Command) -> ExitCode {
         Command::Inventory(args) => {
             // Runs git and gh, so it sets their cleanup up while this is the only thread.
             child::prepare();
-            respond(context().and_then(|ctx| {
-                let options = InventoryOptions {
-                    repos: args.repos,
-                    sizes: args.sizes,
-                };
-                observe::inventory(&ctx.config, &ctx.state, &options)
-            }))
+            match args.worktree {
+                Some(path) => respond(
+                    context()
+                        .and_then(|ctx| observe::worktree_view(&ctx.config, &ctx.state, &path)),
+                ),
+                None => respond(context().and_then(|ctx| {
+                    let options = InventoryOptions {
+                        repos: args.repos,
+                        sizes: args.sizes,
+                    };
+                    observe::inventory(&ctx.config, &ctx.state, &options)
+                })),
+            }
         }
         Command::Inbox(args) => inbox_command(args),
         Command::Plan(args) => {
@@ -329,8 +365,12 @@ fn dispatch(command: Command) -> ExitCode {
                     context()
                         .and_then(|ctx| plan::create_all(&ctx.config, &ctx.state, &args.repos)),
                 ),
+                // A command a timer pass runs: its list facts are cut (section 10.5).
                 Some(PlanCommand::ReclaimWorktree { path }) => respond(context().and_then(|ctx| {
-                    plan::create(&ctx.config, &ctx.state, PlanKind::ReclaimWorktree, &path)
+                    let mut plan =
+                        plan::create(&ctx.config, &ctx.state, PlanKind::ReclaimWorktree, &path)?;
+                    plan::bound_facts(&mut plan.checks);
+                    Ok(plan)
                 })),
                 Some(PlanCommand::ReclaimDir { path }) => respond(context().and_then(|ctx| {
                     plan::create(&ctx.config, &ctx.state, PlanKind::ReclaimDir, &path)
@@ -379,13 +419,38 @@ fn dispatch(command: Command) -> ExitCode {
     }
 }
 
-/// `cardinal inbox` and `cardinal inbox resolve`.
+/// `cardinal inbox` and `cardinal inbox resolve`, with `--brief` printing
+/// `cardinal.inbox-brief.v1`.
 fn inbox_command(args: InboxArgs) -> ExitCode {
+    let brief = match &args.command {
+        Some(InboxCommand::Resolve(resolve)) => resolve.brief,
+        None => args.brief,
+    };
+    let print = |items: Result<Inbox, Error>| {
+        if brief {
+            respond(items.map(|inbox| InboxBrief {
+                schema: InboxBriefSchema,
+                items: inbox.items.iter().map(inbox::brief).collect(),
+            }))
+        } else {
+            respond(items)
+        }
+    };
+    let print_item = |item: Result<InboxItem, Error>| {
+        if brief {
+            print(item.map(|item| Inbox {
+                schema: InboxSchema,
+                items: vec![item],
+            }))
+        } else {
+            respond(item)
+        }
+    };
     match args.command {
-        None if args.assigned => respond(context().and_then(|ctx| {
+        None if args.assigned => print(context().and_then(|ctx| {
             inbox::list_assigned(&ctx.config, &ctx.state, arbiter_pass().as_deref())
         })),
-        None => respond(context().and_then(|ctx| {
+        None => print(context().and_then(|ctx| {
             let status = args.status.map(|status| match status {
                 StatusArg::Open => StatusFilter::Only(InboxStatus::Open),
                 StatusArg::Escalated => StatusFilter::Only(InboxStatus::Escalated),
@@ -395,29 +460,30 @@ fn inbox_command(args: InboxArgs) -> ExitCode {
             });
             inbox::list(&ctx.config, &ctx.state, status, !args.no_refresh)
         })),
-        Some(InboxCommand::Resolve(resolve)) => respond(context().and_then(|ctx| {
-            let outcome = match resolve.outcome {
-                OutcomeArg::Resolved => ResolutionOutcome::Resolved,
-                OutcomeArg::Escalated => ResolutionOutcome::Escalated,
-                OutcomeArg::Dismissed => ResolutionOutcome::Dismissed,
+        Some(InboxCommand::Resolve(resolve)) => print_item(context().and_then(|ctx| {
+            let answer = match resolve.outcome {
+                OutcomeArg::Resolved => AnswerOutcome::Resolved,
+                OutcomeArg::Escalated => AnswerOutcome::Escalated,
+                OutcomeArg::Dismissed => AnswerOutcome::Dismissed,
+                OutcomeArg::Deferred => AnswerOutcome::Deferred,
             };
-            if resolve.assigned {
-                inbox::resolve_assigned(
+            match inbox::closing(answer) {
+                Some(outcome) if !resolve.assigned => inbox::resolve(
+                    &ctx.config,
+                    &ctx.state,
+                    &resolve.key,
+                    outcome,
+                    resolve.note.as_deref(),
+                ),
+                // `validate` accepts `deferred` only with `--assigned`.
+                _ => inbox::resolve_assigned(
                     &ctx.config,
                     &ctx.state,
                     arbiter_pass().as_deref(),
                     &resolve.key,
-                    outcome,
+                    answer,
                     resolve.note.as_deref(),
-                )
-            } else {
-                inbox::resolve(
-                    &ctx.config,
-                    &ctx.state,
-                    &resolve.key,
-                    outcome,
-                    resolve.note.as_deref(),
-                )
+                ),
             }
         })),
     }
@@ -434,8 +500,10 @@ fn act_command(args: ActArgs) -> ExitCode {
         caller: args.caller,
     };
     match context().and_then(|ctx| act::execute(&ctx.config, &ctx.state, &args.plan, &options)) {
-        Ok(result) => {
+        Ok(mut result) => {
             let refused = result.status.is_refusal();
+            // A command a timer pass runs: its list facts are cut (section 10.5).
+            plan::bound_facts(&mut result.checks);
             print_json(&result);
             if refused {
                 ExitCode::from(3)
@@ -521,8 +589,8 @@ mod tests {
     use clap::{CommandFactory, Parser};
 
     use super::{
-        ArbiterCommand, Cli, Command, ExplainSubject, InboxCommand, PlanCommand, StatusArg,
-        TriggerArg, validate,
+        ArbiterCommand, Cli, Command, ExplainSubject, InboxCommand, OutcomeArg, PlanCommand,
+        StatusArg, TriggerArg, validate,
     };
     use crate::contract::Caller;
 
@@ -545,9 +613,12 @@ mod tests {
             (&["hook", "claude", "pre-tool-use"], &[]),
             (&["hook", "claude", "subagent-stop"], &[]),
             (&["hook", "claude", "session-end"], &[]),
-            (&["inventory"], &["repo", "sizes"]),
-            (&["inbox"], &["status", "assigned", "no-refresh"]),
-            (&["inbox", "resolve"], &["outcome", "note", "assigned"]),
+            (&["inventory"], &["repo", "sizes", "worktree"]),
+            (&["inbox"], &["status", "assigned", "no-refresh", "brief"]),
+            (
+                &["inbox", "resolve"],
+                &["outcome", "note", "assigned", "brief"],
+            ),
             (&["plan"], &["repo"]),
             (&["plan", "reclaim-worktree"], &[]),
             (&["plan", "reclaim-dir"], &[]),
@@ -677,6 +748,49 @@ mod tests {
             panic!()
         };
         assert!(matches!(args.command, Some(InboxCommand::Resolve(ref r)) if r.assigned));
+    }
+
+    /// A pass's bounded commands: the brief inbox, one worktree's facts, and the deferral, which
+    /// only an arbiter pass gives (a usage error without `--assigned`).
+    #[test]
+    fn bounded_pass_commands() {
+        let cli = parse(&["inbox", "--assigned", "--brief"]).unwrap();
+        let Command::Inbox(args) = cli.command else {
+            panic!()
+        };
+        assert!(args.assigned && args.brief);
+        let cli = parse(&["inventory", "--worktree", "/w"]).unwrap();
+        let Command::Inventory(args) = cli.command else {
+            panic!()
+        };
+        assert_eq!(args.worktree.as_deref(), Some(std::path::Path::new("/w")));
+        for other in [&["--repo", "/r"][..], &["--sizes"]] {
+            let mut args = vec!["inventory", "--worktree", "/w"];
+            args.extend_from_slice(other);
+            assert!(parse(&args).is_err(), "{args:?}");
+        }
+        let deferred = [
+            "inbox",
+            "resolve",
+            "k",
+            "--outcome",
+            "deferred",
+            "--note",
+            "n",
+        ];
+        let err = parse(&deferred).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        assert_eq!(err.exit_code(), 2);
+        let mut assigned = deferred.to_vec();
+        assigned.extend(["--assigned", "--brief"]);
+        let cli = parse(&assigned).unwrap();
+        let Command::Inbox(args) = cli.command else {
+            panic!()
+        };
+        assert!(matches!(
+            args.command,
+            Some(InboxCommand::Resolve(ref r)) if r.assigned && r.brief && r.outcome == OutcomeArg::Deferred
+        ));
     }
 
     #[test]

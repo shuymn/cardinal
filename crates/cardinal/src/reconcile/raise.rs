@@ -20,12 +20,12 @@ use std::path::Path;
 
 use crate::config::Config;
 use crate::contract::{
-    Approval, CheckResult, DiskLevel, DiskReport, DiskState, Error, IgnoredClass, InboxChanges,
-    InboxItem, InboxKind, InboxSubject, Inventory, MergeEvidence, Plan, PlanKind, Repo, Tri,
-    Worktree,
+    Approval, CheckResult, DiskLevel, DiskReport, DiskState, Error, InboxChanges, InboxItem,
+    InboxKind, InboxSubject, Inventory, MergeEvidence, Plan, PlanKind, Repo, Tri, Worktree,
 };
 use crate::inbox::{self, NewItem, Occurrence};
-use crate::state::{self, StateDir};
+use crate::observe;
+use crate::state::StateDir;
 
 use super::Observation;
 
@@ -237,26 +237,9 @@ fn fact_items(inventory: &Inventory, repo: &Repo, worktree: &Worktree) -> Vec<Ne
 
 /// The `unclassifiable_data` condition of a worktree whose ignored entries were listed, with
 /// its unclassifiable entries in path order; `None` when it has none or they were not listed.
-/// `<set>` is the FNV-1a of the sorted paths, each followed by a NUL.
+/// `<set>` is `observe::unclassifiable_set`'s, which `cardinal inventory --worktree` prints.
 fn unclassifiable(worktree: &Worktree) -> Option<(String, Vec<&crate::contract::IgnoredEntry>)> {
-    if unknown(worktree, "no_unclassifiable") {
-        return None;
-    }
-    let mut entries: Vec<_> = worktree
-        .ignored
-        .iter()
-        .filter(|entry| entry.class == IgnoredClass::Unclassifiable)
-        .collect();
-    if entries.is_empty() {
-        return None;
-    }
-    entries.sort_by(|a, b| a.path.cmp(&b.path));
-    let mut bytes = Vec::new();
-    for entry in &entries {
-        bytes.extend_from_slice(entry.path.as_bytes());
-        bytes.push(0);
-    }
-    let set = state::key(&bytes);
+    let (set, entries) = observe::unclassifiable_set(worktree)?;
     Some((format!("unclassifiable:{}:{set}", worktree.path), entries))
 }
 

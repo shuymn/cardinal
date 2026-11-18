@@ -3,9 +3,9 @@
 
 use cardinal::contract::{
     ActClaim, ActManifest, ActResult, ArbiterPass, ClassifyRequest, ClassifyResponse, DiskState,
-    EntryPath, ErrorDoc, Explain, Inbox, InboxItem, Inventory, ManifestEntry, Plan, PlanList,
-    Reconcile, ReconcileState, Record, Reservation, ReservationView, RunSpec, SessionSnapshot,
-    Snapshot,
+    EntryPath, ErrorDoc, Explain, Inbox, InboxBrief, InboxItem, Inventory, ManifestEntry, Plan,
+    PlanList, Reconcile, ReconcileState, Record, Reservation, ReservationView, RunSpec,
+    SessionSnapshot, Snapshot, WorktreeView,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -73,7 +73,11 @@ fn check(name: &str, role: &str, result: &str) -> Value {
 
 fn plan() -> Value {
     let mut clean = check("clean", "invariant", "pass");
-    clean["facts"] = json!([{"name": "worktree.facts.dirty", "value": "no", "source": "git"}]);
+    clean["facts"] = json!([
+        {"name": "worktree.facts.dirty", "value": "no", "source": "git"},
+        {"name": "worktree.ignored", "value": [{"path": "a", "class": "regenerable"}],
+         "source": "git", "omitted": 12}
+    ]);
     json!({
         "schema": "cardinal.plan.v1", "id": "fedcba9876543210", "created_ms": 5,
         "host_id": "00000000000000aa", "kind": "reclaim_worktree",
@@ -97,8 +101,9 @@ fn inbox_item() -> Value {
         "subject": {"job_id": "0123456789abcdef", "worktree": "/w"},
         "evidence": {"members": [101], "verified": false},
         "created_ms": 1, "updated_ms": 2, "seen": 3, "ended_ms": null,
-        "arbiter": {"pass": "fedcba9876543210", "assigned_ms": 2, "outcome": "failed:exit 1",
-                    "ended_ms": 3},
+        "arbiter": {"pass": "fedcba9876543210", "assigned_ms": 2,
+                    "answer": {"outcome": "escalated", "note": "n", "at_ms": 2},
+                    "outcome": "failed:exit 1", "ended_ms": 3},
         "resolution": {"outcome": "escalated", "by": "arbiter", "note": "n", "at_ms": 2}
     })
 }
@@ -608,6 +613,22 @@ fn inbox_documents() {
     rejects::<InboxItem>(&inbox_item(), "an unknown pass outcome", |d| {
         d["arbiter"]["outcome"] = json!("lost");
     });
+    for outcome in ["resolved", "escalated", "dismissed", "deferred"] {
+        let mut doc = inbox_item();
+        doc["arbiter"]["answer"]["outcome"] = json!(outcome);
+        round_trips::<InboxItem>(&doc);
+    }
+    rejects::<InboxItem>(&inbox_item(), "an unknown answer", |d| {
+        d["arbiter"]["answer"]["outcome"] = json!("ignored");
+    });
+    // An item assigned before passes answered still loads, with no answer.
+    let mut unanswered = inbox_item();
+    unanswered["arbiter"]
+        .as_object_mut()
+        .unwrap()
+        .remove("answer");
+    let loaded: InboxItem = serde_json::from_value(unanswered).unwrap();
+    assert_eq!(loaded.arbiter.unwrap().answer, None);
     // An item stored before occurrences and passes still loads, with both null.
     let mut old = inbox_item();
     old.as_object_mut().unwrap().remove("ended_ms");
@@ -626,6 +647,39 @@ fn inbox_documents() {
     let inbox = json!({"schema": "cardinal.inbox.v1", "items": [inbox_item()]});
     round_trips::<Inbox>(&inbox);
     rejects_wrong_schema_and_missing::<Inbox>(&inbox, "items");
+
+    let item = inbox_item();
+    let brief = json!({"schema": "cardinal.inbox-brief.v1", "items": [{
+        "key": item["key"], "kind": item["kind"], "status": item["status"],
+        "subject": item["subject"], "evidence": {"members": [101]},
+        "omitted": {"/evidence/members": 7},
+        "truncated": {"/resolution/note": 300}, "arbiter": item["arbiter"],
+        "resolution": item["resolution"]
+    }]});
+    round_trips::<InboxBrief>(&brief);
+    rejects_wrong_schema_and_missing::<InboxBrief>(&brief, "items");
+    for field in ["omitted", "truncated"] {
+        rejects::<InboxBrief>(&brief, &format!("an item without {field}"), |d| {
+            d["items"][0].as_object_mut().unwrap().remove(field);
+        });
+    }
+}
+
+#[test]
+fn worktree_document() {
+    let mut repo = repo();
+    repo["worktrees"] = json!([]);
+    let doc = json!({
+        "schema": "cardinal.worktree.v1", "observed_ms": 10, "repo": repo,
+        "worktree": worktree(), "ignored_entries": 40,
+        "unclassifiable_set": "0123456789abcdef",
+        "errors": [{"scope": "worktree:/w", "message": "status failed"}]
+    });
+    round_trips::<WorktreeView>(&doc);
+    rejects_wrong_schema_and_missing::<WorktreeView>(&doc, "ignored_entries");
+    let mut none = doc.clone();
+    none["unclassifiable_set"] = json!(null);
+    round_trips::<WorktreeView>(&none);
 }
 
 #[test]
@@ -691,6 +745,8 @@ const TESTED: &[&str] = &[
     "cardinal.act-manifest.v1",
     "cardinal.inbox-item.v1",
     "cardinal.inbox.v1",
+    "cardinal.inbox-brief.v1",
+    "cardinal.worktree.v1",
     "cardinal.explain.v1",
     "cardinal.record.v1",
     "cardinal.session-snapshot.v1",

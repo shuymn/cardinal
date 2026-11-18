@@ -47,6 +47,9 @@ pub const RECONCILE_OBSERVED: &str = "reconcile.observed";
 pub const ARBITER_LOCKED: &str = "arbiter.locked";
 /// The launcher recorded the pass and its keys in `arbiter/last.json` and assigned no item.
 pub const ARBITER_RECORDED: &str = "arbiter.recorded";
+/// The launcher, holding `inbox/.lock`, read the items of the pass and decided its outcome from
+/// their answers, and has written it into none of them.
+pub const ARBITER_ITEMS_WRITING: &str = "arbiter.items_writing";
 /// The launcher wrote the pass's outcome into every item of the pass and, still holding
 /// `inbox/.lock`, not yet its end into `arbiter/last.json`.
 pub const ARBITER_OUTCOMES: &str = "arbiter.outcomes";
@@ -119,6 +122,7 @@ pub const POINTS: &[&str] = &[
     RECONCILE_OBSERVED,
     ARBITER_LOCKED,
     ARBITER_RECORDED,
+    ARBITER_ITEMS_WRITING,
     ARBITER_OUTCOMES,
     ARBITER_ANSWERING,
     WALK_TARGET_CHECKED,
