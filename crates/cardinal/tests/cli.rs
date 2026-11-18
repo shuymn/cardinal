@@ -157,24 +157,9 @@ fn unbuilt_entry_points_answer_not_implemented() {
     for args in [
         &["reconcile"][..],
         &["reconcile", "--trigger", "job-end"],
-        &["arbiter", "run"],
         &["ui"],
-        &["inbox", "--assigned"],
-        &[
-            "inbox",
-            "resolve",
-            "k",
-            "--outcome",
-            "resolved",
-            "--assigned",
-        ],
     ] {
-        let assert = dirs
-            .cmd()
-            .env("CARDINAL_ARBITER_PASS", "0123456789abcdef")
-            .args(args)
-            .assert()
-            .code(1);
+        let assert = dirs.cmd().args(args).assert().code(1);
         let doc = json(&assert.get_output().stdout);
         assert_eq!(doc["schema"], "cardinal.error.v1", "{args:?}");
         assert_eq!(doc["error"]["code"], "not_implemented", "{args:?}");
