@@ -93,7 +93,7 @@ fn start_launcher() -> Result<u32, Error> {
 /// exists but cannot be read.
 pub fn run(config: &Config, state: &StateDir) -> Result<ArbiterPass, Error> {
     let Some(lock) = state::try_lock(&state.arbiter_lock(), LockMode::Exclusive)? else {
-        return read_last(state)?.ok_or_else(|| {
+        return inbox::read_last(state)?.ok_or_else(|| {
             Error::new(
                 ErrorCode::NotFound,
                 "another arbiter launcher holds arbiter/.lock and has recorded no pass yet",
@@ -186,7 +186,7 @@ enum Last {
 /// `last.json`. A pass recorded with an end gets the `arbiter_failing` its launcher died
 /// before raising.
 fn settle(config: &Config, state: &StateDir, now: u64) -> Result<Last, Error> {
-    let Some(mut last) = read_last(state)? else {
+    let Some(mut last) = inbox::read_last(state)? else {
         return Ok(Last::Settled(None));
     };
     if last.ended_ms.is_some() {
@@ -371,26 +371,6 @@ fn interval_passed(config: &Config, last: Option<&ArbiterPass>, now: u64) -> boo
     })
 }
 
-/// The pass `arbiter/last.json` records: `None` when no pass ever ran, an error when the file
-/// exists but cannot be read or parsed.
-fn read_last(state: &StateDir) -> Result<Option<ArbiterPass>, Error> {
-    let path = state.arbiter_last();
-    let unreadable = |err: &dyn std::fmt::Display| {
-        Error::new(
-            ErrorCode::StateUnavailable,
-            format!("{}: {err}", path.display()),
-        )
-    };
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(unreadable(&err)),
-    };
-    serde_json::from_slice(&bytes)
-        .map(Some)
-        .map_err(|err| unreadable(&err))
-}
-
 /// Replaces `arbiter/last.json`; not fsynced (section 4.2).
 fn write_last(state: &StateDir, pass: &ArbiterPass) -> Result<(), Error> {
     let bytes =
@@ -443,7 +423,7 @@ mod tests {
 
     use cardinal_test_support::Scope;
 
-    use super::{read_last, trigger_with, write_last};
+    use super::{trigger_with, write_last};
     use crate::config::Config;
     use crate::contract::{
         ArbiterPass, ArbiterPassSchema, ArbiterStart, Error, ErrorCode, InboxKind, InboxStatus,
@@ -568,7 +548,7 @@ mod tests {
         drop(held);
         last(&e, "p1", state::now_ms() - 59_000, false, 0);
         assert_eq!(trigger(&e), (ArbiterStart::Running, 0));
-        assert_eq!(read_last(&e.state).unwrap().unwrap().outcome, None);
+        assert_eq!(inbox::read_last(&e.state).unwrap().unwrap().outcome, None);
     }
 
     /// A `last.json` that exists but cannot be read is an error, and no launcher starts: a pass
@@ -636,7 +616,7 @@ mod tests {
         last(&e, "p1", started, false, 2);
 
         assert_eq!(trigger(&e), (ArbiterStart::NotNeeded, 0));
-        let pass = read_last(&e.state).unwrap().unwrap();
+        let pass = inbox::read_last(&e.state).unwrap().unwrap();
         assert_eq!(pass.outcome, Some(PassOutcome::Abandoned));
         assert_eq!(pass.ended_ms, Some(started + 60_000));
         assert_eq!(pass.failures_in_a_row, 3);

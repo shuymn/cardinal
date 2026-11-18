@@ -15,7 +15,7 @@ use std::cmp::Ordering;
 use crate::config::{Arbiter, Config};
 use crate::contract::{
     ArbiterPass, Error, ErrorCode, Inbox, InboxItem, InboxKind, InboxSchema, InboxStatus,
-    ItemArbiter, PassOutcome, Resolution, ResolutionOutcome,
+    ItemArbiter, PassOutcome, ResolutionOutcome,
 };
 use crate::state::{self, StateDir};
 
@@ -136,7 +136,7 @@ pub fn record_outcome(
             {
                 item.ended_ms = Some(ended_ms);
                 if matches!(item.status, InboxStatus::Open | InboxStatus::Escalated) {
-                    close(
+                    super::set_resolution(
                         &mut item,
                         ResolutionOutcome::Resolved,
                         super::BY_CARDINAL,
@@ -225,7 +225,7 @@ pub fn resolve_assigned(
                 format!("the inbox item `{key}` was already answered"),
             ));
         }
-        close(
+        super::set_resolution(
             &mut item,
             outcome,
             super::BY_CLI,
@@ -271,25 +271,10 @@ fn assigned_to(item: &InboxItem, pass: &str) -> bool {
         .is_some_and(|assigned| assigned.pass == pass && assigned.outcome.is_none())
 }
 
-/// Sets the outcome of an open or escalated item.
-fn close(item: &mut InboxItem, outcome: ResolutionOutcome, by: &str, note: &str, at_ms: u64) {
-    item.status = match outcome {
-        ResolutionOutcome::Resolved => InboxStatus::Resolved,
-        ResolutionOutcome::Escalated => InboxStatus::Escalated,
-        ResolutionOutcome::Dismissed => InboxStatus::Dismissed,
-    };
-    item.resolution = Some(Resolution {
-        outcome,
-        by: by.to_owned(),
-        note: note.to_owned(),
-        at_ms,
-    });
-    item.updated_ms = at_ms;
-}
-
 /// The pass `arbiter/last.json` records: `None` when no pass ever ran, an error when the file
-/// exists but cannot be read or parsed.
-fn read_last(state: &StateDir) -> Result<Option<ArbiterPass>, Error> {
+/// exists but cannot be read or parsed. The launcher, its trigger, and `--assigned` read it
+/// through this.
+pub fn read_last(state: &StateDir) -> Result<Option<ArbiterPass>, Error> {
     let path = state.arbiter_last();
     let unreadable = |err: &dyn std::fmt::Display| {
         Error::new(
