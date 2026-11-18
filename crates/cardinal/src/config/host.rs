@@ -19,7 +19,10 @@ pub struct HostConfig {
     pub hook: Hook,
     pub observe: Observe,
     pub records: Records,
-    /// `[unit.<name>]` tables. Phase 0 honors only `act`.
+    pub disk: Disk,
+    pub arbiter: Arbiter,
+    pub reconcile: Reconcile,
+    /// `[unit.<name>]` tables, which honor only `act`.
     pub units: BTreeMap<String, Unit>,
 }
 
@@ -66,11 +69,93 @@ pub struct Records {
     pub keep: u32,
 }
 
+/// A volume's lines in MiB of free space (section 10.4), with
+/// `critical < warning < recovery`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DiskLines {
+    /// Below: under pressure.
+    pub warning_mib: u64,
+    /// Pressure ends above this.
+    pub recovery_mib: u64,
+    /// Below: critical.
+    pub critical_mib: u64,
+}
+
+impl DiskLines {
+    /// The lines in bytes.
+    #[must_use]
+    pub fn to_bytes(self) -> crate::contract::DiskLines {
+        let bytes = |mib: u64| mib.saturating_mul(1024 * 1024);
+        crate::contract::DiskLines {
+            warning_bytes: bytes(self.warning_mib),
+            recovery_bytes: bytes(self.recovery_mib),
+            critical_bytes: bytes(self.critical_mib),
+        }
+    }
+}
+
+/// `[disk]`: the lines of every watched volume.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Disk {
+    /// The lines of a volume without an entry in `volumes`.
+    pub lines: DiskLines,
+    /// Per-mount lines, matched against the mount point a path resolves to.
+    pub volumes: Vec<VolumeLines>,
+}
+
+impl Disk {
+    /// The lines of the volume mounted at `mount`: its `volumes` entry, else the global
+    /// lines.
+    #[must_use]
+    pub fn lines_for(&self, mount: &Path) -> DiskLines {
+        self.volumes
+            .iter()
+            .find(|volume| volume.mount == mount)
+            .map_or(self.lines, |volume| volume.lines)
+    }
+}
+
+/// One `[disk] volumes` entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VolumeLines {
+    pub mount: PathBuf,
+    pub lines: DiskLines,
+}
+
+/// `[arbiter]` (section 10.5).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Arbiter {
+    /// The session's argv, never a shell string.
+    pub command: Vec<String>,
+    /// The launcher stops the session after this.
+    pub timeout_s: u64,
+    /// The least time between the starts of two passes.
+    pub min_interval_s: u64,
+    /// An item is due again this long after its pass ended.
+    pub retry_s: u64,
+}
+
+/// `[reconcile]` (section 10.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Reconcile {
+    /// A full observation (git, gh) runs at most this often, unless a volume is under
+    /// pressure.
+    pub observe_every_s: u64,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Unit {
-    /// Whether `act` may execute for this unit; `false` makes it a dry run.
+    /// Whether the unit's runs are recorded as `act`; `false` records them as `planned`
+    /// (C16). Phase 1 executes nothing either way.
     pub act: bool,
 }
+
+/// The arbiter's prompt in the default `[arbiter] command`, as in
+/// `integrations/claude-code/README.md`.
+const ARBITER_PROMPT: &str = "Start the cardinal-arbiter subagent for one arbiter pass. Run no command yourself, and print its final report verbatim.";
+
+/// The allow list of the default `[arbiter] command`: the five subcommands the skill uses.
+const ARBITER_TOOLS: &str = "Bash(cardinal inventory:*),Bash(cardinal inbox:*),Bash(cardinal explain:*),Bash(cardinal plan:*),Bash(cardinal act:*)";
 
 impl HostConfig {
     /// The configuration of a host without `host.toml`.
@@ -94,8 +179,9 @@ impl HostConfig {
         raw.resolve(path, cpus, home)
     }
 
-    /// Whether `act` called as `unit:<name>` may execute (`docs/architecture.md` section 9.6).
-    /// Units without a table, and units with `act = false`, may not.
+    /// Whether `act` called as `unit:<name>` is recorded as `act` rather than `planned`
+    /// (`docs/architecture.md` section 9.6). Units without a table, and units with
+    /// `act = false`, are not.
     #[must_use]
     pub fn unit_may_act(&self, name: &str) -> bool {
         self.units.get(name).is_some_and(|unit| unit.act)
@@ -161,6 +247,9 @@ struct RawHost {
     hook: RawHook,
     observe: RawObserve,
     records: RawRecords,
+    disk: RawDisk,
+    arbiter: RawArbiter,
+    reconcile: RawReconcile,
     unit: BTreeMap<String, RawUnit>,
 }
 
@@ -249,6 +338,76 @@ impl Default for RawRecords {
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct RawDisk {
+    warning_mib: u64,
+    recovery_mib: u64,
+    critical_mib: u64,
+    volumes: Vec<RawVolume>,
+}
+
+impl Default for RawDisk {
+    fn default() -> Self {
+        Self {
+            warning_mib: 20 * 1024,
+            recovery_mib: 30 * 1024,
+            critical_mib: 5 * 1024,
+            volumes: Vec::new(),
+        }
+    }
+}
+
+/// A `[disk] volumes` entry: every line is required.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawVolume {
+    mount: String,
+    warning_mib: u64,
+    recovery_mib: u64,
+    critical_mib: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct RawArbiter {
+    command: Vec<String>,
+    timeout_s: u64,
+    min_interval_s: u64,
+    retry_s: u64,
+}
+
+impl Default for RawArbiter {
+    fn default() -> Self {
+        Self {
+            command: vec![
+                "claude".into(),
+                "-p".into(),
+                ARBITER_PROMPT.into(),
+                "--allowedTools".into(),
+                ARBITER_TOOLS.into(),
+            ],
+            timeout_s: 1200,
+            min_interval_s: 1800,
+            retry_s: 7200,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct RawReconcile {
+    observe_every_s: u64,
+}
+
+impl Default for RawReconcile {
+    fn default() -> Self {
+        Self {
+            observe_every_s: 3600,
+        }
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 struct RawUnit {
@@ -326,6 +485,9 @@ impl RawHost {
             ));
         }
 
+        let disk = self.disk.resolve(home).map_err(invalid)?;
+        let arbiter = self.arbiter.resolve().map_err(invalid)?;
+
         Ok(HostConfig {
             budget,
             admission: Admission {
@@ -351,12 +513,80 @@ impl RawHost {
                 max_bytes: self.records.max_bytes,
                 keep: self.records.keep,
             },
+            disk,
+            arbiter,
+            reconcile: Reconcile {
+                observe_every_s: self.reconcile.observe_every_s,
+            },
             units: self
                 .unit
                 .into_iter()
                 .map(|(name, unit)| (name, Unit { act: unit.act }))
                 .collect(),
         })
+    }
+}
+
+impl RawDisk {
+    /// The lines, each set checked for `critical < warning < recovery`, and the volume
+    /// mounts made absolute.
+    fn resolve(self, home: Option<&Path>) -> Result<Disk, String> {
+        let lines = checked_lines(
+            "disk",
+            DiskLines {
+                warning_mib: self.warning_mib,
+                recovery_mib: self.recovery_mib,
+                critical_mib: self.critical_mib,
+            },
+        )?;
+        let mut volumes: Vec<VolumeLines> = Vec::new();
+        for volume in self.volumes {
+            let mount =
+                absolute_path(&volume.mount, home).map_err(|m| format!("disk.volumes: {m}"))?;
+            if volumes.iter().any(|v| v.mount == mount) {
+                return Err(format!("disk.volumes: {} is listed twice", mount.display()));
+            }
+            let lines = checked_lines(
+                &format!("disk.volumes {}", mount.display()),
+                DiskLines {
+                    warning_mib: volume.warning_mib,
+                    recovery_mib: volume.recovery_mib,
+                    critical_mib: volume.critical_mib,
+                },
+            )?;
+            volumes.push(VolumeLines { mount, lines });
+        }
+        Ok(Disk { lines, volumes })
+    }
+}
+
+impl RawArbiter {
+    /// The arbiter settings, with a command that names a program and a positive timeout.
+    fn resolve(self) -> Result<Arbiter, String> {
+        if self.command.first().is_none_or(String::is_empty) {
+            return Err("arbiter.command must name a program as its first word".into());
+        }
+        if self.timeout_s == 0 {
+            return Err("arbiter.timeout_s must be positive".into());
+        }
+        Ok(Arbiter {
+            command: self.command,
+            timeout_s: self.timeout_s,
+            min_interval_s: self.min_interval_s,
+            retry_s: self.retry_s,
+        })
+    }
+}
+
+/// `lines` if `critical < warning < recovery`.
+fn checked_lines(what: &str, lines: DiskLines) -> Result<DiskLines, String> {
+    if lines.critical_mib < lines.warning_mib && lines.warning_mib < lines.recovery_mib {
+        Ok(lines)
+    } else {
+        Err(format!(
+            "{what}: the lines must satisfy critical_mib < warning_mib < recovery_mib, not {} < {} < {}",
+            lines.critical_mib, lines.warning_mib, lines.recovery_mib
+        ))
     }
 }
 
@@ -391,7 +621,7 @@ mod tests {
     use std::num::NonZeroU64;
     use std::path::{Path, PathBuf};
 
-    use super::{HostConfig, validate_runner};
+    use super::{DiskLines, HostConfig, validate_runner};
 
     /// An absolute home directory on every OS.
     fn home() -> PathBuf {
@@ -424,7 +654,153 @@ mod tests {
         assert_eq!(host.observe.gh_timeout_ms, 20_000);
         assert_eq!(host.records.max_bytes, 8_388_608);
         assert_eq!(host.records.keep, 4);
+        assert_eq!(
+            host.disk.lines,
+            DiskLines {
+                warning_mib: 20_480,
+                recovery_mib: 30_720,
+                critical_mib: 5120,
+            }
+        );
+        assert_eq!(host.disk.volumes, []);
+        assert_eq!(host.arbiter.command[..2], ["claude", "-p"]);
+        assert_eq!(host.arbiter.command[3], "--allowedTools");
+        assert_eq!(host.arbiter.timeout_s, 1200);
+        assert_eq!(host.arbiter.min_interval_s, 1800);
+        assert_eq!(host.arbiter.retry_s, 7200);
+        assert_eq!(host.reconcile.observe_every_s, 3600);
         assert!(!host.unit_may_act("anything"));
+    }
+
+    /// The default arbiter command is the launch the integration's README documents.
+    #[test]
+    fn default_arbiter_command_is_the_documented_launch() {
+        let readme = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../integrations/claude-code/README.md"),
+        )
+        .unwrap();
+        let host = parse("").unwrap();
+        let [_, _, prompt, _, tools] = &host.arbiter.command[..] else {
+            panic!("{:?}", host.arbiter.command)
+        };
+        assert!(
+            readme.contains(&format!("claude -p '{prompt}'")),
+            "{prompt}"
+        );
+        assert!(
+            readme.contains(&format!("--allowedTools '{tools}'")),
+            "{tools}"
+        );
+    }
+
+    #[test]
+    fn disk_lines_per_volume() {
+        let host = parse(
+            r#"
+            [disk]
+            warning_mib = 300
+            recovery_mib = 400
+            critical_mib = 100
+            volumes = [{ mount = "~/Scratch", warning_mib = 600, recovery_mib = 900, critical_mib = 200 }]
+            [arbiter]
+            command = ["/bin/arbiter"]
+            timeout_s = 5
+            min_interval_s = 0
+            retry_s = 0
+            [reconcile]
+            observe_every_s = 60
+            "#,
+        )
+        .unwrap();
+        let scratch = DiskLines {
+            warning_mib: 600,
+            recovery_mib: 900,
+            critical_mib: 200,
+        };
+        assert_eq!(host.disk.lines_for(&home().join("Scratch")), scratch);
+        assert_eq!(host.disk.lines_for(&home()).warning_mib, 300);
+        assert_eq!(scratch.to_bytes().critical_bytes, 200 * 1024 * 1024);
+        assert_eq!(host.arbiter.command, ["/bin/arbiter"]);
+        assert_eq!(host.reconcile.observe_every_s, 60);
+    }
+
+    /// Each invalid case fails its own check, which the message names. Mounts start at `~`,
+    /// which is absolute on every OS once expanded, so only the relative one fails for that.
+    #[test]
+    fn disk_and_arbiter_validation() {
+        let order = "critical_mib < warning_mib < recovery_mib";
+        for (text, expected) in [
+            // The global lines out of order, and equal lines.
+            (
+                "[disk]\nwarning_mib = 10\nrecovery_mib = 5\ncritical_mib = 1",
+                order,
+            ),
+            (
+                "[disk]\nwarning_mib = 10\nrecovery_mib = 20\ncritical_mib = 10",
+                order,
+            ),
+            (
+                "[disk]\nwarning_mib = 30\nrecovery_mib = 40\ncritical_mib = 35",
+                order,
+            ),
+            // A volume's lines out of order, a volume without every line, a relative mount,
+            // a mount listed twice, an unknown key, a negative line.
+            (
+                "[disk]\nvolumes = [{ mount = \"~/v\", warning_mib = 9, recovery_mib = 8, critical_mib = 1 }]",
+                order,
+            ),
+            (
+                "[disk]\nvolumes = [{ mount = \"~/v\", warning_mib = 9 }]",
+                "missing field",
+            ),
+            (
+                "[disk]\nvolumes = [{ mount = \"v\", warning_mib = 2, recovery_mib = 3, critical_mib = 1 }]",
+                "is not an absolute path",
+            ),
+            (
+                "[disk]\nvolumes = [{ mount = \"~/v\", warning_mib = 2, recovery_mib = 3, critical_mib = 1 }, { mount = \"~/v\", warning_mib = 2, recovery_mib = 3, critical_mib = 1 }]",
+                "is listed twice",
+            ),
+            ("[disk]\nwarning = 1", "unknown field"),
+            ("[disk]\nwarning_mib = -1", "invalid value"),
+            // An empty command, an empty program, a shell string, a zero timeout, unknown
+            // keys.
+            ("[arbiter]\ncommand = []", "first word"),
+            ("[arbiter]\ncommand = [\"\", \"-p\"]", "first word"),
+            ("[arbiter]\ncommand = \"claude -p x\"", "invalid type"),
+            ("[arbiter]\ntimeout_s = 0", "must be positive"),
+            ("[arbiter]\ninterval = 1", "unknown field"),
+            ("[reconcile]\nobserve_every = 1", "unknown field"),
+        ] {
+            let message = match parse(text) {
+                Ok(_) => panic!("accepted: {text}"),
+                Err(err) => err.to_string(),
+            };
+            assert!(message.contains(expected), "{text}: {message}");
+        }
+    }
+
+    /// Unit X's settings (section 9.7) come with X: in the first release each is an unknown
+    /// key, so no host can grant a caller execution before anything executes.
+    #[test]
+    fn execution_settings_are_unknown_in_the_first_release() {
+        for (text, expected) in [
+            (
+                "[act]\nexecute = { owner = [\"reclaim_dir\"] }",
+                "unknown field `act`",
+            ),
+            ("[disk]\nreserve_mib = 64", "unknown field `reserve_mib`"),
+            (
+                "[reconcile]\nreclaim_budget_s = 120",
+                "unknown field `reclaim_budget_s`",
+            ),
+        ] {
+            let message = match parse(text) {
+                Ok(_) => panic!("accepted: {text}"),
+                Err(err) => err.to_string(),
+            };
+            assert!(message.contains(expected), "{text}: {message}");
+        }
     }
 
     #[test]

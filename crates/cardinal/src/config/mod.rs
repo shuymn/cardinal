@@ -11,12 +11,13 @@ mod profile;
 use std::path::{Path, PathBuf};
 
 pub use host::{
-    Admission, Hook, HostConfig, Managed, Observe, Records, Unit, logical_cpus, validate_runner,
+    Admission, Arbiter, Disk, DiskLines, Hook, HostConfig, Managed, Observe, Reconcile, Records,
+    Unit, VolumeLines, logical_cpus, validate_runner,
 };
 pub use locations::{Base, config_dir, resolve, state_dir};
 pub use profile::{
     DataList, Matcher, Pattern, Profile, Rule, Selection, data_pattern_covers, git_common_dir,
-    normalize_remote,
+    git_dir, normalize_remote,
 };
 
 use crate::contract::{Error, ErrorCode};

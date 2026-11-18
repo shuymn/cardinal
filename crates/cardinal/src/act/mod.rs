@@ -22,12 +22,15 @@ use crate::plan::{self, DataLists, InUseFacts, Inspection, Real, Walk};
 use crate::state::{self, Probe, StateDir};
 use crate::testpoint;
 
-/// `cardinal act` flags. In phase 0 neither `dry_run` nor `owner_approved` enables
-/// deletion: every run reports.
+/// `cardinal act` flags. No flag enables execution: every run reports (section 9.3).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ActOptions {
     pub dry_run: bool,
+    /// Accepted only with `caller` `owner` (a usage error otherwise).
     pub owner_approved: bool,
+    /// The caller judged HEAD squash-merged: merge evidence counts as present when
+    /// `content_in_base` is `yes` in `act`'s own observation (section 9.3).
+    pub squash_merged: bool,
     pub caller: Caller,
 }
 
@@ -258,6 +261,8 @@ impl Run<'_> {
             checks: outcome.checks,
             freed_bytes: outcome.freed_bytes,
             skipped_changed: Vec::new(),
+            trash: None,
+            recovered: false,
             error: outcome.error,
             finished_ms: state::now_ms(),
         };

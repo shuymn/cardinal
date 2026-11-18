@@ -24,20 +24,37 @@ impl ActStatus {
     }
 }
 
-/// `cardinal.act-result.v1`: the `act` output. Phase 0 `act` prints it and records it in an
-/// `act` or `planned` record; it writes no result file (`docs/architecture.md` section 9.5).
+/// `cardinal.act-result.v1`: the `act` output. `act` prints it and records it in an `act` or
+/// `planned` record (`docs/architecture.md` section 9.5); an execution also writes it to
+/// `executions/<plan>/result.json` (section 9.7). The first release reports only `dry_run`,
+/// `rejected`, and `expired`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActResult {
     pub schema: ActResultSchema,
     pub plan_id: String,
     pub caller: String,
     pub status: ActStatus,
-    /// Failing check names, `"owner_approval_required"`, `"identity_changed:<field>"`.
+    /// Failing check names, `"owner_approval_required"`, and `"identity_changed:<field>"`;
+    /// why a `dry_run` did not execute: `"execution_not_granted"`, `"dry_run_requested"`,
+    /// `"execution_not_designed"` (whole worktrees, Windows, and every plan of the first
+    /// release), or an eligibility rule's `"not_on_state_mount"`, `"bound_elsewhere"`,
+    /// `"sparse_checkout"`, `"tracked_overlap"`, `"not_directory_excluded"`; and an
+    /// execution's `"changed_during_act"`, `"no_space"`, `"trash_occupied"`,
+    /// `"interrupted"`, `"in_progress"`, `"claim_unreadable"`, `"in_use_while_deleting"`.
     pub reasons: Vec<String>,
     pub checks: Vec<Check>,
+    /// `dry_run`: the snapshot's bytes; `executed` and `partial`: the blocks freed.
     pub freed_bytes: Option<u64>,
-    /// Entries changed or created since the snapshot.
+    /// Entries an execution kept, relative to the target.
     pub skipped_changed: Vec<String>,
+    /// The trash entry holding what an execution kept or could not put back. Absent in
+    /// results made before it was recorded, which read as null.
+    #[serde(default)]
+    pub trash: Option<String>,
+    /// Whether recovery wrote the result (section 9.7). Absent in results made before it was
+    /// recorded, which read as false.
+    #[serde(default)]
+    pub recovered: bool,
     pub error: Option<String>,
     pub finished_ms: u64,
 }

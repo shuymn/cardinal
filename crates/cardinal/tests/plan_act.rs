@@ -41,9 +41,11 @@ fn check(plan_or_checks: &[cardinal::contract::Check], name: &str) -> CheckResul
         .result
 }
 
+/// `--owner-approved`, which only the owner gives (section 9.3).
 fn owner_approved() -> cardinal::act::ActOptions {
     cardinal::act::ActOptions {
         owner_approved: true,
+        caller: cardinal::contract::Caller::Owner,
         ..arbiter()
     }
 }
@@ -291,7 +293,7 @@ mod identity {
         assert_eq!(result.reasons, ["identity_changed:host_id"]);
         assert!(wt.join("target/x").exists());
         assert!(
-            !s.state.plan_claim(&plan.id).exists(),
+            !s.state.execution_claim(&plan.id).exists(),
             "an expired plan of another host is not claimed"
         );
     }

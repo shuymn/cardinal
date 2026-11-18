@@ -1,5 +1,9 @@
 //! The inbox: store, dedup, and refresh (`docs/architecture.md` sections 4.8 and 10.1).
 //!
+//! Phase 1 adds occurrences (section 10.1), [`raise_occurrence`] and [`end_occurrence`], which
+//! raisers from observation and disk states go through, and the assignment of items to arbiter
+//! passes (section 10.5) in [`assign`]; their bodies come with their work units.
+//!
 //! One file per item, `inbox/<key-hash>.json`, written durably under `inbox/.lock`. Raising
 //! a key that exists updates the item while it is open or escalated and never reopens it once
 //! resolved or dismissed (C19). The refresh that `cardinal inbox` runs first is the only
@@ -7,6 +11,8 @@
 //! `outlived_processes` items. A refresh clears only items it saw before it started observing,
 //! and only while they are unchanged, so it never closes an item another refresh raised or
 //! updated from a newer observation.
+
+mod assign;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -22,6 +28,8 @@ use crate::os::{Detail, ProcessTable};
 use crate::record::Recorder;
 use crate::state::{self, Durability, LockMode, StateDir};
 use crate::testpoint;
+
+pub use assign::{assign, due, list_assigned, record_outcome, resolve_assigned};
 
 /// How long an upsert waits for `inbox/.lock`.
 const LOCK_WAIT: Duration = Duration::from_secs(5);
@@ -92,6 +100,8 @@ pub fn raise_item(state: &StateDir, item: &NewItem) -> Result<(InboxItem, Raised
                 created_ms: now,
                 updated_ms: now,
                 seen: 1,
+                ended_ms: None,
+                arbiter: None,
                 resolution: None,
             },
             Raised::New,
@@ -99,6 +109,34 @@ pub fn raise_item(state: &StateDir, item: &NewItem) -> Result<(InboxItem, Raised
     };
     write(state, &path, &stored)?;
     Ok((stored, raised))
+}
+
+/// Raises one occurrence of a condition (section 10.1): `item.key` is the condition's key
+/// without its occurrence suffix, and `since_ms` the time of the observation that found it.
+/// While the condition's latest occurrence has not ended, this updates `seen` and the
+/// evidence of an open or escalated item and leaves a resolved or dismissed one alone;
+/// after it ended, it raises a new item, `<key>@<since_ms>`.
+pub fn raise_occurrence(
+    _state: &StateDir,
+    _item: &NewItem,
+    _since_ms: u64,
+) -> Result<(InboxItem, Raised), Error> {
+    Err(Error::not_implemented("inbox occurrences"))
+}
+
+/// Ends the latest occurrence of the condition `key` (its key without the occurrence suffix)
+/// once a raiser observed its clearing condition: sets the item's `ended_ms` and resolves it
+/// if it is open or escalated. `before` holds the item as the raiser read it before it
+/// started observing; an item changed since is left alone. `None` when no occurrence is
+/// open.
+pub fn end_occurrence(
+    _state: &StateDir,
+    _key: &str,
+    _before: Option<&InboxItem>,
+    _ended_ms: u64,
+    _note: &str,
+) -> Result<Option<InboxItem>, Error> {
+    Err(Error::not_implemented("inbox occurrences"))
 }
 
 /// `--status`: one status, or `all`.
@@ -197,6 +235,7 @@ pub fn refresh_with(
                 job_id: Some(reservation.job_id.clone()),
                 session_id: reservation.session.as_ref().map(|s| s.id.clone()),
                 worktree: reservation.worktree.as_ref().map(|w| w.path.clone()),
+                ..InboxSubject::default()
             },
             evidence,
         };

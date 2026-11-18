@@ -34,6 +34,9 @@ fn help_lists_every_command() {
         "inbox",
         "plan",
         "act",
+        "reconcile",
+        "arbiter",
+        "ui",
         "explain",
     ] {
         assert!(
@@ -98,8 +101,83 @@ fn usage_errors_exit_2() {
         &["act", "abcd", "--caller", "nobody"],
         &["inbox", "resolve", "k"],
         &["wait", "abcd"],
+        &["reconcile", "--trigger", "hourly"],
+        &["arbiter"],
+        &["ui", "extra"],
     ] {
         dirs.cmd().args(bad).assert().code(2);
+    }
+}
+
+/// `--owner-approved` is a usage error unless the caller is the owner (section 9.3); with
+/// `--caller owner` it parses and the command runs (here, finding no plan).
+#[test]
+fn owner_approved_needs_the_owner() {
+    let dirs = Dirs::new();
+    for caller in [
+        &[][..],
+        &["--caller", "arbiter"],
+        &["--caller", "unit:disk-reclaim"],
+    ] {
+        let mut args = vec!["act", "abcd", "--owner-approved"];
+        args.extend_from_slice(caller);
+        let assert = dirs.cmd().args(&args).assert().code(2);
+        let output = assert.get_output();
+        assert!(output.stdout.is_empty(), "{args:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("--caller owner"),
+            "{args:?}"
+        );
+    }
+    let assert = dirs
+        .cmd()
+        .args(["act", "abcd", "--owner-approved", "--caller", "owner"])
+        .assert()
+        .code(1);
+    assert_eq!(
+        json(&assert.get_output().stdout)["error"]["code"],
+        "not_found"
+    );
+    let assert = dirs
+        .cmd()
+        .args(["act", "abcd", "--squash-merged"])
+        .assert()
+        .code(1);
+    assert_eq!(
+        json(&assert.get_output().stdout)["error"]["code"],
+        "not_found"
+    );
+}
+
+/// The phase 1 entry points whose bodies later units write answer `not_implemented` as a
+/// `cardinal.error.v1` document with exit 1.
+#[test]
+fn unbuilt_entry_points_answer_not_implemented() {
+    let dirs = Dirs::new();
+    for args in [
+        &["reconcile"][..],
+        &["reconcile", "--trigger", "job-end"],
+        &["arbiter", "run"],
+        &["ui"],
+        &["inbox", "--assigned"],
+        &[
+            "inbox",
+            "resolve",
+            "k",
+            "--outcome",
+            "resolved",
+            "--assigned",
+        ],
+    ] {
+        let assert = dirs
+            .cmd()
+            .env("CARDINAL_ARBITER_PASS", "0123456789abcdef")
+            .args(args)
+            .assert()
+            .code(1);
+        let doc = json(&assert.get_output().stdout);
+        assert_eq!(doc["schema"], "cardinal.error.v1", "{args:?}");
+        assert_eq!(doc["error"]["code"], "not_implemented", "{args:?}");
     }
 }
 

@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-use super::{InventorySchema, ReservationView, Resources, ScopedError, SessionProcess, Tri};
+use super::{
+    ArbiterPass, DiskState, InventorySchema, ReservationView, Resources, ScopedError,
+    SessionProcess, Tri,
+};
 
 /// `cardinal.inventory.v1`
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -14,7 +17,17 @@ pub struct Inventory {
     pub reservations: Vec<ReservationView>,
     pub repos: Vec<Repo>,
     pub outlived: Vec<Outlived>,
+    /// The disk states of `disk/`, read, not measured (section 8.5).
+    pub disk: Vec<DiskState>,
+    pub arbiter: ArbiterView,
     pub errors: Vec<ScopedError>,
+}
+
+/// Whether an arbiter pass runs, and the last one (section 10.5).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArbiterView {
+    pub running: bool,
+    pub last: Option<ArbiterPass>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,14 +105,39 @@ pub struct InUse {
     pub jobs: Vec<String>,
 }
 
+/// Why `dirty` is `unknown` although status listed only modifications.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DirtyUnknownReason {
+    /// Every entry is a worktree-side modification of a path whose `filter` attribute names
+    /// a configured driver, which observation does not run (section 8.1).
+    FilteredPaths,
+}
+
+/// The paths behind a `dirty` of `unknown` (section 8.2).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirtyUnknown {
+    pub reason: DirtyUnknownReason,
+    /// Up to 20 worktree-relative paths.
+    pub paths: Vec<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Facts {
     pub dirty: Tri,
+    pub dirty_unknown: Option<DirtyUnknown>,
     pub has_upstream: Tri,
     pub unpushed: Tri,
     pub open_pr: Tri,
     pub merge_evidence: MergeEvidence,
     pub merged_pr: Option<PrRef>,
+    /// Whether every file the branch changed has the same content in the base; `unknown`
+    /// unless `merge_evidence` is `none`.
+    pub content_in_base: Tri,
+    /// Up to 20 paths the branch changed that differ from the base.
+    pub content_diff: Vec<String>,
+    /// The newest pull request of the branch closed without merging.
+    pub closed_pr: Option<PrRef>,
     pub in_use: InUse,
 }
 
@@ -116,7 +154,11 @@ pub enum IgnoredClass {
 pub struct IgnoredEntry {
     pub path: String,
     pub class: IgnoredClass,
+    /// Whether the entry matches a regenerable pattern, whatever its class (section 8.3).
+    pub regenerable_match: bool,
     pub allocated_bytes: Option<u64>,
+    /// The part of `allocated_bytes` held by files with links outside the entry.
+    pub aliased_bytes: Option<u64>,
 }
 
 /// Whether a worktree is a whole-worktree reclaim candidate, with failing and unknown checks.
@@ -134,6 +176,10 @@ pub struct Worktree {
     pub head: Option<String>,
     pub branch: Option<String>,
     pub upstream: Option<String>,
+    /// The worktree's administrative entry (`git rev-parse --absolute-git-dir`).
+    pub git_dir: Option<String>,
+    /// The modification time of the worktree's index.
+    pub last_activity_ms: Option<u64>,
     /// App name or `"git-lock"`.
     pub managed_by: Option<String>,
     pub facts: Facts,

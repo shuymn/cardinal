@@ -6,6 +6,7 @@
 //! reached through [`Real`], which calls the `observe` and `admission` modules.
 
 mod checks;
+mod merge;
 mod walk;
 
 use std::path::{Path, PathBuf};
@@ -237,10 +238,12 @@ fn build(
             worktree: observation.worktree.path.clone(),
             head: observation.worktree.head.clone(),
             branch: observation.worktree.branch.clone(),
+            git_dir: observation.worktree.git_dir.clone(),
             root_id,
             root_created_ms,
         },
         allocated_bytes: walked.as_ref().ok().map(Walk::allocated),
+        aliased_bytes: None,
         invariants_ok: invariants_ok(&checks),
         approval: approval(&checks),
         checks,

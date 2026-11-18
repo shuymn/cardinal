@@ -5,18 +5,22 @@
 //! Every fact is read fresh. A git or gh call that fails to start, exits with a status that
 //! carries no meaning for the fact, prints output that does not parse, or misses its
 //! deadline makes the fact `unknown`, never "safe". Observation writes nothing: git runs
-//! with `--no-optional-locks` and `GIT_OPTIONAL_LOCKS=0`, never `fetch`, and `inventory`
-//! never deletes reservations or signals processes.
+//! with `--no-optional-locks` and `GIT_OPTIONAL_LOCKS=0`, never `fetch`, with every
+//! configured filter driver disabled, and with `GIT_NO_LAZY_FETCH=1`, so a missing object in
+//! a partial clone fails the step instead of being fetched; with a git that does not honor
+//! that variable in every read (before 2.45.1) nothing that reads objects runs in a promisor
+//! repository (section 8.1). `inventory` never deletes reservations or signals processes.
 
 mod data;
 mod gh;
 mod git;
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 pub use crate::os::child::{ChildError, Output};
@@ -24,13 +28,15 @@ pub use crate::os::child::{ChildError, Output};
 use crate::admission;
 use crate::config::{Config, DataList, Selection};
 use crate::contract::{
-    BaseRef, CheckResult, DerivedState, Error, ErrorCode, Facts, GhStatus, HostInfo, IgnoredClass,
-    IgnoredEntry, InUse, Inventory, InventorySchema, MergeEvidence, Os, Outlived, PrRef,
-    ReclaimSummary, Repo, ReservationView, Resources, ScopedError, SessionSnapshot, Tri, Worktree,
+    ArbiterView, BaseRef, CheckResult, DerivedState, DirtyUnknown, DirtyUnknownReason, Error,
+    ErrorCode, Facts, GhStatus, HostInfo, IgnoredClass, IgnoredEntry, InUse, Inventory,
+    InventorySchema, MergeEvidence, Os, Outlived, PrRef, ReclaimSummary, Repo, ReservationView,
+    Resources, ScopedError, SessionSnapshot, Tri, Worktree,
 };
 use crate::os::child;
 use crate::os::{Detail, ProcessTable};
 use crate::state::{Probe, StateDir, find_worktree_root, now_ms, probe, worktree_key};
+use crate::testpoint;
 
 use data::DataPatterns;
 use git::ListedWorktree;
@@ -81,6 +87,39 @@ pub fn observe_worktree(
     Observer::new(config).observe_worktree(state, path)
 }
 
+/// `content_in_base` (`docs/architecture.md` section 8.2): whether every file the branch at
+/// `head` changed since its merge base with `base` has the same content and mode in `base`,
+/// with up to 20 of the paths that differ.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContentInBase {
+    pub value: Tri,
+    pub diff: Vec<String>,
+}
+
+impl ContentInBase {
+    /// Not read: `unknown` with no paths.
+    #[must_use]
+    pub fn unknown() -> Self {
+        Self {
+            value: Tri::Unknown,
+            diff: Vec::new(),
+        }
+    }
+}
+
+/// Reads `content_in_base` for the worktree at `worktree` from tree-to-tree diffs, which read
+/// no index. Observation reads it only when merge evidence is `none`; `act` reads it again
+/// for `--squash-merged`.
+#[must_use]
+pub fn content_in_base(
+    _config: &Config,
+    _worktree: &Path,
+    _head: &str,
+    _base: &BaseRef,
+) -> ContentInBase {
+    ContentInBase::unknown()
+}
+
 /// Runs `git --no-optional-locks -C <dir> <args>` with the constructed environment of
 /// section 8.1 and `[observe] git_timeout_ms`. This is the one way cardinal runs git.
 pub fn git<S: AsRef<OsStr>>(config: &Config, dir: &Path, args: &[S]) -> Result<Output, ChildError> {
@@ -97,7 +136,33 @@ pub struct Observer<'a> {
     gh_env: Vec<(OsString, OsString)>,
     /// The caller's `GH_HOST`: a host besides `github.com` whose remotes are GitHub.
     gh_host: Option<String>,
+    /// `git --version` as `(major, minor)`, read once when first needed; `None` when it
+    /// could not be read.
+    version: OnceLock<Option<(u32, u32, u32)>>,
 }
+
+/// The first git that refuses a lazy fetch under `GIT_NO_LAZY_FETCH=1`.
+/// 2.45.0 reads the variable, but its inexact rename detection, which `status` runs on a
+/// staged rename, fetches without asking it.
+const NO_LAZY_FETCH_SINCE: (u32, u32, u32) = (2, 45, 1);
+
+/// How many paths `dirty_unknown` lists.
+const DIRTY_UNKNOWN_PATHS: usize = 20;
+
+/// The most bytes of paths, by [`arg_cost`], one `git check-attr` command line carries
+/// outside Windows.
+const CHECK_ATTR_ARGS: usize = 64 * 1024;
+
+/// The characters of a Windows command line (`CreateProcessW`), its terminating NUL left
+/// out.
+const WINDOWS_COMMAND_LINE: usize = 32_766;
+
+/// The characters of a command line cmd.exe runs, as it runs a batch file on Windows.
+const CMD_COMMAND_LINE: usize = 8_191;
+
+/// What the standard library puts before the quoted path of a batch file it starts on Windows,
+/// whose command line it then closes with one more `"`.
+const CMD_PREFIX: &str = "cmd.exe /e:ON /v:OFF /d /c \"";
 
 /// Facts shared by every worktree of one inventory.
 struct Shared<'a> {
@@ -130,6 +195,42 @@ struct History {
     gh_error: Option<String>,
 }
 
+impl History {
+    /// History read without git: every fact that needs objects `unknown`, the open pull
+    /// request from the repository's list.
+    fn unknown(ctx: &RepoContext, branch: Option<&str>, head: Option<&str>) -> Self {
+        Self {
+            merge_evidence: MergeEvidence::Unknown,
+            merged_pr: None,
+            unpushed: Tri::Unknown,
+            open_pr: match &ctx.open_prs {
+                Some(prs) => tri(gh::open_pr_for(prs, branch, head).is_some()),
+                None => Tri::Unknown,
+            },
+            gh_error: None,
+        }
+    }
+}
+
+/// The facts that need a worktree's index.
+struct IndexFacts {
+    status: Option<git::Status>,
+    tracked: Option<Tracked>,
+    dirty: Tri,
+    dirty_unknown: Option<DirtyUnknown>,
+}
+
+impl IndexFacts {
+    fn unknown() -> Self {
+        Self {
+            status: None,
+            tracked: None,
+            dirty: Tri::Unknown,
+            dirty_unknown: None,
+        }
+    }
+}
+
 /// What one worktree observation found, besides the worktree itself.
 struct WorktreeResult {
     worktree: Worktree,
@@ -146,6 +247,7 @@ impl<'a> Observer<'a> {
             env: Vec::new(),
             gh_env: Vec::new(),
             gh_host: None,
+            version: OnceLock::new(),
         }
         .with_env(std::env::vars_os())
     }
@@ -164,32 +266,96 @@ impl<'a> Observer<'a> {
 
     /// See [`git`](fn@git).
     pub fn git<S: AsRef<OsStr>>(&self, dir: &Path, args: &[S]) -> Result<Output, ChildError> {
+        self.git_with(dir, args, &[])
+    }
+
+    /// [`Observer::git`] with `extra` added to the constructed environment, for the
+    /// configuration that disables a worktree's filter drivers.
+    fn git_with<S: AsRef<OsStr>>(
+        &self,
+        dir: &Path,
+        args: &[S],
+        extra: &[(OsString, OsString)],
+    ) -> Result<Output, ChildError> {
         let observe = &self.config.host.observe;
-        // No optional locks, and no filesystem monitor: a configured fsmonitor would start a
-        // daemon that writes inside `.git`.
-        let mut command: Vec<OsString> = vec![
-            "--no-optional-locks".into(),
-            "-c".into(),
-            "core.fsmonitor=false".into(),
-            "-C".into(),
-            dir.into(),
-        ];
+        let mut command = git_prefix(dir);
         command.extend(args.iter().map(|a| a.as_ref().to_os_string()));
+        let env;
+        let env = if extra.is_empty() {
+            &self.env
+        } else {
+            env = self.env.iter().chain(extra).cloned().collect::<Vec<_>>();
+            &env
+        };
         child::run(
             &observe.git,
             &command,
-            &self.env,
+            env,
             dir,
             limits(observe.git_timeout_ms),
         )
     }
 
+    /// `git --version` as `(major, minor)`, read once per observation, run in `dir` so that
+    /// it does not inherit this process's working directory.
+    fn version(&self, dir: &Path) -> Option<(u32, u32, u32)> {
+        *self.version.get_or_init(|| {
+            let out = self.git_ok(dir, &["--version"]).ok()?;
+            git::parse_version(&out.stdout)
+        })
+    }
+
+    /// Why no command that reads objects may run in `dir`, if that is so: a git before
+    /// 2.45.1, which can fetch a missing object from a promisor remote despite
+    /// `GIT_NO_LAZY_FETCH`, where the configuration git reads in `dir` (a linked worktree's
+    /// `config.worktree` included) names a promisor: `extensions.partialClone`, a
+    /// `remote.<name>.partialCloneFilter`, or a `remote.<name>.promisor` that is not false. A
+    /// configuration or version that cannot be read fails closed.
+    fn objects_unreadable(&self, dir: &Path) -> Option<String> {
+        let out = match self.git(
+            dir,
+            &[
+                "config",
+                "-z",
+                "--get-regexp",
+                r"^(extensions\.partialclone|remote\..*\.(promisor|partialclonefilter))$",
+            ],
+        ) {
+            // Exit 1: no such key.
+            Ok(out) if out.code == Some(1) => return None,
+            Ok(out) => out.success("git config --get-regexp"),
+            Err(err) => Err(err.to_string()),
+        };
+        let promisor = match out {
+            Ok(out) => git::parse_promisor(&out.stdout),
+            Err(message) => {
+                return Some(format!(
+                    "cannot tell whether the repository is a partial clone: {message}"
+                ));
+            }
+        };
+        if !promisor {
+            return None;
+        }
+        promisor_unreadable(self.version(dir))
+    }
+
     /// git that must exit 0; anything else is an error message.
     fn git_ok<S: AsRef<OsStr>>(&self, dir: &Path, args: &[S]) -> Result<Output, String> {
+        self.git_ok_with(dir, args, &[])
+    }
+
+    /// [`Observer::git_ok`] with `extra` added to the environment (see [`Observer::git_with`]).
+    fn git_ok_with<S: AsRef<OsStr>>(
+        &self,
+        dir: &Path,
+        args: &[S],
+        extra: &[(OsString, OsString)],
+    ) -> Result<Output, String> {
         let what = args.first().map_or("git".to_owned(), |a| {
             format!("git {}", a.as_ref().to_string_lossy())
         });
-        self.git(dir, args)
+        self.git_with(dir, args, extra)
             .map_err(|err| err.to_string())?
             .success(&what)
     }
@@ -245,6 +411,8 @@ impl<'a> Observer<'a> {
             reservations,
             repos,
             outlived,
+            disk: Vec::new(),
+            arbiter: ArbiterView::default(),
             errors,
         })
     }
@@ -395,9 +563,13 @@ impl<'a> Observer<'a> {
                 .map(str::to_owned)
                 .collect(),
         };
-        let (base, failure) = match self.base(&dir, selection.base()) {
-            Ok(base) => (base, None),
-            Err(message) => (None, Some(message)),
+        // Peeling the base to its commit reads an object, here in `dir`.
+        let (base, failure) = match self.objects_unreadable(&dir) {
+            Some(reason) => (None, Some(reason)),
+            None => match self.base(&dir, selection.base()) {
+                Ok(base) => (base, None),
+                Err(message) => (None, Some(message)),
+            },
         };
 
         let github = remote_url.and_then(|url| gh::github_repo(url, self.gh_host.as_deref()));
@@ -565,18 +737,36 @@ impl<'a> Observer<'a> {
             .map(|m| m.app.clone())
             .or_else(|| listed.locked.then(|| "git-lock".to_owned()));
 
-        let (status, tracked) = self.index_facts(&path, &ctx.patterns, &mut note);
+        // The worktree's own configuration decides, which can differ from the entry
+        // directory's (`config.worktree`).
+        let no_objects = self.objects_unreadable(&path);
+        let IndexFacts {
+            status,
+            tracked,
+            dirty,
+            dirty_unknown,
+        } = match &no_objects {
+            // `status` compares the index with HEAD's tree, which reads objects.
+            Some(reason) => {
+                note(reason.clone());
+                IndexFacts::unknown()
+            }
+            None => self.index_facts(&path, &ctx.patterns, &mut note),
+        };
         let (head, branch, upstream) = match &status {
             Some(s) => (s.head.clone(), s.branch.clone(), s.upstream.clone()),
             None => (listed.head.clone(), listed.branch.clone(), None),
         };
         let head = head.filter(|h| git::is_oid(h));
-        let dirty = status.as_ref().map_or(Tri::Unknown, |s| tri(s.dirty));
         let has_upstream = status
             .as_ref()
             .map_or(Tri::Unknown, |s| tri(s.upstream.is_some()));
 
-        let history = self.history(ctx, &path, head.as_deref(), branch.as_deref(), &mut note);
+        let history = if no_objects.is_some() {
+            History::unknown(ctx, branch.as_deref(), head.as_deref())
+        } else {
+            self.history(ctx, &path, head.as_deref(), branch.as_deref(), &mut note)
+        };
 
         let (in_use, in_use_known) = in_use(&path, shared);
 
@@ -585,13 +775,23 @@ impl<'a> Observer<'a> {
         });
         let step_failed = !errors.is_empty() || history.gh_error.is_some() || ctx.failure.is_some();
 
+        let content = match (&ctx.repo.base, head.as_deref()) {
+            (Some(base), Some(head)) if history.merge_evidence == MergeEvidence::None => {
+                content_in_base(self.config, &path, head, base)
+            }
+            _ => ContentInBase::unknown(),
+        };
         let facts = Facts {
             dirty,
+            dirty_unknown,
             has_upstream,
             unpushed: history.unpushed,
             open_pr: history.open_pr,
             merge_evidence: history.merge_evidence,
             merged_pr: history.merged_pr,
+            content_in_base: content.value,
+            content_diff: content.diff,
+            closed_pr: None,
             in_use,
         };
         let worktree = Worktree {
@@ -600,6 +800,8 @@ impl<'a> Observer<'a> {
             head,
             branch,
             upstream,
+            git_dir: None,
+            last_activity_ms: None,
             managed_by,
             reclaim: ReclaimSummary::default(),
             allocated_bytes: shared.sizes.then(|| data::allocated_bytes(&path)).flatten(),
@@ -716,25 +918,45 @@ impl<'a> Observer<'a> {
     /// The facts that need the worktree's index: its status and its tracked files. Neither
     /// is read when the worktree uses a split index: reading one freshens its shared index
     /// file inside `.git`, even without optional locks.
+    ///
+    /// No filter driver runs (section 8.1): the drivers the worktree's configuration defines
+    /// are listed first and each one's `clean`, `smudge`, and `process` passed as empty and
+    /// `required` as false. Without its filter a filtered file is compared raw with its
+    /// cleaned blob, so a worktree-side modification of a path whose `filter` attribute names
+    /// a configured driver cannot be told from an unchanged file: when only such entries are
+    /// present, `dirty` is `unknown` with those paths. The drivers are listed again after
+    /// `status`, and a changed list fails the worktree's index facts (`filters_changed`).
     fn index_facts(
         &self,
         path: &Path,
         patterns: &DataPatterns,
         note: &mut dyn FnMut(String),
-    ) -> (Option<git::Status>, Option<Tracked>) {
+    ) -> IndexFacts {
         match self.split_index(path) {
             Ok(false) => {}
             Ok(true) => {
                 note("the worktree uses a split index, which reading would modify; its status and tracked files are not read".to_owned());
-                return (None, None);
+                return IndexFacts::unknown();
             }
             Err(message) => {
                 note(message);
-                return (None, None);
+                return IndexFacts::unknown();
             }
         }
+        let drivers = match self.filter_drivers(path) {
+            Ok(drivers) => drivers,
+            Err(message) => {
+                note(message);
+                return IndexFacts::unknown();
+            }
+        };
+        if let Err(err) = testpoint::hit(testpoint::OBSERVE_FILTERS_LISTED) {
+            note(err.to_string());
+            return IndexFacts::unknown();
+        }
+        let disabled = disabled_filters(&drivers);
         let status = self
-            .git_ok(
+            .git_ok_with(
                 path,
                 &[
                     "status",
@@ -747,19 +969,100 @@ impl<'a> Observer<'a> {
                     "--untracked-files=all",
                     "--ignored=matching",
                 ],
+                &disabled,
             )
             .and_then(|out| git::parse_status(&out.stdout))
             .map_err(&mut *note)
             .ok();
-        let tracked = self.tracked(path, patterns).map_err(note).ok();
-        (status, tracked)
+        let (dirty, dirty_unknown) = match &status {
+            None => (Tri::Unknown, None),
+            Some(s) if s.other_changes => (Tri::Yes, None),
+            Some(s) if s.modified.is_empty() => (Tri::No, None),
+            // Without a driver no path is filtered, and no attribute is looked up.
+            Some(_) if drivers.is_empty() => (Tri::Yes, None),
+            Some(s) => match self.filtered(path, &s.modified, &drivers, &disabled) {
+                Ok(filtered) if filtered.len() == s.modified.len() => (
+                    Tri::Unknown,
+                    Some(DirtyUnknown {
+                        reason: DirtyUnknownReason::FilteredPaths,
+                        paths: s
+                            .modified
+                            .iter()
+                            .take(DIRTY_UNKNOWN_PATHS)
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .collect(),
+                    }),
+                ),
+                Ok(_) => (Tri::Yes, None),
+                Err(message) => {
+                    note(message);
+                    (Tri::Unknown, None)
+                }
+            },
+        };
+        let tracked = self
+            .tracked(path, patterns, &disabled)
+            .map_err(&mut *note)
+            .ok();
+        match self.filter_drivers(path) {
+            Ok(after) if after == drivers => IndexFacts {
+                status,
+                tracked,
+                dirty,
+                dirty_unknown,
+            },
+            Ok(_) => {
+                note("filters_changed: the worktree's filter drivers changed while its status was read".to_owned());
+                IndexFacts::unknown()
+            }
+            Err(message) => {
+                note(message);
+                IndexFacts::unknown()
+            }
+        }
+    }
+
+    /// The filter drivers the configuration of the worktree at `path` defines. Reads
+    /// configuration only.
+    fn filter_drivers(&self, path: &Path) -> Result<BTreeSet<String>, String> {
+        let out = self
+            .git(
+                path,
+                &["config", "-z", "--name-only", "--get-regexp", r"^filter\."],
+            )
+            .map_err(|err| err.to_string())?;
+        // Exit 1: no such key.
+        if out.code == Some(1) {
+            return Ok(BTreeSet::new());
+        }
+        let out = out.success("git config --get-regexp")?;
+        git::parse_filter_drivers(&out.stdout)
+    }
+
+    /// Which of `paths` (worktree-relative) have a `filter` attribute naming one of
+    /// `drivers`, read with `git check-attr`. `os::child` closes a child's stdin, so the paths
+    /// go as arguments, in commands that fit the command line ([`check_attr_commands`]).
+    fn filtered(
+        &self,
+        path: &Path,
+        paths: &[PathBuf],
+        drivers: &BTreeSet<String>,
+        disabled: &[(OsString, OsString)],
+    ) -> Result<BTreeSet<PathBuf>, String> {
+        let program = OsStr::new(&self.config.host.observe.git);
+        let mut filtered = BTreeSet::new();
+        for args in check_attr_commands(program, path, paths, cfg!(windows)) {
+            let out = self.git_ok_with(path, &args, disabled)?;
+            filtered.extend(git::parse_filtered(&out.stdout, drivers)?);
+        }
+        Ok(filtered)
     }
 
     /// Whether the worktree at `path` uses a split index: a `sharedindex.*` file in its git
     /// dir or the common dir, or `core.splitIndex` set. Reads only files and configuration,
     /// never the index.
     fn split_index(&self, path: &Path) -> Result<bool, String> {
-        let git_dir = worktree_git_dir(path)
+        let git_dir = crate::config::git_dir(path)
             .ok_or_else(|| format!("cannot read the .git entry of {}", path.display()))?;
         let mut dirs = vec![git_dir];
         dirs.extend(crate::config::git_common_dir(path));
@@ -791,8 +1094,13 @@ impl<'a> Observer<'a> {
     /// What the index of the worktree at `path` holds that `act` would refuse: a tracked path
     /// covered by a protected pattern, and a gitlink (mode 160000) whose directory has its
     /// own `.git` entry.
-    fn tracked(&self, path: &Path, patterns: &DataPatterns) -> Result<Tracked, String> {
-        let out = self.git_ok(path, &["ls-files", "-z", "--stage"])?;
+    fn tracked(
+        &self,
+        path: &Path,
+        patterns: &DataPatterns,
+        disabled: &[(OsString, OsString)],
+    ) -> Result<Tracked, String> {
+        let out = self.git_ok_with(path, &["ls-files", "-z", "--stage"], disabled)?;
         let mut tracked = Tracked::default();
         for entry in out.stdout.split(|&b| b == 0).filter(|e| !e.is_empty()) {
             let (meta, file) = git::parse_stage_entry(entry)?;
@@ -809,24 +1117,124 @@ impl<'a> Observer<'a> {
     }
 }
 
+/// The arguments before a git command's own: no optional locks, no filesystem monitor (a
+/// configured one would start a daemon that writes inside `.git`), and `-C dir`.
+fn git_prefix(dir: &Path) -> Vec<OsString> {
+    vec![
+        "--no-optional-locks".into(),
+        "-c".into(),
+        "core.fsmonitor=false".into(),
+        "-C".into(),
+        dir.into(),
+    ]
+}
+
+/// The arguments of `git check-attr` before its paths.
+const CHECK_ATTR: [&str; 4] = ["check-attr", "-z", "filter", "--"];
+
+/// Whether the standard library starts `program` through cmd.exe on Windows: a batch file,
+/// whose name ends in `.bat` or `.cmd`, in any case.
+fn is_batch_file(program: &OsStr) -> bool {
+    Path::new(program)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("bat") || ext.eq_ignore_ascii_case("cmd"))
+}
+
+/// The most one argument adds to a command line: a separating space, two quotes, and its
+/// bytes, which are at least its UTF-16 units on Windows, with a `"` or `\` counted twice for
+/// its escape. To a batch file's (`batch_file`), a `%` adds 8, as the standard library writes
+/// `%%cd:~,%` for it so that cmd.exe expands no variable.
+fn arg_cost(arg: &OsStr, batch_file: bool) -> usize {
+    3 + arg
+        .as_encoded_bytes()
+        .iter()
+        .map(|b| match b {
+            b'"' | b'\\' => 2,
+            b'%' if batch_file => 8,
+            _ => 1,
+        })
+        .sum::<usize>()
+}
+
+/// The `git check-attr` commands `program` runs in `dir` for `paths`, on Windows if
+/// `windows`: each the arguments after [`git_prefix`], [`CHECK_ATTR`] and the next of `paths`
+/// that fit. On Windows the whole command line fits, within the 8,191 characters of cmd.exe
+/// for a batch file ([`is_batch_file`]), else within the 32,767 of `CreateProcessW`;
+/// elsewhere the paths cost at most [`CHECK_ATTR_ARGS`]. A path that alone costs more goes in
+/// a command of its own, which then fails.
+fn check_attr_commands(
+    program: &OsStr,
+    dir: &Path,
+    paths: &[PathBuf],
+    windows: bool,
+) -> Vec<Vec<OsString>> {
+    let batch_file = windows && is_batch_file(program);
+    let fixed = arg_cost(program, batch_file)
+        + git_prefix(dir)
+            .iter()
+            .chain(&CHECK_ATTR.map(OsString::from))
+            .map(|a| arg_cost(a, batch_file))
+            .sum::<usize>();
+    let budget = match (windows, batch_file) {
+        (false, _) => CHECK_ATTR_ARGS,
+        (true, false) => WINDOWS_COMMAND_LINE.saturating_sub(fixed),
+        (true, true) => CMD_COMMAND_LINE.saturating_sub(fixed + CMD_PREFIX.len() + 1),
+    };
+    let mut commands = Vec::new();
+    let mut rest = paths;
+    while !rest.is_empty() {
+        let mut cost = 0;
+        let taken = rest
+            .iter()
+            .take_while(|p| {
+                cost += arg_cost(p.as_os_str(), batch_file);
+                cost <= budget
+            })
+            .count()
+            .max(1);
+        let args = CHECK_ATTR.iter().map(OsString::from);
+        commands.push(
+            args.chain(rest[..taken].iter().map(OsString::from))
+                .collect(),
+        );
+        rest = &rest[taken..];
+    }
+    commands
+}
+
+/// The configuration that disables every one of `drivers` for one git command:
+/// `filter.<driver>.clean`, `.smudge`, and `.process` empty and `.required` false, as
+/// `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_<n>`, and `GIT_CONFIG_VALUE_<n>`, which carry any
+/// driver name and take precedence over every configuration file.
+fn disabled_filters(drivers: &BTreeSet<String>) -> Vec<(OsString, OsString)> {
+    let entries: Vec<(String, &str)> = drivers
+        .iter()
+        .flat_map(|driver| {
+            [
+                (format!("filter.{driver}.clean"), ""),
+                (format!("filter.{driver}.smudge"), ""),
+                (format!("filter.{driver}.process"), ""),
+                (format!("filter.{driver}.required"), "false"),
+            ]
+        })
+        .collect();
+    if entries.is_empty() {
+        return Vec::new();
+    }
+    let mut env: Vec<(OsString, OsString)> =
+        vec![("GIT_CONFIG_COUNT".into(), entries.len().to_string().into())];
+    for (n, (key, value)) in entries.into_iter().enumerate() {
+        env.push((format!("GIT_CONFIG_KEY_{n}").into(), key.into()));
+        env.push((format!("GIT_CONFIG_VALUE_{n}").into(), value.into()));
+    }
+    env
+}
+
 /// Tracked content `act` would refuse.
 #[derive(Clone, Copy, Debug, Default)]
 struct Tracked {
     protected: bool,
     nested: bool,
-}
-
-/// The git dir of the worktree at `path`, read from its `.git` entry without running git:
-/// the `.git` directory itself, or the `gitdir:` a `.git` file names.
-fn worktree_git_dir(path: &Path) -> Option<PathBuf> {
-    let dot_git = path.join(".git");
-    let meta = std::fs::symlink_metadata(&dot_git).ok()?;
-    if meta.is_dir() {
-        return Some(dot_git);
-    }
-    let text = std::fs::read_to_string(&dot_git).ok()?;
-    let gitdir = text.strip_prefix("gitdir:")?.trim();
-    Some(path.join(gitdir))
 }
 
 /// The ignored entries of the worktree at `root`, classified, with sizes of regenerable ones
@@ -848,7 +1256,9 @@ fn ignored_entries(
             IgnoredEntry {
                 path: display(&entry),
                 class,
+                regenerable_match: patterns.covers(DataList::Regenerable, rel),
                 allocated_bytes,
+                aliased_bytes: None,
             }
         })
         .collect()
@@ -1142,10 +1552,149 @@ fn display(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
+/// Why a promisor repository's objects may not be read with the git of `version` (`None`:
+/// unreadable), if that is so: before 2.45.1 git fetches despite `GIT_NO_LAZY_FETCH`.
+fn promisor_unreadable(version: Option<(u32, u32, u32)>) -> Option<String> {
+    match version {
+        Some(version) if version >= NO_LAZY_FETCH_SINCE => None,
+        Some((major, minor, patch)) => Some(format!(
+            "a partial clone, and git {major}.{minor}.{patch} would fetch missing objects (GIT_NO_LAZY_FETCH holds in every read from git 2.45.1): objects are not read"
+        )),
+        None => Some(
+            "a partial clone, and the git version cannot be read: objects are not read".to_owned(),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::plain_target;
+    use std::ffi::{OsStr, OsString};
+    use std::path::{Path, PathBuf};
+
+    use super::{CHECK_ATTR, check_attr_commands, git_prefix, plain_target, promisor_unreadable};
     use crate::contract::CheckResult;
+
+    /// The length in UTF-16 units of the command line the standard library builds on Windows
+    /// to start `program` with `args`, or more: the program quoted, each argument quoted
+    /// where it has a space, with backslashes doubled before a `"` it escapes. A batch file
+    /// (`.bat`, `.cmd`) runs as `cmd.exe /e:ON /v:OFF /d /c ""<script>" <args>"`, each
+    /// argument quoted here and each `%` written `%%cd:~,%`.
+    fn windows_command_line(program: &str, args: &[OsString]) -> usize {
+        let ext = program.rsplit('.').next().unwrap_or_default();
+        let batch = ext.eq_ignore_ascii_case("bat") || ext.eq_ignore_ascii_case("cmd");
+        let mut line = String::new();
+        if batch {
+            line.push_str("cmd.exe /e:ON /v:OFF /d /c \"");
+        }
+        line.push('"');
+        line.push_str(program);
+        line.push('"');
+        for arg in args {
+            let arg = arg.to_str().unwrap();
+            let quote = batch || arg.is_empty() || arg.contains([' ', '\t']);
+            line.push(' ');
+            if quote {
+                line.push('"');
+            }
+            let mut backslashes = 0;
+            for c in arg.chars() {
+                match c {
+                    '\\' => backslashes += 1,
+                    '"' => {
+                        line.push_str(&"\\".repeat(backslashes + 1));
+                        backslashes = 0;
+                    }
+                    '%' if batch => {
+                        line.push_str("%%cd:~,");
+                        backslashes = 0;
+                    }
+                    _ => backslashes = 0,
+                }
+                line.push(c);
+            }
+            if quote {
+                line.push_str(&"\\".repeat(backslashes));
+                line.push('"');
+            }
+        }
+        if batch {
+            line.push('"');
+        }
+        line.encode_utf16().count()
+    }
+
+    /// The paths `git check-attr` gets are split into commands that fit: on Windows each
+    /// whole command line stays within the 32,767 characters of `CreateProcessW`, or the
+    /// 8,191 of cmd.exe for a batch file, whose `%` take 8 characters each; elsewhere the
+    /// paths of a command take at most 64 KiB. Each command has every path once, in order,
+    /// and all but the last fill more than half their limit; a path too long for any command
+    /// goes alone.
+    #[test]
+    fn check_attr_commands_fit_the_command_line() {
+        let paths: Vec<PathBuf> = (0..3000)
+            .map(|n| PathBuf::from(format!("assets/textures/{n:05}/50% diffuse-map.bin")))
+            .collect();
+        let exe = r"C:\Program Files\Git\cmd\git.exe";
+        let batch = r"C:\Program Files\Git\cmd\git.CMD";
+        let dir = Path::new(r"C:\Users\dev\src\some repository");
+        let path_bytes = |args: &[OsString]| -> usize { args.iter().map(|a| a.len() + 3).sum() };
+        for (program, windows) in [(exe, true), (batch, true), (batch, false)] {
+            let case = format!("{program} on Windows: {windows}");
+            let commands = check_attr_commands(OsStr::new(program), dir, &paths, windows);
+            assert!(commands.len() > 1, "{case}");
+            let mut seen = Vec::new();
+            for (n, args) in commands.iter().enumerate() {
+                assert_eq!(
+                    args[..CHECK_ATTR.len()],
+                    CHECK_ATTR.map(OsString::from),
+                    "{case}"
+                );
+                let given = &args[CHECK_ATTR.len()..];
+                seen.extend(given.iter().map(PathBuf::from));
+                let (used, limit) = if windows {
+                    let mut full = git_prefix(dir);
+                    full.extend(args.iter().cloned());
+                    let limit = if program == batch { 8_191 } else { 32_766 };
+                    (windows_command_line(program, &full), limit)
+                } else {
+                    (path_bytes(given), 64 * 1024)
+                };
+                assert!(used <= limit, "{case}: command {n} takes {used} of {limit}");
+                if n + 1 < commands.len() {
+                    assert!(
+                        used > limit / 2,
+                        "{case}: command {n} takes {used} of {limit}"
+                    );
+                }
+            }
+            assert_eq!(seen, paths, "{case}");
+        }
+        let long = [PathBuf::from("x".repeat(40_000)), PathBuf::from("y")];
+        let commands = check_attr_commands(OsStr::new(exe), dir, &long, true);
+        let given: Vec<_> = commands
+            .iter()
+            .map(|args| &args[CHECK_ATTR.len()..])
+            .collect();
+        assert_eq!(
+            given,
+            [[long[0].clone()], [long[1].clone()]].map(|p| p.map(OsString::from))
+        );
+        let none = check_attr_commands(OsStr::new(exe), dir, &[], true);
+        assert_eq!(none, Vec::<Vec<OsString>>::new());
+    }
+
+    /// A promisor repository's objects are read only with a git that honors
+    /// `GIT_NO_LAZY_FETCH` in every read (2.45.1 and later; 2.45.0's rename detection
+    /// fetches without asking it); an older or unreadable version fails closed.
+    #[test]
+    fn promisor_below_2_45_1_reads_no_objects() {
+        for old in [Some((2, 45, 0)), Some((2, 44, 9)), Some((1, 99, 0)), None] {
+            assert!(promisor_unreadable(old).is_some(), "{old:?}");
+        }
+        for new in [(2, 45, 1), (2, 54, 0), (3, 0, 0)] {
+            assert_eq!(promisor_unreadable(Some(new)), None, "{new:?}");
+        }
+    }
 
     #[test]
     fn plain_target_passes_a_plain_directory_and_fails_a_link_to_one() {

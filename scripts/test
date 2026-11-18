@@ -12,10 +12,12 @@
 # archived tests with cargo-nextest in a constructed environment under a per-run root R
 # (HOME, XDG dirs, temp dir, and git's global config inside R), each test process confined
 # so that it can write only inside R: sandbox-exec on macOS, bubblewrap on Linux where it
-# works; Windows gets the environment and the guard only. Afterwards every process the run
-# left behind is listed, killed, and fails the run. A run's processes are those in its
-# sandbox on macOS and those carrying a marker unique to the run, CARDINAL_TEST_RUN=<id>, on
-# Linux; run-processes from crates/test-support finds and kills them.
+# works; Windows gets the environment and the guard only. The tests' small volumes are an
+# empty disk image under R on macOS and a tmpfs bubblewrap mounts for each test on Linux.
+# Afterwards every process the run left behind, and every disk image it left attached, is
+# listed, ended, and fails the run. A run's processes are those in its sandbox on macOS and
+# those carrying a marker unique to the run, CARDINAL_TEST_RUN=<id>, on Linux;
+# run-processes from crates/test-support finds and kills them.
 
 # POSIX prelude: start over in a constructed environment before bash reads any startup file.
 # A script run by `sh` reads no startup file, and `bash --noprofile --norc` with BASH_ENV and
@@ -84,14 +86,23 @@ marker="CARDINAL_TEST_RUN=$run_id"
 # allows `<name>.allowed`; only this run's sandbox does both.
 sandbox_name=dev.cardinal.test-run.$run_id
 
-# On every exit: the sweep, then R. The self-check's listener at $R.sock exits once its
-# socket is gone.
+# On every exit: the sweep, the disk images a test left attached, then R, unless an image
+# under it is still attached. The self-check's listener at $R.sock exits once its socket is
+# gone.
 cleanup() {
   local status=$?
   if ! sweep; then
     status=1
   fi
-  rm -rf "$R" "$R.sock"
+  if ! detach_images; then
+    status=1
+  fi
+  if [ -n "${keep_root-}" ]; then
+    say "left $R in place: a disk image under it may still be attached"
+    rm -f "$R.sock"
+  else
+    rm -rf "$R" "$R.sock"
+  fi
   exit "$status"
 }
 trap cleanup EXIT
@@ -273,10 +284,12 @@ check_sweep() {
 
 # --- Confinement -------------------------------------------------------------------------
 
-# Sets `runner` to the command that confines one test process, or empty, and `confinement`
-# to a description.
+# Sets `runner` to the command that confines one test process, or empty, `confinement` to a
+# description, and on Linux under bubblewrap `volume` to the path of each test process's
+# tmpfs.
 runner=
 confinement=
+volume=
 setup_confinement() {
   case $R in *' '*)
     # A target runner is split at spaces.
@@ -316,7 +329,10 @@ EOF
       # that hold the host's Unix sockets (agents, the session bus, container daemons) and
       # shared memory, so a test cannot reach them; then the checkout, read-only, where one
       # of them hid it (a test's working directory and the files it reads are there; the
-      # test binaries run from the archive, extracted under R); then R, which lies under /tmp.
+      # test binaries run from the archive, extracted under R); then R, which lies under /tmp;
+      # then a 64 MiB tmpfs at R/volume, a small volume of each test process's own
+      # (`Scope::tmpfs`, docs/architecture.md section 13.3): bubblewrap mounts it in its own
+      # user namespace, whose ID map lets the test create files there.
       local bwrap=(bwrap --ro-bind / / --dev /dev) mask masks=()
       for mask in /tmp /var/tmp /run /var/run /dev/shm; do
         if [ "$mask" = /dev/shm ] || { [ -d "$mask" ] && [ ! -L "$mask" ]; }; then
@@ -338,16 +354,28 @@ EOF
             ;;
         esac
       done
-      bwrap+=(--bind "$R" "$R" --unshare-net --die-with-parent --)
-      local error
-      if ! error=$("${bwrap[@]}" sh -c ': >/dev/null && : >"$1/probe"' sh "$R" 2>&1); then
+      bwrap+=(--bind "$R" "$R")
+      local tail=(--unshare-net --die-with-parent --) error
+      local sized=(--size $((64 << 20)) --tmpfs "$R/volume")
+      if ! error=$("${bwrap[@]}" "${tail[@]}" sh -c ': >/dev/null && : >"$1/probe"' sh "$R" 2>&1)
+      then
         confinement="UNCONFINED: bubblewrap does not work here (${error:-not installed}); writes outside the per-run root are found only by the repository guard, and those to other worktrees' branches, the objects, or other refs only in CI"
-      elif ! "${bwrap[@]}" test -r "$root/Cargo.toml"; then
+      elif ! "${bwrap[@]}" "${tail[@]}" test -r "$root/Cargo.toml"; then
         say "bubblewrap hides the checkout $root from the tests"
         exit 1
       else
-        runner="${bwrap[*]}"
         confinement="bubblewrap: writes only under the per-run root, no network, host sockets masked"
+        # Probed apart, so a bubblewrap without `--size` still confines the tests; the tests
+        # that need the volume then fail in CI and are skipped elsewhere.
+        mkdir "$R/volume"
+        if error=$("${bwrap[@]}" "${sized[@]}" "${tail[@]}" sh -c ': >"$1/volume/probe"' sh \
+          "$R" 2>&1); then
+          bwrap+=("${sized[@]}")
+          volume=$R/volume
+        else
+          confinement="$confinement; no tmpfs volume, bubblewrap cannot mount a size-limited tmpfs (${error:-no message})"
+        fi
+        runner="${bwrap[*]} ${tail[*]}"
       fi
       ;;
     *)
@@ -355,6 +383,59 @@ EOF
       ;;
   esac
   say "$confinement"
+}
+
+# --- Disk image (macOS) -------------------------------------------------------------------
+
+# The empty APFS image `Scope::attach_image` clones for a small volume that fills up
+# (docs/architecture.md section 13.3), made before the tests start: inside their sandbox
+# `hdiutil create` fails, while `hdiutil attach` of an existing image works. Without it the
+# tests that need one are skipped, or fail where CI is true.
+image=
+make_image() {
+  [ "$os" = Darwin ] || return 0
+  mkdir "$R/image"
+  if hdiutil create -quiet -size 256m -fs APFS -volname cardinal-test -layout NONE \
+    "$R/image/empty.dmg"; then
+    image=$R/image/empty.dmg
+  else
+    say "no disk image: hdiutil create failed; the tests that need one are skipped"
+  fi
+}
+
+# The whole device of each attached disk image whose file is under R.
+attached_images() {
+  hdiutil info | awk -v r="$R/" '
+    /^image-path/ { sub(/^image-path[ \t]*:[ \t]*/, ""); keep = index($0, r) == 1; next }
+    keep && /^\/dev\/disk[0-9]+[ \t]/ { print $1; keep = 0 }'
+}
+
+# The image's guard detaches each clone, from outside the sandbox, so the sweep cannot end a
+# clone a killed test left attached: it is detached here, listing again after each try, up to
+# three tries, and fails the run. While one stays attached, or the list cannot be read,
+# `keep_root` keeps R from being removed through the mounted volume.
+keep_root=
+detach_images() {
+  [ -n "${image-}" ] || return 0
+  local devices device tries=0 found=0
+  while devices=$(attached_images); do
+    [ -n "$devices" ] || return "$found"
+    found=1
+    if [ "$tries" -ge 3 ]; then
+      say "disk images still attached after $tries tries:" $devices
+      keep_root=1
+      return 1
+    fi
+    tries=$((tries + 1))
+    for device in $devices; do
+      say "a test left the disk image $device attached; detaching it"
+      hdiutil detach -force -quiet "$device" || true
+    done
+    sleep 1
+  done
+  say "cannot list the attached disk images"
+  keep_root=1
+  return 1
 }
 
 # --- Phase 2 -----------------------------------------------------------------------------
@@ -393,6 +474,8 @@ run_archive() {
   fi
   [ -z "${CARGO_TERM_COLOR-}" ] || env+=(CARGO_TERM_COLOR="$CARGO_TERM_COLOR")
   [ -z "${CI-}" ] || env+=(CI="$CI")
+  [ -z "$image" ] || env+=(CARDINAL_TEST_IMAGE="$image")
+  [ -z "$volume" ] || env+=(CARDINAL_TEST_TMPFS="$volume")
   [ -z "$runner" ] || env+=("$runner_var=$runner")
   (clean_exec '' "${env[@]}" cargo-nextest nextest run --archive-file "$archive" \
     --workspace-remap "$workspace" --extract-to "$extract" \
@@ -584,6 +667,7 @@ build_scanner
 
 setup_confinement
 check_sweep
+make_image
 # The checkout's files are compared only where nothing stops a test from writing them: in CI,
 # and when the tests run unconfined. Locally a confined test cannot write there, while the
 # developer may edit files during the run.

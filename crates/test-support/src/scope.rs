@@ -16,7 +16,8 @@ use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 use std::process::{ChildStderr, ChildStdin, ChildStdout, ExitStatus, Output, Stdio};
 #[cfg(unix)]
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::AtomicI32;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
@@ -25,8 +26,17 @@ use tempfile::TempDir;
 #[cfg(unix)]
 use crate::marker::Marker;
 
+#[cfg(target_os = "macos")]
+mod image;
 #[cfg(target_os = "linux")]
 mod mount;
+#[cfg(target_os = "linux")]
+mod tmpfs;
+
+#[cfg(target_os = "macos")]
+pub use image::{IMAGE_VAR, Image};
+#[cfg(target_os = "linux")]
+pub use tmpfs::TMPFS_VAR;
 
 /// The variable the test harness sets to a value unique to each harness run. A scope passes
 /// it to every child, so the harness can find what a test left running.
@@ -54,7 +64,13 @@ pub struct Scope {
     #[cfg(unix)]
     marker: Arc<Marker>,
     // Removed after the registry's children are gone (see `Drop`).
-    _dir: TempDir,
+    dir: TempDir,
+    /// Whether the root stays when the scope drops, for the harness's sweep: a disk image
+    /// its guard could not detach (macOS, `image::Image`) is mounted inside it.
+    keep_root: AtomicBool,
+    // Released after the root on the volume is removed.
+    #[cfg(target_os = "linux")]
+    volume: Option<tmpfs::Claim>,
 }
 
 impl Scope {
@@ -66,6 +82,11 @@ impl Scope {
             .prefix("cardinal-scope-")
             .tempdir()
             .expect("create the scope root");
+        Self::with_dir(dir)
+    }
+
+    /// A scope whose root is `dir`, a new directory.
+    fn with_dir(dir: TempDir) -> Self {
         let root = dunce::canonicalize(dir.path()).expect("canonical scope root");
         if let Some(repo) = root
             .ancestors()
@@ -106,7 +127,10 @@ impl Scope {
             #[cfg(unix)]
             marker: Arc::new(Marker::create(&root)),
             root,
-            _dir: dir,
+            dir,
+            keep_root: AtomicBool::new(false),
+            #[cfg(target_os = "linux")]
+            volume: None,
         }
     }
 
@@ -259,6 +283,42 @@ impl Scope {
     }
 }
 
+/// Reports on stderr that a test is skipped because the run lacks `reason`'s host feature,
+/// and panics instead where `CI` is `true`, so a CI run never passes a test without running
+/// it.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn skip(reason: &str) {
+    assert!(
+        std::env::var("CI").as_deref() != Ok("true"),
+        "CI runs every test: {reason}"
+    );
+    report(&format!("skipped: {reason}"));
+}
+
+/// Writes `line` to this process's stderr directly, past the test harness's capture.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn report(line: &str) {
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stderr(), "{line}");
+}
+
+/// Writes zeros to `path` in 1 MiB steps until a write fails, up to 1 GiB; the bytes written
+/// and the error.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+fn fill(path: &Path) -> (u64, Option<io::Error>) {
+    use std::io::Write as _;
+    let mut file = std::fs::File::create(path).unwrap();
+    let chunk = vec![0_u8; 1 << 20];
+    let mut written = 0;
+    for _ in 0..1024 {
+        match file.write_all(&chunk) {
+            Ok(()) => written += chunk.len() as u64,
+            Err(err) => return (written, Some(err)),
+        }
+    }
+    (written, None)
+}
+
 impl Default for Scope {
     fn default() -> Self {
         Self::new()
@@ -268,6 +328,9 @@ impl Default for Scope {
 impl Drop for Scope {
     fn drop(&mut self) {
         self.registry.cleanup_all();
+        if self.keep_root.load(Ordering::SeqCst) {
+            self.dir.disable_cleanup(true);
+        }
     }
 }
 

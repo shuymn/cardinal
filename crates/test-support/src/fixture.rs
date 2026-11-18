@@ -6,8 +6,9 @@
 //! must be inside the root, and git's own answer to which git dir and common dir the call
 //! would use must be inside it too (a decoy `.git` file pointing elsewhere is refused). A
 //! directory that is not a repository is told apart from any other failure to resolve one.
-//! The scope's git config disables every transport, so only [`Fixture::push`] moves objects,
-//! and only into a [`BareRepo`] of this fixture.
+//! The scope's git config disables every transport, so only [`Fixture::push`] and
+//! [`Fixture::partial_clone`] move objects, and only to or from a [`BareRepo`] of this
+//! fixture.
 
 #![allow(
     clippy::must_use_candidate,
@@ -41,6 +42,15 @@ impl BareRepo {
     }
 }
 
+/// What a partial clone ([`Fixture::partial_clone`]) leaves out until a command needs it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Omit {
+    /// `--filter=tree:0`: every tree and blob the checkout did not need.
+    Trees,
+    /// `--filter=blob:none`: every blob the checkout did not need.
+    Blobs,
+}
+
 /// A filesystem monitor configured for one fixture repository by [`Fixture::fsmonitor`].
 /// Dropping it stops the monitor daemon running for the repository, if any
 /// (`git fsmonitor--daemon stop`), and removes the setting, but only while the directory
@@ -55,7 +65,7 @@ pub struct Fsmonitor<'a> {
 
 impl Drop for Fsmonitor<'_> {
     fn drop(&mut self) {
-        if self.fixture.git_dirs(&self.repo).as_ref() != Some(&self.dirs) {
+        if self.fixture.git_dirs(&self.repo).as_ref() != Ok(&self.dirs) {
             return;
         }
         self.fixture
@@ -200,6 +210,86 @@ impl Fixture {
                 "-u",
                 &path,
                 branch,
+            ],
+        );
+    }
+
+    /// `git clone --filter=tree:0` or `--filter=blob:none` (by `omit`) of `source` into
+    /// `root/name`, through the `file` transport that only this call and [`Fixture::push`]
+    /// enable: a partial clone, which holds every commit but only the trees (or blobs) its
+    /// checkout needed, and whose `origin` is a promisor remote. `source` gets
+    /// `uploadpack.allowFilter`, which its `upload-pack` reads from its own configuration
+    /// only. A later git command that needs a missing object fetches it from `source` unless
+    /// the transport is disabled for it or `GIT_NO_LAZY_FETCH` refuses it, which is what a
+    /// lazy-fetch test looks for.
+    pub fn partial_clone(&self, source: &BareRepo, name: &str, omit: Omit) -> PathBuf {
+        let name = checked_name("clone", name);
+        assert!(
+            !name.contains('/'),
+            "refusing git: clone {name:?} is not one name"
+        );
+        self.assert_inside(source.path(), "clone source");
+        self.require_repo(source.path());
+        let path = source.path().to_string_lossy().replace('\\', "/");
+        assert!(
+            path.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-' | ':')),
+            "refusing git: clone source {path:?} needs quoting in a URL"
+        );
+        let url = if path.starts_with('/') {
+            format!("file://{path}")
+        } else {
+            format!("file:///{path}")
+        };
+        self.git(
+            source.path(),
+            &["config", "--local", "uploadpack.allowFilter", "true"],
+        );
+        self.resolve(self.root());
+        self.run(
+            self.root(),
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "clone",
+                "-q",
+                match omit {
+                    Omit::Trees => "--filter=tree:0",
+                    Omit::Blobs => "--filter=blob:none",
+                },
+                "--",
+                &url,
+                name,
+            ],
+        );
+        let clone = self.path(name);
+        self.require_repo(&clone);
+        clone
+    }
+
+    /// Configures `filter.<name>.clean` in `repo`'s local config to run `script`, a file
+    /// inside the root, and marks the driver `required`: a filter is the owner's program, so
+    /// a test can show that observation never runs one. `script` runs through git's shell.
+    pub fn clean_filter(&self, repo: &Path, name: &str, script: &Path) {
+        let name = checked_name("filter", name);
+        self.assert_inside(script, "filter script");
+        let script = script.to_string_lossy().replace('\\', "/");
+        assert!(
+            !script.contains('\''),
+            "refusing git: filter script {script:?} needs quoting"
+        );
+        let clean = format!("'{script}'");
+        self.git(
+            repo,
+            &["config", "--local", &format!("filter.{name}.clean"), &clean],
+        );
+        self.git(
+            repo,
+            &[
+                "config",
+                "--local",
+                &format!("filter.{name}.required"),
+                "true",
             ],
         );
     }
@@ -443,29 +533,9 @@ impl Fixture {
         }
     }
 
-    /// The git dir and common dir git would use in `dir`, or `None` when it cannot resolve
-    /// them. Never panics for a directory inside the root.
-    fn git_dirs(&self, dir: &Path) -> Option<Vec<PathBuf>> {
-        let output = self.output(
-            dir,
-            &[
-                "rev-parse",
-                "--path-format=absolute",
-                "--absolute-git-dir",
-                "--git-common-dir",
-            ],
-        );
-        output.status.success().then(|| {
-            String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .map(|line| PathBuf::from(line.trim()))
-                .collect()
-        })
-    }
-
-    /// Asks git which git dir and common dir it would use in `dir`, and refuses any outside
-    /// the root. Panics on any failure other than "not a git repository".
-    fn resolve(&self, dir: &Path) -> Resolution {
+    /// The git dir and common dir git would use in `dir`, or git's stderr when it cannot
+    /// resolve them. Never panics for a directory inside the root.
+    fn git_dirs(&self, dir: &Path) -> Result<Vec<PathBuf>, String> {
         let output = self.output(
             dir,
             &[
@@ -476,18 +546,33 @@ impl Fixture {
             ],
         );
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            assert!(
-                stderr.starts_with("fatal: not a git repository (or any"),
-                "git cannot resolve the repository at {}: {stderr}",
-                dir.display()
-            );
-            return Resolution::NotARepository;
+            return Err(String::from_utf8_lossy(&output.stderr).into_owned());
         }
-        for line in String::from_utf8_lossy(&output.stdout).lines() {
-            self.assert_inside(Path::new(line.trim()), "git dir");
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(|line| PathBuf::from(line.trim()))
+            .collect())
+    }
+
+    /// Asks git which git dir and common dir it would use in `dir`, and refuses any outside
+    /// the root. Panics on any failure other than "not a git repository".
+    fn resolve(&self, dir: &Path) -> Resolution {
+        match self.git_dirs(dir) {
+            Ok(dirs) => {
+                for dir in &dirs {
+                    self.assert_inside(dir, "git dir");
+                }
+                Resolution::Repository
+            }
+            Err(stderr) => {
+                assert!(
+                    stderr.starts_with("fatal: not a git repository (or any"),
+                    "git cannot resolve the repository at {}: {stderr}",
+                    dir.display()
+                );
+                Resolution::NotARepository
+            }
         }
-        Resolution::Repository
     }
 
     fn assert_inside(&self, path: &Path, what: &str) {

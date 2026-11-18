@@ -176,19 +176,25 @@ impl<'a> Selection<'a> {
     }
 }
 
-/// The git common dir of the worktree rooted at `worktree`, read from its `.git` entry
-/// without running git: the `.git` directory itself, or for a `.git` file the `gitdir:` it
-/// names, followed by that directory's `commondir` file when present. Canonical, or `None`.
+/// The git dir of the worktree rooted at `worktree`, read from its `.git` entry without
+/// running git: the `.git` directory itself, or for a `.git` file the `gitdir:` it names.
 #[must_use]
-pub fn git_common_dir(worktree: &Path) -> Option<PathBuf> {
+pub fn git_dir(worktree: &Path) -> Option<PathBuf> {
     let dot_git = worktree.join(".git");
-    let meta = std::fs::metadata(&dot_git).ok()?;
-    if meta.is_dir() {
-        return dunce::canonicalize(&dot_git).ok();
+    if std::fs::metadata(&dot_git).ok()?.is_dir() {
+        return Some(dot_git);
     }
     let text = std::fs::read_to_string(&dot_git).ok()?;
     let gitdir = text.strip_prefix("gitdir:")?.trim();
-    let gitdir = worktree.join(gitdir);
+    Some(worktree.join(gitdir))
+}
+
+/// The git common dir of the worktree rooted at `worktree`, read without running git: its
+/// [`git_dir`], followed by that directory's `commondir` file when present. Canonical, or
+/// `None`.
+#[must_use]
+pub fn git_common_dir(worktree: &Path) -> Option<PathBuf> {
+    let gitdir = git_dir(worktree)?;
     let common = match std::fs::read_to_string(gitdir.join("commondir")) {
         Ok(rel) => gitdir.join(rel.trim()),
         Err(_) => gitdir,

@@ -11,6 +11,8 @@ pub enum ErrorCode {
     NotFound,
     AmbiguousId,
     InvalidArgument,
+    /// `inbox --assigned`: the item is not assigned to the running pass (section 10.5).
+    NotAssigned,
     NotImplemented,
     Internal,
 }
@@ -25,6 +27,7 @@ impl ErrorCode {
             Self::NotFound => "not_found",
             Self::AmbiguousId => "ambiguous_id",
             Self::InvalidArgument => "invalid_argument",
+            Self::NotAssigned => "not_assigned",
             Self::NotImplemented => "not_implemented",
             Self::Internal => "internal",
         }
@@ -106,6 +109,7 @@ mod tests {
             ErrorCode::NotFound,
             ErrorCode::AmbiguousId,
             ErrorCode::InvalidArgument,
+            ErrorCode::NotAssigned,
             ErrorCode::NotImplemented,
             ErrorCode::Internal,
         ] {

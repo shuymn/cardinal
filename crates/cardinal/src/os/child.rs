@@ -96,9 +96,11 @@ const INHERITED_WINDOWS: &[&str] = &[
     "TMP",
 ];
 
-/// Variables every git and gh child gets: no optional locks, no prompts, no colors.
+/// Variables every git and gh child gets: no optional locks, no lazy fetch of a partial
+/// clone's missing objects (git 2.45 and later), no prompts, no colors.
 const ADDED: &[(&str, &str)] = &[
     ("GIT_OPTIONAL_LOCKS", "0"),
+    ("GIT_NO_LAZY_FETCH", "1"),
     ("GIT_TERMINAL_PROMPT", "0"),
     ("GH_PROMPT_DISABLED", "1"),
     ("GH_NO_UPDATE_NOTIFIER", "1"),
@@ -598,6 +600,7 @@ mod tests {
             names.iter().filter(|n| **n == "GIT_OPTIONAL_LOCKS").count(),
             1
         );
+        assert_eq!(lookup(&env, "GIT_NO_LAZY_FETCH").unwrap(), "1");
         assert_eq!(lookup(&env, "GIT_TERMINAL_PROMPT").unwrap(), "0");
         assert_eq!(lookup(&env, "GH_PROMPT_DISABLED").unwrap(), "1");
     }

@@ -78,6 +78,10 @@ impl StateDir {
             root.join("sessions"),
             root.join("inbox"),
             root.join("plans"),
+            root.join("reconcile"),
+            root.join("disk"),
+            root.join("arbiter"),
+            root.join("ui"),
             root.join("records"),
             root.join("tmp"),
         ] {
@@ -214,18 +218,145 @@ impl StateDir {
         self.plan_dir(plan).join("plan.json")
     }
 
-    /// `plans/<plan>/claim`, for the deletion phase: the `act` that executes the plan will
-    /// create it once. Phase 0 `act` never creates it.
+    /// `executions/`: one directory per plan an execution worked on (section 9.7). Unit X
+    /// creates it; the first release does not.
     #[must_use]
-    pub fn plan_claim(&self, plan: &str) -> PathBuf {
-        self.plan_dir(plan).join("claim")
+    pub fn executions_dir(&self) -> PathBuf {
+        self.root.join("executions")
     }
 
-    /// `plans/<plan>/result.json` (`cardinal.act-result.v1`), for the deletion phase. Phase 0
-    /// `act` never writes it.
+    /// `executions/<plan>/`: an execution's records.
     #[must_use]
-    pub fn plan_result(&self, plan: &str) -> PathBuf {
-        self.plan_dir(plan).join("result.json")
+    pub fn execution_dir(&self, plan: &str) -> PathBuf {
+        self.executions_dir().join(plan)
+    }
+
+    /// `executions/<plan>/act.lock`: empty; held by the `act` or the recovery working on the
+    /// plan's execution. Removed only with its directory (section 4.3).
+    #[must_use]
+    pub fn execution_lock(&self, plan: &str) -> PathBuf {
+        self.execution_dir(plan).join("act.lock")
+    }
+
+    /// `executions/<plan>/manifest` (`cardinal.act-manifest.v1`).
+    #[must_use]
+    pub fn execution_manifest(&self, plan: &str) -> PathBuf {
+        self.execution_dir(plan).join("manifest")
+    }
+
+    /// `executions/<plan>/claim` (`cardinal.act-claim.v1`).
+    #[must_use]
+    pub fn execution_claim(&self, plan: &str) -> PathBuf {
+        self.execution_dir(plan).join("claim")
+    }
+
+    /// `executions/<plan>/result.json` (`cardinal.act-result.v1`).
+    #[must_use]
+    pub fn execution_result(&self, plan: &str) -> PathBuf {
+        self.execution_dir(plan).join("result.json")
+    }
+
+    /// `trash/`: where an execution moves its targets, on the state dir's mount (section
+    /// 9.7). Unit X creates it; the first release does not.
+    #[must_use]
+    pub fn trash_dir(&self) -> PathBuf {
+        self.root.join("trash")
+    }
+
+    /// `trash/<plan>/`: the trash entry an execution owns.
+    #[must_use]
+    pub fn trash_entry(&self, plan: &str) -> PathBuf {
+        self.trash_dir().join(plan)
+    }
+
+    /// `trash/<plan>/t`: the target as moved out of its worktree.
+    #[must_use]
+    pub fn trash_target(&self, plan: &str) -> PathBuf {
+        self.trash_entry(plan).join("t")
+    }
+
+    /// `trash/<plan>/h`: the hold the target's entries pass through while they are deleted.
+    #[must_use]
+    pub fn trash_hold(&self, plan: &str) -> PathBuf {
+        self.trash_entry(plan).join("h")
+    }
+
+    /// `reconcile.lock`: one reconcile pass at a time. Never deleted.
+    #[must_use]
+    pub fn reconcile_lock(&self) -> PathBuf {
+        self.root.join("reconcile.lock")
+    }
+
+    #[must_use]
+    pub fn reconcile_dir(&self) -> PathBuf {
+        self.root.join("reconcile")
+    }
+
+    /// `reconcile/state.json` (`cardinal.reconcile-state.v1`): pass times. Written under
+    /// `reconcile.lock`.
+    #[must_use]
+    pub fn reconcile_state(&self) -> PathBuf {
+        self.reconcile_dir().join("state.json")
+    }
+
+    /// `reconcile/observation.json` (`cardinal.inventory.v1`): the last full observation.
+    /// Written under `reconcile.lock`.
+    #[must_use]
+    pub fn reconcile_observation(&self) -> PathBuf {
+        self.reconcile_dir().join("observation.json")
+    }
+
+    #[must_use]
+    pub fn disk_dir(&self) -> PathBuf {
+        self.root.join("disk")
+    }
+
+    /// `disk/<volume>.json` (`cardinal.disk-state.v1`), `volume` the key of a volume's
+    /// identity (section 10.4). Written under `reconcile.lock`.
+    #[must_use]
+    pub fn disk_state(&self, volume: &str) -> PathBuf {
+        self.disk_dir().join(format!("{}.json", file_safe(volume)))
+    }
+
+    #[must_use]
+    pub fn arbiter_dir(&self) -> PathBuf {
+        self.root.join("arbiter")
+    }
+
+    /// `arbiter/.lock`: held by the arbiter launcher (section 10.5). Never deleted.
+    #[must_use]
+    pub fn arbiter_lock(&self) -> PathBuf {
+        self.arbiter_dir().join(".lock")
+    }
+
+    /// `arbiter/last.json` (`cardinal.arbiter-pass.v1`): the last arbiter pass. Written under
+    /// `arbiter/.lock`.
+    #[must_use]
+    pub fn arbiter_last(&self) -> PathBuf {
+        self.arbiter_dir().join("last.json")
+    }
+
+    /// `arbiter/<pass>.log`: an arbiter pass's output, capped.
+    #[must_use]
+    pub fn arbiter_log(&self, pass: &str) -> PathBuf {
+        self.arbiter_dir().join(format!("{}.log", file_safe(pass)))
+    }
+
+    #[must_use]
+    pub fn ui_dir(&self) -> PathBuf {
+        self.root.join("ui")
+    }
+
+    /// `ui/index.html`: the read-only web UI's page (section 10.6).
+    #[must_use]
+    pub fn ui_page(&self) -> PathBuf {
+        self.ui_dir().join("index.html")
+    }
+
+    /// `ui/snapshot.json` (`cardinal.snapshot.v1`), the snapshot the page embeds.
+    #[must_use]
+    pub fn ui_snapshot(&self) -> PathBuf {
+        self.ui_dir().join("snapshot.json")
     }
 
     #[must_use]
@@ -252,19 +383,20 @@ impl StateDir {
         self.records_dir().join(".lock")
     }
 
-    /// `jobs/`: reserved for phase 2 accepted jobs; not created in phase 0.
+    /// `jobs/`: reserved for phase 2 accepted jobs; not created.
     #[must_use]
     pub fn jobs_dir(&self) -> PathBuf {
         self.root.join("jobs")
     }
 
-    /// `tickets/`: reserved for phase 2 queue tickets; not created in phase 0.
+    /// `tickets/`: reserved for phase 2 queue tickets; not created.
     #[must_use]
     pub fn tickets_dir(&self) -> PathBuf {
         self.root.join("tickets")
     }
 
-    /// `reserve`: reserved for the phase 1 disk reserve file; not created in phase 0.
+    /// `reserve`: the reserve file of the state dir's volume (section 9.7). Unit X writes it;
+    /// the first release does not.
     #[must_use]
     pub fn reserve_file(&self) -> PathBuf {
         self.root.join("reserve")
@@ -348,12 +480,16 @@ mod tests {
             "sessions",
             "inbox",
             "plans",
+            "reconcile",
+            "disk",
+            "arbiter",
+            "ui",
             "records",
             "tmp",
         ] {
             assert!(tmp.path().join(dir).is_dir(), "{dir}");
         }
-        for reserved in ["jobs", "tickets", "reserve"] {
+        for reserved in ["jobs", "tickets", "reserve", "executions", "trash"] {
             assert!(!tmp.path().join(reserved).exists(), "{reserved}");
         }
         assert_eq!(
@@ -405,6 +541,70 @@ mod tests {
             state.session("../x").parent().unwrap(),
             state.sessions_dir()
         );
+    }
+
+    /// Every path of the layout in `docs/architecture.md` section 4.1, relative to the root.
+    #[test]
+    fn paths_follow_the_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = StateDir::open(tmp.path()).unwrap();
+        let rel = |path: std::path::PathBuf| {
+            path.strip_prefix(tmp.path())
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/")
+        };
+        let job = "0123456789abcdef";
+        for (path, expected) in [
+            (state.admission_lock(), "admission.lock"),
+            (state.live_lock(job), "live/0123456789abcdef.lock"),
+            (state.reservation(job), "reservations/0123456789abcdef.json"),
+            (state.worktree_lock(job), "worktrees/0123456789abcdef.lock"),
+            (state.session("s"), "sessions/s.json"),
+            (state.inbox_lock(), "inbox/.lock"),
+            (state.plan_file(job), "plans/0123456789abcdef/plan.json"),
+            (
+                state.execution_lock(job),
+                "executions/0123456789abcdef/act.lock",
+            ),
+            (
+                state.execution_manifest(job),
+                "executions/0123456789abcdef/manifest",
+            ),
+            (
+                state.execution_claim(job),
+                "executions/0123456789abcdef/claim",
+            ),
+            (
+                state.execution_result(job),
+                "executions/0123456789abcdef/result.json",
+            ),
+            (state.trash_target(job), "trash/0123456789abcdef/t"),
+            (state.trash_hold(job), "trash/0123456789abcdef/h"),
+            (state.reconcile_lock(), "reconcile.lock"),
+            (state.reconcile_state(), "reconcile/state.json"),
+            (state.reconcile_observation(), "reconcile/observation.json"),
+            (state.disk_state(job), "disk/0123456789abcdef.json"),
+            (state.arbiter_lock(), "arbiter/.lock"),
+            (state.arbiter_last(), "arbiter/last.json"),
+            (state.arbiter_log(job), "arbiter/0123456789abcdef.log"),
+            (state.ui_page(), "ui/index.html"),
+            (state.ui_snapshot(), "ui/snapshot.json"),
+            (state.records_file(), "records/records.jsonl"),
+            (state.rotated_records(1), "records/records.1.jsonl"),
+            (state.records_lock(), "records/.lock"),
+            (state.jobs_dir(), "jobs"),
+            (state.tickets_dir(), "tickets"),
+            (state.reserve_file(), "reserve"),
+        ] {
+            assert_eq!(rel(path), expected);
+        }
+        // Names that come from outside stay inside their directory.
+        assert_eq!(
+            state.arbiter_log("../x").parent().unwrap(),
+            state.arbiter_dir()
+        );
+        assert_eq!(state.disk_state("../x").parent().unwrap(), state.disk_dir());
     }
 
     #[test]

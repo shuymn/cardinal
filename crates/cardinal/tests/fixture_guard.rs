@@ -5,7 +5,7 @@ use std::ffi::OsString;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 
-use cardinal_test_support::fixture::Fixture;
+use cardinal_test_support::fixture::{Fixture, Omit};
 
 fn panic_message(run: impl FnOnce()) -> Option<String> {
     let err = catch_unwind(AssertUnwindSafe(run)).err()?;
@@ -140,6 +140,41 @@ fn push_into_another_fixture_is_refused() {
         fixture.remote_add(&repo, "origin", &outside);
     });
     assert_eq!(other.for_each_ref(outside.path()), "");
+}
+
+/// `partial_clone` clones only a bare repository of its own fixture into one plain name, and
+/// `clean_filter` configures only a script inside the root under a plain name.
+#[test]
+fn partial_clones_and_filters_stay_inside_the_fixture() {
+    let fixture = Fixture::new();
+    let repo = fixture.init("repo");
+    fixture.commit_file(&repo, "a.txt", "a\n", "first");
+    let origin = fixture.init_bare("origin.git");
+    fixture.push(&repo, &origin, "main");
+    let other = Fixture::new();
+    let outside = other.init_bare("other.git");
+    refuses("a clone of another fixture", || {
+        fixture.partial_clone(&outside, "clone", Omit::Trees);
+    });
+    for name in ["sub/clone", "--bare", "../clone"] {
+        refuses(name, || {
+            fixture.partial_clone(&origin, name, Omit::Trees);
+        });
+    }
+    assert!(!fixture.path("clone").exists() && !fixture.path("sub").exists());
+
+    let before = state(&fixture, &repo);
+    let script = fixture.path("filter.sh");
+    std::fs::write(&script, "#!/bin/sh\ncat\n").unwrap();
+    let outside_script = other.path("filter.sh");
+    std::fs::write(&outside_script, "#!/bin/sh\ncat\n").unwrap();
+    refuses("a filter script outside the root", || {
+        fixture.clean_filter(&repo, "store", &outside_script);
+    });
+    refuses("an option as a filter name", || {
+        fixture.clean_filter(&repo, "--global", &script);
+    });
+    assert_eq!(state(&fixture, &repo), before);
 }
 
 #[cfg(unix)]
