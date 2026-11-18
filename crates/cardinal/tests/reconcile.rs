@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use cardinal::contract::{
     ArbiterStart, DiskLevel, InboxItem, InboxKind, InboxStatus, Inventory, ResolutionOutcome,
-    SessionProcess, SessionSnapshot, SessionSnapshotSchema, Skipped, SnapshotAgent, Tri,
+    SessionProcess, SessionSnapshot, SessionSnapshotSchema, Skipped, Snapshot, SnapshotAgent, Tri,
 };
 use cardinal::inbox::{self, StatusFilter};
 use cardinal::testpoint::{RECONCILE_OBSERVED, release_file};
@@ -96,7 +96,8 @@ fn paused_pass(d: &Disk) -> Child {
 
 /// Section 13.6, the handoff: paused at `reconcile.observed`, a pass under pressure has
 /// written no disk item; released, its `disk_low` and `disk_critical` items carry its disk
-/// report, and the trigger starts no arbiter pass for them. The pass ends only the items it read before step 4: `disk_critical`, escalated by
+/// report, and so do they on the page the pass wrote; the trigger starts no arbiter pass for
+/// them. The pass ends only the items it read before step 4: `disk_critical`, escalated by
 /// the owner while the next pass observes, keeps the escalation although that pass left
 /// `critical`; the pass after it ends the item, and `disk_low` stays until the recovery line.
 #[test]
@@ -140,6 +141,18 @@ fn disk_items_follow_the_observation() {
         );
         assert!(first.inbox.raised.contains(&item.key), "{first:#?}");
     }
+    // The page the pass wrote at step 8 read the items as complete as the store holds them.
+    let page: Snapshot =
+        serde_json::from_slice(&std::fs::read(d.s.state.ui_snapshot()).unwrap()).unwrap();
+    let mut shown: Vec<&InboxItem> = page
+        .inbox
+        .iter()
+        .map(|i| &i.item)
+        .filter(|i| matches!(i.kind, InboxKind::DiskLow | InboxKind::DiskCritical))
+        .collect();
+    shown.sort_by_key(|i| i.kind == InboxKind::DiskCritical);
+    assert_eq!(shown, items.iter().collect::<Vec<_>>());
+    assert_eq!(page.arbiter, None, "the trigger started no arbiter pass");
 
     let second = paused_pass(&d);
     inbox::resolve(
@@ -171,6 +184,34 @@ fn disk_items_follow_the_observation() {
     let last = d.reconcile();
     assert_eq!(last.disk[0].state, DiskLevel::Ok);
     assert_eq!(d.disk_statuses(), (resolved, resolved));
+}
+
+/// A records file that a rotation keeping one file set aside in `tmp/` and never removed (a
+/// crash between the two) is removed by a pass once it is older than the cleanup's hour; a
+/// younger one stays.
+#[test]
+fn a_pass_removes_a_records_file_a_rotation_left_behind() {
+    let d = Disk::new(LINES);
+    d.fixture_reads(&[Some(10 * MIB)]);
+    let (old, young) = (
+        cardinal::record::set_aside(&d.s.state),
+        cardinal::record::set_aside(&d.s.state),
+    );
+    for path in [&old, &young] {
+        std::fs::write(path, b"{}\n").unwrap();
+    }
+    std::fs::File::options()
+        .write(true)
+        .open(&old)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - Duration::from_hours(2))
+        .unwrap();
+
+    let pass = d.reconcile();
+
+    assert_eq!(own_errors(&pass), Vec::<String>::new());
+    assert!(!old.exists(), "{} is left", old.display());
+    assert!(young.exists(), "{} was removed", young.display());
 }
 
 /// C9: a process listed in a session snapshot that is alive after the session's agent ended
@@ -283,8 +324,9 @@ fn raised(d: &Disk, pass: &cardinal::contract::Reconcile, prefix: &str) -> Inbox
 
 /// Section 13.6, the handoff to the arbiter: under pressure, a pass that raises a due worktree
 /// item along with its disk items starts an arbiter pass at step 7, which is assigned that item
-/// and no disk item; the next pass, with nothing due, starts none. On Windows the test's job
-/// refuses the launcher's start: the pass reports it and assigns nothing.
+/// and no disk item; the next pass, with nothing due, starts none, and its page shows the pass
+/// with the item. On Windows the test's job refuses the launcher's start: the pass reports it
+/// and assigns nothing.
 #[test]
 fn a_due_worktree_item_starts_an_arbiter_pass() {
     let d = Disk::new(LINES);
@@ -314,12 +356,27 @@ fn a_due_worktree_item_starts_an_arbiter_pass() {
             .arbiter
             .map(|a| a.pass)
     };
-    assert_eq!(assigned(&reclaimable), Some(arbiter.id));
+    assert_eq!(assigned(&reclaimable), Some(arbiter.id.clone()));
     assert_eq!(assigned(&disk_low), None, "never assigned");
 
     let next = d.reconcile();
     assert_eq!(own_errors(&next), Vec::<String>::new());
     assert_eq!(next.arbiter, ArbiterStart::NotNeeded);
+    // The page the next pass wrote shows the arbiter pass the first one's trigger started, and
+    // the item assigned to it; the launcher records the pass on its own, so the first pass's
+    // page, written meanwhile, may not.
+    let page: Snapshot =
+        serde_json::from_slice(&std::fs::read(d.s.state.ui_snapshot()).unwrap()).unwrap();
+    assert_eq!(page.arbiter.as_ref(), Some(&arbiter));
+    let shown = page
+        .inbox
+        .iter()
+        .find(|i| i.item.key == reclaimable.key)
+        .expect("the reclaimable item on the page");
+    assert_eq!(
+        shown.item.arbiter.as_ref().map(|a| &a.pass),
+        Some(&arbiter.id)
+    );
 }
 
 /// A `closed_pr_dirty` item from a real pass reaches the arbiter with what its subject check

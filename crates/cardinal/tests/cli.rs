@@ -149,17 +149,6 @@ fn owner_approved_needs_the_owner() {
     );
 }
 
-/// The phase 1 entry point whose body a later unit writes, `cardinal ui`, answers
-/// `not_implemented` as a `cardinal.error.v1` document with exit 1.
-#[test]
-fn unbuilt_entry_points_answer_not_implemented() {
-    let dirs = Dirs::new();
-    let assert = dirs.cmd().arg("ui").assert().code(1);
-    let doc = json(&assert.get_output().stdout);
-    assert_eq!(doc["schema"], "cardinal.error.v1");
-    assert_eq!(doc["error"]["code"], "not_implemented");
-}
-
 #[test]
 fn invalid_config_is_config_invalid() {
     let dirs = Dirs::new();

@@ -31,7 +31,7 @@ const TOTAL: u64 = 64 * MIB;
 
 /// Scopes of the pass's steps whose bodies other units write (`docs/architecture.md` section
 /// 14.2): their errors say nothing about the steps these tests check.
-const OTHER_UNITS: &[&str] = &["ui"];
+const OTHER_UNITS: &[&str] = &[];
 
 pub struct Disk {
     pub s: Setup,
