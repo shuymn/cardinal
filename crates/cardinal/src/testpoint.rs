@@ -91,6 +91,12 @@ pub const ACT_RESTORED: &str = "act.restored";
 pub const ACT_FINISHING: &str = "act.finishing";
 /// A recovery holds an execution's `act.lock` and has read nothing.
 pub const RECOVER_LOCKED: &str = "recover.locked";
+/// The snapshot opened the record files and took their lengths, released `records/.lock`, and
+/// has read no line.
+pub const SNAPSHOT_RECORDS_OPENED: &str = "snapshot.records_opened";
+/// The snapshot read the reservations in its one pass, released the admission lock, and has
+/// derived no state.
+pub const SNAPSHOT_RESERVATIONS_READ: &str = "snapshot.reservations_read";
 
 /// Every pause point.
 pub const POINTS: &[&str] = &[
@@ -128,6 +134,8 @@ pub const POINTS: &[&str] = &[
     ACT_RESTORED,
     ACT_FINISHING,
     RECOVER_LOCKED,
+    SNAPSHOT_RECORDS_OPENED,
+    SNAPSHOT_RESERVATIONS_READ,
 ];
 
 /// How long a paused process waits for its release file before aborting.
