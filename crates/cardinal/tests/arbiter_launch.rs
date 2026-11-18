@@ -747,8 +747,8 @@ fn retried_after_the_cooldown() {
 
 /// A19: a launcher killed after it recorded the pass in `last.json` and before it assigned
 /// anything leaves the listed items unassigned: the pass counts as running until `timeout_s`
-/// after its start, a launcher that finds it held reports it, and after that the next
-/// launcher records it `abandoned` and takes the items at once, `retry_s` not applying.
+/// after its start, and after that the next launcher records it `abandoned` and takes the
+/// items at once, `retry_s` not applying.
 #[test]
 fn killed_before_assigning() {
     let pinned = Pinned {
@@ -763,10 +763,6 @@ fn killed_before_assigning() {
     points.wait_reached(ARBITER_RECORDED, launcher.id(), WAIT);
     let first = e.last().unwrap();
     assert_eq!(first.items, ["reclaimable:/a@h@1"]);
-    // One launcher at a time: one that finds the lock held reports the running pass.
-    let (code, doc) = e.arbiter_run();
-    assert_eq!(code, Some(0), "{doc}");
-    assert_eq!(pass_of(&doc), first);
     launcher.kill();
 
     assert_eq!(e.item("reclaimable:/a@h@1").arbiter, None, "never assigned");
@@ -1551,4 +1547,62 @@ fn an_ending_pass_takes_no_answer() {
     assert_eq!((a.status, a.resolution), (InboxStatus::Open, None));
     assert_eq!(a.arbiter.unwrap().outcome, None, "the outcome write failed");
     assert_eq!(e.last().unwrap().outcome, Some(PassOutcome::Completed));
+}
+
+/// A19: a launcher waits a few seconds for `arbiter/.lock`, which a trigger holds while it
+/// settles the last pass. Released meanwhile, it runs its pass; still held, it prints the
+/// running pass when `last.json` records one without an end, and otherwise fails as busy,
+/// never printing the last pass, which ended, as its own.
+#[test]
+fn the_lock_is_waited_for_briefly() {
+    let pinned = Pinned {
+        timeout_s: 60,
+        min_interval_s: 0,
+        retry_s: 0,
+    };
+    let e = Env::new(pinned, &[]);
+    e.raise("reclaimable:/a@h@1", InboxKind::Reclaimable);
+    let (code, doc) = e.arbiter_run();
+    assert_eq!(code, Some(0), "{doc}");
+    let first = pass_of(&doc);
+    let held = state::lock(
+        &e.state.arbiter_lock(),
+        LockMode::Exclusive,
+        Instant::now() + WAIT,
+    )
+    .unwrap();
+
+    let start = Instant::now();
+    let (code, doc) = e.arbiter_run();
+    assert!(
+        start.elapsed() >= Duration::from_secs(3),
+        "the launcher waits for the lock"
+    );
+    assert_eq!((code, error_code(&doc)), (Some(1), "state_unavailable"));
+    assert_eq!(e.last(), Some(first.clone()), "no pass started");
+
+    let running = ArbiterPass {
+        id: "running".into(),
+        ended_ms: None,
+        outcome: None,
+        ..first.clone()
+    };
+    std::fs::write(
+        e.state.arbiter_last(),
+        serde_json::to_vec(&running).unwrap(),
+    )
+    .unwrap();
+    let (code, doc) = e.arbiter_run();
+    assert_eq!(code, Some(0), "{doc}");
+    assert_eq!(pass_of(&doc), running, "the running pass");
+    std::fs::write(e.state.arbiter_last(), serde_json::to_vec(&first).unwrap()).unwrap();
+
+    let points = TestPoints::new(e.dirs.scope());
+    let mut launcher = e.spawn_launcher(&points, &[]);
+    std::thread::sleep(Duration::from_millis(500));
+    drop(held);
+    assert!(launcher.wait().unwrap().success());
+    let second = e.last().unwrap();
+    assert_ne!(second.id, first.id, "a pass of its own");
+    assert_eq!(second.outcome, Some(PassOutcome::Completed));
 }

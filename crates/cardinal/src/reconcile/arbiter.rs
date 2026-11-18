@@ -26,7 +26,7 @@ use crate::contract::{
 use crate::inbox::{self, NewItem};
 use crate::os::{self, child};
 use crate::record::{self, Recorder};
-use crate::state::{self, Durability, LockMode, StateDir};
+use crate::state::{self, Durability, LockError, LockMode, StateDir};
 use crate::testpoint;
 
 /// The environment variable that names the pass a session runs for.
@@ -38,6 +38,10 @@ const LOG_CAP: u64 = 1 << 20;
 
 /// Failed, timed-out, or abandoned passes in a row that raise `arbiter_failing`.
 const FAILING_AFTER: u64 = 3;
+
+/// How long `cardinal arbiter run` waits for `arbiter/.lock`, which a trigger holds while it
+/// settles the last pass.
+const LOCK_WAIT: Duration = Duration::from_secs(3);
 
 /// Step 7: starts `cardinal arbiter run` detached when an item is due and `min_interval_s`
 /// has passed since the last pass started. An error, starting nothing, when `last.json`
@@ -86,19 +90,31 @@ fn start_launcher() -> Result<u32, Error> {
         .map_err(|err| Error::new(ErrorCode::Internal, err.to_string()))
 }
 
-/// `cardinal arbiter run`: one bounded arbiter pass, or the running one when
-/// `arbiter/.lock` is held or a pass whose launcher died is within `timeout_s` of its start.
-/// Refused with `not_found` when no item is due, `min_interval_s` has not passed, or every
-/// due item was closed before it was assigned, and with `state_unavailable` when `last.json`
-/// exists but cannot be read.
+/// `cardinal arbiter run`: one bounded arbiter pass, or the running one when `arbiter/.lock`
+/// stays held for [`LOCK_WAIT`] and `last.json` records a pass without an end, or a pass whose
+/// launcher died is within `timeout_s` of its start. Refused with `not_found` when no item is
+/// due, `min_interval_s` has not passed, or every due item was closed before it was assigned,
+/// and with `state_unavailable` when `last.json` exists but cannot be read, or the lock stays
+/// held and no pass is running.
 pub fn run(config: &Config, state: &StateDir) -> Result<ArbiterPass, Error> {
-    let Some(lock) = state::try_lock(&state.arbiter_lock(), LockMode::Exclusive)? else {
-        return inbox::read_last(state)?.ok_or_else(|| {
-            Error::new(
-                ErrorCode::NotFound,
-                "another arbiter launcher holds arbiter/.lock and has recorded no pass yet",
-            )
-        });
+    let lock = match state::lock(
+        &state.arbiter_lock(),
+        LockMode::Exclusive,
+        Instant::now() + LOCK_WAIT,
+    ) {
+        Ok(lock) => lock,
+        Err(LockError::TimedOut(_)) => {
+            return match inbox::read_last(state)? {
+                Some(running) if running.ended_ms.is_none() => Ok(running),
+                // A trigger, or a launcher that has recorded no pass yet: never the last
+                // pass, which ended, as this one's.
+                _ => Err(Error::new(
+                    ErrorCode::StateUnavailable,
+                    "arbiter/.lock is busy and no arbiter pass is running",
+                )),
+            };
+        }
+        Err(err) => return Err(err.into()),
     };
     injected(testpoint::hit(testpoint::ARBITER_LOCKED))?;
     let now = state::now_ms();
