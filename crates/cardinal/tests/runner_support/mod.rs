@@ -46,10 +46,21 @@ pub struct Env {
 }
 
 impl Env {
-    /// An environment whose `host.toml` is `host_toml`.
+    /// An environment whose `host.toml` is `host_toml`. Without a `[disk]` table of the
+    /// test's own, the disk lines sit below any free space, so the job-end check never starts
+    /// a `reconcile` pass (`docs/architecture.md` section 5.2).
     pub fn new(host_toml: &str) -> Self {
         let dirs = Dirs::new();
-        std::fs::write(dirs.config().join("host.toml"), host_toml).expect("write host.toml");
+        let disk = if host_toml.contains("[disk]") {
+            ""
+        } else {
+            "[disk]\nwarning_mib = 1\nrecovery_mib = 2\ncritical_mib = 0\n"
+        };
+        std::fs::write(
+            dirs.config().join("host.toml"),
+            format!("{disk}{host_toml}"),
+        )
+        .expect("write host.toml");
         let scope = dirs.scope();
         std::fs::create_dir_all(scope.path("wt/.git")).expect("create the worktree");
         std::fs::create_dir_all(scope.path("wt/sub")).expect("create a subdirectory");

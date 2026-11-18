@@ -23,6 +23,9 @@ use cardinal_test_support::fixture::Fixture;
 
 pub const GITHUB: &str = "acme/app";
 
+/// Disk lines below any free space (`docs/architecture.md` section 5.2).
+pub const QUIET_DISK: &str = "[disk]\nwarning_mib = 1\nrecovery_mib = 2\ncritical_mib = 0\n";
+
 pub struct Scene {
     pub fx: Fixture,
     pub repo: PathBuf,
@@ -70,6 +73,7 @@ impl Scene {
         scene.write_gh();
         scene.set_open("[]");
         scene.set_merged_default("[]");
+        scene.set_closed("[]");
         scene
     }
 
@@ -119,7 +123,12 @@ impl Scene {
         std::fs::write(self.gh_dir.join("merged.out"), json).unwrap();
     }
 
-    /// Makes the `kind` (`open` or `merged`) query exit with `code`.
+    /// The closed pull request list gh returns for any branch.
+    pub fn set_closed(&self, json: &str) {
+        std::fs::write(self.gh_dir.join("closed.out"), json).unwrap();
+    }
+
+    /// Makes the `kind` (`open`, `merged`, or `closed`) query exit with `code`.
     pub fn gh_fails(&self, kind: &str, code: u8) {
         std::fs::write(self.gh_dir.join(format!("{kind}.code")), code.to_string()).unwrap();
     }
@@ -225,10 +234,17 @@ exit "$code"
         .unwrap();
     }
 
-    /// Writes `host.toml` and loads the configuration.
+    /// Writes `host.toml` and loads the configuration. Without a `[disk]` table of the
+    /// test's own, the disk lines sit below any free space, so a runner's job-end check never
+    /// starts a `reconcile` pass.
     pub fn config(&self) -> Config {
+        let disk = if self.observe_extra.contains("[disk]") {
+            ""
+        } else {
+            QUIET_DISK
+        };
         let host = format!(
-            "[observe]\ngh = '{}'\ngh_timeout_ms = {}\ngit_timeout_ms = {}\n{}",
+            "{disk}[observe]\ngh = '{}'\ngh_timeout_ms = {}\ngit_timeout_ms = {}\n{}",
             self.gh_program().display(),
             self.gh_timeout_ms,
             self.git_timeout_ms,
@@ -306,10 +322,13 @@ exit "$code"
     /// environment (`env_clear` first), and the fixture root as its working directory. Every
     /// caller passes `--repo <fixture repository>`.
     pub fn cardinal(&self) -> Command {
+        self.cardinal_in(self.fx.root())
+    }
+
+    /// [`Scene::cardinal`] started in `dir`, which must be inside the fixture.
+    pub fn cardinal_in(&self, dir: &Path) -> Command {
         self.config();
-        let mut command = self
-            .fx
-            .command(env!("CARGO_BIN_EXE_cardinal"), self.fx.root());
+        let mut command = self.fx.command(env!("CARGO_BIN_EXE_cardinal"), dir);
         for (name, value) in self.isolation() {
             command.env(name, value);
         }

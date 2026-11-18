@@ -84,7 +84,7 @@ pub struct ReportTarget {
 }
 
 /// An entry matching a regenerable pattern whose plan failed, with its first failed check
-/// (or `"aliased"` for a target whose bytes are all aliased).
+/// (or `"aliased"` for a target whose regular files' bytes are all aliased).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReportBlocked {
     pub worktree: String,
@@ -106,4 +106,16 @@ pub struct DiskReport {
     /// The bytes still missing to the recovery line; 0 when the targets reach it.
     pub shortfall_bytes: u64,
     pub blocked: Vec<ReportBlocked>,
+    /// The worktrees on the volume that the pass's observation read only in part, so that
+    /// what is listed there is not all there is. Absent in reports made before it was
+    /// recorded, which read as empty.
+    #[serde(default)]
+    pub incomplete: Vec<ReportIncomplete>,
+}
+
+/// A worktree on the volume whose observation failed in part, and why.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReportIncomplete {
+    pub worktree: String,
+    pub reason: String,
 }

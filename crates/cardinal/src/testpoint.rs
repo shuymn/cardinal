@@ -66,6 +66,8 @@ pub const RECORD_OPENED: &str = "record.opened";
 /// The inbox refresh observed reservations, processes, and sessions, and has not raised or
 /// cleared anything.
 pub const INBOX_OBSERVED: &str = "inbox.observed";
+/// A refresh found `inbox/.refresh.lock` held and is about to wait for it.
+pub const INBOX_REFRESH_WAITING: &str = "inbox.refresh_waiting";
 /// `act` or recovery opened an execution's `act.lock` and has not tried it.
 pub const ACT_LOCK_OPENED: &str = "act.lock_opened";
 /// `act` holds the plan's `act.lock` and the worktree's in-use lock and has taken no
@@ -122,6 +124,7 @@ pub const POINTS: &[&str] = &[
     HOOK_CLASSIFIED,
     RECORD_OPENED,
     INBOX_OBSERVED,
+    INBOX_REFRESH_WAITING,
     ACT_LOCK_OPENED,
     ACT_EXCLUDED,
     ACT_PUBLISHING,

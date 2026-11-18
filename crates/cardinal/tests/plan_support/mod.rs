@@ -39,6 +39,9 @@ regenerable = ["node_modules", "target", ".DS_Store"]
 protected = ["fuzz/corpus", "fuzz/artifacts", "proptest-regressions"]
 "#;
 
+/// How long one `cardinal plan` or `cardinal act` may take before the test fails.
+pub const RUN_LIMIT: Duration = Duration::from_secs(120);
+
 /// What the main repository ignores, so worktrees stay clean around their ignored data.
 const GITIGNORE: &str = "node_modules/\ntarget/\n.DS_Store\nfuzz/corpus/\nfuzz/artifacts/\n";
 
@@ -122,15 +125,20 @@ impl Setup {
 
     /// `cardinal plan reclaim-worktree|reclaim-dir TARGET`.
     pub fn try_plan(&self, kind: PlanKind, target: &Path) -> Result<Plan, Error> {
+        self.try_plan_in(kind, target, self.fx.root())
+    }
+
+    /// [`Setup::try_plan`] run from `dir`, inside the fixture.
+    pub fn try_plan_in(&self, kind: PlanKind, target: &Path, dir: &Path) -> Result<Plan, Error> {
         let sub = match kind {
             PlanKind::ReclaimWorktree => "reclaim-worktree",
             PlanKind::ReclaimDir => "reclaim-dir",
         };
         let output = self
-            .cardinal()
+            .cardinal_in(dir)
             .args(["plan", sub])
             .arg(target)
-            .output()
+            .output_within(RUN_LIMIT)
             .expect("run cardinal plan");
         document(&output, &[0])
     }
@@ -148,7 +156,7 @@ impl Setup {
             .arg("plan")
             .arg("--repo")
             .arg(&self.main)
-            .output()
+            .output_within(RUN_LIMIT)
             .expect("run cardinal plan");
         document(&output, &[0]).expect("a plan list")
     }
@@ -165,6 +173,9 @@ impl Setup {
         if options.owner_approved {
             command.arg("--owner-approved");
         }
+        if options.squash_merged {
+            command.arg("--squash-merged");
+        }
         command
     }
 
@@ -173,7 +184,7 @@ impl Setup {
     pub fn act(&self, plan: &str, options: &ActOptions) -> Result<ActResult, Error> {
         let output = self
             .act_command(plan, options)
-            .output()
+            .output_within(RUN_LIMIT)
             .expect("run cardinal act");
         act_result(&output)
     }

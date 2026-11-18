@@ -519,6 +519,7 @@ fn plain_target_checks(
         },
         patterns: &cardinal::plan::DataLists::default(),
         managed: &[],
+        squash_merged: false,
     })
 }
 
@@ -640,34 +641,86 @@ fn managed_reclaim_dir_refused() {
     assert!(control.join("node_modules/pkg/index.js").exists());
 }
 
-/// `plan` with no target plans every candidate worktree and the regenerable entries of
-/// worktrees that are not candidates.
+/// A24: `plan` with no target plans every linked worktree, whatever its checks find, and
+/// every ignored entry matching a regenerable pattern; a failing plan carries its reason.
 #[cfg(unix)]
 #[test]
-fn plan_all_covers_candidates_and_regenerable_entries() {
+fn bulk_plans_every_worktree() {
     let s = Setup::new();
     let done = s.worktree("done");
     let busy = s.worktree("busy");
     write(&busy, "target/x", "x");
     write(&busy, "notes.txt", "not committed\n");
     let list = s.plan_all();
-    let mut targets: Vec<(String, PlanKind)> = list
+    let mut targets: Vec<(String, PlanKind, bool)> = list
         .plans
         .iter()
-        .map(|p| (p.target.path.clone(), p.kind))
+        .map(|p| (p.target.path.clone(), p.kind, p.invariants_ok))
         .collect();
     targets.sort_by(|a, b| a.0.cmp(&b.0));
     assert_eq!(
         targets,
         [
+            (busy.display().to_string(), PlanKind::ReclaimWorktree, false),
             (
                 busy.join("target").display().to_string(),
-                PlanKind::ReclaimDir
+                PlanKind::ReclaimDir,
+                true
             ),
-            (done.display().to_string(), PlanKind::ReclaimWorktree),
+            (done.display().to_string(), PlanKind::ReclaimWorktree, true),
         ]
     );
+    let refused = list
+        .plans
+        .iter()
+        .find(|p| {
+            p.kind == PlanKind::ReclaimWorktree && p.target.path == busy.display().to_string()
+        })
+        .unwrap();
+    let failed: Vec<&str> = refused
+        .checks
+        .iter()
+        .filter(|c| c.result != CheckResult::Pass)
+        .map(|c| c.name.as_str())
+        .collect();
+    assert_eq!(failed, ["clean"], "{:#?}", refused.checks);
     assert!(list.errors.is_empty(), "{:?}", list.errors);
+}
+
+/// A24: a `target/` holding protected data deep inside matches a regenerable pattern, so the
+/// bulk `plan` plans it, and its plan is refused by `no_protected` alone, beside a control
+/// `target/` that passes.
+#[cfg(unix)]
+#[test]
+fn protected_target_dir_planned_and_refused() {
+    let s = Setup::new();
+    let wt = s.worktree("fuzzed");
+    write(&wt, "target/a/b/fuzz/corpus/seed", "keep");
+    let control = s.worktree("control");
+    write(&control, "target/x", "x");
+    let list = s.plan_all();
+    let plan_of = |path: &Path| {
+        list.plans
+            .iter()
+            .find(|p| p.target.path == path.display().to_string())
+            .unwrap_or_else(|| panic!("{} not planned: {list:#?}", path.display()))
+    };
+    let refused = plan_of(&wt.join("target"));
+    assert!(!refused.invariants_ok);
+    let failed: Vec<&str> = refused
+        .checks
+        .iter()
+        .filter(|c| c.result != CheckResult::Pass)
+        .map(|c| c.name.as_str())
+        .collect();
+    assert_eq!(failed, ["no_protected"], "{:#?}", refused.checks);
+    let result = s.act(&refused.id, &plan_support::arbiter()).unwrap();
+    assert_eq!(result.reasons, ["no_protected"]);
+    let passing = plan_of(&control.join("target"));
+    assert!(passing.invariants_ok, "{:#?}", passing.checks);
+    let result = s.act(&passing.id, &plan_support::arbiter()).unwrap();
+    assert_eq!(result.status, ActStatus::DryRun);
+    assert!(wt.join("target/a/b/fuzz/corpus/seed").exists());
 }
 
 /// Plans are bound and stored; the CLI resolves unique prefixes; a main worktree is never
@@ -717,4 +770,209 @@ fn cli_plan_on_a_fixture_repo() {
     assert_eq!(doc["schema"], "cardinal.plan-list.v1", "{doc:#}");
     assert_eq!(doc["plans"], serde_json::json!([]), "{doc:#}");
     assert_eq!(doc["errors"], serde_json::json!([]), "{doc:#}");
+}
+
+/// C15: a process working anywhere in the worktree uses its `node_modules` and `target/`, so
+/// a `reclaim_dir` plan counts the whole worktree: one in `src/` refuses the plan of
+/// `node_modules` by `not_in_use` alone, beside a control with no process inside.
+#[cfg(unix)]
+#[test]
+fn working_directory_in_the_worktree_refused() {
+    let s = Setup::new();
+    let busy = s.worktree("busy");
+    write(&busy, "node_modules/pkg/index.js", "x");
+    let control = s.worktree("idle");
+    write(&control, "node_modules/pkg/index.js", "x");
+    let plan = s.plan(PlanKind::ReclaimDir, &busy.join("node_modules"));
+    let idle = s.plan(PlanKind::ReclaimDir, &control.join("node_modules"));
+    let mut sleeper = support::helper::spawn(
+        s.fx.scope(),
+        &support::helper::Mode::Sleep,
+        &busy.join("src"),
+    );
+    cardinal_test_support::process::wait_for(
+        "the sleeper's cwd",
+        std::time::Duration::from_secs(10),
+        || cardinal::os::cwd(sleeper.id()).filter(|cwd| cwd.starts_with(&busy)),
+    );
+    let result = s.act(&plan.id, &arbiter()).unwrap();
+    assert_eq!(result.status, ActStatus::Rejected, "{result:#?}");
+    assert_eq!(result.reasons, ["not_in_use"]);
+    assert!(detail(&result, "not_in_use").contains(&sleeper.id().to_string()));
+    let result = s.act(&idle.id, &arbiter()).unwrap();
+    assert_eq!(result.status, ActStatus::DryRun, "{result:#?}");
+    sleeper.kill();
+    assert!(busy.join("node_modules/pkg/index.js").exists());
+}
+
+/// A `plan` run from inside the worktree does not count itself: its own working directory is
+/// in the worktree, and `not_in_use` passes.
+#[cfg(unix)]
+#[test]
+fn the_planning_process_is_not_in_use() {
+    let s = Setup::new();
+    let wt = s.worktree("here");
+    write(&wt, "target/x", "x");
+    let plan = s
+        .try_plan_in(PlanKind::ReclaimDir, &wt.join("target"), &wt.join("src"))
+        .unwrap();
+    assert_eq!(
+        check(&plan.checks, "not_in_use"),
+        CheckResult::Pass,
+        "{plan:#?}"
+    );
+    assert!(plan.invariants_ok, "{plan:#?}");
+}
+
+/// What observation of the worktree could not read is in its plans' provenance: a directory
+/// git status cannot open leaves the worktree's ignored data unknown, and the plan says why.
+#[cfg(unix)]
+#[test]
+fn a_plan_says_what_observation_could_not_read() {
+    use std::os::unix::fs::PermissionsExt;
+
+    /// Gives the directory its permissions back, so the setup can be removed.
+    struct Readable(std::path::PathBuf);
+    impl Drop for Readable {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    let s = Setup::new();
+    let wt = s.worktree("hidden");
+    write(&wt, "target/x", "x");
+    let private = wt.join("private");
+    std::fs::create_dir(&private).unwrap();
+    std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let _readable = Readable(private.clone());
+    if std::fs::read_dir(&private).is_ok() {
+        let _ = std::io::Write::write_all(
+            &mut std::io::stderr(),
+            b"skipped a_plan_says_what_observation_could_not_read: the directory stays readable (root)\n",
+        );
+        return;
+    }
+    let plan = s.plan(PlanKind::ReclaimDir, &wt.join("target"));
+    assert!(
+        plan.provenance
+            .errors
+            .iter()
+            .any(|e| e.source == "observation"
+                && e.message.contains("git status is incomplete")
+                && e.message.contains("could not open directory 'private/'")),
+        "{plan:#?}"
+    );
+}
+
+/// A git directory (`HEAD`, `objects/`, `refs/`) below a regenerable entry.
+#[cfg(unix)]
+fn bare_repository(at: &Path) {
+    write(at, "HEAD", "ref: refs/heads/main\n");
+    write(at, "objects/info/packs", "");
+    write(at, "refs/heads/.keep", "");
+}
+
+/// A7: a bare repository below the target, made after the plan and removed once `act` has
+/// recorded its snapshot, refuses the plan by `no_nested_repository` alone; the control
+/// without it passes.
+#[cfg(unix)]
+#[test]
+fn bare_repository_refused() {
+    let s = Setup::new();
+    let wt = s.worktree("bare-below");
+    write(&wt, "node_modules/pkg/index.js", "x");
+    let plan = s.plan(PlanKind::ReclaimDir, &wt.join("node_modules"));
+    assert!(plan.invariants_ok, "{:#?}", plan.checks);
+    bare_repository(&wt.join("node_modules/cache.git"));
+    let result = s.act_at(
+        &plan.id,
+        &arbiter(),
+        cardinal::testpoint::ACT_SNAPSHOTTED,
+        || std::fs::remove_dir_all(wt.join("node_modules/cache.git")).unwrap(),
+    );
+    assert_eq!(result.status, ActStatus::Rejected, "{result:#?}");
+    assert_eq!(result.reasons, ["no_nested_repository"]);
+    assert_eq!(
+        detail(&result, "no_nested_repository"),
+        "repositories inside: node_modules/cache.git"
+    );
+    let result = s.act(&plan.id, &arbiter()).unwrap();
+    assert_eq!(result.status, ActStatus::DryRun, "the control: {result:#?}");
+}
+
+/// A7: a target that is itself a bare repository is refused by `no_nested_repository`, and
+/// observation classifies it as a nested repository.
+#[cfg(unix)]
+#[test]
+fn bare_repository_at_the_target_root_refused() {
+    let s = Setup::new();
+    let wt = s.worktree("bare-root");
+    bare_repository(&wt.join("node_modules"));
+    let plan = s.plan(PlanKind::ReclaimDir, &wt.join("node_modules"));
+    let failed: Vec<&str> = plan
+        .checks
+        .iter()
+        .filter(|c| c.result != CheckResult::Pass)
+        .map(|c| c.name.as_str())
+        .collect();
+    assert_eq!(failed, ["no_nested_repository"], "{:#?}", plan.checks);
+    let result = s.act(&plan.id, &arbiter()).unwrap();
+    assert_eq!(result.reasons, ["no_nested_repository"]);
+    assert!(wt.join("node_modules/HEAD").exists());
+}
+
+/// Filtered paths (section 13.6): a same-size edit of a tracked file whose filter observation
+/// does not run makes `dirty` `unknown` with `filtered_paths`; the worktree's plan is refused
+/// by `clean` alone, which names the path and carries the reason as a fact, and a
+/// `reclaim_dir` plan in it stays `observed` and reports `dry_run`.
+#[cfg(unix)]
+#[test]
+fn filtered_paths_fail_clean_alone() {
+    use std::os::unix::fs::PermissionsExt;
+    let s = Setup::new();
+    let script = s.fx.path("passthrough.sh");
+    std::fs::write(&script, "#!/bin/sh\ncat\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    s.fx.clean_filter(&s.main, "store", &script);
+    let wt = s.fx.worktree_add(&s.main, "filtered", "filtered");
+    write(&wt, ".gitattributes", "*.bin filter=store\n");
+    s.fx.add(&wt, ".gitattributes");
+    s.fx.commit_file(&wt, "asset.bin", "original\n", "asset");
+    s.publish(&wt, "filtered");
+    s.merge(&wt);
+    write(&wt, "node_modules/pkg/index.js", "x");
+    write(&wt, "asset.bin", "modified\n");
+
+    let whole = s.plan(PlanKind::ReclaimWorktree, &wt);
+    let failed: Vec<&str> = whole
+        .checks
+        .iter()
+        .filter(|c| c.result != CheckResult::Pass)
+        .map(|c| c.name.as_str())
+        .collect();
+    assert_eq!(failed, ["clean"], "{:#?}", whole.checks);
+    let result = s.act(&whole.id, &owner_approved()).unwrap();
+    assert_eq!(result.reasons, ["clean"]);
+    let clean = result.checks.iter().find(|c| c.name == "clean").unwrap();
+    assert!(
+        clean.detail.starts_with("filtered_paths") && clean.detail.contains("asset.bin"),
+        "{clean:#?}"
+    );
+    let unknown = &clean
+        .facts
+        .iter()
+        .find(|f| f.name == "worktree.facts.dirty_unknown")
+        .unwrap()
+        .value;
+    assert_eq!(
+        unknown,
+        &serde_json::json!({"reason": "filtered_paths", "paths": ["asset.bin"]})
+    );
+
+    let dir = s.plan(PlanKind::ReclaimDir, &wt.join("node_modules"));
+    assert!(dir.invariants_ok, "{:#?}", dir.checks);
+    let result = s.act(&dir.id, &arbiter()).unwrap();
+    assert_eq!(result.status, ActStatus::DryRun, "{result:#?}");
+    assert_eq!(check(&result.checks, "observed"), CheckResult::Pass);
 }

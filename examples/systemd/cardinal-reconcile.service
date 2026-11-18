@@ -1,0 +1,16 @@
+# One `cardinal reconcile` pass (docs/architecture.md section 10.3), started by
+# cardinal-reconcile.timer. Copy both units to ~/.config/systemd/user/, replace
+# %h/.local/bin/cardinal with the absolute path of your cardinal, make PATH find git, gh, and
+# claude, then run `systemctl --user daemon-reload` and
+# `systemctl --user enable --now cardinal-reconcile.timer`.
+[Unit]
+Description=cardinal reconcile pass
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/cardinal reconcile --trigger timer
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Nice=10
+IOSchedulingClass=idle
+StandardOutput=null
+StandardError=null

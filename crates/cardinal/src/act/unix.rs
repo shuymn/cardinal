@@ -173,10 +173,12 @@ impl Target {
                 mount: Mount::Unknown("not reached: a symbolic link is on the way".to_owned()),
                 link_in_path: Some(link.clone()),
                 entries: Vec::new(),
+                boundaries: Vec::new(),
             });
         }
         let root = entry(self.rel.clone(), &lstat_at(&self.parent, &self.name)?);
         let mut entries = Vec::new();
+        let mut boundaries = Vec::new();
         // A target that is not on its parent's mount is refused: nothing below is recorded.
         let mount = if root.dev != self.parent_dev {
             Mount::Boundary
@@ -187,7 +189,13 @@ impl Target {
             }
             let (mount, own) = self.target_mount(root.dev, Some(&fd));
             if let (Mount::Same, Ok(key)) = (&mount, &own) {
-                snapshot_dir(&fd, &self.rel, root.dev, key, &mut entries)?;
+                snapshot_dir(
+                    &fd,
+                    &self.rel,
+                    (root.dev, key),
+                    &mut entries,
+                    &mut boundaries,
+                )?;
             }
             mount
         } else {
@@ -198,6 +206,7 @@ impl Target {
             mount,
             link_in_path: None,
             entries,
+            boundaries,
         })
     }
 
@@ -216,13 +225,14 @@ impl Target {
 }
 
 /// Records the entries below `fd`. A directory on another device or mount than `dev` and
-/// `on_mount` is recorded but not entered; a mount that cannot be read fails the snapshot.
+/// `on_mount` is recorded but not entered, and goes into `boundaries`; a mount that cannot be
+/// read fails the snapshot.
 fn snapshot_dir(
     fd: &OwnedFd,
     rel: &Path,
-    dev: u64,
-    on_mount: &[u8],
+    (dev, on_mount): (u64, &[u8]),
     out: &mut Vec<Entry>,
+    boundaries: &mut Vec<PathBuf>,
 ) -> io::Result<()> {
     for name in names(fd)? {
         let st = match lstat_at(fd, &name) {
@@ -232,6 +242,9 @@ fn snapshot_dir(
             Err(err) => return Err(err),
         };
         let child = entry(rel.join(&name), &st);
+        if child.kind == EntryKind::Dir && child.dev != dev {
+            boundaries.push(child.rel.clone());
+        }
         let enter = child.kind == EntryKind::Dir && child.dev == dev;
         let index = out.len();
         out.push(child);
@@ -241,11 +254,13 @@ fn snapshot_dir(
                     let opened = entry(PathBuf::new(), &rustix::fs::fstat(&child_fd)?);
                     // Replaced between the stat and the open: the entry stays as the stat
                     // saw it, and nothing below the replacement is recorded.
-                    if out[index].same_identity(&opened)
-                        && mount::of_dir(&child_fd).map_err(io::Error::other)? == on_mount
-                    {
+                    if out[index].same_identity(&opened) {
                         let child_rel = out[index].rel.clone();
-                        snapshot_dir(&child_fd, &child_rel, dev, on_mount, out)?;
+                        if mount::of_dir(&child_fd).map_err(io::Error::other)? == on_mount {
+                            snapshot_dir(&child_fd, &child_rel, (dev, on_mount), out, boundaries)?;
+                        } else {
+                            boundaries.push(child_rel);
+                        }
                     }
                 }
                 Err(err)
