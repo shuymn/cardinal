@@ -48,7 +48,10 @@ pub fn run(config: &Config, state: &StateDir, trigger: Trigger) -> Result<Reconc
     if let Some(changes) = pass.step("inbox", refresh_inbox(config, state)) {
         pass.add(changes);
     }
-    // 4.
+    // 4. The items as they were before the readings: the raisers end only these.
+    let before = pass
+        .step("inbox_before", raise::snapshot(state))
+        .unwrap_or_default();
     let mut disks = pass
         .step("disk", read_volumes(config, state))
         .unwrap_or_default();
@@ -63,7 +66,7 @@ pub fn run(config: &Config, state: &StateDir, trigger: Trigger) -> Result<Reconc
         }
         if let Some(changes) = pass.step(
             "worktree_items",
-            raise::worktree_items(config, state, observation),
+            raise::worktree_items(config, state, &before, observation),
         ) {
             pass.add(changes);
         }
@@ -79,7 +82,7 @@ pub fn run(config: &Config, state: &StateDir, trigger: Trigger) -> Result<Reconc
         .unwrap_or_default();
     if let Some(changes) = pass.step(
         "disk_items",
-        raise::disk_items(config, state, &disks, &reports),
+        raise::disk_items(config, state, &before, &disks, &reports),
     ) {
         pass.add(changes);
     }
