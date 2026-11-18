@@ -718,3 +718,71 @@ fn a_staged_gitlink_change_is_dirty() {
     assert_eq!(w.facts.dirty, Tri::Yes, "the staged gitlink");
     assert!(w.reclaim.failed.contains(&"clean".to_owned()), "{w:#?}");
 }
+
+/// A directory status cannot open: git exits 0, warns on stderr (`could not open directory
+/// 'private/': Permission denied`), and leaves out what is below it. The status is then
+/// incomplete, so `dirty` and the ignored data are unknown and the failure is reported; an
+/// empty ignored list is never taken as complete. The control, readable, lists the file.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_directory_makes_the_status_unknown() {
+    use std::os::unix::fs::PermissionsExt;
+
+    /// Gives the directory its permissions back, so the scene can be removed.
+    struct Readable(std::path::PathBuf);
+    impl Drop for Readable {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    let (scene, wt, _) = merged_scene();
+    let info = scene.repo.join(".git/info");
+    std::fs::create_dir_all(&info).unwrap();
+    std::fs::write(info.join("exclude"), "*.log\n").unwrap();
+    let private = wt.join("private");
+    std::fs::create_dir(&private).unwrap();
+    std::fs::write(private.join("notes.log"), "notes").unwrap();
+    let notes = private.join("notes.log").display().to_string();
+
+    let control = scene.inventory();
+    let w = worktree(&control, &wt);
+    assert!(
+        w.ignored.iter().any(|e| e.path == notes),
+        "{:#?}",
+        w.ignored
+    );
+    assert_eq!(w.facts.dirty, Tri::No);
+    // No profile classifies the file, so it fails `no_unclassifiable` while it is seen.
+    assert_eq!(reclaim(w), (false, vec!["no_unclassifiable"], vec![]));
+
+    std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let _readable = Readable(private.clone());
+    if std::fs::read_dir(&private).is_ok() {
+        let _ = std::io::Write::write_all(
+            &mut std::io::stderr(),
+            b"skipped an_unreadable_directory_makes_the_status_unknown: the directory stays readable (root)\n",
+        );
+        return;
+    }
+    let inv = scene.inventory();
+    let w = worktree(&inv, &wt);
+    assert_eq!(w.facts.dirty, Tri::Unknown);
+    assert_eq!(w.facts.dirty_unknown, None);
+    assert!(w.ignored.is_empty(), "{:#?}", w.ignored);
+    let (candidate, failed, unknown) = reclaim(w);
+    assert!(!candidate);
+    assert!(failed.contains(&"observed"), "{failed:?}");
+    for check in ["no_protected", "no_unclassifiable", "no_nested_repository"] {
+        assert!(unknown.contains(&check), "{check}: {unknown:?}");
+    }
+    // The worktree's error, with git's diagnostic: the reason is visible.
+    let scope = format!("worktree:{}", std::fs::canonicalize(&wt).unwrap().display());
+    assert!(
+        inv.errors.iter().any(|e| e.scope == scope
+            && e.message.contains("git status is incomplete")
+            && e.message.contains("could not open directory 'private/'")),
+        "{:?}",
+        inv.errors
+    );
+}

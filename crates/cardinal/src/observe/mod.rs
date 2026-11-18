@@ -1184,7 +1184,7 @@ impl<'a> Observer<'a> {
                 ],
                 &disabled,
             )
-            .and_then(|out| git::parse_status(&out.stdout))
+            .and_then(|out| complete_status(&out))
             .map_err(&mut *note)
             .ok();
         let (dirty, dirty_unknown) = match &status {
@@ -1519,6 +1519,17 @@ fn ignored_entries(
             }
         })
         .collect()
+}
+
+/// The status `out` printed, when it is complete. Status exits 0 when it cannot read a
+/// directory (`warning: could not open directory 'private/': Permission denied`) and leaves
+/// out what is below it, which could hold untracked or ignored files, so any diagnostic makes
+/// the whole status, the ignored list and `dirty` with it, unknown rather than a complete list.
+fn complete_status(out: &Output) -> Result<git::Status, String> {
+    match out.stderr_line() {
+        line if line.is_empty() => git::parse_status(&out.stdout),
+        line => Err(format!("git status is incomplete: {line}")),
+    }
 }
 
 /// Whether a worktree is in use, and whether every source of that answer could be read: its
