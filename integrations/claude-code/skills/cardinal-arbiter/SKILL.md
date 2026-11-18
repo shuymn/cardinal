@@ -18,40 +18,46 @@ In phase 1, `act` only reports: it evaluates a plan and returns `dry_run` when i
 
 ## Which pass this is
 
-Run `cardinal inbox --assigned` first. It lists the open and escalated items of the arbiter pass cardinal's timer started this session for.
+Run `cardinal inbox --assigned --brief` first. It lists the open and escalated items of the arbiter pass cardinal's timer started this session for.
 
-- It prints a `cardinal.inbox.v1`: the timer started this session. Follow "A pass the timer started" with exactly the items it listed, even when there are none.
+- It prints a `cardinal.inbox-brief.v1`: the timer started this session. Follow "A pass the timer started" with exactly the items it listed, even when there are none.
 - It fails with code `not_assigned`: no pass names this session, so the owner started it. Follow "The owner's request".
 
 ## A pass the timer started
 
-1. **Items.** Work on the items `cardinal inbox --assigned` listed and on no others. For each, run `cardinal explain inbox KEY`; for a `recovery_needed` item also run `cardinal explain job JOB` with its `subject.job_id`.
-2. **Inventory.** Run `cardinal inventory` once: the current state of every worktree the items name.
-3. **Plans.** For each `reclaimable` and `merge_undecided` item, run `cardinal plan reclaim-worktree PATH` with its `subject.worktree` as PATH. Make no other plan.
-4. **Subject.** Before you act on or resolve an item about a worktree, check from its plan and the inventory that what it was raised for still holds. The inventory lists the worktree when one of its `worktrees` has `path` equal to the item's `subject.worktree`:
-   - `reclaimable`: the plan's `target` has the item's `subject` (`worktree`, `head`, and `branch`), with `invariants_ok: true` and `approval: "none"`.
-   - `merge_undecided`: the plan's `target` has the item's `subject`, with `invariants_ok: true`, and the inventory lists the worktree with `facts.merge_evidence: "none"`.
-   - `closed_pr_dirty`: the inventory lists the worktree with `facts.dirty: "yes"`, and `facts.closed_pr.number` is the pull request number in the item's key (`#NUMBER`).
-   - `managed_merged`: the inventory lists the worktree with the item's `subject.head`, a `managed_by` that is not null, `facts.merge_evidence` `"base_ancestor"` or `"merged_pr"`, `facts.dirty: "no"`, and `facts.in_use.value: false`.
-   - `unclassifiable_data`: the inventory lists the worktree, and its `ignored` entries with `class: "unclassifiable"` are the paths in the item's evidence. Evidence that lists 50 paths, the most it holds, may leave some out, so the subject cannot be confirmed: leave the item open, and report under Owner decisions that this pass could not confirm it.
+Every command this section runs prints a bounded amount whatever the host holds, so its whole output reaches you. Run no other command in such a pass: no explanation, no inventory of more than one worktree, and no plan but the ones step 2 names. When what these commands print is not enough to decide an item, defer or escalate it with what is unknown.
 
-   When it does not hold, the worktree is no longer as the item says: leave the item open, run nothing more for it, and report under Inbox what differs. cardinal ends the item once a `reconcile` pass observes the change, and otherwise a pass after `retry_s` reads it again.
-5. **Act.** Decide each plan with the plan table, and handle each `act` result with the result table.
-6. **Resolve.** Apply the inbox table's decisions to the `open` items, always with `--assigned`:
+1. **Items.** Work on the items `cardinal inbox --assigned --brief` listed and on no others. Each holds its `key`, `kind`, `status`, and `subject`, the `evidence` fields its kind's decision reads, and `arbiter.answer` once this pass answered it. Lists in the evidence keep their first entries, and `omitted` counts the rest by JSON pointer into the item. Keys, paths, IDs, and PIDs are always whole; free text (a command line, a reason, a note) longer than 120 characters is a preview ending in `…`, its full length in `truncated`, so never quote a preview as the whole text. Report a cut list as its entries and the count left out; a note that escalates an item with a cut list names the entries shown, says how many were omitted, and says that the owner finds the full evidence in the item.
+2. **Facts.** For each open item about a worktree, read the worktree afresh, with its `subject.worktree` as PATH:
+   - `reclaimable` and `merge_undecided`: run `cardinal plan reclaim-worktree PATH`. Make no other plan.
+   - `closed_pr_dirty`, `managed_merged`, and `unclassifiable_data`: run `cardinal inventory --worktree PATH`. It prints a `cardinal.worktree.v1`: the worktree, its repository, and `unclassifiable_set`.
+
+   A command that fails with `cardinal.error.v1` (the worktree is gone, for one) leaves the item unchecked: defer it with the error's `code` and `message` as the note.
+3. **Subject.** Before you act on or answer an item about a worktree, check from step 2's output that what it was raised for still holds:
+   - `reclaimable`: the plan's `target` has the item's `subject` (`worktree`, `head`, and `branch`), with `invariants_ok: true` and `approval: "none"`.
+   - `merge_undecided`: the plan's `target` has the item's `subject`, with `invariants_ok: true`, and its `merge_evidence` check has the fact `worktree.facts.merge_evidence` with the value `"none"`.
+   - `closed_pr_dirty`: the view's `worktree` has `facts.dirty: "yes"`, and `facts.closed_pr.number` is the pull request number in the item's key (`#NUMBER`).
+   - `managed_merged`: the view's `worktree` has the item's `subject.head` as `head`, a `managed_by` that is not null, `facts.merge_evidence` `"base_ancestor"` or `"merged_pr"`, `facts.dirty: "no"`, and `facts.in_use.value: false`.
+   - `unclassifiable_data`: the view's `unclassifiable_set` equals the item's `evidence.set`: the worktree's unclassifiable entries are still the ones the item was raised for.
+
+   When it does not hold, the worktree is no longer as the item says: defer the item with what differs as the note, run nothing more for it, and report under Inbox what differs. cardinal ends the item once a `reconcile` pass observes the change, and otherwise a pass after `retry_s` reads it again.
+4. **Act.** Decide each plan with the plan table, and handle each `act` result with the result table.
+5. **Answer.** Answer every `open` item once, with the inbox table's decision, always with `--assigned --brief`:
 
    ```sh
-   cardinal inbox resolve KEY --outcome resolved --note "NOTE" --assigned
-   cardinal inbox resolve KEY --outcome escalated --note "NOTE" --assigned
+   cardinal inbox resolve KEY --outcome resolved --note "NOTE" --assigned --brief
+   cardinal inbox resolve KEY --outcome escalated --note "NOTE" --assigned --brief
+   cardinal inbox resolve KEY --outcome deferred --note "NOTE" --assigned --brief
    ```
 
-   An `escalated` item is answered already: report it under Owner decisions with its note, and resolve it no more. A refusal with code `not_assigned` means the pass has ended, so nothing more is answered: stop and report. One with `invalid_argument` means the item was answered already: report it and go on.
-7. **Report** (format at the end). Done when every item, plan, `act` result, and error from steps 1–6 appears in it.
+   `deferred` leaves the item open for a pass after `retry_s`, with your note saying why: use it wherever the inbox table or a step above leaves an item open. A pass that ends having answered none of its open items counts as failed, so answer each item you checked, deferring included. An `escalated` item, and one whose `arbiter.answer` is set, is answered already: report it with its note, and answer it no more. A refusal with code `not_assigned` means the pass has ended, so nothing more is answered: stop and report. One with `invalid_argument` means the item was answered already: report it and go on.
+6. **Report** (format at the end). Done when every item, plan, `act` result, and error from steps 1–5 appears in it.
 
 ## The owner's request
 
 1. **Inbox.** Run `cardinal inbox`. It first runs the recovery pass and refreshes items, then lists the open and escalated ones. For each, run `cardinal explain inbox KEY`, and for a `recovery_needed` item `cardinal explain job JOB`; run `cardinal inventory` once.
 2. **Plans.** Run `cardinal plan`; it prints a `cardinal.plan-list.v1` whose `plans` array holds one plan per target. When the request names targets, plan each one instead: `cardinal plan reclaim-worktree PATH` for a worktree, `cardinal plan reclaim-dir PATH` for regenerable data; each prints one `cardinal.plan.v1`.
-3. **Act** as on a pass the timer started, checking each item's subject as there before you act on or resolve it. Act on a `reclaim_dir` plan only when the request names its target: otherwise regenerable data is `disk-reclaim`'s, under disk pressure.
+3. **Act** as on a pass the timer started, reading each worktree item's facts and checking its subject as there (its steps 2 and 3) before you act on or resolve it. Act on a `reclaim_dir` plan only when the request names its target: otherwise regenerable data is `disk-reclaim`'s, under disk pressure.
 4. **Resolve.** Apply the inbox table's decisions to the `open` items, without `--assigned`:
 
    ```sh
@@ -59,23 +65,23 @@ Run `cardinal inbox --assigned` first. It lists the open and escalated items of 
    cardinal inbox resolve KEY --outcome escalated --note "NOTE"
    ```
 
-   An `escalated` item waits for the owner: report it under Owner decisions with its note, and resolve it no more.
+   An `escalated` item waits for the owner: report it under Owner decisions with its note, and resolve it no more. An item the inbox table leaves open stays as it is: `deferred` is only for a pass the timer started.
 5. **Report** (format at the end), with every entry of `errors` in `cardinal plan` and `cardinal inventory`.
 
 ## Inbox items
 
-A note is one line: the decision, the IDs (job, session, plan, PIDs), and for an escalation the question the owner must answer.
+A note is one line: the decision, the IDs (job, session, plan, PIDs), and for an escalation the question the owner must answer. Where the table leaves an item open, a pass the timer started answers it `deferred` with the reason as the note.
 
 | Kind | Decision |
 | --- | --- |
-| `reclaimable` | Act on its plan (plan table). Once `act` reports `dry_run`, resolve it with the result as the note (plan ID, bytes, `reasons`): that report is what the item asks for, and the worktree stays until the owner removes it. When the plan or its `act` is refused, leave it open and report the refusal |
+| `reclaimable` | Act on its plan (plan table). Once `act` reports `dry_run`, resolve it with the result as the note (plan ID, bytes, `reasons`): that report is what the item asks for, and the worktree stays until the owner removes it. When the plan or its `act` is refused, leave it open with the refusal as the note, and report it |
 | `merge_undecided` | Judge its plan (plan table). Once `act` with `--squash-merged` reports `dry_run`, resolve it with your judgment as the note; otherwise escalate it with the evidence and the question whether HEAD was merged |
 | `closed_pr_dirty` | Escalate with the worktree path and the pull request: the owner decides what happens to the uncommitted changes |
 | `managed_merged` | Escalate with the worktree path and the app that manages it: only that app or the owner removes it |
 | `unclassifiable_data` | Escalate with its paths and the question whether each is `regenerable` or `protected` in the repository's profile |
-| `recovery_needed` | With `verified: true`, leave it open: cardinal never signals the group, releases the reservation once its members have exited, and resolves the item itself, and a later pass reads it again. With `verified: false`, escalate with the job ID and each member's PID and name |
+| `recovery_needed` | With `verified: true`, leave it open with the job ID as the note: cardinal never signals the group, releases the reservation once its members have exited, and resolves the item itself, and a later pass reads it again. With `verified: false`, escalate with the job ID and each member's PID and name |
 | `outlived_processes` | Escalate: the owner decides whether the processes may keep running. Note the session ID and each process's PID, name, and command |
-| `disk_low` | The owner's, never assigned to a pass. On the owner's request, report the volume's disk report from the item's evidence (the reading, the lines, the targets, the shortfall, and the blocked entries), never `cardinal inventory`'s `disk`; leave the item as it is |
+| `disk_low` | The owner's, never assigned to a pass. On the owner's request, report the volume's disk report from the item's evidence (the reading, the lines, the targets, the shortfall, and the blocked entries), never the inventory's `disk`; leave the item as it is |
 | `disk_critical` | As `disk_low` |
 | `arbiter_failing` | The owner's, never assigned to a pass. On the owner's request, report the failed passes and their logs from its evidence; leave the item as it is |
 | `reclaim_stranded` | The owner's, never assigned to a pass. On the owner's request, report the trash entry, the target's original path, and what is left; leave the item as it is |

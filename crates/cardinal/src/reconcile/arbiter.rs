@@ -1,6 +1,9 @@
 //! Starting the arbiter (`docs/architecture.md` section 10.5): the trigger a pass runs at
-//! step 7, and `cardinal arbiter run`, the launcher that records a pass, assigns its due
-//! items, and runs `[arbiter] command` under `arbiter/.lock` with a deadline.
+//! step 7, and `cardinal arbiter run`, the launcher that records a pass, assigns it the items
+//! due longest, at most `max_items`, and runs `[arbiter] command` under `arbiter/.lock` with a
+//! deadline. A session that exits 0 having answered none of its items while one of them is
+//! still open ends `failed:no_answer`, and one whose answers could not be read back
+//! `failed:unverified`, failures like any other.
 //!
 //! The launcher writes `arbiter/last.json` before it assigns anything and the pass's outcome
 //! into its items before it records the end there, so a launcher that dies at any point
@@ -147,7 +150,9 @@ pub fn run(config: &Config, state: &StateDir) -> Result<ArbiterPass, Error> {
         started_ms: now,
         ended_ms: None,
         outcome: None,
-        items: due.into_iter().map(|item| item.key).collect(),
+        // The longest due items, at most `max_items` and as many as the brief listing holds:
+        // the rest wait for later passes.
+        items: inbox::batch(&due, config.host.arbiter.max_items),
         log: log.display().to_string(),
         failures_in_a_row: last.as_ref().map_or(0, |last| last.failures_in_a_row),
     };
@@ -232,23 +237,37 @@ fn finish(
     notes: &mut Vec<String>,
 ) -> Result<(), Error> {
     let id = pass.id.clone();
-    let (written, published) = inbox::record_outcome(state, &id, outcome, ended, || {
-        injected(testpoint::hit(testpoint::ARBITER_OUTCOMES))?;
-        pass.failures_in_a_row = if *outcome == PassOutcome::Completed {
-            0
-        } else {
-            pass.failures_in_a_row.saturating_add(1)
-        };
-        pass.ended_ms = Some(ended);
-        pass.outcome = Some(outcome.clone());
-        write_last(state, pass)
-    });
+    let keys = pass.items.clone();
+    let (written, published, ended_as) =
+        inbox::record_outcome(state, &id, &keys, outcome, ended, |ended_as| {
+            injected(testpoint::hit(testpoint::ARBITER_OUTCOMES))?;
+            pass.failures_in_a_row = if *ended_as == PassOutcome::Completed {
+                0
+            } else {
+                pass.failures_in_a_row.saturating_add(1)
+            };
+            pass.ended_ms = Some(ended);
+            pass.outcome = Some(ended_as.clone());
+            write_last(state, pass)
+        });
     if let Err(err) = written {
         // Each item of the pass still ends when `last.json` records the end (section 10.5).
         notes.push(format!(
-            "writing the outcome into the items failed: {}",
+            "recording the outcome in the items failed: {}",
             err.message
         ));
+    }
+    if ended_as == PassOutcome::Failed(inbox::NO_ANSWER.into()) {
+        notes.push(format!(
+            "the session exited 0 but answered none of the pass's {} items",
+            pass.items.len()
+        ));
+    } else if ended_as == PassOutcome::Failed(inbox::UNVERIFIED.into()) {
+        notes.push(
+            "the session exited 0, but its answers could not be checked: the pass's items \
+             could not all be read under inbox/.lock"
+                .to_owned(),
+        );
     }
     published?;
     let recorder = recorder(config, state);
@@ -668,6 +687,10 @@ mod tests {
         b_item.arbiter.as_mut().unwrap().ended_ms = Some(started + 1);
         std::fs::write(&b.0, serde_json::to_vec(&b_item).unwrap()).unwrap();
         last(&e, "p1", started, false, 2);
+        // The launcher recorded the pass's keys before it assigned them.
+        let mut recorded = inbox::read_last(&e.state).unwrap().unwrap();
+        recorded.items = keys.to_vec();
+        write_last(&e.state, &recorded).unwrap();
 
         assert_eq!(trigger(&e), (ArbiterStart::NotNeeded, 0));
         let pass = inbox::read_last(&e.state).unwrap().unwrap();

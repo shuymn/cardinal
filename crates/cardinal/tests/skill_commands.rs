@@ -1,10 +1,11 @@
 //! Arbiter skill v2 (`docs/architecture.md` section 14.3): every `cardinal …` command in the
 //! skill parses with the real CLI definition and stays inside the arbiter's reach; the text a
-//! pass the timer started follows runs no bare `cardinal plan`, reads and answers only with
-//! `--assigned`, runs `cardinal inventory` once, and checks the subject of every kind of item
-//! about a worktree; the owner's request reads the whole inbox and answers without
-//! `--assigned`; and the skill's tables cover exactly the `act` statuses of section 11.3 and
-//! the inbox kinds of section 10.1.
+//! pass the timer started follows runs only commands whose output is bounded (section 10.5):
+//! no bare `cardinal plan`, no `cardinal explain`, `cardinal inventory` only with `--worktree`,
+//! and the inbox only with `--assigned --brief`; it checks the subject of every kind of item
+//! about a worktree and answers every item, deferring the ones it leaves open; the owner's
+//! request reads the whole inbox and answers without `--assigned`; and the skill's tables cover
+//! exactly the `act` statuses of section 11.3 and the inbox kinds of section 10.1.
 
 use std::collections::BTreeSet;
 
@@ -342,55 +343,56 @@ fn skill_commands_parse_with_the_cli() {
     );
 }
 
-/// What in `skill` would take a pass the timer started beyond its items. Such a pass follows
-/// every section but the owner's request, so the shared sections count too: a plan other than
-/// `cardinal plan reclaim-worktree`, an inbox command without `--assigned`, an inventory with
-/// options, and anything but one inventory in the pass's own steps.
+/// What in `skill` would take a pass the timer started beyond its items or past the bound on
+/// its commands' output. Such a pass follows every section but the owner's request, so the
+/// shared sections count too: a plan other than `cardinal plan reclaim-worktree`, an inbox
+/// command without `--assigned` and `--brief`, an inventory without `--worktree`, and any
+/// `cardinal explain`.
 fn timer_violations(skill: &str) -> Vec<String> {
     let timer = skill.replacen(section(skill, "The owner's request"), "", 1);
     let mut violations = Vec::new();
     for command in skill_commands(&timer) {
         let words = shell_words(&command);
+        let has = |flag: &str| words.iter().any(|w| w == flag);
         match words[1].as_str() {
             "plan" if words.get(2).map(String::as_str) != Some("reclaim-worktree") => {
                 violations.push(format!("a plan of another kind: {command}"));
             }
-            "inbox" if !words.iter().any(|w| w == "--assigned") => {
-                violations.push(format!("the inbox without --assigned: {command}"));
+            "inbox" if !has("--assigned") || !has("--brief") => {
+                violations.push(format!("the inbox without --assigned --brief: {command}"));
             }
-            "inventory" if words.len() > 2 => {
-                violations.push(format!("an inventory with options: {command}"));
+            "inventory" if !has("--worktree") || words.len() != 4 => {
+                violations.push(format!("an inventory of more than a worktree: {command}"));
             }
+            "explain" => violations.push(format!("an unbounded explanation: {command}")),
             _ => {}
         }
-    }
-    let inventories = skill_commands(section(skill, "A pass the timer started"))
-        .iter()
-        .filter(|command| shell_words(command)[1] == "inventory")
-        .count();
-    if inventories != 1 {
-        violations.push(format!("{inventories} inventories in the pass's steps"));
     }
     violations
 }
 
-/// A pass the timer started works on its assigned items only: it plans just their
-/// worktrees, never with a bare `cardinal plan` or a `reclaim_dir` plan, runs one bare
-/// `inventory`, and lists and answers items only with `--assigned`, in its own steps and in
-/// the sections it shares with the owner's request.
+/// A pass the timer started works on its assigned items only, through commands whose output is
+/// bounded: it plans just their worktrees, never with a bare `cardinal plan` or a
+/// `reclaim_dir` plan, reads other worktree items' facts with `cardinal inventory --worktree`,
+/// explains nothing, and lists and answers items only with `--assigned --brief`, in its own
+/// steps and in the sections it shares with the owner's request.
 #[test]
 fn a_timer_pass_stays_on_its_items() {
     assert_eq!(timer_violations(SKILL), Vec::<String>::new());
-    let steps = section(SKILL, "A pass the timer started");
-    assert!(
-        skill_commands(steps)
-            .iter()
-            .any(|command| command.starts_with("cardinal plan reclaim-worktree ")),
-        "a timer pass plans its items' worktrees"
-    );
+    let steps = skill_commands(section(SKILL, "A pass the timer started"));
+    for expected in [
+        "cardinal plan reclaim-worktree ",
+        "cardinal inventory --worktree ",
+    ] {
+        assert!(
+            steps.iter().any(|command| command.starts_with(expected)),
+            "a timer pass runs `{expected}PATH`"
+        );
+    }
     // The pass's first command tells a timer pass from the owner's request.
     assert!(
-        section(SKILL, "Which pass this is").contains("Run `cardinal inbox --assigned` first."),
+        section(SKILL, "Which pass this is")
+            .contains("Run `cardinal inbox --assigned --brief` first."),
         "the skill starts by listing the pass's items"
     );
     // A command added to a shared section is in the pass's reach.
@@ -398,8 +400,11 @@ fn a_timer_pass_stays_on_its_items() {
         "`cardinal plan`",
         "`cardinal plan reclaim-dir PATH`",
         "`cardinal inbox`",
-        "`cardinal inbox resolve KEY --outcome resolved`",
+        "`cardinal inbox --assigned`",
+        "`cardinal inbox resolve KEY --outcome resolved --assigned`",
+        "`cardinal inventory`",
         "`cardinal inventory --sizes`",
+        "`cardinal explain inbox KEY`",
     ] {
         let skill = SKILL.replacen("\n## Plans\n", &format!("\n## Plans\n\nRun {added}.\n"), 1);
         assert!(
@@ -407,12 +412,38 @@ fn a_timer_pass_stays_on_its_items() {
             "{added} in the Plans section"
         );
     }
-    let twice = SKILL.replacen(
-        "5. **Act.**",
-        "5. **Act.** Run `cardinal inventory` again.",
-        1,
+}
+
+/// A pass the timer started answers every item it checked, deferring the ones it leaves open,
+/// because a pass that answers none of its open items counts as failed (section 10.5).
+#[test]
+fn a_timer_pass_answers_every_item() {
+    let steps = section(SKILL, "A pass the timer started");
+    let outcomes: BTreeSet<String> = skill_commands(steps)
+        .iter()
+        .map(|command| shell_words(command))
+        .filter(|words| words.get(2).map(String::as_str) == Some("resolve"))
+        .filter_map(|words| flag_value(&words, "--outcome").map(str::to_owned))
+        .collect();
+    assert_eq!(
+        outcomes,
+        BTreeSet::from(["deferred", "escalated", "resolved"].map(String::from))
     );
-    assert!(!timer_violations(&twice).is_empty(), "a second inventory");
+    assert!(
+        steps.contains("Answer every `open` item once"),
+        "every item is answered"
+    );
+    assert!(
+        steps.contains("answered none of its open items counts as failed"),
+        "the skill says why"
+    );
+    // What the brief view cut is reported as cut, never as the whole.
+    for phrase in [
+        "never quote a preview as the whole text",
+        "names the entries shown, says how many were omitted",
+    ] {
+        assert!(steps.contains(phrase), "{phrase}");
+    }
 }
 
 /// Before it answers an item about a worktree, a pass checks, for every such kind, that the
@@ -437,18 +468,18 @@ fn the_subject_of_every_worktree_item_is_checked() {
             "the subject step checks {kind:?}"
         );
     }
-    // An `unclassifiable_data` item whose evidence lists only part of its set cannot be
-    // confirmed.
+    // An `unclassifiable_data` item's entries are compared as a set, whatever their number.
     let unclassifiable = checks
         .iter()
         .find(|check| check.starts_with("`unclassifiable_data`"))
         .expect("an unclassifiable_data check");
     assert!(
-        unclassifiable.contains("50 paths") && unclassifiable.contains("cannot be confirmed"),
-        "a truncated evidence list is left open: {unclassifiable}"
+        unclassifiable.contains("`unclassifiable_set`")
+            && unclassifiable.contains("`evidence.set`"),
+        "the set is compared: {unclassifiable}"
     );
     assert!(
-        section(SKILL, "The owner's request").contains("checking each item's subject as there"),
+        section(SKILL, "The owner's request").contains("checking its subject as there"),
         "the owner's request checks subjects too"
     );
 }
@@ -490,10 +521,18 @@ fn the_owners_request_reads_everything() {
             words.join(" ")
         );
     }
-    for heading in ["A pass the timer started", "The owner's request"] {
+    for (heading, rule) in [
+        (
+            "A pass the timer started",
+            "Answer every `open` item once, with the inbox table's decision",
+        ),
+        (
+            "The owner's request",
+            "Apply the inbox table's decisions to the `open` items",
+        ),
+    ] {
         assert!(
-            section(SKILL, heading)
-                .contains("Apply the inbox table's decisions to the `open` items"),
+            section(SKILL, heading).contains(rule),
             "{heading}: decisions apply to open items"
         );
     }

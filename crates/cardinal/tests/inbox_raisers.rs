@@ -464,6 +464,104 @@ fn managed_merged_raised_and_ended() {
     assert_resolved_by_cardinal(&e.items()[0], "HEAD changed");
 }
 
+/// Section 10.5: the brief view of each worktree item, as its raiser writes it, keeps the
+/// evidence fields the skill's decision for its kind reads, and an `unclassifiable_data` item
+/// names its key's set, which is `inventory --worktree`'s `unclassifiable_set` for the
+/// worktree.
+#[test]
+fn brief_views_keep_what_the_decision_reads() {
+    let e = env();
+    let reclaimable = e.worktree_dir("reclaimable");
+    let undecided = e.worktree_dir("undecided");
+    let dirty = e.worktree_dir("dirty");
+    let managed = e.worktree_dir("managed");
+    let data = e.worktree_dir("data");
+    let closed_pr = json!({"number": 7, "url": "https://github.com/o/r/pull/7"});
+    let mut undecided_wt = worktree(&undecided);
+    undecided_wt["facts"]["content_in_base"] = json!("yes");
+    undecided_wt["facts"]["closed_pr"] = closed_pr.clone();
+    let mut dirty_wt = worktree(&dirty);
+    dirty_wt["facts"]["dirty"] = json!("yes");
+    dirty_wt["facts"]["closed_pr"] = closed_pr.clone();
+    let mut managed_wt = merged(worktree(&managed), H1);
+    managed_wt["managed_by"] = json!("t3code");
+    let entries: Vec<(String, &str, Option<u64>)> = (0..60)
+        .map(|i| (format!("notes/{i:02}.log"), "unclassifiable", Some(10)))
+        .collect();
+    let entries: Vec<(&str, &str, Option<u64>)> = entries
+        .iter()
+        .map(|(p, c, b)| (p.as_str(), *c, *b))
+        .collect();
+    let data_wt = with_ignored(&data, &entries);
+    let observed = inventory(
+        100,
+        &[
+            merged(worktree(&reclaimable), H1),
+            undecided_wt,
+            dirty_wt,
+            managed_wt,
+            data_wt,
+        ],
+        &[],
+    );
+    let set = cardinal::observe::unclassifiable_set(&observed.repos[0].worktrees[4])
+        .map(|(set, _)| set)
+        .unwrap();
+    e.worktree_pass(&observation(
+        observed,
+        vec![
+            plan("p1", &reclaimable, H1, &[]),
+            plan("p2", &undecided, H1, &["merge_evidence"]),
+        ],
+    ));
+    let items = e.items();
+    assert_eq!(items.len(), 5, "{items:#?}");
+    for item in &items {
+        let brief = inbox::brief(item);
+        let mut kept: Vec<String> = brief.evidence.keys().cloned().collect();
+        kept.sort();
+        let expected: &[&str] = match item.kind {
+            InboxKind::Reclaimable => &["observed_ms", "plan_id"],
+            InboxKind::MergeUndecided => &[
+                "closed_pr",
+                "content_diff",
+                "content_in_base",
+                "merge_evidence",
+                "observed_ms",
+                "plan_id",
+            ],
+            InboxKind::ClosedPrDirty => &["closed_pr", "facts", "observed_ms"],
+            InboxKind::ManagedMerged => &["facts", "managed_by", "observed_ms"],
+            InboxKind::UnclassifiableData => &["entries", "observed_ms", "paths", "set"],
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(kept, expected, "{:?}", item.kind);
+        match item.kind {
+            InboxKind::ClosedPrDirty => {
+                assert_eq!(brief.evidence["facts"], json!({"dirty": "yes"}));
+            }
+            InboxKind::ManagedMerged => assert_eq!(
+                brief.evidence["facts"],
+                json!({"merge_evidence": "base_ancestor", "merged_pr": null, "dirty": "no",
+                       "in_use": {"value": false}})
+            ),
+            InboxKind::UnclassifiableData => {
+                assert_eq!(brief.evidence["set"], json!(set));
+                assert_eq!(brief.evidence["entries"], 60);
+                assert_eq!(
+                    brief.omitted["/evidence/paths"],
+                    50 - inbox::LIST_ENTRIES as u64
+                );
+            }
+            InboxKind::MergeUndecided => {
+                assert_eq!(brief.evidence["content_in_base"], "yes");
+                assert_eq!(brief.evidence["closed_pr"]["number"], 7);
+            }
+            _ => {}
+        }
+    }
+}
+
 /// The worktree `path` holding the ignored `entries`, each `(path, class, allocated_bytes)`.
 fn with_ignored(path: &str, entries: &[(&str, &str, Option<u64>)]) -> Value {
     let mut wt = worktree(path);

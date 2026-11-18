@@ -3,9 +3,9 @@
 //! into those items only; a session lists and answers only its own pass's items while it
 //! runs, and answers each once; a launcher that dies strands no item; a pass none of whose
 //! items is left to assign runs no session; a `last.json` that cannot be read starts nothing;
-//! a session is killed at `timeout_s`; three failures in a row raise `arbiter_failing`, once
-//! per run of failures, also when the launcher died before raising it, and a recorded
-//! completed pass ends it.
+//! a session is killed at `timeout_s`; a session that answers none of its open items fails its
+//! pass; three failures in a row raise `arbiter_failing`, once per run of failures, also when
+//! the launcher died before raising it, and a recorded completed pass ends it.
 //!
 //! Every pass runs through the binary (`cardinal arbiter run`), which re-checks the trigger
 //! from the items it lists. `[arbiter] command` names a fake session: this test binary re-run
@@ -24,12 +24,14 @@ use std::time::{Duration, Instant};
 
 use cardinal::config::Config;
 use cardinal::contract::{
-    ArbiterPass, InboxItem, InboxKind, InboxStatus, InboxSubject, PassOutcome, RecordKind,
-    ResolutionOutcome,
+    AnswerOutcome, ArbiterPass, InboxItem, InboxKind, InboxStatus, InboxSubject, PassOutcome,
+    RecordKind, ResolutionOutcome,
 };
 use cardinal::inbox::{self, NewItem};
 use cardinal::state::{self, LockMode, StateDir};
-use cardinal::testpoint::{ARBITER_ANSWERING, ARBITER_OUTCOMES, ARBITER_RECORDED};
+use cardinal::testpoint::{
+    ARBITER_ANSWERING, ARBITER_ITEMS_WRITING, ARBITER_OUTCOMES, ARBITER_RECORDED,
+};
 use cardinal_test_support::process::wait_for;
 use cardinal_test_support::{Child, Scope};
 use serde::{Deserialize, Serialize};
@@ -59,6 +61,9 @@ enum Step {
     Run(Vec<String>),
     /// Waits until `<dir>/<name>` exists, then goes on.
     Hold(String),
+    /// Lists the pass's items with `cardinal inbox --assigned` and defers each open one, as
+    /// a session that checked them and left them open does.
+    DeferAll,
     /// Exits with this status.
     Exit(i32),
 }
@@ -123,31 +128,58 @@ fn run_session_if_requested() {
                 }
             }
             Step::Run(args) => {
-                // The session's commands get the session's own cardinal environment, as the
-                // agent's Bash tool passes it on.
-                let scope = Scope::new();
-                let mut command = scope.command(env!("CARGO_BIN_EXE_cardinal"), scope.root());
-                command.args(args);
-                for name in [
-                    "CARDINAL_STATE_DIR",
-                    "CARDINAL_CONFIG_DIR",
-                    "CARDINAL_ARBITER_PASS",
-                ] {
-                    if let Some(value) = std::env::var_os(name) {
-                        command.env(name, value);
+                let ran = session_cardinal(args);
+                publish(&script.dir, &format!("{pass}.run{i}.json"), &ran);
+            }
+            Step::DeferAll => {
+                let listed = session_cardinal(&["inbox".into(), "--assigned".into()]);
+                let listed: serde_json::Value =
+                    serde_json::from_str(&listed.stdout).expect("the assigned items");
+                for item in listed["items"].as_array().into_iter().flatten() {
+                    if item["status"] == "open" {
+                        let key = item["key"].as_str().expect("a key").to_owned();
+                        session_cardinal(
+                            &[
+                                "inbox",
+                                "resolve",
+                                &key,
+                                "--outcome",
+                                "deferred",
+                                "--note",
+                                "checked",
+                                "--assigned",
+                            ]
+                            .map(String::from),
+                        );
                     }
                 }
-                let output = command.output_within(WAIT).expect("run cardinal");
-                let ran = Ran {
-                    code: output.status.code(),
-                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                };
-                publish(&script.dir, &format!("{pass}.run{i}.json"), &ran);
             }
             Step::Exit(code) => std::process::exit(*code),
         }
     }
     std::process::exit(0);
+}
+
+/// Runs `cardinal ARGS` as the fake session's Bash tool does: with the session's own cardinal
+/// environment.
+fn session_cardinal(args: &[String]) -> Ran {
+    let scope = Scope::new();
+    let mut command = scope.command(env!("CARGO_BIN_EXE_cardinal"), scope.root());
+    command.args(args);
+    for name in [
+        "CARDINAL_STATE_DIR",
+        "CARDINAL_CONFIG_DIR",
+        "CARDINAL_ARBITER_PASS",
+    ] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    let output = command.output_within(WAIT).expect("run cardinal");
+    Ran {
+        code: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+    }
 }
 
 /// Writes `value` to `dir/name` atomically.
@@ -331,10 +363,24 @@ impl Env {
         let mut command = self.dirs.cmd();
         command
             .args(["arbiter", "run"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
         points.apply(&mut command, pause, fail);
         command.spawn().expect("start the launcher")
+    }
+
+    /// Waits for a launcher [`Env::spawn_launcher`] started and asserts that it succeeded,
+    /// failing with what it printed and `last.json` otherwise.
+    fn launcher_succeeded(&self, launcher: Child) {
+        let output = launcher.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "the launcher exited {:?}\nstdout: {}\nstderr: {}\nlast.json: {:?}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+            self.last()
+        );
     }
 
     /// `cardinal inbox resolve KEY --outcome resolved --assigned` for `pass` in the background,
@@ -434,7 +480,7 @@ fn due_items_only() {
         min_interval_s: 3600,
         retry_s: 3600,
     };
-    let e = Env::new(pinned, &[]);
+    let e = Env::new(pinned, &[Step::DeferAll]);
     e.raise("reclaimable:/a@h@1", InboxKind::Reclaimable);
     // A later millisecond: items created in the same one are ordered by key, which would
     // put this one first.
@@ -469,8 +515,14 @@ fn due_items_only() {
     e.raise(recent, InboxKind::UnclassifiableData);
     let now = state::now_ms();
     inbox::assign(&e.state, "p0", &[recent.to_owned()], now).unwrap();
-    let (written, published) =
-        inbox::record_outcome(&e.state, "p0", &PassOutcome::Completed, now, || Ok(()));
+    let (written, published, _) = inbox::record_outcome(
+        &e.state,
+        "p0",
+        &[recent.to_owned()],
+        &PassOutcome::Completed,
+        now,
+        |_| Ok(()),
+    );
     written.unwrap();
     published.unwrap();
 
@@ -518,7 +570,7 @@ fn disk_items_start_no_pass() {
         min_interval_s: 0,
         retry_s: 0,
     };
-    let e = Env::new(pinned, &[]);
+    let e = Env::new(pinned, &[Step::DeferAll]);
     for (key, kind) in OWNERS {
         e.raise(key, kind);
     }
@@ -583,7 +635,7 @@ fn assigned_items_only() {
     e.raise("reclaimable:/a@h@1", InboxKind::Reclaimable);
     e.raise("reclaimable:/b@h@1", InboxKind::Reclaimable);
     let points = TestPoints::new(e.dirs.scope());
-    let mut launcher = e.spawn_launcher(&points, &[]);
+    let launcher = e.spawn_launcher(&points, &[]);
     let pass = wait_for("the pass in last.json", WAIT, || e.last());
     let recorded = e.session(&pass.id);
 
@@ -594,7 +646,7 @@ fn assigned_items_only() {
     assert_eq!(pass_of(&doc).id, pass.id, "the running pass is reported");
     assert_eq!(pass_of(&doc).outcome, None);
     e.signal("go");
-    assert!(launcher.wait().unwrap().success());
+    e.launcher_succeeded(launcher);
 
     assert_session_environment(&e, &pass, &recorded);
 
@@ -756,7 +808,7 @@ fn killed_before_assigning() {
         min_interval_s: 0,
         retry_s: 3600,
     };
-    let e = Env::new(pinned, &[]);
+    let e = Env::new(pinned, &[Step::DeferAll]);
     e.raise("reclaimable:/a@h@1", InboxKind::Reclaimable);
     let points = TestPoints::new(e.dirs.scope());
     let mut launcher = e.spawn_launcher(&points, &[ARBITER_RECORDED]);
@@ -809,7 +861,7 @@ fn outcomes_kept_when_abandoned() {
         min_interval_s: 0,
         retry_s: 3600,
     };
-    let e = Env::new(pinned, &[]);
+    let e = Env::new(pinned, &[Step::DeferAll]);
     e.raise("reclaimable:/a@h@1", InboxKind::Reclaimable);
     e.raise("reclaimable:/b@h@1", InboxKind::Reclaimable);
     let points = TestPoints::new(e.dirs.scope());
@@ -926,7 +978,7 @@ fn launcher_killed() {
     let (code, doc) = e.cardinal(&resolve, Some(&first.id));
     assert_eq!((code, error_code(&doc)), (Some(1), "not_assigned"));
     assert_eq!(e.item("reclaimable:/a@h@1").status, InboxStatus::Open);
-    e.configure(pinned, &[]);
+    e.configure(pinned, &[Step::DeferAll]);
     let (code, doc) = e.arbiter_run();
     assert_eq!(
         (code, error_code(&doc)),
@@ -988,7 +1040,7 @@ fn failing_raised() {
         serde_json::from_value(item.evidence["passes"].clone()).unwrap();
     assert_eq!(evidence, failed, "the failed passes");
 
-    e.configure(pinned, &[]);
+    e.configure(pinned, &[Step::DeferAll]);
     let (code, doc) = e.arbiter_run();
     assert_eq!(code, Some(0), "{doc}");
     let completed = pass_of(&doc);
@@ -1002,6 +1054,172 @@ fn failing_raised() {
     assert_eq!(item.status, InboxStatus::Resolved);
     assert_eq!(item.resolution.unwrap().by, "cardinal");
     assert_eq!(item.ended_ms, completed.ended_ms);
+}
+
+/// A20: a session that exits 0 having answered none of its items, as one that could not read
+/// them does, ends the pass `failed:no_answer`, and the third such pass in a row raises
+/// `arbiter_failing`; a pass that answers its items, deferring them included, completes and
+/// ends it.
+#[test]
+fn a_pass_that_answers_nothing_fails() {
+    let pinned = Pinned {
+        timeout_s: 60,
+        min_interval_s: 0,
+        retry_s: 0,
+    };
+    let listing = Step::Run(vec!["inbox".into(), "--assigned".into(), "--brief".into()]);
+    let e = Env::new(pinned, &[listing]);
+    e.raise("reclaimable:/a@h@1", InboxKind::Reclaimable);
+    e.raise("closed_pr_dirty:/b#1@1", InboxKind::ClosedPrDirty);
+    let mut failed = Vec::new();
+    for round in 1..=3 {
+        assert_eq!(failing_keys(&e), Vec::<String>::new(), "round {round}");
+        let (code, doc) = e.arbiter_run();
+        assert_eq!(code, Some(0), "{doc}");
+        let pass = pass_of(&doc);
+        let listed: serde_json::Value = serde_json::from_str(&e.ran(&pass.id, 0).stdout).unwrap();
+        assert_eq!(
+            listed["items"].as_array().unwrap().len(),
+            2,
+            "it read its items"
+        );
+        assert_eq!(
+            pass.outcome,
+            Some(PassOutcome::Failed(inbox::NO_ANSWER.into()))
+        );
+        assert_eq!(pass.failures_in_a_row, round);
+        for key in ["reclaimable:/a@h@1", "closed_pr_dirty:/b#1@1"] {
+            let assigned = e.item(key).arbiter.unwrap();
+            assert_eq!(assigned.outcome, pass.outcome, "{key}");
+            assert_eq!(assigned.answer, None, "{key}");
+        }
+        let log = std::fs::read_to_string(&pass.log).unwrap();
+        assert!(log.contains("answered none"), "{log}");
+        failed.push(pass);
+    }
+    let key = failing_key(&failed[0]);
+    assert_eq!(failing_keys(&e), std::slice::from_ref(&key));
+
+    e.configure(pinned, &[Step::DeferAll]);
+    let (code, doc) = e.arbiter_run();
+    assert_eq!(code, Some(0), "{doc}");
+    let completed = pass_of(&doc);
+    assert_eq!(completed.outcome, Some(PassOutcome::Completed));
+    assert_eq!(completed.failures_in_a_row, 0);
+    assert_eq!(e.item(&key).status, InboxStatus::Resolved);
+}
+
+/// An answer of any kind makes a pass that exits 0 complete, items it leaves unanswered
+/// included; so does a pass none of whose items is left open to answer. A deferred item stays
+/// open with the pass's note, is not answered again, and is due again after `retry_s`.
+#[test]
+fn answers_complete_a_pass() {
+    let pinned = Pinned {
+        timeout_s: 60,
+        min_interval_s: 0,
+        retry_s: 3,
+    };
+    let (a, b) = ("reclaimable:/a@h@1", "managed_merged:/b@h@1");
+    let e = Env::new(
+        pinned,
+        &[
+            answer(a, "deferred", "the act was refused: rejected (not_in_use)"),
+            answer(a, "resolved", "again"),
+        ],
+    );
+    e.raise(a, InboxKind::Reclaimable);
+    e.raise(b, InboxKind::ManagedMerged);
+    let (code, doc) = e.arbiter_run();
+    assert_eq!(code, Some(0), "{doc}");
+    let pass = pass_of(&doc);
+    assert_eq!(pass.outcome, Some(PassOutcome::Completed), "b unanswered");
+    let deferred = e.ran(&pass.id, 0);
+    assert_eq!(deferred.code, Some(0), "{}", deferred.stdout);
+    let again: serde_json::Value = serde_json::from_str(&e.ran(&pass.id, 1).stdout).unwrap();
+    assert_eq!(error_code(&again), "invalid_argument", "answered once");
+    let item = e.item(a);
+    assert_eq!((item.status, item.resolution), (InboxStatus::Open, None));
+    let answer = item.arbiter.unwrap().answer.unwrap();
+    assert_eq!(answer.outcome, AnswerOutcome::Deferred);
+    assert_eq!(answer.note, "the act was refused: rejected (not_in_use)");
+    assert!(
+        e.records(RecordKind::InboxResolved).is_empty(),
+        "a deferral resolves nothing"
+    );
+    // Due again after `retry_s`, like any item the pass left open.
+    let (code, doc) = e.arbiter_run();
+    assert_eq!((code, error_code(&doc)), (Some(1), "not_found"));
+    sleep_until(pass.ended_ms.unwrap() + 3000);
+    e.configure(pinned, &[Step::Wait("go".into())]);
+    let points = TestPoints::new(e.dirs.scope());
+    let launcher = e.spawn_launcher(&points, &[]);
+    let second = wait_for("the second pass", WAIT, || {
+        e.last()
+            .filter(|last| last.ended_ms.is_none() && last.id != pass.id)
+    });
+    // Both came due when the first pass's cooldown ran out: by key.
+    assert_eq!(second.items, [b, a]);
+    // The launcher records the pass before it assigns the items, and starts the session after:
+    // closed before then, they would leave nothing to assign, and no pass.
+    e.session(&second.id);
+    // Both items are closed while the session runs: nothing is left to answer.
+    for key in [a, b] {
+        inbox::resolve(
+            &e.config(),
+            &e.state,
+            key,
+            ResolutionOutcome::Resolved,
+            None,
+        )
+        .unwrap();
+    }
+    e.signal("go");
+    e.launcher_succeeded(launcher);
+    assert_eq!(e.last().unwrap().outcome, Some(PassOutcome::Completed));
+}
+
+/// A19: passes take due items in the order they became due, so an item behind more than
+/// `max_items` others is assigned within `ceil(n / max_items) + 1` passes even when every pass
+/// leaves its items open and they come due again before it is reached.
+#[test]
+fn every_due_item_gets_a_pass() {
+    const N: usize = 41;
+    let pinned = Pinned {
+        timeout_s: 60,
+        min_interval_s: 0,
+        retry_s: 1,
+    };
+    let e = Env::new(pinned, &[Step::DeferAll]);
+    let keys: Vec<String> = (0..N)
+        .map(|i| format!("reclaimable:/w{i:02}@h@1"))
+        .collect();
+    for key in &keys {
+        e.raise(key, InboxKind::Reclaimable);
+    }
+    let max_items = cardinal::config::MAX_ITEMS;
+    let passes = N.div_ceil(max_items) + 1;
+    let mut assigned: Vec<Vec<String>> = Vec::new();
+    for i in 0..passes {
+        if i >= N / max_items {
+            // From the pass that reaches the last item on, every item a pass left open is due
+            // again, so retries compete with it however fast the earlier passes ran.
+            sleep_until(e.last().unwrap().ended_ms.unwrap() + 1000);
+        }
+        let (code, doc) = e.arbiter_run();
+        assert_eq!(code, Some(0), "{doc}");
+        let pass = pass_of(&doc);
+        assert_eq!(pass.outcome, Some(PassOutcome::Completed));
+        assert_eq!(pass.items.len(), max_items);
+        assigned.push(pass.items);
+    }
+    let never: Vec<_> = keys
+        .iter()
+        .filter(|key| !assigned.iter().flatten().any(|k| k == *key))
+        .collect();
+    assert!(
+        never.is_empty(),
+        "never assigned: {never:?}; passes: {assigned:?}"
+    );
 }
 
 /// `cardinal inbox resolve KEY --outcome OUTCOME --note NOTE --assigned` as a session step.
@@ -1053,7 +1271,7 @@ fn unreadable_history_starts_nothing() {
         min_interval_s: 0,
         retry_s: 0,
     };
-    let e = Env::new(pinned, &[]);
+    let e = Env::new(pinned, &[Step::DeferAll]);
     e.raise("reclaimable:/a@h@1", InboxKind::Reclaimable);
     // Assigned to the pass `p`, as far as the item says.
     e.raise("reclaimable:/b@h@1", InboxKind::Reclaimable);
@@ -1121,7 +1339,7 @@ fn no_session_without_items() {
         min_interval_s: 0,
         retry_s: 3600,
     };
-    let e = Env::new(pinned, &[]);
+    let e = Env::new(pinned, &[Step::DeferAll]);
     let points = TestPoints::new(e.dirs.scope());
     let close = |key: &str| {
         inbox::resolve(
@@ -1208,7 +1426,7 @@ fn no_session_without_items() {
     // One of two items closed before it was assigned: the pass lists the other.
     e.raise("reclaimable:/d@h@1", InboxKind::Reclaimable);
     e.raise("reclaimable:/e@h@1", InboxKind::Reclaimable);
-    let mut launcher = e.spawn_launcher(&points, &[ARBITER_RECORDED]);
+    let launcher = e.spawn_launcher(&points, &[ARBITER_RECORDED]);
     points.wait_reached(ARBITER_RECORDED, launcher.id(), WAIT);
     assert_eq!(
         e.last().unwrap().items,
@@ -1216,7 +1434,7 @@ fn no_session_without_items() {
     );
     close("reclaimable:/e@h@1");
     points.release(ARBITER_RECORDED);
-    assert!(launcher.wait().unwrap().success());
+    e.launcher_succeeded(launcher);
     let partial = e.last().unwrap();
     assert_eq!(partial.items, ["reclaimable:/d@h@1"]);
     assert_eq!(partial.outcome, Some(PassOutcome::Completed));
@@ -1356,7 +1574,7 @@ fn failing_raised_once() {
     );
     assert_eq!(raised[0].status, InboxStatus::Open);
 
-    e.configure(pinned, &[]);
+    e.configure(pinned, &[Step::DeferAll]);
     let (code, doc) = e.arbiter_run();
     assert_eq!(code, Some(0), "{doc}");
     let completed = pass_of(&doc);
@@ -1403,7 +1621,7 @@ fn one_alert_per_run_of_failures() {
     let key = failing_key(&failed[0]);
     assert_eq!(failing_keys(&e), std::slice::from_ref(&key));
 
-    e.configure(pinned, &[]);
+    e.configure(pinned, &[Step::DeferAll]);
     let points = TestPoints::new(e.dirs.scope());
     let mut launcher = e.spawn_launcher_with(&points, &[], Some(ARBITER_OUTCOMES));
     assert_eq!(
@@ -1442,8 +1660,8 @@ fn one_alert_per_run_of_failures() {
 }
 
 /// A20: a pass recorded `completed` ends the open `arbiter_failing` also when its outcome could
-/// not be written into its items (`inbox/.lock` held until the write timed out), so the next
-/// run of three failures raises a new one.
+/// not be written into its items (a failure injected after the launcher read their answers),
+/// so the next run of three failures raises a new one.
 #[test]
 fn a_completed_pass_ends_the_alert() {
     let pinned = Pinned {
@@ -1462,25 +1680,12 @@ fn a_completed_pass_ends_the_alert() {
     let key = failing_key(&failed[0]);
     assert_eq!(failing_keys(&e), std::slice::from_ref(&key));
 
-    e.configure(pinned, &[Step::Wait("go".into())]);
+    // The session answers, and the launcher, having read the answer, fails to write the
+    // outcome into the item.
+    e.configure(pinned, &[Step::DeferAll]);
     let points = TestPoints::new(e.dirs.scope());
-    let mut launcher = e.spawn_launcher(&points, &[ARBITER_OUTCOMES]);
-    let pass = wait_for("the fourth pass in last.json", WAIT, || {
-        e.last().filter(|last| last.ended_ms.is_none())
-    });
-    e.session(&pass.id);
-    let held = state::lock(
-        &e.state.inbox_lock(),
-        LockMode::Exclusive,
-        Instant::now() + WAIT,
-    )
-    .unwrap();
-    e.signal("go");
-    // Reached once writing the outcome into the items has timed out.
-    points.wait_reached(ARBITER_OUTCOMES, launcher.id(), WAIT);
-    drop(held);
-    points.release(ARBITER_OUTCOMES);
-    assert!(launcher.wait().unwrap().success());
+    let launcher = e.spawn_launcher_with(&points, &[], Some(ARBITER_ITEMS_WRITING));
+    e.launcher_succeeded(launcher);
     let completed = e.last().unwrap();
     assert_eq!(completed.outcome, Some(PassOutcome::Completed));
     assert_eq!(e.item("reclaimable:/a@h@1").arbiter.unwrap().outcome, None);
@@ -1516,7 +1721,7 @@ fn an_ending_pass_takes_no_answer() {
     let e = Env::new(pinned, &[Step::Wait("go".into())]);
     e.raise("reclaimable:/a@h@1", InboxKind::Reclaimable);
     let points = TestPoints::new(e.dirs.scope());
-    let mut launcher = e.spawn_launcher(&points, &[ARBITER_OUTCOMES]);
+    let launcher = e.spawn_launcher(&points, &[ARBITER_OUTCOMES]);
     let pass = wait_for("the pass in last.json", WAIT, || e.last());
     e.session(&pass.id);
     // No item can be written: the launcher's outcome write fails.
@@ -1530,7 +1735,7 @@ fn an_ending_pass_takes_no_answer() {
     let answer = e.spawn_answer(&points, &pass.id, "reclaimable:/a@h@1");
     points.wait_reached(ARBITER_ANSWERING, answer.id(), WAIT);
     points.release(ARBITER_OUTCOMES);
-    assert!(launcher.wait().unwrap().success());
+    e.launcher_succeeded(launcher);
     let output = answer.wait_with_output().unwrap();
     std::fs::set_permissions(&inbox_dir, mode(0o755)).unwrap();
     // A user who writes there anyway (root) has nothing to check here.
@@ -1546,7 +1751,140 @@ fn an_ending_pass_takes_no_answer() {
     let a = e.item("reclaimable:/a@h@1");
     assert_eq!((a.status, a.resolution), (InboxStatus::Open, None));
     assert_eq!(a.arbiter.unwrap().outcome, None, "the outcome write failed");
-    assert_eq!(e.last().unwrap().outcome, Some(PassOutcome::Completed));
+    // The session answered nothing.
+    assert_eq!(
+        e.last().unwrap().outcome,
+        Some(PassOutcome::Failed(inbox::NO_ANSWER.into()))
+    );
+}
+
+/// A20: when a session exits 0 while `inbox/.lock` is held past the launcher's wait, nothing
+/// checks its answers, and its pass ends `failed:unverified`, a failure in the run; a pass that
+/// failed on its own keeps its outcome.
+#[test]
+fn unchecked_answers_fail_the_pass() {
+    let pinned = Pinned {
+        timeout_s: 60,
+        min_interval_s: 0,
+        retry_s: 0,
+    };
+    let e = Env::new(pinned, &[]);
+    e.raise("reclaimable:/a@h@1", InboxKind::Reclaimable);
+    let mut ended = Vec::new();
+    for (go, steps) in [
+        ("go1", vec![Step::Wait("go1".into())]),
+        ("go2", vec![Step::Wait("go2".into()), Step::Exit(2)]),
+    ] {
+        e.configure(pinned, &steps);
+        let points = TestPoints::new(e.dirs.scope());
+        let launcher = e.spawn_launcher(&points, &[ARBITER_OUTCOMES]);
+        let pass = wait_for("the pass in last.json", WAIT, || {
+            e.last().filter(|last| last.ended_ms.is_none())
+        });
+        e.session(&pass.id);
+        let held = state::lock(
+            &e.state.inbox_lock(),
+            LockMode::Exclusive,
+            Instant::now() + WAIT,
+        )
+        .unwrap();
+        e.signal(go);
+        // The launcher records the end only once its wait for the lock has failed.
+        points.wait_reached(ARBITER_OUTCOMES, launcher.id(), WAIT);
+        drop(held);
+        points.release(ARBITER_OUTCOMES);
+        e.launcher_succeeded(launcher);
+        let last = e.last().unwrap();
+        assert_eq!(last.id, pass.id);
+        let a = e.item("reclaimable:/a@h@1").arbiter.unwrap();
+        assert_eq!((a.pass, a.outcome), (pass.id, None), "no item was written");
+        ended.push((last.outcome.unwrap(), last.failures_in_a_row));
+    }
+    assert_eq!(
+        ended,
+        [
+            (PassOutcome::Failed(inbox::UNVERIFIED.into()), 1),
+            (PassOutcome::Failed("exit 2".into()), 2),
+        ]
+    );
+}
+
+/// A20: a session that exits 0 while one of its pass's items does not parse, or on Unix cannot
+/// be read, has an answer nobody can check: its pass ends `failed:unverified` and continues the
+/// run of failures, whose `arbiter_failing` the next launcher raises once the inbox reads
+/// again (the inbox applies no change over an item it cannot read), instead of completing and
+/// ending the run.
+#[test]
+fn an_unreadable_item_fails_the_pass() {
+    let pinned = Pinned {
+        timeout_s: 60,
+        min_interval_s: 0,
+        retry_s: 0,
+    };
+    let key = "reclaimable:/a@h@1";
+    let e = Env::new(pinned, &[Step::Exit(2)]);
+    e.raise(key, InboxKind::Reclaimable);
+    for _ in 0..2 {
+        let (code, doc) = e.arbiter_run();
+        assert_eq!(code, Some(0), "{doc}");
+    }
+    let file = e.state.inbox_item(key, 0);
+    // A pass whose session exits 0 once `spoil` made the item unreadable; `restore` undoes it
+    // after the launcher exited.
+    let pass_with = |spoil: &dyn Fn(), restore: &dyn Fn()| -> ArbiterPass {
+        e.configure(pinned, &[Step::Wait("go".into())]);
+        let before = e.last().unwrap().id;
+        let points = TestPoints::new(e.dirs.scope());
+        let mut launcher = e.spawn_launcher(&points, &[]);
+        let pass = wait_for("the next pass in last.json", WAIT, || {
+            e.last()
+                .filter(|last| last.ended_ms.is_none() && last.id != before)
+        });
+        e.session(&pass.id);
+        spoil();
+        e.signal("go");
+        let _ = launcher.wait();
+        restore();
+        std::fs::remove_file(e.sessions.join("go")).unwrap();
+        e.last().unwrap()
+    };
+    let unverified = Some(PassOutcome::Failed(inbox::UNVERIFIED.into()));
+
+    let saved = std::fs::read(&file).unwrap();
+    let pass = pass_with(&|| std::fs::write(&file, b"{\"schema\":").unwrap(), &|| {
+        std::fs::write(&file, &saved).unwrap();
+    });
+    assert_eq!(
+        (pass.outcome, pass.failures_in_a_row),
+        (unverified.clone(), 3)
+    );
+    e.configure(pinned, &[Step::Exit(2)]);
+    let (code, doc) = e.arbiter_run();
+    assert_eq!(code, Some(0), "{doc}");
+    assert_eq!(pass_of(&doc).failures_in_a_row, 4);
+    let open = || {
+        failing(&e)
+            .into_iter()
+            .filter(|item| item.ended_ms.is_none())
+            .count()
+    };
+    assert_eq!(open(), 1, "the run of failures raised its alert");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let mode = |bits| std::fs::Permissions::from_mode(bits);
+        let pass = pass_with(
+            &|| std::fs::set_permissions(&file, mode(0o000)).unwrap(),
+            &|| std::fs::set_permissions(&file, mode(0o644)).unwrap(),
+        );
+        // A user who reads it anyway (root) has nothing to check here.
+        if pass.outcome != Some(PassOutcome::Completed) {
+            assert_eq!((pass.outcome, pass.failures_in_a_row), (unverified, 5));
+            assert_eq!(open(), 1, "the alert stays open");
+        }
+    }
 }
 
 /// A19: a launcher waits a few seconds for `arbiter/.lock`, which a trigger holds while it
@@ -1560,7 +1898,7 @@ fn the_lock_is_waited_for_briefly() {
         min_interval_s: 0,
         retry_s: 0,
     };
-    let e = Env::new(pinned, &[]);
+    let e = Env::new(pinned, &[Step::DeferAll]);
     e.raise("reclaimable:/a@h@1", InboxKind::Reclaimable);
     let (code, doc) = e.arbiter_run();
     assert_eq!(code, Some(0), "{doc}");
@@ -1598,10 +1936,10 @@ fn the_lock_is_waited_for_briefly() {
     std::fs::write(e.state.arbiter_last(), serde_json::to_vec(&first).unwrap()).unwrap();
 
     let points = TestPoints::new(e.dirs.scope());
-    let mut launcher = e.spawn_launcher(&points, &[]);
+    let launcher = e.spawn_launcher(&points, &[]);
     std::thread::sleep(Duration::from_millis(500));
     drop(held);
-    assert!(launcher.wait().unwrap().success());
+    e.launcher_succeeded(launcher);
     let second = e.last().unwrap();
     assert_ne!(second.id, first.id, "a pass of its own");
     assert_eq!(second.outcome, Some(PassOutcome::Completed));

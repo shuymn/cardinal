@@ -14,8 +14,8 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use cardinal::contract::{
-    ArbiterStart, DiskLevel, InboxItem, InboxKind, InboxStatus, Inventory, ResolutionOutcome,
-    SessionProcess, SessionSnapshot, SessionSnapshotSchema, Skipped, Snapshot, SnapshotAgent, Tri,
+    ArbiterStart, DiskLevel, InboxItem, InboxKind, InboxStatus, ResolutionOutcome, SessionProcess,
+    SessionSnapshot, SessionSnapshotSchema, Skipped, Snapshot, SnapshotAgent, Tri, WorktreeView,
 };
 use cardinal::inbox::{self, StatusFilter};
 use cardinal::testpoint::{RECONCILE_OBSERVED, release_file};
@@ -381,9 +381,9 @@ fn a_due_worktree_item_starts_an_arbiter_pass() {
 
 /// A `closed_pr_dirty` item from a real pass reaches the arbiter with what its subject check
 /// compares (`integrations/claude-code/skills/cardinal-arbiter/SKILL.md`): its pass is
-/// assigned it, and `cardinal inventory` lists its worktree with the item's HEAD, dirty, and
-/// with the closed pull request its key names. On Windows the test's job refuses the
-/// launcher's start, and the inventory is checked alone.
+/// assigned it, and `cardinal inventory --worktree` shows its worktree with the item's HEAD,
+/// dirty, and with the closed pull request its key names. On Windows the test's job refuses the
+/// launcher's start, and the worktree's view is checked alone.
 #[test]
 fn a_closed_pr_dirty_item_reaches_the_subject_check() {
     let d = Disk::new(LINES);
@@ -419,17 +419,13 @@ fn a_closed_pr_dirty_item_reaches_the_subject_check() {
 
     let output =
         d.s.cardinal()
-            .arg("inventory")
+            .args(["inventory", "--worktree", &worktree])
             .output_within(plan_support::RUN_LIMIT)
             .unwrap();
     assert!(output.status.success(), "{output:?}");
-    let inventory: Inventory = serde_json::from_slice(&output.stdout).unwrap();
-    let listed = inventory
-        .repos
-        .iter()
-        .flat_map(|repo| &repo.worktrees)
-        .find(|w| w.path == worktree)
-        .expect("the inventory lists the item's worktree");
+    let view: WorktreeView = serde_json::from_slice(&output.stdout).unwrap();
+    let listed = &view.worktree;
+    assert_eq!(listed.path, worktree);
     assert_eq!(
         Some(listed.head.clone()),
         item.subject.head,
