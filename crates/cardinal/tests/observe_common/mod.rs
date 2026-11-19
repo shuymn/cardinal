@@ -166,13 +166,13 @@ impl Scene {
         }
     }
 
+    /// Started once, so the first start of the new file is not within a deadline
+    /// (`Scope::started_script`).
     #[cfg(unix)]
     fn write_gh(&self) {
-        use std::os::unix::fs::PermissionsExt;
         let dir = self.gh_dir.display();
         let script = format!(
-            r#"#!/bin/sh
-dir='{dir}'
+            r#"dir='{dir}'
 printf '%s\n' "$*" >> "$dir/calls.log"
 env > "$dir/env.log"
 kind=""; search=""; prev=""
@@ -189,9 +189,7 @@ code=0; [ -f "$dir/$kind.code" ] && code=$(cat "$dir/$kind.code")
 exit "$code"
 "#
         );
-        let path = self.gh_program();
-        std::fs::write(&path, script).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        self.fx.scope().started_script(&self.gh_program(), &script);
     }
 
     #[cfg(windows)]

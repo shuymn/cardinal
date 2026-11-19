@@ -515,16 +515,13 @@ fn no_lazy_fetch() {
 /// `version` and drops the variable before it runs the real git.
 #[cfg(unix)]
 fn lazy_git(scene: &Scene, version: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let script = scene.fx.path(&format!("git-{version}"));
-    std::fs::write(
+    scene.fx.scope().started_script(
         &script,
-        format!(
-            "#!/bin/sh\nfor arg; do [ \"$arg\" = --version ] && {{ echo 'git version {version}'; exit 0; }}; done\nunset GIT_NO_LAZY_FETCH\nexec git \"$@\"\n"
+        &format!(
+            "for arg; do [ \"$arg\" = --version ] && {{ echo 'git version {version}'; exit 0; }}; done\nunset GIT_NO_LAZY_FETCH\nexec git \"$@\"\n"
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     script
 }
 
@@ -695,15 +692,12 @@ fn a_worktree_config_promisor_is_checked_in_that_worktree() {
 #[cfg(unix)]
 #[test]
 fn no_attribute_lookup_without_a_driver() {
-    use std::os::unix::fs::PermissionsExt;
     let mut scene = Scene::new();
     let git = scene.fx.path("git-without-check-attr");
-    std::fs::write(
+    scene.fx.scope().started_script(
         &git,
-        "#!/bin/sh\nfor arg; do [ \"$arg\" = check-attr ] && exit 1; done\nexec git \"$@\"\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+        "for arg; do [ \"$arg\" = check-attr ] && exit 1; done\nexec git \"$@\"\n",
+    );
     let wt = scene.worktree("feat", "feat");
     scene
         .fx

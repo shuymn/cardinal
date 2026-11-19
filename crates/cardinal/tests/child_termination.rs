@@ -73,19 +73,15 @@ fn ignored(sig: i32) -> bool {
 /// and waits.
 #[cfg(unix)]
 fn sleeping_git(scene: &mut Scene) -> std::path::PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-
     let pids = scene.fx.path("pids");
     let wrapper = scene.fx.path("git-wrapper");
-    std::fs::write(
+    scene.fx.scope().started_script(
         &wrapper,
-        format!(
-            "#!/bin/sh\nsleep 30 &\necho $$ $! > '{0}.tmp'\nmv '{0}.tmp' '{0}'\nwait\n",
+        &format!(
+            "sleep 30 &\necho $$ $! > '{0}.tmp'\nmv '{0}.tmp' '{0}'\nwait\n",
             pids.display()
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     scene.observe_config(&format!("git = '{}'", wrapper.display()));
     pids
 }

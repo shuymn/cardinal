@@ -776,6 +776,15 @@ mod tests {
     fn a_found_script_without_an_interpreter_line_runs_in_sh() {
         let scope = Scope::new();
         tool(&scope, "bin", "echo \"run by sh\"\n", 0o755);
+        // Started once before the deadline, as `Scope::started_script` does but without the
+        // `#!` line it writes: `sh` execs the file and, refused, runs it as `execvp` does.
+        let started = scope
+            .command("sh", scope.root())
+            .args(["-c", "exec \"$0\" > /dev/null"])
+            .arg(scope.path("bin").join("tool"))
+            .status()
+            .expect("start the script once");
+        assert!(started.success(), "{started}");
         let env = with_path(&scope, &[scope.path("bin")]);
         let out = run(
             "tool",
