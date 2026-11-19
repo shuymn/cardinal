@@ -155,8 +155,10 @@ mod refusals {
     }
 
     /// A file of the target with a hard link outside it, held open through its name inside,
-    /// refuses the target by `not_in_use`, naming the process and that name: only a file held
-    /// through a name outside is left to that name.
+    /// refuses the target by `not_in_use`, naming the process, and on Linux that name: only a
+    /// file held through a name outside is left to that name. macOS names a descriptor's file
+    /// by the link looked up last (`F_GETPATH`), which the plan's and `act`'s own reads of the
+    /// other link can change, so there the detail names the process alone.
     #[test]
     fn a_file_linked_outside_and_held_open_inside_counts() {
         let s = Setup::new();
@@ -171,12 +173,12 @@ mod refusals {
         let mut child = hold(&s, &target.join("debug/held"));
         let check = assert_refused(&s, &target, "not_in_use", None);
         let pid = child.id().to_string();
-        assert!(
-            check
-                .detail
-                .contains(&format!("{pid} (descriptor 0, target/debug/held)")),
-            "{check:#?}"
-        );
+        let named = if cfg!(target_os = "macos") {
+            format!("{pid} (descriptor 0, ")
+        } else {
+            format!("{pid} (descriptor 0, target/debug/held)")
+        };
+        assert!(check.detail.contains(&named), "{check:#?}");
         child.kill();
     }
 
