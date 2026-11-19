@@ -101,8 +101,9 @@ fn parent_exit_after_the_spawn_stops_the_group() {
     deliverable(&[SIGTERM]);
     let env = Env::with_budget(1);
     let grandchild_file = env.file("grandchild");
+    // The grandchild writes its PID once it ignores SIGTERM, so the test signals no sooner.
     let script = format!(
-        "(trap '' TERM; exec sleep 30) & echo $! > '{}'; wait",
+        "sh -c 'trap \"\" TERM; echo $$ > \"$0\"; exec sleep 30' '{}' & wait",
         grandchild_file.display()
     );
     let runner = env.run_at(None, &["sh", "-c", &script], &[RUN_AFTER_SPAWN], None);
