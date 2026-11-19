@@ -471,7 +471,11 @@ fn symlink_target_refused() {
     std::os::unix::fs::symlink(&outside, deep.join("web")).unwrap();
     let result = s.act(&nested.id, &owner_approved()).unwrap();
     assert_eq!(result.status, ActStatus::Rejected);
-    assert_eq!(result.reasons, ["regenerable", "plain_target"]);
+    // The target is not reached, so the type of its file system is not read either.
+    assert_eq!(
+        result.reasons,
+        ["regenerable", "plain_target", "local_volume"]
+    );
     assert!(outside.join("node_modules/pkg/index.js").exists());
 }
 
@@ -516,6 +520,7 @@ fn plain_target_checks(
             lock_held: Ok(false),
             reservations: Ok(InUse::default()),
             processes: Ok(Vec::new()),
+            descriptors: None,
         },
         patterns: &cardinal::plan::DataLists::default(),
         managed: &[],

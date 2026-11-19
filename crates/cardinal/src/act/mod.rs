@@ -144,6 +144,7 @@ impl Run<'_> {
             reservations,
             // The whole worktree for both kinds (section 9.2).
             processes: plan::processes_inside(&worktree),
+            descriptors: plan::descriptor_scan(self.plan.kind),
         };
         let patterns = observation.as_ref().map_or_else(
             |_| DataLists::default(),

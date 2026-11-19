@@ -4,8 +4,10 @@
 //! which is never treated as safe. Each check carries the facts it read, and [`provenance`]
 //! names the observation errors and configuration keys behind them (section 10.2).
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::config::{Config, DataList, Managed, Selection, data_patterns_cover};
 use crate::contract::{
@@ -13,6 +15,7 @@ use crate::contract::{
     MergeEvidence, ObservedError, PlanKind, Provenance, Tri,
 };
 use crate::observe::WorktreeObservation;
+use crate::os::fds::{Scan, Way};
 use crate::os::{Detail, ProcessTable};
 
 use super::walk::{EntryKind, Mount, Walk};
@@ -27,7 +30,14 @@ pub struct InUseFacts {
     pub reservations: Result<InUse, String>,
     /// Processes whose working directory is inside the target.
     pub processes: Result<Vec<u32>, String>,
+    /// The descriptor scan of section 9.7, read for a `reclaim_dir` target on Unix
+    /// ([`descriptor_scan`]).
+    pub descriptors: Descriptors,
 }
+
+/// The descriptor scan read for a target, or why it is not complete; `None` where it is not
+/// read.
+pub type Descriptors = Option<Result<Arc<Scan>, String>>;
 
 /// Everything the checks are computed from.
 #[derive(Clone, Copy, Debug)]
@@ -84,11 +94,17 @@ const DETAIL_PATHS: usize = 5;
 /// How many entries a list fact keeps where a command prints it bounded.
 pub const FACT_ENTRIES: usize = 10;
 
+/// How many entries `not_in_use` names of each list of processes it reads (those working in
+/// the worktree, those using the target, those the scan could not read), the rest counted in
+/// `omitted`: every plan of a worktree repeats them, while the check itself reads every one.
+const PROCESS_ENTRIES: usize = 3;
+
 /// Every check for the plan kind, in the order of section 9.2.
 #[must_use]
 pub fn evaluate(i: &Inspection<'_>) -> Vec<Check> {
     let worktree = i.kind == PlanKind::ReclaimWorktree;
-    let mut checks = vec![observed(i), not_in_use(i), not_managed(i)];
+    let users = descriptor_users(i);
+    let mut checks = vec![observed(i), not_in_use(i, users.as_deref()), not_managed(i)];
     if worktree {
         let facts = i.observation.ok().map(|o| &o.worktree.facts);
         checks.push(clean(i));
@@ -117,11 +133,14 @@ pub fn evaluate(i: &Inspection<'_>) -> Vec<Check> {
     checks.push(no_protected(i));
     checks.push(no_unclassifiable(i));
     checks.push(no_nested_repository(i));
+    if !worktree && cfg!(unix) {
+        checks.push(local_volume(i));
+    }
     if worktree {
         checks.push(super::merge::merge_evidence(i));
     }
     for check in &mut checks {
-        check.facts = facts(&check.name, i);
+        check.facts = facts(&check.name, i, users.as_deref());
     }
     checks
 }
@@ -184,32 +203,73 @@ fn merge_facts(i: &Inspection<'_>) -> Vec<CheckFact> {
     ]
 }
 
-/// The facts the check `name` reads from `i`, each with what produced it.
-fn facts(name: &str, i: &Inspection<'_>) -> Vec<CheckFact> {
+/// The fact `name` holding the first [`PROCESS_ENTRIES`] of `entries`, the rest counted in
+/// `omitted`.
+fn processes_fact<T: serde::Serialize>(
+    name: &str,
+    entries: Option<&[T]>,
+    source: &str,
+) -> CheckFact {
+    let mut fact = fact(
+        name,
+        entries.map(|all| &all[..all.len().min(PROCESS_ENTRIES)]),
+        source,
+    );
+    fact.omitted = entries
+        .map(|all| all.len().saturating_sub(PROCESS_ENTRIES) as u64)
+        .filter(|&rest| rest > 0);
+    fact
+}
+
+/// The facts `not_in_use` reads, with `users`, what [`descriptor_users`] found.
+fn in_use_facts(i: &Inspection<'_>, users: Option<&[DescriptorUser]>) -> Vec<CheckFact> {
+    let in_use = i.in_use;
+    let unscanned = scan(i).map(|scan| {
+        scan.unscanned
+            .iter()
+            .map(|(pid, error)| serde_json::json!({ "pid": pid, "error": error }))
+            .collect::<Vec<_>>()
+    });
+    vec![
+        fact(
+            "in_use.lock_held",
+            in_use.lock_held.as_ref().ok(),
+            "worktree in-use lock",
+        ),
+        fact(
+            "in_use.reservations",
+            in_use.reservations.as_ref().ok(),
+            "reservations",
+        ),
+        processes_fact(
+            "in_use.processes",
+            in_use.processes.as_deref().ok(),
+            "process table",
+        ),
+        processes_fact("in_use.descriptors.users", users, "descriptor scan"),
+        processes_fact(
+            "in_use.descriptors.unscanned",
+            unscanned.as_deref(),
+            "descriptor scan",
+        ),
+        fact(
+            "in_use.descriptors.others",
+            scan(i).map(|scan| scan.others),
+            "descriptor scan",
+        ),
+    ]
+}
+
+/// The facts the check `name` reads from `i`, each with what produced it; `users` is what
+/// [`descriptor_users`] found.
+fn facts(name: &str, i: &Inspection<'_>, users: Option<&[DescriptorUser]>) -> Vec<CheckFact> {
     let repo = i.observation.ok().map(|o| &o.repo);
     let wt = i.observation.ok().map(|o| &o.worktree);
     let facts = wt.map(|w| &w.facts);
     let walk = i.walk.ok();
-    let in_use = i.in_use;
     match name {
         "observed" => vec![fact("repo.gh", repo.map(|r| r.gh), "gh")],
-        "not_in_use" => vec![
-            fact(
-                "in_use.lock_held",
-                in_use.lock_held.as_ref().ok(),
-                "worktree in-use lock",
-            ),
-            fact(
-                "in_use.reservations",
-                in_use.reservations.as_ref().ok(),
-                "reservations",
-            ),
-            fact(
-                "in_use.processes",
-                in_use.processes.as_ref().ok(),
-                "process table",
-            ),
-        ],
+        "not_in_use" => in_use_facts(i, users),
         "not_managed" => vec![fact(
             "worktree.managed_by",
             wt.map(|w| &w.managed_by),
@@ -271,7 +331,13 @@ fn facts(name: &str, i: &Inspection<'_>) -> Vec<CheckFact> {
                 walk.map(|w| &w.boundaries),
                 "stat, statx, statfs",
             ),
+            fact("walk.special", special(i), "lstat"),
         ],
+        "local_volume" => vec![fact(
+            "walk.fs_type",
+            walk.and_then(|w| w.fs_type.as_ref().ok()),
+            "statfs",
+        )],
         _ => Vec::new(),
     }
 }
@@ -306,6 +372,9 @@ pub fn provenance(config: &Config, i: &Inspection<'_>) -> Provenance {
     }
     if let Err(err) = &i.in_use.processes {
         errors.push(error("process table", err));
+    }
+    if let Some(Err(err)) = &i.in_use.descriptors {
+        errors.push(error("descriptor scan", err));
     }
     let mut keys = Vec::new();
     if let Ok(o) = i.observation {
@@ -381,6 +450,137 @@ pub fn processes_inside(target: &Path) -> Result<Vec<u32>, String> {
         .filter(|p| p.cwd.as_deref().is_some_and(|cwd| cwd.starts_with(target)))
         .map(|p| p.pid)
         .collect())
+}
+
+/// The descriptor scan `not_in_use` reads for a target of `kind`: a `reclaim_dir` target's on
+/// Unix (section 9.2), `None` for any other.
+#[must_use]
+pub fn descriptor_scan(kind: PlanKind) -> Descriptors {
+    #[cfg(unix)]
+    {
+        (kind == PlanKind::ReclaimDir).then(|| crate::os::fds::scan().map(Arc::new))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = kind;
+        None
+    }
+}
+
+/// The complete descriptor scan of `i`, if one was read.
+fn scan<'a>(i: &Inspection<'a>) -> Option<&'a Scan> {
+    i.in_use.descriptors.as_ref()?.as_deref().ok()
+}
+
+/// One use of the target the descriptor scan found.
+#[derive(Debug, serde::Serialize)]
+struct DescriptorUser {
+    pid: u32,
+    way: Way,
+    /// Worktree-relative when inside the worktree.
+    path: Option<PathBuf>,
+}
+
+/// The uses of the target that the descriptor scan found (section 9.7): a working or root
+/// directory, executable, or descriptor that is an entry the walk recorded, by `dev` and
+/// `ino`, or whose path lies at or under the target. A file with more links than the walk
+/// found names for it does not count when the use's path is the name it was opened through
+/// ([`PATH_IS_OPENED_NAME`]), outside the target, and still names the file: removing the
+/// target leaves it to that name. A use through a name inside the target, or whose path cannot
+/// be read, decided, or no longer names the file, counts. `None` without a complete scan and a
+/// walk.
+fn descriptor_users(i: &Inspection<'_>) -> Option<Vec<DescriptorUser>> {
+    let scan = scan(i)?;
+    let walk = i.walk.ok()?;
+    let mut names: HashMap<(u64, u64), (u64, &super::Entry)> = HashMap::new();
+    for entry in walk.all() {
+        names
+            .entry((entry.dev, entry.ino))
+            .and_modify(|(n, _)| *n += 1)
+            .or_insert((1, entry));
+    }
+    // The OS names a path as the volume resolves it, through no symbolic link.
+    let canonical_target = std::fs::canonicalize(i.target).ok();
+    let under = |path: &Path| {
+        path.starts_with(i.target)
+            || canonical_target
+                .as_deref()
+                .is_some_and(|target| path.starts_with(target))
+    };
+    let canonical_worktree = std::fs::canonicalize(i.worktree).ok();
+    let relative = |path: &Path| {
+        path.strip_prefix(i.worktree)
+            .ok()
+            .or_else(|| path.strip_prefix(canonical_worktree.as_deref()?).ok())
+            .unwrap_or(path)
+            .to_path_buf()
+    };
+    // A use's path that establishes it holds the file `id` through a name outside the target.
+    let outside = |path: &Path, id: (u64, u64)| {
+        PATH_IS_OPENED_NAME && path.is_absolute() && !under(path) && names_file(path, id)
+    };
+    let mut found = Vec::new();
+    for process in &scan.processes {
+        for used in &process.uses {
+            let entry = used.id.and_then(|id| Some((id, names.get(&id)?)));
+            let counts = match entry {
+                Some((id, &(n, entry))) => {
+                    entry.kind == EntryKind::Dir
+                        || entry.nlink <= n
+                        || !used.path.as_deref().is_some_and(|path| outside(path, id))
+                }
+                None => used.path.as_deref().is_some_and(under),
+            };
+            if !counts {
+                continue;
+            }
+            found.push(DescriptorUser {
+                pid: process.pid,
+                way: used.way,
+                path: used
+                    .path
+                    .as_deref()
+                    .map(relative)
+                    .or_else(|| entry.map(|(_, (_, e))| e.rel.clone())),
+            });
+        }
+    }
+    Some(found)
+}
+
+/// Whether the path the descriptor scan reads for a use is the name the file was opened
+/// through: on Linux, `/proc/<pid>/fd/<n>` names the opened link. macOS names the link any
+/// process looked up last (`PROC_PIDFDVNODEPATHINFO`; on APFS a descriptor opened through
+/// `out/f` read `in/f` after a `stat` of `in/f`, and `out/f` again after one of `out/f`), so
+/// there a file with names outside the target counts however it was opened.
+const PATH_IS_OPENED_NAME: bool = cfg!(target_os = "linux");
+
+/// Whether `path` names the file `id` (`dev`, `ino`), not following a final symbolic link.
+#[cfg(unix)]
+fn names_file(path: &Path, id: (u64, u64)) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(path).is_ok_and(|meta| (meta.dev(), meta.ino()) == id)
+}
+
+/// Windows reads no descriptor scan (section 9.7), so no use is found to name a file.
+#[cfg(not(unix))]
+fn names_file(_path: &Path, _id: (u64, u64)) -> bool {
+    false
+}
+
+/// The FIFOs, sockets, and devices of a `reclaim_dir` target, worktree-relative (section 9.2);
+/// `None` without a walk.
+fn special<'a>(i: &Inspection<'a>) -> Option<Vec<&'a Path>> {
+    let walk = i.walk.ok()?;
+    if i.kind != PlanKind::ReclaimDir {
+        return Some(Vec::new());
+    }
+    Some(
+        walk.all()
+            .filter(|e| e.kind.is_special())
+            .map(|e| e.rel.as_path())
+            .collect(),
+    )
 }
 
 pub(super) fn check(
@@ -499,7 +699,8 @@ fn observed(i: &Inspection<'_>) -> Check {
     }
 }
 
-fn not_in_use(i: &Inspection<'_>) -> Check {
+/// `not_in_use`, with `users`, what [`descriptor_users`] found.
+fn not_in_use(i: &Inspection<'_>, users: Option<&[DescriptorUser]>) -> Check {
     let mut failed = Vec::new();
     let mut unknown = Vec::new();
     match &i.in_use.lock_held {
@@ -525,12 +726,40 @@ fn not_in_use(i: &Inspection<'_>) -> Check {
         Ok(_) => {}
         Err(err) => unknown.push(format!("processes: {err}")),
     }
+    match (&i.in_use.descriptors, users) {
+        (Some(Err(err)), _) => unknown.push(format!("descriptor scan: {err}")),
+        (Some(Ok(_)), None) => unknown.push("descriptor scan: the target was not walked".into()),
+        (Some(Ok(_)), Some(users)) if !users.is_empty() => {
+            let users: Vec<String> = users
+                .iter()
+                .map(|u| match &u.path {
+                    Some(path) => format!("{} ({}, {})", u.pid, way(u.way), path.display()),
+                    None => format!("{} ({})", u.pid, way(u.way)),
+                })
+                .collect();
+            failed.push(format!(
+                "the user's processes using the target: {}",
+                list(&users)
+            ));
+        }
+        (None, _) | (Some(Ok(_)), Some(_)) => {}
+    }
     if !failed.is_empty() {
         invariant("not_in_use", CheckResult::Fail, failed.join("; "))
     } else if !unknown.is_empty() {
         invariant("not_in_use", CheckResult::Unknown, unknown.join("; "))
     } else {
         pass("not_in_use")
+    }
+}
+
+/// How a process uses a file, for a check detail.
+fn way(way: Way) -> String {
+    match way {
+        Way::WorkingDirectory => "working directory".to_owned(),
+        Way::RootDirectory => "root directory".to_owned(),
+        Way::Executable => "executable".to_owned(),
+        Way::Descriptor(fd) => format!("descriptor {fd}"),
     }
 }
 
@@ -660,7 +889,42 @@ fn plain_target(i: &Inspection<'_>) -> Check {
             CheckResult::Unknown,
             format!("the mount cannot be read: {err}"),
         ),
-        (_, Mount::Same) => pass("plain_target"),
+        (_, Mount::Same) => match special(i) {
+            Some(found) if !found.is_empty() => invariant(
+                "plain_target",
+                CheckResult::Fail,
+                format!("FIFOs, sockets, or devices inside: {}", list(&found)),
+            ),
+            _ => pass("plain_target"),
+        },
+    }
+}
+
+/// The file systems whose users the descriptor scan sees: local ones (section 9.2).
+const LOCAL_VOLUMES: &[&str] = if cfg!(target_os = "macos") {
+    &["apfs", "hfs"]
+} else {
+    &["ext2/ext3/ext4", "xfs", "btrfs", "tmpfs"]
+};
+
+/// `local_volume`: the target's file system is a local one (section 9.2).
+fn local_volume(i: &Inspection<'_>) -> Check {
+    let walk = match i.walk {
+        Ok(walk) => walk,
+        Err(err) => return invariant("local_volume", CheckResult::Unknown, err.to_owned()),
+    };
+    match &walk.fs_type {
+        Ok(ty) if LOCAL_VOLUMES.contains(&ty.as_str()) => pass("local_volume"),
+        Ok(ty) => invariant(
+            "local_volume",
+            CheckResult::Fail,
+            format!("on a {ty} file system, whose users the descriptor scan cannot see"),
+        ),
+        Err(err) => invariant(
+            "local_volume",
+            CheckResult::Unknown,
+            format!("the file system type cannot be read: {err}"),
+        ),
     }
 }
 
@@ -781,5 +1045,190 @@ fn no_nested_repository(i: &Inspection<'_>) -> Check {
             CheckResult::Fail,
             format!("repositories inside: {}", list(&found)),
         )
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::os::unix::fs::MetadataExt as _;
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use super::{DataLists, InUseFacts, Inspection, evaluate};
+    use crate::contract::{CheckResult, InUse, PlanKind};
+    use crate::os::fds::{Process, Scan, Use, Way};
+
+    /// `not_in_use` and its facts for the target `t` of `wt` under `scan`.
+    fn not_in_use(wt: &Path, scan: Option<Result<Scan, String>>) -> crate::contract::Check {
+        not_in_use_with(wt, Vec::new(), scan)
+    }
+
+    /// [`not_in_use`] with `working`, the processes working in `wt`.
+    fn not_in_use_with(
+        wt: &Path,
+        working: Vec<u32>,
+        scan: Option<Result<Scan, String>>,
+    ) -> crate::contract::Check {
+        let target = wt.join("t");
+        let walk = super::super::walk(wt, &target).unwrap();
+        let in_use = InUseFacts {
+            lock_held: Ok(false),
+            reservations: Ok(InUse::default()),
+            processes: Ok(working),
+            descriptors: scan.map(|scan| scan.map(Arc::new)),
+        };
+        let checks = evaluate(&Inspection {
+            kind: PlanKind::ReclaimDir,
+            worktree: wt,
+            target: &target,
+            observation: Err("not observed"),
+            walk: Ok(&walk),
+            in_use: &in_use,
+            patterns: &DataLists::default(),
+            managed: &[],
+            squash_merged: false,
+        });
+        checks.into_iter().find(|c| c.name == "not_in_use").unwrap()
+    }
+
+    fn holding(pid: u32, way: Way, id: Option<(u64, u64)>, path: Option<&Path>) -> Scan {
+        Scan {
+            processes: vec![Process {
+                pid,
+                uses: vec![Use {
+                    way,
+                    id,
+                    path: path.map(Path::to_path_buf),
+                }],
+            }],
+            ..Scan::default()
+        }
+    }
+
+    /// A scan that is not complete leaves `not_in_use` unknown, never passing; the processes
+    /// the scan could not read do not count, and the first three are listed, the rest counted;
+    /// a use of an entry of the target, by `dev` and `ino` or by a path under it, fails the
+    /// check. A file with a name outside the target does not count on Linux when the use's
+    /// path is that name, and counts when the path is a name inside, cannot be read, or no
+    /// longer names the file, and on macOS, whose path is the link looked up last.
+    #[test]
+    fn the_descriptor_scan_decides_only_when_complete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = dunce::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir_all(wt.join("t")).unwrap();
+        std::fs::write(wt.join("outside"), b"x").unwrap();
+        std::fs::hard_link(wt.join("outside"), wt.join("t/linked")).unwrap();
+        std::fs::write(wt.join("t/own"), b"x").unwrap();
+        let id = |rel: &str| {
+            let meta = std::fs::symlink_metadata(wt.join(rel)).unwrap();
+            Some((meta.dev(), meta.ino()))
+        };
+
+        assert_eq!(not_in_use(&wt, None).result, CheckResult::Pass);
+        let incomplete = not_in_use(&wt, Some(Err("the process table does not list".into())));
+        assert_eq!(incomplete.result, CheckResult::Unknown, "{incomplete:#?}");
+        assert!(
+            incomplete.detail.contains("descriptor scan"),
+            "{incomplete:#?}"
+        );
+
+        let unscanned = Scan {
+            unscanned: (42..47)
+                .map(|pid| (pid, "PROC_PIDVNODEPATHINFO: EPERM".into()))
+                .collect(),
+            others: 3,
+            ..Scan::default()
+        };
+        let check = not_in_use(&wt, Some(Ok(unscanned)));
+        assert_eq!(check.result, CheckResult::Pass, "{check:#?}");
+        let fact = check
+            .facts
+            .iter()
+            .find(|f| f.name == "in_use.descriptors.unscanned")
+            .unwrap();
+        assert_eq!(fact.value[0]["pid"], 42, "{fact:#?}");
+        assert_eq!(
+            (fact.value.as_array().map(Vec::len), fact.omitted),
+            (Some(3), Some(2)),
+            "{fact:#?}"
+        );
+
+        let held = not_in_use(
+            &wt,
+            Some(Ok(holding(7, Way::Descriptor(3), id("t/own"), None))),
+        );
+        assert_eq!(held.result, CheckResult::Fail, "{held:#?}");
+        assert!(held.detail.contains("7 (descriptor 3, t/own)"), "{held:#?}");
+        let rooted = not_in_use(&wt, Some(Ok(holding(8, Way::RootDirectory, id("t"), None))));
+        assert!(
+            rooted.detail.contains("8 (root directory, t)"),
+            "{rooted:#?}"
+        );
+        let by_path = holding(9, Way::Executable, None, Some(&wt.join("t/new/bin")));
+        let by_path = not_in_use(&wt, Some(Ok(by_path)));
+        assert!(
+            by_path.detail.contains("9 (executable, t/new/bin)"),
+            "{by_path:#?}"
+        );
+
+        let linked = |path: Option<&Path>| {
+            not_in_use(
+                &wt,
+                Some(Ok(holding(10, Way::Descriptor(0), id("t/linked"), path))),
+            )
+            .result
+        };
+        let through_outside = if cfg!(target_os = "linux") {
+            CheckResult::Pass
+        } else {
+            CheckResult::Fail
+        };
+        assert_eq!(linked(Some(&wt.join("outside"))), through_outside);
+        for path in [Some(wt.join("t/linked")), None, Some(wt.join("removed"))] {
+            assert_eq!(linked(path.as_deref()), CheckResult::Fail, "{path:?}");
+        }
+        let elsewhere = holding(11, Way::WorkingDirectory, id("."), Some(&wt));
+        assert_eq!(
+            not_in_use(&wt, Some(Ok(elsewhere))).result,
+            CheckResult::Pass
+        );
+    }
+
+    /// Every process working in the worktree and every use of the target fails the check,
+    /// while each list's fact names the first three and counts the rest, as every plan of the
+    /// worktree repeats it.
+    #[test]
+    fn process_facts_name_three_and_count_the_rest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = dunce::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir_all(wt.join("t")).unwrap();
+        std::fs::write(wt.join("t/own"), b"x").unwrap();
+        let meta = std::fs::symlink_metadata(wt.join("t/own")).unwrap();
+        let holders = Scan {
+            processes: (20..25)
+                .map(|pid| Process {
+                    pid,
+                    uses: vec![Use {
+                        way: Way::Descriptor(3),
+                        id: Some((meta.dev(), meta.ino())),
+                        path: None,
+                    }],
+                })
+                .collect(),
+            ..Scan::default()
+        };
+        let check = not_in_use_with(&wt, (10..15).collect(), Some(Ok(holders)));
+        assert_eq!(check.result, CheckResult::Fail, "{check:#?}");
+        for pid in (10..15).chain(20..25) {
+            assert!(check.detail.contains(&pid.to_string()), "{pid}: {check:#?}");
+        }
+        for name in ["in_use.processes", "in_use.descriptors.users"] {
+            let fact = check.facts.iter().find(|f| f.name == name).unwrap();
+            assert_eq!(
+                (fact.value.as_array().map(Vec::len), fact.omitted),
+                (Some(3), Some(2)),
+                "{fact:#?}"
+            );
+        }
     }
 }
