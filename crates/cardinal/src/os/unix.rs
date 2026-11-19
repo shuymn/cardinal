@@ -2,8 +2,9 @@
 //! 5.5): the one implementation of these primitives in the product.
 //!
 //! - **Process groups:** [`lead_group`] and [`rejoin_group`] move this process; [`group_exists`]
-//!   (`kill(-pgid, 0)`; only `ESRCH` means empty), [`pgid_of`], [`group_members`], and
-//!   [`other_group_members`] read; [`signal_group`] signals a whole group.
+//!   (`kill(-pgid, 0)`; only `ESRCH` means empty), [`group_emptied`] (the same, waiting out a
+//!   group `kill` still reports once no live member is left), [`pgid_of`], [`group_members`],
+//!   and [`other_group_members`] read; [`signal_group`] signals a whole group.
 //! - **Children:** [`wait_unreaped`] reports a child's [`ChildState`] without reaping it, and
 //!   never takes a stopped child for an ended one (macOS reports a stop even to a wait for
 //!   exits alone); [`take_stop`] takes a stop report; [`reap`] reaps an ended child.
@@ -28,7 +29,7 @@ use std::os::unix::process::CommandExt as _;
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, WaitOptions};
 
@@ -101,6 +102,33 @@ pub fn group_exists(pgid: u32) -> bool {
         rustix::process::test_kill_process_group(pgid),
         Err(rustix::io::Errno::SRCH)
     )
+}
+
+/// How long the runner lets [`group_emptied`] ask `kill(-pgid, 0)` again while the process
+/// table lists no member of the group.
+pub const EMPTYING: Duration = Duration::from_secs(1);
+
+/// Whether group `pgid`, which this process has left, has no member left: [`group_exists`]
+/// answers, and only `ESRCH` means empty. macOS can answer that a group exists for a moment
+/// after its last member was reaped, while the process table already lists no member (up to
+/// 16 ms seen on a loaded host); so while the table lists no live member, `kill` is asked again
+/// until `until`, and once when `until` has passed. A group the table lists a live member of,
+/// one whose table cannot be read, and one `kill` still reports at `until` are not empty.
+#[must_use]
+pub fn group_emptied(pgid: u32, until: Instant) -> bool {
+    let mut delay = Duration::from_millis(1);
+    loop {
+        if !group_exists(pgid) {
+            return true;
+        }
+        let listed = other_group_members(pgid).map(|members| members.is_empty());
+        let now = Instant::now();
+        if listed.ok() != Some(true) || now >= until {
+            return false;
+        }
+        std::thread::sleep(delay.min(until - now));
+        delay = (delay * 2).min(Duration::from_millis(50));
+    }
 }
 
 /// The process group of `pid`, if the process exists.

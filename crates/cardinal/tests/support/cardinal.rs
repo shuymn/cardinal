@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use cardinal_test_support::{Command, Scope};
+use cardinal_test_support::{Command, Scope, bin_exe};
 
 /// A state and a config directory inside a scope of their own.
 pub struct Dirs {
@@ -40,9 +40,7 @@ impl Dirs {
     /// `cardinal` in the scope root, with `CARDINAL_STATE_DIR` and `CARDINAL_CONFIG_DIR` set
     /// to these directories.
     pub fn cmd(&self) -> Command {
-        let mut command = self
-            .scope
-            .command(env!("CARGO_BIN_EXE_cardinal"), self.scope.root());
+        let mut command = self.scope.command(bin_exe("cardinal"), self.scope.root());
         command
             .env("CARDINAL_STATE_DIR", &self.state)
             .env("CARDINAL_CONFIG_DIR", &self.config);

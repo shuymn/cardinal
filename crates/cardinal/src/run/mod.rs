@@ -767,14 +767,23 @@ impl Runner {
 
     /// Whether the job's group has no member left besides the runner. The runner first moves
     /// back into the caller's group, so that `kill(-pgid, 0)` sees only the stage's processes;
-    /// no other process can create a group with this ID while the runner is alive. When it
-    /// cannot move, it reads the process table instead. A group that cannot be read counts as
-    /// not empty.
+    /// no other process can create a group with this ID while the runner is alive. A group
+    /// `kill` still reports while the process table lists no live member is asked about again
+    /// for up to [`os::unix::EMPTYING`] ([`os::unix::group_emptied`]): macOS can report the
+    /// group of a child the runner has just reaped. Once the SIGKILL after the parent's exit is
+    /// due, it is asked once, so the SIGKILL keeps its time. When the runner cannot move, it
+    /// reads the process table instead. A group that cannot be read counts as not empty.
     #[cfg(unix)]
     fn group_is_empty(&self, job: &Job) -> bool {
         let GroupIdentity::Pgid { pgid, .. } = job.reservation().group;
         if self.executor.restore_group() {
-            !os::unix::group_exists(pgid)
+            let now = Instant::now();
+            let until = if self.watch.group_kill_due() {
+                now
+            } else {
+                now + os::unix::EMPTYING
+            };
+            os::unix::group_emptied(pgid, until)
         } else {
             os::unix::other_group_members(pgid).is_ok_and(|members| members.is_empty())
         }

@@ -1,8 +1,9 @@
 //! The bound on what a pass the timer started reads (`docs/architecture.md` sections 10.5 and
-//! 14.3): on a host with 200 worktrees and 210 items, every command the skill runs in such a
-//! pass prints at most [`PASS_OUTPUT`] bytes when it exits 0, and `act`, which exits 3 when it
-//! refuses, at most [`REFUSAL_OUTPUT`], while the whole inventory and the full assigned items,
-//! which a pass read before, are each larger than Claude Code shows inline.
+//! 14.3): on a host with 200 worktrees and a pass's worth of items of each kind, every command
+//! the skill runs in such a pass prints at most [`PASS_OUTPUT`] bytes when it exits 0, and
+//! `act`, which exits 3 when it refuses, at most [`REFUSAL_OUTPUT`], while the whole inventory
+//! and the full assigned items, which a pass read before, are each larger than Claude Code shows
+//! inline.
 //!
 //! Claude Code (2.1.322 and 2.1.325 here) shows a successful Bash command's output inline up to
 //! `bashOutputMaxChars`, 30,000 characters by default, and saves a longer one to a file the
@@ -23,7 +24,7 @@ use std::time::Duration;
 
 use cardinal::config::MAX_ITEMS;
 use cardinal::contract::{
-    ArbiterPass, Check, InboxBrief, InboxKind, InboxSubject, Plan, PlanKind, RecordKind,
+    ArbiterPass, BriefItem, Check, InboxBrief, InboxKind, InboxSubject, Plan, PlanKind, RecordKind,
     WorktreeView,
 };
 use cardinal::inbox::{self, NewItem};
@@ -159,10 +160,12 @@ const KINDS: [InboxKind; 7] = [
     InboxKind::OutlivedProcesses,
 ];
 
-/// How many items the host holds.
-const ITEMS: usize = 210;
+/// How many items the host holds: `max_items` of each kind, as many as a pass may take.
+/// Every command's output is bounded per pass, so more items of a kind would repeat the same
+/// passes, each reading the whole inbox again.
+const ITEMS: usize = KINDS.len() * MAX_ITEMS;
 
-/// Raises [`ITEMS`] items kind by kind, so each pass holds `max_items` of one kind's largest
+/// Raises [`ITEMS`] items kind by kind, so a pass may take `max_items` of one kind's largest
 /// evidence; returns their keys, oldest first.
 fn raise_items(state: &StateDir) -> Vec<String> {
     let mut keys = Vec::new();
@@ -190,10 +193,11 @@ fn raise_items(state: &StateDir) -> Vec<String> {
 /// holds exactly what a session reads, with `max_items` items at most.
 fn listing_host(max_items: usize) -> Dirs {
     let dirs = Dirs::new();
+    let cardinal = cardinal_test_support::bin_exe("cardinal");
     let host = format!(
         "[arbiter]\ncommand = {}\ntimeout_s = 60\nmin_interval_s = 0\nretry_s = 3600\nmax_items = {max_items}\n",
         serde_json::to_string(&[
-            env!("CARGO_BIN_EXE_cardinal"),
+            cardinal.to_str().expect("a UTF-8 path"),
             "inbox",
             "--assigned",
             "--brief"
@@ -245,11 +249,11 @@ fn list_in_passes(dirs: &Dirs, keys: &[String], max_items: usize) -> (Vec<usize>
     (taken, largest)
 }
 
-/// A19: 210 due items with the largest evidence each raiser writes go to passes of at most
-/// `max_items`, in the order they became due, the rest waiting for later passes, and `cardinal
-/// inbox --assigned --brief` lists each pass's items within [`PASS_OUTPUT`], as does `inbox
-/// resolve --brief` for each item, while `cardinal inbox --assigned` would print more than
-/// Claude Code shows.
+/// A19: `max_items` due items of each kind with the largest evidence its raiser writes go to
+/// passes of at most `max_items`, in the order they became due, the rest waiting for later
+/// passes, and `cardinal inbox --assigned --brief` lists each pass's items within
+/// [`PASS_OUTPUT`], as does `inbox resolve --brief` for each item, while `cardinal inbox
+/// --assigned` would print more than Claude Code shows.
 #[test]
 fn assigned_items_stay_within_the_bound() {
     let dirs = listing_host(MAX_ITEMS);
@@ -302,6 +306,49 @@ fn assigned_items_stay_within_the_bound() {
     }
 }
 
+/// Raises `outlived_processes` item `i` with three processes whose commands are
+/// `command_bytes` long; returns its key and its brief listing.
+fn raise_outlived(state: &StateDir, i: usize, command_bytes: usize) -> (String, BriefItem) {
+    let item = NewItem {
+        key: format!("outlived:0f0e0d0c-0b0a-0908-0706-{i:012}@1700000000000"),
+        kind: InboxKind::OutlivedProcesses,
+        subject: InboxSubject {
+            session_id: Some(format!("0f0e0d0c-0b0a-0908-0706-{i:012}")),
+            ..InboxSubject::default()
+        },
+        evidence: json!({
+            "session_id": format!("0f0e0d0c-0b0a-0908-0706-{i:012}"), "reason": "other",
+            "ended_ms": 1_700_000_000_000_u64,
+            "agent": {"pid": 99_999, "start_s": 1_700_000_000, "name": "claude"},
+            "processes": (0..3).map(|p| json!({
+                "pid": 10_000 + 3 * i + p, "start_s": 1_700_000_000, "name": "node",
+                "command": format!("node {} --watch", "x".repeat(command_bytes)),
+            })).collect::<Vec<_>>(),
+        })
+        .as_object()
+        .cloned()
+        .unwrap(),
+    };
+    inbox::raise(state, &item).unwrap();
+    let raised = inbox::read_all(state)
+        .unwrap()
+        .into_iter()
+        .find(|(_, raised)| raised.key == item.key)
+        .unwrap()
+        .1;
+    (item.key, inbox::brief(&raised))
+}
+
+/// The bytes of one brief listing of `items`.
+fn listing_bytes(items: Vec<BriefItem>) -> usize {
+    serde_json::to_string(&InboxBrief {
+        schema: cardinal::contract::InboxBriefSchema,
+        items,
+    })
+    .unwrap()
+    .len()
+}
+
 /// A19: with `max_items` 40, 40 `outlived_processes` items of three processes each, whose
 /// brief listing together would exceed [`PASS_OUTPUT`], go to passes that take as many as the
 /// listing holds, in order, the rest staying due for the next pass.
@@ -310,55 +357,29 @@ fn a_pass_takes_as_many_items_as_its_listing_holds() {
     const MANY: usize = 40;
     let dirs = listing_host(MANY);
     let state = StateDir::open(dirs.state()).unwrap();
-    let mut keys = Vec::new();
-    let mut whole = Vec::new();
-    for i in 0..MANY {
-        let item = NewItem {
-            key: format!("outlived:0f0e0d0c-0b0a-0908-0706-{i:012}@1700000000000"),
-            kind: InboxKind::OutlivedProcesses,
-            subject: InboxSubject {
-                session_id: Some(format!("0f0e0d0c-0b0a-0908-0706-{i:012}")),
-                ..InboxSubject::default()
-            },
-            evidence: json!({
-                "session_id": format!("0f0e0d0c-0b0a-0908-0706-{i:012}"), "reason": "other",
-                "ended_ms": 1_700_000_000_000_u64,
-                "agent": {"pid": 99_999, "start_s": 1_700_000_000, "name": "claude"},
-                "processes": (0..3).map(|p| json!({
-                    "pid": 10_000 + 3 * i + p, "start_s": 1_700_000_000, "name": "node",
-                    "command": format!("node {} --watch", "x".repeat(250)),
-                })).collect::<Vec<_>>(),
-            })
-            .as_object()
-            .cloned()
-            .unwrap(),
-        };
-        inbox::raise(&state, &item).unwrap();
-        let raised = inbox::read_all(&state)
-            .unwrap()
-            .into_iter()
-            .find(|(_, raised)| raised.key == item.key)
-            .unwrap()
-            .1;
-        whole.push(inbox::brief(&raised));
-        keys.push(item.key);
-    }
-    let all = serde_json::to_string(&InboxBrief {
-        schema: cardinal::contract::InboxBriefSchema,
-        items: whole,
-    })
-    .unwrap();
-    assert!(
-        all.len() > PASS_OUTPUT,
-        "{} bytes in one listing",
-        all.len()
-    );
+    let (keys, whole): (Vec<_>, Vec<_>) = (0..MANY).map(|i| raise_outlived(&state, i, 250)).unzip();
+    let all = listing_bytes(whole);
+    assert!(all > PASS_OUTPUT, "{all} bytes in one listing");
     let (taken, largest) = list_in_passes(&dirs, &keys, MANY);
     assert!(taken[0] < MANY, "{taken:?}");
     eprintln!(
-        "40 outlived items: {} bytes in one listing; items per pass: {taken:?}; largest {largest}",
-        all.len()
+        "40 outlived items: {all} bytes in one listing; items per pass: {taken:?}; largest {largest}"
     );
+}
+
+/// A19: with `max_items` 2, five compact items, whose brief listing together fits within
+/// [`PASS_OUTPUT`], go to passes of two, two, and one: `max_items`, not the listing, bounds
+/// these passes.
+#[test]
+fn a_pass_takes_at_most_max_items() {
+    const CAP: usize = 2;
+    let dirs = listing_host(CAP);
+    let state = StateDir::open(dirs.state()).unwrap();
+    let (keys, whole): (Vec<_>, Vec<_>) = (0..5).map(|i| raise_outlived(&state, i, 10)).unzip();
+    let all = listing_bytes(whole);
+    assert!(all <= PASS_OUTPUT, "{all} bytes in one listing");
+    let (taken, _) = list_in_passes(&dirs, &keys, CAP);
+    assert_eq!(taken, [2, 2, 1]);
 }
 
 /// A plan, the record of an `act`, and `cardinal explain plan` keep every entry of a list fact;

@@ -49,7 +49,7 @@ fn parent_exit_before_the_spawn_leaves_nothing() {
     assert_eq!(env.lines("counter"), Vec::<String>::new(), "never started");
     assert_eq!(env.reservations().len(), 1, "only the held reservation");
     assert_eq!(env.live_locks().len(), 1, "the runner's live lock is gone");
-    assert!(env.worktree_lock_free());
+    assert!(env.worktree_lock_freed());
     let finished = env.records_of(RecordKind::JobFinished);
     assert_eq!(finished.len(), 1);
     assert_eq!(finished[0].data["cancelled"], "parent_exited");
@@ -78,7 +78,7 @@ fn parent_exit_at_the_start_boundary_cancels() {
         assert_eq!(env.lines("counter"), Vec::<String>::new(), "{fail:?}");
         assert_eq!(env.reservations(), [], "{fail:?}");
         assert_eq!(env.live_locks(), Vec::<String>::new(), "{fail:?}");
-        assert!(env.worktree_lock_free());
+        assert!(env.worktree_lock_freed());
         let finished = env.records_of(RecordKind::JobFinished);
         assert_eq!(finished.len(), 1, "{fail:?}");
         assert_eq!(finished[0].data["cancelled"], "parent_exited", "{fail:?}");
@@ -150,7 +150,7 @@ fn parent_exit_after_the_spawn_stops_the_group() {
     wait_for("the group to empty", WAIT, || {
         (!cardinal::os::unix::group_exists(runner_pid)).then_some(())
     });
-    assert!(env.worktree_lock_free());
+    assert!(env.worktree_lock_freed());
     let finished = env.records_of(RecordKind::JobFinished);
     assert_eq!(finished.len(), 1, "recorded before SIGKILL");
     let views = list_reservations(&env.state(), &HostConfig::defaults()).unwrap();
@@ -158,6 +158,87 @@ fn parent_exit_after_the_spawn_stops_the_group() {
     assert_eq!(views[0].derived, DerivedState::Stale);
     let report = recovery_pass(&env.state(), &HostConfig::defaults()).unwrap();
     assert_eq!(report.released, [finished[0].job_id.clone().unwrap()]);
+    assert_eq!(env.reservations(), []);
+}
+
+/// The SIGKILL due 5 s after SIGTERM is not put off by the runner's second look at a group
+/// `kill(-pgid, 0)` still reports (section 5.5): the stage's direct child leaves the group and
+/// outlives SIGTERM, and the member it leaves behind ends by SIGTERM and is never reaped, so
+/// `kill` keeps reporting the group while the process table lists no live member, the case
+/// in which a release asks `kill` again for up to `EMPTYING`. Here the runner asks once:
+/// it records the job, leaves the reservation for recovery, and sends SIGKILL at 5 s.
+#[test]
+fn a_due_sigkill_is_not_put_off_by_a_group_kill_still_reports() {
+    use cardinal::exec::PARENT_EXIT_KILL_AFTER;
+    use cardinal::os::unix::{EMPTYING, group_exists, pgid_of};
+
+    deliverable(&[SIGTERM]);
+    let env = Env::with_budget(1);
+    let member_file = env.file("member");
+    let helper_file = env.file("helper");
+    let exe = std::env::current_exe().unwrap();
+    let helper: Vec<String> = std::iter::once(quoted(exe.as_os_str()))
+        .chain(
+            helper::args(&Mode::OwnGroup {
+                out: helper_file.clone(),
+            })
+            .iter()
+            .map(|arg| quoted(arg.as_ref())),
+        )
+        .collect();
+    let script = format!(
+        "sleep 30 & echo $! > '{}'; exec {} >/dev/null",
+        member_file.display(),
+        helper.join(" ")
+    );
+    let runner = env.run_at(None, &["sh", "-c", &script], &[RUN_AFTER_SPAWN], None);
+    let mut parent = env.in_shell(&runner, "; exit $?").spawn().unwrap();
+    let runner_pid = env.wait_any_reached(RUN_AFTER_SPAWN);
+    let _group = GroupGuard::new(env.scope(), runner_pid);
+    let runner_start = cardinal::os::start_time_s(runner_pid).unwrap();
+    let pid_in = |file: &std::path::Path, what: &str| -> u32 {
+        wait_for(what, WAIT, || {
+            std::fs::read_to_string(file).ok()?.trim().parse().ok()
+        })
+    };
+    let member = pid_in(&member_file, "the member PID");
+    let member_start = cardinal::os::start_time_s(member).unwrap();
+    let child = PidGuard::new(env.scope(), pid_in(&helper_file, "the child PID"));
+    assert_eq!(pgid_of(child.pid()), Some(child.pid()), "the child left");
+    assert_eq!(pgid_of(member), Some(runner_pid));
+
+    let killed_at = Instant::now();
+    parent.kill_leader();
+    env.points.release(RUN_AFTER_SPAWN);
+    wait_gone(runner_pid, runner_start);
+    let stopped_after = killed_at.elapsed();
+    assert!(
+        !cardinal::os::is_alive(member, member_start),
+        "the member ended by SIGTERM"
+    );
+    assert!(group_exists(runner_pid), "kill still reports its group");
+    assert!(
+        stopped_after >= Duration::from_secs(4),
+        "SIGKILL comes 5 s after SIGTERM: {stopped_after:?}"
+    );
+    assert!(
+        stopped_after < PARENT_EXIT_KILL_AFTER + EMPTYING,
+        "the group was asked once, not for another {EMPTYING:?}: {stopped_after:?}"
+    );
+    let infra = env.records_of(RecordKind::JobInfraFailure);
+    assert_eq!(
+        infra[0].data["reason"],
+        "the command did not stop within 5 s of SIGTERM"
+    );
+    assert_eq!(env.reservations().len(), 1, "left for recovery");
+
+    // Once the child is gone, nothing holds the member unreaped and the group empties.
+    child.kill();
+    wait_for("the group to empty", WAIT, || {
+        (!group_exists(runner_pid)).then_some(())
+    });
+    let report = recovery_pass(&env.state(), &HostConfig::defaults()).unwrap();
+    assert_eq!(report.released.len(), 1);
     assert_eq!(env.reservations(), []);
 }
 
@@ -197,7 +278,7 @@ fn parent_exit_after_the_child_exited_stops_its_descendants() {
     );
     wait_gone(runner_pid, runner_start);
     assert_eq!(env.reservations(), [], "released: the group is empty");
-    assert!(env.worktree_lock_free());
+    assert!(env.worktree_lock_freed());
     let finished = env.records_of(RecordKind::JobFinished);
     assert_eq!(finished[0].data["exit"], 0);
 }
@@ -414,7 +495,7 @@ impl StoppedJob {
             || (!cardinal::os::is_alive(self.stage, self.stage_start)).then_some(()),
         );
         wait_gone(self.runner, self.runner_start);
-        assert!(env.worktree_lock_free(), "{path}");
+        assert!(env.worktree_lock_freed(), "{path}");
         let finished = env.records_of(RecordKind::JobFinished);
         assert_eq!(finished[0].data["signal"], 15, "{path}: SIGTERM");
     }

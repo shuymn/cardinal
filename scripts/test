@@ -444,7 +444,10 @@ host=$(rustc -vV | sed -n 's/^host: //p')
 runner_var=CARGO_TARGET_$(printf '%s' "$host" | tr 'a-z-' 'A-Z_')_RUNNER
 
 # run_archive <archive> <workspace> [nextest args...]: the archived tests in the constructed
-# environment, each test process confined. Returns nextest's status.
+# environment, each test process confined. `nextest list` extracts the archive; each binary
+# under test then starts once (`--version`), so its first start, which macOS checks for seconds
+# on a loaded host (XProtect, docs/architecture.md section 13.3), is behind every test; the
+# tests run from the extracted tree. Returns nextest's status.
 run_archive() {
   local archive=$1 workspace=$2
   shift 2
@@ -477,9 +480,19 @@ run_archive() {
   [ -z "$image" ] || env+=(CARDINAL_TEST_IMAGE="$image")
   [ -z "$volume" ] || env+=(CARDINAL_TEST_TMPFS="$volume")
   [ -z "$runner" ] || env+=("$runner_var=$runner")
-  (clean_exec '' "${env[@]}" cargo-nextest nextest run --archive-file "$archive" \
-    --workspace-remap "$workspace" --extract-to "$extract" \
-    --config-file "$root/.config/nextest.toml" "$@")
+  local nextest=(clean_exec '' "${env[@]}" cargo-nextest nextest)
+  ("${nextest[@]}" list --archive-file "$archive" --workspace-remap "$workspace" \
+    --extract-to "$extract" --config-file "$root/.config/nextest.toml" >/dev/null) || return
+  local meta=$extract/target/nextest bin
+  for bin in $(awk '/"kind": "bin-exe"/ { found = 1; next }
+      found && /"path":/ { sub(/^[^:]*: *"/, ""); sub(/",?[ \t\r]*$/, ""); print; found = 0 }' \
+    "$meta/binaries-metadata.json"); do
+    # shellcheck disable=SC2086 # the runner is split at spaces, as nextest splits it
+    (clean_exec '' "${env[@]}" $runner "$extract/target/$bin" --version) >/dev/null 2>&1 || true
+  done
+  ("${nextest[@]}" run --binaries-metadata "$meta/binaries-metadata.json" \
+    --cargo-metadata "$meta/cargo-metadata.json" --target-dir-remap "$extract/target" \
+    --workspace-remap "$workspace" --config-file "$root/.config/nextest.toml" "$@")
 }
 
 # --- Self-check ----------------------------------------------------------------------------

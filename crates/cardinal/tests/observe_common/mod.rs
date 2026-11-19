@@ -18,8 +18,8 @@ use cardinal::contract::{Error, Inventory, Worktree};
 use cardinal::observe::{InventoryOptions, Observer, WorktreeObservation};
 use cardinal::state::StateDir;
 
-use cardinal_test_support::Command;
 use cardinal_test_support::fixture::Fixture;
+use cardinal_test_support::{Command, bin_exe};
 
 pub const GITHUB: &str = "acme/app";
 
@@ -326,7 +326,7 @@ exit "$code"
     /// [`Scene::cardinal`] started in `dir`, which must be inside the fixture.
     pub fn cardinal_in(&self, dir: &Path) -> Command {
         self.config();
-        let mut command = self.fx.command(env!("CARGO_BIN_EXE_cardinal"), dir);
+        let mut command = self.fx.command(bin_exe("cardinal"), dir);
         for (name, value) in self.isolation() {
             command.env(name, value);
         }

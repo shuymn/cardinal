@@ -203,6 +203,10 @@ fn a_starting_reservation_left_by_a_killed_runner_still_counts() {
     env.points.release(RUN_SPAWNED);
     env.points.wait_reached(RUN_AFTER_SPAWN, runner.id(), WAIT);
     runner.kill_leader();
+    assert!(
+        env.live_lock_freed(&job),
+        "the killed runner's live lock is let go"
+    );
     drop(held);
     assert_eq!(file(&env, &job).as_deref(), Some(before.as_str()));
 
