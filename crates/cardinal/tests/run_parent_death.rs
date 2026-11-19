@@ -544,11 +544,20 @@ impl StoppedJob {
     /// Waits for the runner to end the stage by SIGTERM within the bound and to exit, and
     /// checks that the in-use lock is free.
     fn wait_cancelled(&self, env: &Env, path: &str) {
-        wait_for(
-            &format!("{path}: the stopped stage to end"),
-            Duration::from_secs(6),
-            || (!cardinal::os::is_alive(self.stage, self.stage_start)).then_some(()),
-        );
+        let bound = Duration::from_secs(6);
+        let start = Instant::now();
+        while cardinal::os::is_alive(self.stage, self.stage_start) {
+            assert!(
+                start.elapsed() < bound,
+                "{path}: the stopped stage did not end within {bound:?}; {}; records {:?}",
+                self.layout(),
+                env.records()
+                    .iter()
+                    .map(|r| (&r.kind, &r.data))
+                    .collect::<Vec<_>>()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         wait_gone(self.runner, self.runner_start);
         assert!(env.worktree_lock_freed(), "{path}");
         let finished = env.records_of(RecordKind::JobFinished);
