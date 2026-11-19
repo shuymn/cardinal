@@ -18,7 +18,7 @@ use std::path::Path;
 
 use rustix::thread::{LinkNameSpaceType, UnshareFlags};
 
-use super::{Child, Command, Scope, Slot, lock};
+use super::{Child, Command, Scope, Slot, lock, resolve};
 
 impl Scope {
     /// Makes `command` start its child in a user and mount namespace of its own, with each
@@ -78,6 +78,28 @@ impl Scope {
                 "the bind mount process: {status}"
             )))
         }
+    }
+
+    /// Makes `command` start its child in a user namespace of its own with its root directory
+    /// changed to `root`, a directory inside the scope's root, right before the program runs.
+    /// The working directory stays where it was, so a relative program path resolves from it,
+    /// outside `root`, while the program's interpreter and libraries resolve inside `root`. The
+    /// child fails to start if the host forbids the namespace. The child gets the absolute path
+    /// `root` resolves to here, the one checked, never a spelling it would resolve again from
+    /// its own working directory.
+    pub fn chroot(&self, command: &mut Command, root: &Path) {
+        let root = resolve(&std::path::absolute(root).expect("an absolute root directory"));
+        self.assert_inside(&root, "root directory");
+        let root = CString::new(root.as_os_str().as_bytes()).expect("a path without NUL");
+        let enter = move || {
+            // SAFETY: as in `mount_namespace`: this child has only one thread.
+            unsafe { rustix::thread::unshare_unsafe(UnshareFlags::NEWUSER) }?;
+            rustix::process::chroot(root.as_c_str())?;
+            Ok(())
+        };
+        // SAFETY: as in `mount_namespace`: system calls on a path made before the fork, no
+        // allocation, no lock.
+        unsafe { command.inner.pre_exec(enter) };
     }
 
     /// `binds` as C strings, each path checked to resolve inside the root.
