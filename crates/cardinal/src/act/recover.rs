@@ -15,8 +15,11 @@
 //! the descriptor scan finds no process using the trash entry: a hold that a cleanup removed is
 //! made again, each entry in the hold is put back through `t` by its manifest path, walking as
 //! the deletion walks, `t` is deleted as live deletion deletes it, and the result is written. A
-//! `claimed` claim is restored by the unit that executes (X1c); recovery here leaves it as it
-//! is.
+//! `claimed` claim is undone: `t` holding the claimed inode is restored into the parent the
+//! claim's chain resolves to ([`restore`], which a live execution's restore is too), and a
+//! trash entry with nothing of the target is removed; the result is `rejected` (`interrupted`).
+//! Whatever recovery leaves in the trash, and a claim it cannot read, raises
+//! `reclaim_stranded` (section 10.1).
 
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
@@ -28,12 +31,16 @@ use super::delete::{self, Deletion, Fate, Guard as _, Watch};
 use crate::config::Config;
 use crate::contract::{
     ActClaim, ActManifest, ActManifestSchema, ActResult, ActResultSchema, ActStatus, Caller, Check,
-    CheckResult, CheckRole, ClaimStage, EntryType, ManifestEntry,
+    CheckResult, CheckRole, ClaimStage, EntryType, InboxKind, InboxSubject, ManifestEntry,
 };
+use crate::inbox::{self, NewItem};
 use crate::observe::Measure;
-use crate::os::dir;
+use crate::os::dir::{self, Kind};
 use crate::state::{self, Op, StateDir};
 use crate::testpoint;
+
+/// The reason of a `claimed` execution that recovery undid (section 9.7).
+pub const INTERRUPTED: &str = "interrupted";
 
 /// A held `executions/<plan>/act.lock`: dropping it releases the lock.
 #[derive(Debug)]
@@ -141,12 +148,17 @@ pub fn read_manifest(state: &StateDir, plan: &str) -> Result<Vec<ManifestEntry>,
 }
 
 /// Writes `claim` under a temporary name and syncs it, through the reserve's retry: the first
-/// half of its publication, which [`state::Staged::publish`] completes.
+/// half of its publication, which [`state::Staged::publish`] completes. A test's fake fails
+/// the write of a `claimed` stage as `claim` and of `committed` as `commit` (section 13.7).
 pub fn stage_claim(state: &StateDir, claim: &ActClaim) -> io::Result<state::Staged> {
     let bytes = serde_json::to_vec(claim).map_err(io::Error::other)?;
     let target = state.execution_claim(&claim.plan_id);
+    let kind = match claim.stage {
+        ClaimStage::Claimed => "claim",
+        ClaimStage::Committed => "commit",
+    };
     state::retry_with_reserve(&state.reserve_file(), || {
-        testpoint::fake_write("claim")?;
+        testpoint::fake_write(kind)?;
         state::Staged::write(&state.tmp_dir(), &target, &bytes)
     })
 }
@@ -167,22 +179,28 @@ pub enum Published {
 pub fn publish_claim(state: &StateDir, claim: &ActClaim) -> io::Result<Published> {
     let mut staged = stage_claim(state, claim)?;
     testpoint::hit(testpoint::ACT_PUBLISHING).map_err(io::Error::other)?;
-    publish_staged(state, &claim.plan_id, &mut staged)
+    publish_staged(state, &claim.plan_id, &mut staged, None)
 }
 
 /// Renames `staged`, a claim of `plan` that [`stage_claim`] wrote, into place through the
-/// reserve's retry (section 9.7, "Space"), and syncs the execution directory. An error means
-/// the rename failed and the claim was not published; the temporary file goes with `staged`.
+/// reserve's retry (section 9.7, "Space"), pauses at `point` when one is given, whose injected
+/// failure stands for a failed sync, and syncs the execution directory. An error means the
+/// rename failed and the claim was not published; the temporary file goes with `staged`.
 pub fn publish_staged(
     state: &StateDir,
     plan: &str,
     staged: &mut state::Staged,
+    point: Option<&'static str>,
 ) -> io::Result<Published> {
     state::retry_with_reserve(&state.reserve_file(), || {
         testpoint::fake_write("claim_rename")?;
         staged.publish()
     })?;
-    let synced = testpoint::fake_write("claim_sync")
+    let paused = point.map_or(Ok(()), |point| {
+        testpoint::hit(point).map_err(io::Error::other)
+    });
+    let synced = paused
+        .and_then(|()| testpoint::fake_write("claim_sync"))
         .and_then(|()| state::sync_dir(&state.execution_dir(plan)));
     Ok(match synced {
         Ok(()) => Published::Durable,
@@ -277,31 +295,44 @@ pub enum Recovered {
         error: String,
         trash: Option<PathBuf>,
     },
-    /// A `claimed` claim, which the unit that executes restores; nothing is touched.
-    Claimed,
-    /// A `committed` execution whose data stays in the trash for now: why, and the trash
-    /// entry. Nothing was deleted when the grant, the gate, the configuration, or the scan
-    /// stopped it first; a deletion that stopped kept what it had not taken. A later recovery
-    /// goes on.
+    /// An execution whose data stays in the trash for now: why, and the trash entry. Under a
+    /// `claimed` claim, `t` could not go back (its parent moved, its name taken, or it holds
+    /// another inode) or the entry holds what the claim does not account for; under a
+    /// `committed` one, nothing was deleted when the grant, the gate, the configuration, or
+    /// the scan stopped it first, and a deletion that stopped kept what it had not taken. A
+    /// later recovery goes on.
     Stranded { why: String, trash: PathBuf },
-    /// A `committed` execution finished: its result, written.
+    /// The execution was finished: its result, written. A `committed` one reports `executed`
+    /// or `partial`, a `claimed` one, undone, `rejected` (`interrupted`).
     Done(Box<ActResult>),
 }
 
-/// Recovers `plan`'s execution as section 9.7's table says for absent, unreadable, and
-/// `committed` claims, loading the configuration from `config_dir`.
+/// Recovers `plan`'s execution as section 9.7's table says, loading the configuration from
+/// `config_dir`, and raises `reclaim_stranded` for what it leaves in the trash.
 pub fn recover(
     state: &StateDir,
     config_dir: &Path,
     plan: &str,
     grant: Grant<'_>,
 ) -> io::Result<Recovered> {
-    let _lock = match lock_execution(state, plan)? {
+    let lock = match lock_execution(state, plan)? {
         Locked::Held(lock) => lock,
         Locked::InProgress => return Ok(Recovered::InProgress),
         Locked::NotFound => return Ok(Recovered::NotFound),
     };
     testpoint::hit(testpoint::RECOVER_LOCKED).map_err(io::Error::other)?;
+    recover_held(state, config_dir, plan, grant, &lock)
+}
+
+/// [`recover`] by the holder of `plan`'s `act.lock`: an `act` recovers its own plan's claim
+/// before it starts another execution (section 9.7, step 1).
+pub fn recover_held(
+    state: &StateDir,
+    config_dir: &Path,
+    plan: &str,
+    grant: Grant<'_>,
+    _lock: &ExecutionLock,
+) -> io::Result<Recovered> {
     // A result renamed into place whose directory's sync failed is made durable before it
     // counts.
     if read_result(state, plan)?.is_some() {
@@ -313,20 +344,328 @@ pub fn recover(
         ClaimRead::Unreadable(error) => {
             let entry = state.trash_entry(plan);
             let trash = std::fs::symlink_metadata(&entry).is_ok().then_some(entry);
+            let mut evidence = serde_json::Map::new();
+            evidence.insert(
+                "execution".into(),
+                state.execution_dir(plan).display().to_string().into(),
+            );
+            evidence.insert(
+                "trash".into(),
+                trash.as_ref().map(|t| t.display().to_string()).into(),
+            );
+            evidence.insert(
+                "reason".into(),
+                format!("the claim cannot be read: {error}").into(),
+            );
+            raise_stranded(state, plan, None, evidence);
             return Ok(Recovered::Unreadable { error, trash });
         }
         ClaimRead::Read(claim) => claim,
     };
     let entry = state.trash_entry(plan);
-    if let Err(err) = make_found_durable(state, &claim) {
-        return Ok(Recovered::Stranded {
+    let recovered = match make_found_durable(state, &claim) {
+        Err(err) => Recovered::Stranded {
             why: format!("what recovery found is not durable: {err}"),
             trash: entry,
-        });
+        },
+        Ok(()) => match claim.stage {
+            ClaimStage::Claimed => claimed(state, &claim)?,
+            ClaimStage::Committed => committed(state, config_dir, &claim, grant)?,
+        },
+    };
+    match &recovered {
+        Recovered::Stranded { why, trash } => stranded(state, &claim, trash, why, &[]),
+        Recovered::Done(result) => {
+            if let Some(trash) = &result.trash {
+                stranded(
+                    state,
+                    &claim,
+                    Path::new(trash),
+                    "entries kept",
+                    &result.skipped_changed,
+                );
+            }
+        }
+        _ => {}
     }
-    match claim.stage {
-        ClaimStage::Claimed => Ok(Recovered::Claimed),
-        ClaimStage::Committed => committed(state, config_dir, &claim, grant),
+    Ok(recovered)
+}
+
+/// Raises `reclaim_stranded` for `claim`'s execution, which leaves data in the trash entry
+/// `trash` for `why`, with the entries it kept (section 10.1).
+pub fn stranded(state: &StateDir, claim: &ActClaim, trash: &Path, why: &str, kept: &[String]) {
+    let mut evidence = serde_json::Map::new();
+    let target = Path::new(&claim.worktree.path).join(target_rel(claim));
+    evidence.insert("target".into(), target.display().to_string().into());
+    evidence.insert("trash".into(), trash.display().to_string().into());
+    let (entries, bytes) = left(trash);
+    evidence.insert("entries_left".into(), entries.into());
+    evidence.insert("bytes_left".into(), bytes.into());
+    evidence.insert(
+        "kept".into(),
+        kept.iter()
+            .take(STRANDED_ENTRIES)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into(),
+    );
+    evidence.insert("reason".into(), why.into());
+    raise_stranded(state, &claim.plan_id, Some(&claim.worktree.path), evidence);
+}
+
+/// How many entries of [`stranded`]'s kept list an item names.
+const STRANDED_ENTRIES: usize = 20;
+
+/// Raises the `reclaim_stranded:<plan>` occurrence with `evidence`. Best effort: an inbox that
+/// cannot be written keeps the trash entry as it is, and a later recovery raises it again.
+fn raise_stranded(
+    state: &StateDir,
+    plan: &str,
+    worktree: Option<&str>,
+    evidence: serde_json::Map<String, serde_json::Value>,
+) {
+    let item = NewItem {
+        key: format!("reclaim_stranded:{plan}"),
+        kind: InboxKind::ReclaimStranded,
+        subject: InboxSubject {
+            worktree: worktree.map(str::to_owned),
+            ..InboxSubject::default()
+        },
+        evidence,
+    };
+    let _ = inbox::raise_occurrence(state, &item, state::now_ms());
+}
+
+/// The entries below `trash` and the bytes they allocate, read without following links; what
+/// cannot be read is left out.
+fn left(trash: &Path) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    let mut entries = 0;
+    let mut bytes = 0;
+    let mut dirs = vec![trash.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        let Ok(listed) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in listed.flatten() {
+            let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+                continue;
+            };
+            entries += 1;
+            bytes += meta.blocks() * 512;
+            if meta.is_dir() {
+                dirs.push(entry.path());
+            }
+        }
+    }
+    (entries, bytes)
+}
+
+/// How a restore ([`restore`]) ended when it did not finish.
+#[derive(Debug)]
+pub enum RestoreError {
+    /// `t` stays in the trash: the name was taken meanwhile, the rename failed, or it failed
+    /// for lack of space after the reserve's retry.
+    Stayed(io::Error),
+    /// `t` went back, and a sync or the removal of the trash entry after the rename failed:
+    /// the restore is left to recovery, which makes durable what it finds before it decides.
+    NotDurable(io::Error),
+}
+
+impl std::fmt::Display for RestoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Stayed(err) => write!(f, "the target stays in the trash: {err}"),
+            Self::NotDurable(err) => write!(f, "the restore is not durable: {err}"),
+        }
+    }
+}
+
+/// Restores `plan`'s target (section 9.7, "Restore"): renames the trash entry's `t` back as
+/// `name` into `parent`, without replacing, wherever `parent` now is, so a rollback stays
+/// bound to the original parent, through the reserve's retry; pauses at `act.restored`; syncs
+/// both directories; and removes the empty hold and the trash entry, syncing `<state>/trash/`.
+pub fn restore(
+    state: &StateDir,
+    plan: &str,
+    parent: &File,
+    name: &OsStr,
+) -> Result<(), RestoreError> {
+    let entry_path = state.trash_entry(plan);
+    let entry = match dir::open(&entry_path) {
+        Ok(Some(entry)) => entry,
+        Ok(None) => {
+            return Err(RestoreError::Stayed(io::Error::other(
+                "the trash entry is not a directory",
+            )));
+        }
+        Err(err) => return Err(RestoreError::Stayed(err)),
+    };
+    let to = || dir::current_path(parent).unwrap_or_default().join(name);
+    state::retry_with_reserve(&state.reserve_file(), || {
+        testpoint::fake_write("restore")?;
+        let renamed = dir::rename_noreplace(&entry, OsStr::new("t"), parent, name);
+        state::logged(Op::Rename, &entry_path.join("t"), Some(&to()), renamed)
+    })
+    .map_err(RestoreError::Stayed)?;
+    let durable = (|| {
+        testpoint::hit(testpoint::ACT_RESTORED).map_err(io::Error::other)?;
+        let parent_path = dir::current_path(parent).unwrap_or_default();
+        state::logged(Op::Sync, &parent_path, None, parent.sync_all())?;
+        state::logged(Op::Sync, &entry_path, None, entry.sync_all())?;
+        remove_empty_entry(state, plan)
+    })();
+    durable.map_err(RestoreError::NotDurable)
+}
+
+/// Removes `plan`'s trash entry when it holds nothing but an empty hold, and syncs
+/// `<state>/trash/`. A missing entry or hold is fine; one that holds anything else is an error,
+/// and the entry stays.
+pub fn remove_empty_entry(state: &StateDir, plan: &str) -> io::Result<()> {
+    let entry = state.trash_entry(plan);
+    for path in [entry.join("h"), entry.clone()] {
+        match state::logged(Op::Rmdir, &path, None, std::fs::remove_dir(&path)) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+    }
+    state::sync_dir(&state.trash_dir())
+}
+
+/// Recovers a `claimed` execution (section 9.7's three `claimed` rows): `t` holding the
+/// claimed inode goes back into the parent the chain resolves to, and a trash entry that holds
+/// nothing of the target is removed when the target's name in that parent holds the claimed
+/// inode, each ending `rejected` (`interrupted`); otherwise nothing is touched.
+fn claimed(state: &StateDir, claim: &ActClaim) -> io::Result<Recovered> {
+    let plan = &claim.plan_id;
+    let entry = state.trash_entry(plan);
+    let stranded = |why: String| {
+        Ok(Recovered::Stranded {
+            why,
+            trash: entry.clone(),
+        })
+    };
+    let mut names = Vec::new();
+    match std::fs::read_dir(&entry) {
+        Ok(listed) => {
+            for name in listed {
+                names.push(name?.file_name());
+            }
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+    if names.iter().any(|name| name != "t" && name != "h") {
+        return stranded("the trash entry holds what the claim does not account for".into());
+    }
+    match std::fs::read_dir(entry.join("h")) {
+        Ok(mut listed) => {
+            if listed.next().is_some() {
+                return stranded("the hold holds what the claim does not account for".into());
+            }
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+    if !names.iter().any(|name| name == "t") {
+        // Nothing of the target was moved, or a restore renamed it back, when its name holds
+        // the claimed inode: only the empty entry is left. Otherwise the target left `t` for
+        // somewhere recovery cannot vouch for, and the entry stays as the evidence.
+        if let Some(why) = not_at_its_name(claim)? {
+            return stranded(why);
+        }
+        if let Err(err) = remove_empty_entry(state, plan) {
+            return stranded(format!("the trash entry cannot be removed: {err}"));
+        }
+        return Ok(interrupted(state, claim));
+    }
+    let t = dir::stat_at(&File::open(&entry)?, OsStr::new("t"))?;
+    let kind = match t.kind {
+        Kind::Dir => Some(EntryType::Dir),
+        Kind::File => Some(EntryType::File),
+        Kind::Symlink => Some(EntryType::Symlink),
+        _ => None,
+    };
+    if (Some(claim.target.kind), t.dev, t.ino) != (kind, claim.target.dev, claim.target.ino) {
+        return stranded("t holds another inode than the claimed target".into());
+    }
+    let target = Path::new(&claim.worktree.path).join(target_rel(claim));
+    let Some(parent) = resolve_parent(claim)? else {
+        return stranded(format!(
+            "the target's parent no longer resolves to {}; the target stays at {}",
+            target.parent().unwrap_or(&target).display(),
+            entry.join("t").display()
+        ));
+    };
+    match restore(state, plan, &parent, OsStr::new(&claim.target.name)) {
+        Ok(()) => Ok(interrupted(state, claim)),
+        Err(err) => stranded(format!(
+            "{} cannot go back to {}: {err}",
+            entry.join("t").display(),
+            target.display()
+        )),
+    }
+}
+
+/// Why the target's name, in the parent the claim's chain resolves to, does not hold the
+/// claimed inode with its kind; `None` when it does.
+fn not_at_its_name(claim: &ActClaim) -> io::Result<Option<String>> {
+    let target = Path::new(&claim.worktree.path).join(target_rel(claim));
+    let Some(parent) = resolve_parent(claim)? else {
+        return Ok(Some(format!(
+            "no t, and the target's parent no longer resolves to {}",
+            target.parent().unwrap_or(&target).display()
+        )));
+    };
+    let found = match dir::stat_at(&parent, OsStr::new(&claim.target.name)) {
+        Ok(st) => st,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return Ok(Some(format!(
+                "no t, and nothing at {}: the claimed target is elsewhere",
+                target.display()
+            )));
+        }
+        Err(err) => return Err(err),
+    };
+    let kind = match found.kind {
+        Kind::Dir => Some(EntryType::Dir),
+        Kind::File => Some(EntryType::File),
+        Kind::Symlink => Some(EntryType::Symlink),
+        _ => None,
+    };
+    Ok(((Some(claim.target.kind), found.dev, found.ino)
+        != (kind, claim.target.dev, claim.target.ino))
+        .then(|| {
+            format!(
+                "no t, and {} holds another inode than the claimed target",
+                target.display()
+            )
+        }))
+}
+
+/// Writes the result of a `claimed` execution recovery undid: `rejected` (`interrupted`).
+fn interrupted(state: &StateDir, claim: &ActClaim) -> Recovered {
+    let result = ActResult {
+        schema: ActResultSchema,
+        plan_id: claim.plan_id.clone(),
+        caller: claim.caller.clone(),
+        status: ActStatus::Rejected,
+        reasons: vec![INTERRUPTED.to_owned()],
+        checks: Vec::new(),
+        freed_bytes: None,
+        skipped_changed: Vec::new(),
+        trash: None,
+        recovered: true,
+        error: None,
+        finished_ms: state::now_ms(),
+    };
+    match write_result(state, &result) {
+        Ok(()) => Recovered::Done(Box::new(result)),
+        Err(err) => Recovered::Stranded {
+            why: format!("the result: {err}"),
+            trash: state.trash_entry(&claim.plan_id),
+        },
     }
 }
 
@@ -366,7 +705,7 @@ fn make_found_durable(state: &StateDir, claim: &ActClaim) -> io::Result<()> {
 /// claimed identity, without following a symbolic link; `None` when the chain does not
 /// resolve: a name missing, not a directory, or not the one claimed. A read that fails
 /// otherwise is an error (section 9.7, "Reads that fail").
-fn resolve_parent(claim: &ActClaim) -> io::Result<Option<File>> {
+pub fn resolve_parent(claim: &ActClaim) -> io::Result<Option<File>> {
     let opened = |opened: io::Result<Option<File>>| match opened {
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
         other => other,
@@ -392,7 +731,8 @@ fn resolve_parent(claim: &ActClaim) -> io::Result<Option<File>> {
 }
 
 /// The target's path relative to its worktree: the chain's names and the target's.
-fn target_rel(claim: &ActClaim) -> PathBuf {
+#[must_use]
+pub fn target_rel(claim: &ActClaim) -> PathBuf {
     claim
         .chain
         .iter()

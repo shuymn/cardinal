@@ -49,6 +49,9 @@ pub const BATCH: Duration = Duration::from_secs(2);
 /// The name of the target in its trash entry.
 const T: &str = "t";
 
+/// How a guard's stop begins when it found a process using the trash entry.
+pub const IN_USE: &str = "in use: ";
+
 /// What the deletion's checks read beyond the manifest.
 pub trait Guard {
     /// Runs before each batch: scans the trash entry and loads the configuration again when
@@ -844,7 +847,7 @@ impl Guard for Watch {
         if users.is_empty() {
             Ok(())
         } else {
-            Err(format!("in use: {}", users.join(", ")))
+            Err(format!("{IN_USE}{}", users.join(", ")))
         }
     }
 

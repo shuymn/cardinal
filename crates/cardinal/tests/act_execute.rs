@@ -1,7 +1,7 @@
-//! Unit X's execution tests (`docs/architecture.md` section 13.7) as far as unit X1a reaches:
-//! each refusal before the move, alone, beside a control on which every check passes and
-//! `act` reports `dry_run`, and the plan's and the dry run's readings of the freed bytes.
-//! Nothing executes: a plan whose checks pass reports `execution_not_designed`.
+//! Unit X's execution tests (`docs/architecture.md` section 13.7): each refusal before the
+//! move, alone, beside a control on which every check passes and the arbiter's `act`, which
+//! holds no grant, reports `dry_run` with `execution_not_granted`, and the plan's and the dry
+//! run's readings of the freed bytes.
 
 #![cfg(unix)]
 
@@ -57,7 +57,7 @@ fn assert_passes(s: &Setup, target: &Path, fakes: Option<&Path>) -> (Plan, ActRe
     assert!(plan.invariants_ok, "{:#?}", plan.checks);
     let result = act(s, &plan, fakes);
     assert_eq!(result.status, ActStatus::DryRun, "{result:#?}");
-    assert_eq!(result.reasons, ["execution_not_designed"], "{result:#?}");
+    assert_eq!(result.reasons, ["execution_not_granted"], "{result:#?}");
     (plan, result)
 }
 

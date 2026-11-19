@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 pub use crate::os::child::{ChildError, Output};
 
 use crate::admission;
-use crate::config::{Config, DataList, Selection};
+use crate::config::{Config, DataList, Managed, Selection};
 use crate::contract::{
     ArbiterView, BaseRef, CheckResult, DerivedState, DirtyUnknown, DirtyUnknownReason, DiskState,
     Error, ErrorCode, Facts, GhStatus, HostInfo, IgnoredClass, IgnoredEntry, InUse, Inventory,
@@ -1056,15 +1056,15 @@ impl<'a> Observer<'a> {
         let mut note = |message: String| errors.push(scoped(&scope, message));
         let main = index == 0;
 
-        let managed_by = self
-            .config
-            .host
-            .observe
-            .managed
-            .iter()
-            .find(|m| path.starts_with(canonical(&m.root)))
-            .map(|m| m.app.clone())
-            .or_else(|| listed.locked.then(|| "git-lock".to_owned()));
+        // A root that does not resolve is noted; `not_managed` resolves it again, unknown.
+        let app = match Managed::covering(&self.config.host.observe.managed, &path) {
+            Ok(managed) => managed.map(|m| m.app.clone()),
+            Err(why) => {
+                note(format!("managed root: {why}"));
+                None
+            }
+        };
+        let managed_by = app.or_else(|| listed.locked.then(|| "git-lock".to_owned()));
 
         // The worktree's own configuration decides, which can differ from the entry
         // directory's (`config.worktree`).

@@ -1,8 +1,11 @@
-//! The first release's `act` is report-only (A10, C14; `docs/architecture.md` sections 9.3
-//! and 9.5): for both plan kinds, with and without owner approval and `--dry-run`, and for
-//! every caller, a repeated `act` reports, a plan whose checks pass as `dry_run` with
-//! `execution_not_designed`, and leaves the target's contents, the worktree's `.git`, Git's
-//! administrative data for the worktree, and the plan unclaimed and unchanged.
+//! `act` without a grant is report-only (A10, C14; `docs/architecture.md` sections 9.3, 9.5,
+//! and 9.7): for both plan kinds, with and without owner approval and `--dry-run`, and for
+//! every caller, with no `[act] execute` in `host.toml`, a repeated `act` reports, a plan
+//! whose checks pass as `dry_run` with `execution_not_granted` (`reclaim_dir` on Unix) or
+//! `execution_not_designed` (a whole worktree, never executed, and every plan on Windows,
+//! which stays report-only), and leaves the target's
+//! contents, the worktree's `.git`, Git's administrative data for the worktree, and the plan
+//! unclaimed and unchanged.
 //!
 //! Each `act` is the `cardinal` binary, which observes the fixture through git and the fake
 //! `gh` of `tests/plan_support`.
@@ -133,6 +136,8 @@ fn repeated_act_changes_nothing() {
                     ActStatus::Rejected,
                     vec!["owner_approval_required".to_owned()],
                 )
+            } else if kind == PlanKind::ReclaimDir && cfg!(unix) {
+                (ActStatus::DryRun, vec!["execution_not_granted".to_owned()])
             } else {
                 (ActStatus::DryRun, vec!["execution_not_designed".to_owned()])
             };

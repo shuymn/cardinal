@@ -453,7 +453,6 @@ fn describe(recovered: Recovered) -> serde_json::Value {
         Recovered::Unreadable { error, trash } => {
             json!({"outcome": "unreadable", "why": error, "trash": trash})
         }
-        Recovered::Claimed => json!({"outcome": "claimed"}),
         Recovered::Stranded { why, trash } => {
             json!({"outcome": "stranded", "why": why, "trash": trash})
         }

@@ -63,6 +63,37 @@ pub struct Managed {
     pub root: PathBuf,
 }
 
+impl Managed {
+    /// Whether `path` is at or below this root, both as the volume resolves them (section 8.4):
+    /// a root named through a symbolic link or an alias such as `/tmp` covers the worktree it
+    /// leads to. Observation and the checks decide through this one comparison. A root that
+    /// does not exist covers nothing; any other failure to resolve the root or `path` is an
+    /// error, since the path as written could miss what it leads to.
+    pub fn covers(&self, path: &Path) -> Result<bool, String> {
+        let root = match dunce::canonicalize(&self.root) {
+            Ok(root) => root,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => return Err(format!("the root {}: {err}", self.root.display())),
+        };
+        let path = dunce::canonicalize(path).map_err(|err| format!("{}: {err}", path.display()))?;
+        Ok(path.starts_with(root))
+    }
+
+    /// The first of `roots` that [`Managed::covers`] `path`; when none does, the first
+    /// failure to resolve one, if any. Observation and `not_managed` decide through it.
+    pub fn covering<'a>(roots: &'a [Self], path: &Path) -> Result<Option<&'a Self>, String> {
+        let mut unresolved = None;
+        for managed in roots {
+            match managed.covers(path) {
+                Ok(true) => return Ok(Some(managed)),
+                Ok(false) => {}
+                Err(why) => unresolved = unresolved.or(Some(why)),
+            }
+        }
+        unresolved.map_or(Ok(None), Err)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Records {
     pub max_bytes: u64,
