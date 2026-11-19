@@ -3,11 +3,14 @@
 //! dir's reserve and is retried at once; without a reserve, a failed put-back or result leaves
 //! the claim to a later recovery. Unit X1b injects the failures at a put-back and at the
 //! result through the fake of section 13.7, in recovery of a `committed` execution
-//! (`tests/execution_support`); X1c adds the execution's own writes, and X2 the pass and the
-//! real volumes (section 14.2).
+//! (`tests/execution_support`); X1c adds the execution's own writes through a granted
+//! owner's `act` (`tests/live_support`), and X2 the pass and the real volumes (section 14.2).
 #![cfg(unix)]
 
 mod execution_support;
+mod live_support;
+mod observe_common;
+mod plan_support;
 mod support;
 
 use std::time::{Duration, SystemTime};
@@ -133,5 +136,93 @@ fn the_result_without_a_reserve_leaves_the_claim() {
         let again = x.recover(true);
         assert_eq!(again["outcome"], "done", "{error}: {again}");
         assert_eq!(again["result"]["status"], "executed");
+    }
+}
+
+/// The execution's own writes (section 13.7, "Full volumes"): the execution directory's
+/// creation, the manifest, the claim, the move, the commit, and a restore.
+mod live {
+    use cardinal::contract::ActStatus;
+    use cardinal::testpoint;
+    use live_support::{Live, assert_restored};
+
+    use super::ERRORS;
+    use crate::live_support;
+
+    /// The writes before the commit, each of which stops an execution without a reserve
+    /// before anything stays moved.
+    const BEFORE_THE_COMMIT: [&str; 5] = ["execution_dir", "manifest", "claim", "move", "commit"];
+
+    /// With the reserve present, each write that fails once for lack of space deletes it and
+    /// is retried at once, and the execution completes.
+    #[test]
+    fn each_write_spends_the_reserve() {
+        for kind in BEFORE_THE_COMMIT {
+            for error in ERRORS {
+                let x = Live::new("reserve", "target", &["debug/app"]);
+                x.write_reserve();
+                let result = x.spawn_failing_write(&[], kind, error, "once").finish(&[]);
+                assert_eq!(
+                    result.status,
+                    ActStatus::Executed,
+                    "{kind} {error}: {result:#?}"
+                );
+                assert!(!x.target().exists(), "{kind} {error}");
+                assert!(!x.s.state.reserve_file().exists(), "{kind} {error}");
+            }
+        }
+    }
+
+    /// Without a reserve, a write before the commit that fails for lack of space gives
+    /// `rejected` (`no_space`) with the target in place: before the move nothing moved, and
+    /// at the commit the target is restored.
+    #[test]
+    fn without_a_reserve_nothing_stays_moved() {
+        for kind in BEFORE_THE_COMMIT {
+            for error in ERRORS {
+                let x = Live::new("no-reserve", "target", &["debug/app"]);
+                let before = x.files();
+                let result = x
+                    .spawn_failing_write(&[], kind, error, "always")
+                    .finish(&[]);
+                assert_restored(&x, &result, ActStatus::Rejected, &["no_space"], &before);
+            }
+        }
+    }
+
+    /// A restore that fails for lack of space with the reserve present spends it and goes
+    /// back; without one, `t` stays under its `claimed` claim with `reclaim_stranded`, `act`
+    /// reports `rejected` (`no_space`) naming the trash entry, and a later `act` restores it.
+    #[test]
+    fn a_restore_without_space() {
+        for (reserve, times) in [(true, "once"), (false, "always")] {
+            let x = Live::new("restore-space", "target", &["debug/app", "debug/log"]);
+            if reserve {
+                x.write_reserve();
+            }
+            let paused = x.spawn_failing_write(&[testpoint::ACT_MOVED], "restore", "ENOSPC", times);
+            paused.wait(testpoint::ACT_MOVED);
+            std::fs::write(x.t().join("debug/log"), "changed").unwrap();
+            let result = paused.finish(&[testpoint::ACT_MOVED]);
+            assert_eq!(result.status, ActStatus::Rejected, "{result:#?}");
+            if reserve {
+                assert_eq!(result.reasons, ["changed_during_act"], "{result:#?}");
+                assert!(x.target().join("debug/app").exists());
+                assert!(!x.s.state.reserve_file().exists());
+                continue;
+            }
+            assert_eq!(result.reasons, ["no_space"], "{result:#?}");
+            assert_eq!(result.trash, Some(x.entry().display().to_string()));
+            assert!(x.t().join("debug/app").exists());
+            assert!(!x.target().exists());
+            let again = x.act();
+            assert_eq!(again.status, ActStatus::Rejected, "{again:#?}");
+            assert_eq!(again.reasons, ["interrupted"], "{again:#?}");
+            assert_eq!(
+                std::fs::read_to_string(x.target().join("debug/log")).unwrap(),
+                "changed"
+            );
+            assert!(!x.entry().exists());
+        }
     }
 }

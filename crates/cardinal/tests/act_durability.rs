@@ -5,10 +5,14 @@
 //! checked against each row of the durable order (every change after a sync that succeeded
 //! for what that row makes durable first), and the steps a power loss could undo (a put-back,
 //! the result) are undone by hand before recovery runs again, which must handle the state as
-//! its table says. X1c adds the move, the claim's stages, and the restore (section 14.2).
+//! its table says. X1c adds the move, the claim's stages, and the restore (section 14.2),
+//! through a granted owner's `act` (`tests/live_support`).
 #![cfg(unix)]
 
 mod execution_support;
+mod live_support;
+mod observe_common;
+mod plan_support;
 mod support;
 
 use std::path::{Path, PathBuf};
@@ -266,4 +270,185 @@ fn an_undone_put_back_is_put_back_again() {
     assert_eq!(got["result"]["status"], "partial", "{got}");
     assert_eq!(std::fs::read(x.t().join("b/h")).unwrap(), b"b/h");
     assert!(!x.held("b/h").exists());
+}
+
+/// A live execution's write log against the durable order (A30, A37).
+mod live {
+    use std::path::{Path, PathBuf};
+
+    use cardinal::contract::ActStatus;
+    use cardinal::testpoint;
+    use live_support::{Live, assert_restored};
+    use serde_json::Value;
+
+    use super::{first, path, synced};
+    use crate::live_support;
+
+    /// The position of the rename of `from` to `to` that succeeded.
+    fn renamed(log: &[Value], from: &Path, to: &Path) -> usize {
+        first(
+            log,
+            &format!("the rename of {} to {}", from.display(), to.display()),
+            |op| {
+                op["op"] == "rename"
+                    && path(op, "path") == from
+                    && path(op, "to") == to
+                    && op["error"].is_null()
+            },
+        )
+    }
+
+    /// Asserts that each of `dirs` was synced, successfully, before `at`.
+    #[track_caller]
+    fn synced_before(log: &[Value], at: usize, dirs: &[PathBuf], what: &str) {
+        for dir in dirs {
+            assert!(
+                log[..at].iter().any(|op| synced(op, dir)),
+                "{} not synced before {what}: {log:#?}",
+                dir.display()
+            );
+        }
+    }
+
+    /// Publishing the claim follows the manifest's sync and `executions/<plan>/` made durable
+    /// in `executions/`; the move follows the claim's and the trash entry's syncs; `committed`
+    /// follows the move's syncs of the parent and the trash entry; the first take follows
+    /// `committed`'s; and the result follows the cleanup's sync of `<state>/trash/`.
+    #[test]
+    fn an_execution_follows_the_durable_order() {
+        let x = Live::new("ordered", "target", &["debug/app", "debug/log"]);
+        let state = &x.s.state;
+        let plan = &x.plan.id;
+        let (result, log) = x.spawn(&[], None).finish_logged(&[]);
+        assert_eq!(result.status, ActStatus::Executed, "{result:#?}");
+        let claim = state.execution_claim(plan);
+        let publish = first(&log, "the claim's publication", |op| {
+            op["op"] == "rename" && path(op, "to") == claim && op["error"].is_null()
+        });
+        let manifest = state.execution_manifest(plan);
+        let manifest_at = first(&log, "the manifest", |op| {
+            op["op"] == "rename" && path(op, "to") == manifest && op["error"].is_null()
+        });
+        assert!(manifest_at < publish, "{log:#?}");
+        synced_before(
+            &log,
+            publish,
+            &[state.execution_dir(plan), state.executions_dir()],
+            "the claim",
+        );
+        let moved = renamed(&log, &x.target(), &x.t());
+        synced_before(
+            &log[publish..],
+            moved - publish,
+            &[state.execution_dir(plan), x.entry(), state.trash_dir()],
+            "the move",
+        );
+        let committed = log
+            .iter()
+            .rposition(|op| op["op"] == "rename" && path(op, "to") == claim)
+            .unwrap();
+        assert!(committed > moved);
+        synced_before(
+            &log[moved..],
+            committed - moved,
+            &[x.wt.clone(), x.entry()],
+            "committed",
+        );
+        let take = first(&log, "a take", |op| {
+            op["op"] == "rename" && path(op, "path").starts_with(x.t())
+        });
+        assert!(take > committed);
+        synced_before(
+            &log[committed..],
+            take - committed,
+            &[state.execution_dir(plan)],
+            "the first take",
+        );
+        let result_at = first(&log, "the result", |op| {
+            op["op"] == "rename"
+                && path(op, "to") == state.execution_result(plan)
+                && op["error"].is_null()
+        });
+        synced_before(
+            &log[take..],
+            result_at - take,
+            &[state.trash_dir()],
+            "the result",
+        );
+    }
+
+    /// A restore's rename back into the parent is followed by syncs of the parent and the
+    /// trash entry before the result.
+    #[test]
+    fn a_restore_follows_the_durable_order() {
+        let x = Live::new("restore-ordered", "target", &["debug/app", "debug/log"]);
+        let paused = x.spawn(&[testpoint::ACT_MOVED], None);
+        paused.wait(testpoint::ACT_MOVED);
+        std::fs::write(x.t().join("debug/log"), "changed").unwrap();
+        let (result, log) = paused.finish_logged(&[testpoint::ACT_MOVED]);
+        assert_eq!(result.reasons, ["changed_during_act"], "{result:#?}");
+        let back = renamed(&log, &x.t(), &x.target());
+        let result_at = first(&log, "the result", |op| {
+            op["op"] == "rename"
+                && path(op, "to") == x.s.state.execution_result(&x.plan.id)
+                && op["error"].is_null()
+        });
+        synced_before(
+            &log[back..],
+            result_at - back,
+            &[x.wt.clone(), x.entry()],
+            "the result",
+        );
+    }
+
+    /// The move undone by hand after a kill at `act.moved`, as a power loss before its sync
+    /// would leave it: recovery finds the target in place under the `claimed` claim and
+    /// reports `rejected` (`interrupted`).
+    #[test]
+    fn an_undone_move_is_recovered() {
+        let x = Live::new("undone-move", "target", &["debug/app"]);
+        x.kill_at(testpoint::ACT_MOVED);
+        std::fs::rename(x.t(), x.target()).unwrap();
+        let before = x.files();
+        let result = x.act();
+        assert_restored(&x, &result, ActStatus::Rejected, &["interrupted"], &before);
+    }
+
+    /// `committed` undone by hand after a kill at `act.committed`, before its sync: the claim
+    /// reads `claimed` again, and recovery restores the target.
+    #[test]
+    fn an_undone_committed_is_restored() {
+        let x = Live::new("undone-commit", "target", &["debug/app", "debug/log"]);
+        let before = x.files();
+        let mut paused = x.spawn(&[testpoint::ACT_COMMITTED], None);
+        paused.wait(testpoint::ACT_COMMITTED);
+        paused.child.kill();
+        let claim_path = x.s.state.execution_claim(&x.plan.id);
+        let claim = std::fs::read_to_string(&claim_path).unwrap();
+        assert!(claim.contains("\"committed\""), "{claim}");
+        std::fs::write(&claim_path, claim.replace("\"committed\"", "\"claimed\"")).unwrap();
+        let result = x.act();
+        assert_restored(&x, &result, ActStatus::Rejected, &["interrupted"], &before);
+    }
+
+    /// A restore undone by hand after a kill at `act.restored`, before its syncs: recovery
+    /// finds `t` holding the claimed inode and restores it again.
+    #[test]
+    fn an_undone_restore_is_restored_again() {
+        let x = Live::new("undone-restore", "target", &["debug/app", "debug/log"]);
+        let mut paused = x.spawn(&[testpoint::ACT_MOVED, testpoint::ACT_RESTORED], None);
+        paused.wait(testpoint::ACT_MOVED);
+        std::fs::write(x.t().join("debug/log"), "changed").unwrap();
+        paused.release(testpoint::ACT_MOVED);
+        paused.wait(testpoint::ACT_RESTORED);
+        paused.child.kill();
+        std::fs::rename(x.target(), x.t()).unwrap();
+        let before = plan_support_listing(&x.t());
+        let result = x.act();
+        assert_restored(&x, &result, ActStatus::Rejected, &["interrupted"], &before);
+    }
+
+    fn plan_support_listing(dir: &Path) -> std::collections::BTreeMap<PathBuf, String> {
+        crate::plan_support::listing(dir)
+    }
 }

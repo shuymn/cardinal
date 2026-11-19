@@ -204,6 +204,54 @@ fn invalid_config_is_config_invalid() {
     );
 }
 
+/// A25: `[act] execute` may grant `reclaim_dir` to the owner and `unit:disk-reclaim` only. A
+/// grant to the arbiter, of `reclaim_worktree`, or to another caller makes every command
+/// fail with `config_invalid`, `act` included, so no such grant ever executes.
+#[test]
+fn act_execute_refuses_the_arbiter_and_worktrees() {
+    let dirs = Dirs::new();
+    for (grant, says) in [
+        ("arbiter = [\"reclaim_dir\"]", "arbiter holds no grant"),
+        ("owner = [\"reclaim_worktree\"]", "never executed"),
+        (
+            "\"unit:disk-reclaim\" = [\"reclaim_worktree\"]",
+            "never executed",
+        ),
+        (
+            "\"unit:other\" = [\"reclaim_dir\"]",
+            "not a caller that executes",
+        ),
+        ("owner = [\"everything\"]", "not a plan kind that executes"),
+    ] {
+        std::fs::write(
+            dirs.config().join("host.toml"),
+            format!("[act]\nexecute = {{ {grant} }}\n"),
+        )
+        .unwrap();
+        for args in [&["inventory"][..], &["act", "abcd", "--caller", "owner"]] {
+            let assert = dirs.cmd().args(args).assert().code(1);
+            let doc = json(&assert.get_output().stdout);
+            assert_eq!(doc["error"]["code"], "config_invalid", "{grant}, {args:?}");
+            let message = doc["error"]["message"].as_str().unwrap();
+            assert!(message.contains(says), "{grant}: {message}");
+        }
+    }
+    std::fs::write(
+        dirs.config().join("host.toml"),
+        "[act]\nexecute = { owner = [\"reclaim_dir\"], \"unit:disk-reclaim\" = [] }\n",
+    )
+    .unwrap();
+    let assert = dirs
+        .cmd()
+        .args(["act", "abcd", "--caller", "owner"])
+        .assert()
+        .code(1);
+    assert_eq!(
+        json(&assert.get_output().stdout)["error"]["code"],
+        "not_found"
+    );
+}
+
 #[test]
 fn unusable_state_dir_is_state_unavailable() {
     let dirs = Dirs::new();

@@ -5,6 +5,7 @@
 
 #![cfg(unix)]
 
+mod live_support;
 mod observe_common;
 mod plan_support;
 mod support;
@@ -13,6 +14,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use cardinal::contract::{ActResult, ActStatus, Check, CheckResult, Plan, PlanKind};
+use live_support::{GRANT, Live, owner};
 use plan_support::{RUN_LIMIT, Setup, arbiter, write_synced};
 
 /// `cardinal plan reclaim-dir TARGET`, reading the fakes in `fakes` (`CARDINAL_TEST_DIR`)
@@ -420,7 +422,7 @@ mod freed_bytes {
     /// A linked worktree at `rel` inside the fixture on a new branch `branch`, meeting every
     /// reclaim condition as [`Setup::worktree`] makes one.
     #[cfg(target_os = "macos")]
-    fn worktree_at(s: &Setup, rel: &str, branch: &str) -> PathBuf {
+    pub(super) fn worktree_at(s: &Setup, rel: &str, branch: &str) -> PathBuf {
         let wt = s.fx.worktree_add(&s.main, rel, branch);
         s.fx.commit_file(&wt, "src/lib.rs", &format!("// {branch}\n"), "work");
         s.publish(&wt, branch);
@@ -554,6 +556,110 @@ mod freed_bytes {
         image.detach().expect("detach the image");
     }
 
+    /// The image's free bytes after a `sync`.
+    #[cfg(target_os = "macos")]
+    fn free_after_sync(volume: &Path) -> u64 {
+        // SAFETY: `sync` takes no arguments and cannot fail.
+        unsafe { libc::sync() };
+        let stat = rustix::fs::statvfs(volume).unwrap();
+        stat.f_bavail * stat.f_frsize
+    }
+
+    /// Plans `target` with the state dir `state` on the image, reports it with `--dry-run`,
+    /// and executes it, reading the image's free space at `act.committed` and at
+    /// `act.finishing`, between which the execution only takes and deletes entries. Returns
+    /// the plan, the dry run, the result, and the rise in free space.
+    #[cfg(target_os = "macos")]
+    fn measured(
+        s: &Setup,
+        state: &Path,
+        volume: &Path,
+        target: &Path,
+    ) -> (Plan, ActResult, ActResult, u64) {
+        use cardinal::testpoint::{ACT_COMMITTED, ACT_FINISHING};
+        let output = s
+            .cardinal()
+            .env("CARDINAL_STATE_DIR", state)
+            .args(["plan", "reclaim-dir"])
+            .arg(target)
+            .output_within(RUN_LIMIT)
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let plan: Plan = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(plan.invariants_ok, "{:#?}", plan.checks);
+        let act = |dry_run: bool| {
+            let options = cardinal::act::ActOptions { dry_run, ..owner() };
+            let mut command = s.act_command(&plan.id, &options);
+            command.env("CARDINAL_STATE_DIR", state);
+            command
+        };
+        let output = act(true).output_within(RUN_LIMIT).unwrap();
+        let dry = plan_support::act_result(&output).unwrap();
+        assert_eq!(dry.reasons, ["dry_run_requested"], "{dry:#?}");
+        let scope = cardinal_test_support::Scope::new();
+        let points = support::testpoints::TestPoints::new(&scope);
+        let mut command = act(false);
+        points.apply(&mut command, &[ACT_COMMITTED, ACT_FINISHING], None);
+        let child = command
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        points.wait_reached(ACT_COMMITTED, child.id(), live_support::WAIT);
+        let committed = free_after_sync(volume);
+        points.release(ACT_COMMITTED);
+        points.wait_reached(ACT_FINISHING, child.id(), live_support::WAIT);
+        let finishing = free_after_sync(volume);
+        points.release(ACT_FINISHING);
+        let result = plan_support::act_result(&child.wait_with_output().unwrap()).unwrap();
+        assert_eq!(result.status, ActStatus::Executed, "{result:#?}");
+        (plan, dry, result, finishing.saturating_sub(committed))
+    }
+
+    /// The freed bytes of an execution (section 13.7), on an APFS volume with the state dir
+    /// on it: the image's free space rises by at least the plan's `exclusive_bytes`, the dry
+    /// run's `freed_bytes`, and the result's `freed_bytes`, for a target of files written in
+    /// place, and for a target holding only two clones of one file by their size, which the
+    /// result counts though the plan's bound is 0.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn of_an_execution_on_an_apfs_volume() {
+        let s = Setup::with_host(GRANT);
+        let volume = s.fx.path("volume");
+        std::fs::create_dir_all(&volume).unwrap();
+        let Some(mut image) = s.fx.scope().attach_image(&volume) else {
+            return;
+        };
+        let state = volume.join("state");
+
+        let written = worktree_at(&s, "volume/written", "written");
+        write_synced(&written, "target/a.bin", &vec![b'a'; 256 * 1024]);
+        write_synced(&written, "target/sub/b.bin", &vec![b'b'; 128 * 1024]);
+        let (plan, dry, result, rise) = measured(&s, &state, &volume, &written.join("target"));
+        let bound = plan.exclusive_bytes.unwrap();
+        assert!(bound >= 384 * 1024, "{plan:#?}");
+        assert_eq!(dry.freed_bytes, Some(bound));
+        let freed = result.freed_bytes.unwrap();
+        assert!(
+            rise >= bound && rise >= freed,
+            "rise {rise}, bound {bound}, freed {freed}"
+        );
+
+        let clones = worktree_at(&s, "volume/clones", "clones");
+        write_synced(&clones, "target/one.bin", &vec![b'1'; 1 << 20]);
+        clone(
+            &clones.join("target/one.bin"),
+            &clones.join("target/two.bin"),
+        );
+        let (plan, dry, result, rise) = measured(&s, &state, &volume, &clones.join("target"));
+        assert_eq!(plan.exclusive_bytes, Some(0), "{plan:#?}");
+        assert_eq!(dry.freed_bytes, Some(0));
+        let freed = result.freed_bytes.unwrap();
+        assert!(freed >= 1 << 20, "{result:#?}");
+        assert!(rise >= freed, "rise {rise}, freed {freed}");
+
+        image.detach().expect("detach the image");
+    }
+
     /// On ext4 (R on CI's runners): a sparse file with no data and a 2 KiB extended
     /// attribute that a file outside the target also has, which ext4 keeps in one shared
     /// block, reads 4,096 bytes in `st_blocks` and counts nothing in the bound, and a file of
@@ -595,5 +701,421 @@ mod freed_bytes {
         write_synced(&wt, "target/data.bin", &vec![b'd'; 64 * 1024]);
         assert_bound(&s, &target, ExclusiveMeasure::Extents, 64 * 1024);
         report("ext4_extents: ran on ext4");
+    }
+}
+
+/// The control of section 13.7: a granted owner's `act` executes a target on which every
+/// check passes. The target is gone from the worktree, the trash entry with it, the result
+/// is `executed` and durable, and nothing else in the worktree changed (A27).
+#[test]
+fn control_executes() {
+    let x = Live::new("control", "target", &["debug/app", "debug/deps/lib.rlib"]);
+    std::os::unix::fs::symlink("debug/app", x.target().join("app")).unwrap();
+    let mut x = x;
+    x.replan();
+    let mut before = plan_support::listing(&x.wt);
+    before.retain(|path, _| !path.starts_with("target"));
+    let result = x.act();
+    assert_eq!(result.status, ActStatus::Executed, "{result:#?}");
+    assert_eq!(result.reasons, Vec::<String>::new(), "{result:#?}");
+    assert!(result.skipped_changed.is_empty(), "{result:#?}");
+    assert!(result.trash.is_none(), "{result:#?}");
+    assert!(!x.target().exists());
+    assert!(!x.entry().exists());
+    assert!(x.s.state.execution_result(&x.plan.id).exists());
+    assert_eq!(plan_support::listing(&x.wt), before);
+}
+
+/// Once: a second `act` on an executed plan reports `already_executed` and changes nothing,
+/// and a target made again at the path needs a new plan.
+#[test]
+fn once() {
+    let x = Live::new("once", "target", &["debug/app"]);
+    assert_eq!(x.act().status, ActStatus::Executed);
+    write_synced(&x.wt, "target/debug/app", b"rebuilt");
+    let result = x.act();
+    assert_eq!(result.status, ActStatus::AlreadyExecuted, "{result:#?}");
+    assert_eq!(
+        std::fs::read(x.target().join("debug/app")).unwrap(),
+        b"rebuilt"
+    );
+}
+
+/// A25: a whole worktree's plan never executes, for the granted owner too: `dry_run` with
+/// `execution_not_designed`, and nothing changes.
+#[test]
+fn worktree_plans_never_execute() {
+    let s = Setup::with_host(GRANT);
+    let wt = s.worktree("whole");
+    write_synced(&wt, "target/debug/app", b"bin");
+    let plan = s.plan(PlanKind::ReclaimWorktree, &wt);
+    assert!(plan.invariants_ok, "{:#?}", plan.checks);
+    let before = plan_support::listing(&wt);
+    let result = s.act(&plan.id, &owner()).unwrap();
+    assert_eq!(result.status, ActStatus::DryRun, "{result:#?}");
+    assert_eq!(result.reasons, ["execution_not_designed"], "{result:#?}");
+    assert_eq!(plan_support::listing(&wt), before);
+    assert!(!s.state.execution_claim(&plan.id).exists());
+}
+
+/// C15: a runner holding the worktree's in-use lock while its stage runs keeps a granted
+/// owner's `act` out: the one try at the lock fails, and `act` reports `rejected`
+/// (`not_in_use`) with nothing moved.
+#[test]
+fn held_lock_refuses() {
+    let x = Live::new("held-lock", "target", &["debug/app"]);
+    let before = x.files();
+    let started = x.s.fx.path("started");
+    let gate = x.s.fx.path("gate");
+    let script = format!(
+        "touch '{}'; i=0; while [ ! -e '{}' ] && [ $i -lt 600 ]; do sleep 0.05; i=$((i+1)); done",
+        started.display(),
+        gate.display()
+    );
+    let mut runner = x.s.cardinal_in(&x.wt);
+    runner.args(["run", "--", "sh", "-c", &script]);
+    let mut runner = runner.spawn().unwrap();
+    cardinal_test_support::process::wait_for("the stage", live_support::WAIT, || {
+        started.exists().then_some(())
+    });
+    let result = x.act();
+    std::fs::write(&gate, b"").unwrap();
+    assert_eq!(runner.wait().unwrap().code(), Some(0));
+    assert_eq!(result.status, ActStatus::Rejected, "{result:#?}");
+    assert_eq!(result.reasons, ["not_in_use"], "{result:#?}");
+    assert_eq!(
+        result.error.as_deref(),
+        Some("another process holds the worktree's in-use lock"),
+        "{result:#?}"
+    );
+    assert_eq!(x.files(), before);
+    assert!(!x.s.state.execution_claim(&x.plan.id).exists());
+}
+
+/// A25: who executes. Every case leaves the target and the state's trash as they were.
+mod grants {
+    use super::*;
+
+    /// Runs `act` on `x`'s plan as `options` and asserts `dry_run` for `reason`, nothing
+    /// moved, and no claim.
+    #[track_caller]
+    fn assert_reports(x: &Live, options: &cardinal::act::ActOptions, reason: &str) {
+        let before = x.files();
+        let result = x.s.act(&x.plan.id, options).unwrap();
+        assert_eq!(result.status, ActStatus::DryRun, "{result:#?}");
+        assert_eq!(result.reasons, [reason], "{result:#?}");
+        assert_eq!(x.files(), before);
+        assert!(!x.s.state.execution_claim(&x.plan.id).exists());
+        assert!(!x.entry().exists());
+    }
+
+    /// Without `[act] execute`, the owner reports `execution_not_granted`.
+    #[test]
+    fn the_owner_needs_a_grant() {
+        let x = Live::with_host("", "ungranted", "target", &["debug/app"], |_, _| {});
+        assert_reports(&x, &owner(), "execution_not_granted");
+    }
+
+    /// A grant to another caller does not reach the owner.
+    #[test]
+    fn a_grant_names_its_caller() {
+        let host = "[unit.disk-reclaim]\nact = true\n[act]\nexecute = { \"unit:disk-reclaim\" = [\"reclaim_dir\"] }\n";
+        let x = Live::with_host(host, "other", "target", &["debug/app"], |_, _| {});
+        assert_reports(&x, &owner(), "execution_not_granted");
+    }
+
+    /// The granted owner's `--dry-run` reports `dry_run_requested`.
+    #[test]
+    fn a_dry_run_is_requested() {
+        let x = Live::new("dry", "target", &["debug/app"]);
+        let options = cardinal::act::ActOptions {
+            dry_run: true,
+            ..owner()
+        };
+        assert_reports(&x, &options, "dry_run_requested");
+    }
+
+    /// The arbiter never executes, with the owner granted.
+    #[test]
+    fn the_arbiter_never_executes() {
+        let x = Live::new("arbiter", "target", &["debug/app"]);
+        assert_reports(&x, &arbiter(), "execution_not_granted");
+    }
+
+    /// A granted `disk-reclaim` whose `act` is true reports `execution_not_designed`: its
+    /// execution comes with unit X2's pass (section 14.2).
+    #[test]
+    fn a_granted_unit_waits_for_its_pass() {
+        let host = "[unit.disk-reclaim]\nact = true\n[act]\nexecute = { \"unit:disk-reclaim\" = [\"reclaim_dir\"] }\n";
+        let x = Live::with_host(host, "unit", "target", &["debug/app"], |_, _| {});
+        let options = cardinal::act::ActOptions {
+            caller: cardinal::contract::Caller::Unit("disk-reclaim".into()),
+            ..owner()
+        };
+        assert_reports(&x, &options, "execution_not_designed");
+    }
+}
+
+/// Report-only targets (A27, section 13.7): each alone reports `dry_run` with its rule's
+/// reason while the control executes.
+mod eligibility {
+    use super::*;
+
+    /// Runs the owner's `act` on `x` and asserts `dry_run` with `reason`, nothing moved, no
+    /// claim, and the detail naming `what`.
+    #[track_caller]
+    fn assert_report_only(x: &Live, reason: &str, what: &str) {
+        let before = x.files();
+        let result = x.act();
+        assert_eq!(result.status, ActStatus::DryRun, "{result:#?}");
+        assert_eq!(result.reasons, [reason], "{result:#?}");
+        let error = result.error.as_deref().unwrap_or_default();
+        assert!(error.contains(what), "{what}: {result:#?}");
+        assert_eq!(x.files(), before);
+        assert!(!x.s.state.execution_claim(&x.plan.id).exists());
+        assert!(!x.entry().exists());
+    }
+
+    /// A worktree whose only skip-worktree entry is a `.gitignore` removed from the worktree,
+    /// with `core.sparseCheckout` false: `sparse_checkout`.
+    #[test]
+    fn a_skip_worktree_entry() {
+        let x = Live::with_host(
+            GRANT,
+            "skip",
+            "pkg/node_modules",
+            &["a/index.js"],
+            |s, wt| {
+                s.fx.commit_file(wt, "pkg/.gitignore", "*.log\n", "pkg ignores");
+                s.fx.skip_worktree(wt, "pkg/.gitignore");
+                std::fs::remove_file(wt.join("pkg/.gitignore")).unwrap();
+            },
+        );
+        assert_report_only(&x, "sparse_checkout", "pkg/.gitignore");
+    }
+
+    /// `core.sparseCheckout` set with no skip-worktree or sparse-directory entry and no
+    /// `info/sparse-checkout` file executes.
+    #[test]
+    fn sparse_checkout_set_alone_executes() {
+        let x = Live::with_host(GRANT, "sparse-set", "target", &["debug/app"], |s, wt| {
+            s.fx.config_core(wt, "core.sparseCheckout", "true");
+        });
+        assert_eq!(x.act().status, ActStatus::Executed);
+    }
+
+    /// A `sharedindex.*` file that `git update-index --no-split-index` left behind, with the
+    /// index whole again: no split index, so the plan passes and the owner's `act` executes,
+    /// leaving the leftover file as it was.
+    #[test]
+    fn a_shared_index_left_behind_executes() {
+        let x = Live::with_host(GRANT, "unsplit", "target", &["debug/app"], |s, wt| {
+            s.fx.split_index(wt);
+            s.fx.no_split_index(wt);
+        });
+        let git_dir = x.git_dir();
+        let shared: Vec<_> = std::fs::read_dir(&git_dir)
+            .unwrap()
+            .map(|e| e.unwrap())
+            .filter(|e| {
+                e.file_name()
+                    .as_encoded_bytes()
+                    .starts_with(b"sharedindex.")
+            })
+            .map(|e| (e.path(), e.metadata().unwrap().modified().unwrap()))
+            .collect();
+        assert_eq!(shared.len(), 1, "{shared:?}");
+        assert_eq!(x.act().status, ActStatus::Executed);
+        assert_eq!(
+            std::fs::metadata(&shared[0].0).unwrap().modified().unwrap(),
+            shared[0].1
+        );
+    }
+
+    /// A profile for `github.com/o/other` that protects `target/draft`.
+    const OTHER_PROTECTS_DRAFT: &str =
+        "[match]\nremotes = [\"github.com/o/other\"]\n[data]\nprotected = [\"target/draft\"]\n";
+
+    fn set_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// `origin` named only by a legacy `remotes/origin` file, the URL of a profile that
+    /// protects `target/draft`, made unreadable: git exits 2 as for no `origin`, with the
+    /// failed read on stderr. `observed` fails naming `origin`, and the owner's `act` leaves
+    /// `target/draft` where it is.
+    #[test]
+    fn an_unreadable_legacy_origin_is_unknown() {
+        let s = Setup::with_host(GRANT);
+        s.profile("other", OTHER_PROTECTS_DRAFT);
+        let wt = s.worktree("legacy");
+        write_synced(&wt, "target/draft/x", b"draft");
+        let config = s.main.join(".git/config");
+        let text = std::fs::read_to_string(&config).unwrap();
+        let start = text
+            .find("[remote \"origin\"]")
+            .expect("origin in the config");
+        let end = text[start + 1..]
+            .find("\n[")
+            .map_or(text.len(), |at| start + at + 2);
+        std::fs::write(&config, format!("{}{}", &text[..start], &text[end..])).unwrap();
+        let legacy = s.main.join(".git/remotes/origin");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, "URL: https://github.com/o/other.git\n").unwrap();
+        set_mode(&legacy, 0o000);
+        let plan = s.plan(PlanKind::ReclaimDir, &wt.join("target"));
+        let result = s.act(&plan.id, &owner()).unwrap();
+        set_mode(&legacy, 0o644);
+        let observed = plan.checks.iter().find(|c| c.name == "observed").unwrap();
+        assert_eq!(observed.result, CheckResult::Fail, "{:#?}", plan.checks);
+        let unknown = observed
+            .detail
+            .strip_prefix("unknown: ")
+            .unwrap_or_default();
+        assert!(unknown.contains("origin"), "{observed:#?}");
+        assert_ne!(result.status, ActStatus::Executed, "{result:#?}");
+        assert!(wt.join("target/draft/x").exists());
+    }
+
+    /// An `[observe] managed` root that is a symbolic link to the worktree, in a directory
+    /// that cannot be searched: the root does not resolve, so `not_managed` is unknown and
+    /// the owner's `act` moves nothing.
+    #[test]
+    fn an_unresolvable_managed_root_is_unknown() {
+        let mut s = Setup::with_host("");
+        let wt = s.worktree("unresolved");
+        write_synced(&wt, "target/debug/app", b"app");
+        let shut = s.fx.path("shut");
+        std::fs::create_dir(&shut).unwrap();
+        let root = shut.join("link");
+        std::os::unix::fs::symlink(&wt, &root).unwrap();
+        s.scene.observe_config(&format!(
+            "managed = [{{ app = \"t3code\", root = {:?} }}]\n{GRANT}",
+            root.display().to_string()
+        ));
+        set_mode(&shut, 0o000);
+        let plan = s.plan(PlanKind::ReclaimDir, &wt.join("target"));
+        let result = s.act(&plan.id, &owner()).unwrap();
+        set_mode(&shut, 0o755);
+        let check = plan
+            .checks
+            .iter()
+            .find(|c| c.name == "not_managed")
+            .unwrap();
+        assert_eq!(check.result, CheckResult::Unknown, "{:#?}", plan.checks);
+        assert_ne!(result.status, ActStatus::Executed, "{result:#?}");
+        assert!(wt.join("target/debug/app").exists());
+    }
+
+    /// `core.excludesFile` set to `target/global-ignore`, holding the rule:
+    /// `not_directory_excluded`, an ignore input in the target.
+    #[test]
+    fn an_excludes_file_in_the_target() {
+        let x = Live::with_host(GRANT, "excludes-in", "target", &["debug/app"], |s, wt| {
+            write_synced(wt, "target/global-ignore", b"target/\n");
+            s.fx.config_core(wt, "core.excludesFile", "target/global-ignore");
+        });
+        assert_report_only(&x, "not_directory_excluded", "target/global-ignore");
+    }
+
+    /// The same excludes file, with the root `.gitignore` holding the rule `check-ignore -v`
+    /// names: still `not_directory_excluded`.
+    #[test]
+    fn an_excludes_file_in_the_target_beside_the_rule() {
+        let x = Live::with_host(
+            GRANT,
+            "excludes-beside",
+            "target",
+            &["debug/app"],
+            |s, wt| {
+                write_synced(wt, "target/global-ignore", b"*.swp\n");
+                s.fx.config_core(wt, "core.excludesFile", "target/global-ignore");
+            },
+        );
+        assert_report_only(&x, "not_directory_excluded", "target/global-ignore");
+    }
+
+    /// A target on another mount than the state dir (an APFS image on macOS):
+    /// `not_on_state_mount`; and a mount over `<state>/trash/`, with the target on the state
+    /// dir's volume, too.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_target_off_the_state_mount() {
+        let s = Setup::with_host(GRANT);
+        let volume = s.fx.path("volume");
+        std::fs::create_dir_all(&volume).unwrap();
+        let Some(mut image) = s.fx.scope().attach_image(&volume) else {
+            return;
+        };
+        let wt = freed_bytes::worktree_at(&s, "volume/other", "other");
+        write_synced(&wt, "target/debug/app", b"bin");
+        let plan = s.plan(PlanKind::ReclaimDir, &wt.join("target"));
+        assert!(plan.invariants_ok, "{:#?}", plan.checks);
+        let before = plan_support::listing(&wt.join("target"));
+        let result = s.act(&plan.id, &owner()).unwrap();
+        assert_eq!(result.status, ActStatus::DryRun, "{result:#?}");
+        assert_eq!(result.reasons, ["not_on_state_mount"], "{result:#?}");
+        assert_eq!(plan_support::listing(&wt.join("target")), before);
+        image.detach().expect("detach the image");
+
+        let x = Live::new("trash-mounted", "target", &["debug/app"]);
+        let trash = x.s.state.trash_dir();
+        std::fs::create_dir_all(&trash).unwrap();
+        let Some(mut image) = x.s.fx.scope().attach_image(&trash) else {
+            return;
+        };
+        assert_report_only(&x, "not_on_state_mount", "<state>/trash/");
+        image.detach().expect("detach the image");
+    }
+
+    /// On macOS, a tracked `Target/x` with `core.ignoreCase` false, which APFS resolves to
+    /// the target: `tracked_overlap`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_tracked_alias_of_the_target() {
+        let x = Live::with_host(GRANT, "alias", "target", &["x"], |s, wt| {
+            s.fx.config_core(wt, "core.ignoreCase", "false");
+            // The directory is made as `target`; the index names it `Target`.
+            write_synced(wt, "target/x", b"x");
+            s.fx.add(wt, "Target/x");
+            s.fx.commit(wt, "track Target/x");
+        });
+        if !x.wt.join("TARGET").exists() {
+            eprintln!("skipped a_tracked_alias_of_the_target: the volume is case-sensitive");
+            return;
+        }
+        assert_report_only(&x, "tracked_overlap", "Target/x");
+    }
+
+    /// On macOS, a tracked path with the target's name decomposed (NFD), which APFS resolves
+    /// to the target: `tracked_overlap`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_tracked_decomposed_name() {
+        let composed = "caf\u{e9}";
+        let decomposed = "cafe\u{301}";
+        let x = Live::with_host(GRANT, "nfd", composed, &["x"], |s, wt| {
+            s.fx.config_core(wt, "core.precomposeUnicode", "false");
+            s.profile(
+                "generic",
+                &plan_support::PROFILE.replace(
+                    "regenerable = [",
+                    &format!("regenerable = [\"{composed}\", "),
+                ),
+            );
+            let gitignore = std::fs::read_to_string(wt.join(".gitignore")).unwrap();
+            s.fx.commit_file(
+                wt,
+                ".gitignore",
+                &format!("{gitignore}/{composed}/\n"),
+                "ignore the target",
+            );
+            // The directory is made composed; the index names it decomposed.
+            write_synced(wt, &format!("{composed}/x"), b"x");
+            s.fx.add_force(wt, &format!("{decomposed}/x"));
+            s.fx.commit(wt, "track the decomposed name");
+        });
+        assert_report_only(&x, "tracked_overlap", "x");
     }
 }

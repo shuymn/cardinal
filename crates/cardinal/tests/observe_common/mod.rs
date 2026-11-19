@@ -38,6 +38,8 @@ pub struct Scene {
     pub gh_timeout_ms: u64,
     /// `[observe] git_timeout_ms`: long enough for a loaded machine by default.
     pub git_timeout_ms: u64,
+    /// Variables every `cardinal` command of the scene gets on top of its environment.
+    pub cardinal_env: Vec<(OsString, OsString)>,
 }
 
 impl Scene {
@@ -60,6 +62,7 @@ impl Scene {
             observe_extra: String::new(),
             gh_timeout_ms: 15_000,
             git_timeout_ms: 15_000,
+            cardinal_env: Vec::new(),
         };
         scene.observe_new_repo("repo");
         scene.write_gh();
@@ -232,6 +235,12 @@ exit "$code"
         self.observe_extra.push('\n');
     }
 
+    /// Drops every line [`Scene::observe_config`] added, so `host.toml` holds the scene's
+    /// own settings alone from the next command on.
+    pub fn clear_observe_config(&mut self) {
+        self.observe_extra.clear();
+    }
+
     /// Writes `repos/<name>.toml`.
     pub fn profile(&self, name: &str, toml: &str) {
         std::fs::write(
@@ -336,7 +345,11 @@ exit "$code"
     pub fn cardinal_in(&self, dir: &Path) -> Command {
         self.config();
         let mut command = self.fx.command(bin_exe("cardinal"), dir);
-        for (name, value) in self.isolation() {
+        for (name, value) in self
+            .isolation()
+            .into_iter()
+            .chain(self.cardinal_env.clone())
+        {
             command.env(name, value);
         }
         command
