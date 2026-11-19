@@ -1,4 +1,4 @@
-//! Processes a test did not start itself, and polling.
+//! Processes a test did not start itself, polling, and the signals a test delivers.
 //!
 //! The guards own exactly the processes of their scope: on Unix those that hold the scope's
 //! marker open (see `crate::marker`), checked when a [`PidGuard`] is made and again right
@@ -436,6 +436,39 @@ pub fn is_stopped(pid: u32) -> bool {
     system
         .process(pid)
         .is_some_and(|process| process.status() == ProcessStatus::Stop)
+}
+
+/// Gives each of `signals` its default disposition in this process and unblocks it on the
+/// calling thread, so in the threads that thread starts after the call. A process starts with
+/// the signals its parent ignores still ignored and with its parent's signal mask, and an
+/// ignored signal stays ignored in every process the test starts: Rust's `Command` resets only
+/// the mask and `SIGPIPE` in a child. A test that delivers a signal calls this first, so the
+/// delivery it checks happens whatever started the test.
+#[cfg(unix)]
+pub fn deliverable(signals: &[i32]) {
+    let mut set = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+    // SAFETY: `sigemptyset` initializes `set`, which `sigaddset` and `pthread_sigmask` then
+    // use; `action` is a zeroed `sigaction` with `SIG_DFL` as its handler and an empty mask,
+    // which `sigaction` reads, and a null old action makes it write nothing.
+    unsafe {
+        libc::sigemptyset(set.as_mut_ptr());
+        for &sig in signals {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = libc::SIG_DFL;
+            libc::sigemptyset(&raw mut action.sa_mask);
+            assert_eq!(
+                libc::sigaction(sig, &raw const action, std::ptr::null_mut()),
+                0,
+                "the default disposition of signal {sig}: {}",
+                std::io::Error::last_os_error()
+            );
+            assert_eq!(libc::sigaddset(set.as_mut_ptr(), sig), 0, "signal {sig}");
+        }
+        assert_eq!(
+            libc::pthread_sigmask(libc::SIG_UNBLOCK, set.as_ptr(), std::ptr::null_mut()),
+            0
+        );
+    }
 }
 
 /// Waits until `check` returns `Some`, polling every 10 ms; panics after `timeout`.

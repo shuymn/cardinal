@@ -449,8 +449,6 @@ fn a_full_merged_page_without_the_head_is_unknown() {
 #[cfg(unix)]
 #[test]
 fn a_failed_git_step_fails_observed() {
-    use std::os::unix::fs::PermissionsExt;
-
     let real_git = std::env::split_paths(&std::env::var_os("PATH").unwrap())
         .map(|dir| dir.join("git"))
         .find(|path| path.is_file())
@@ -485,15 +483,13 @@ fn a_failed_git_step_fails_observed() {
         scene.push(&wt, "feat");
         scene.set_merged(&head, &merged_json(42, &head));
         let wrapper = scene.fx.path("git-wrapper");
-        std::fs::write(
+        scene.fx.scope().started_script(
             &wrapper,
-            format!(
-                "#!/bin/sh\ncase \" $* \" in {arm} esac\nexec '{}' \"$@\"\n",
+            &format!(
+                "case \" $* \" in {arm} esac\nexec '{}' \"$@\"\n",
                 real_git.display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         scene.observe_config(&format!("git = '{}'", wrapper.display()));
 
         let inv = scene.inventory();

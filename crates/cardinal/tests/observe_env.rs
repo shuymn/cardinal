@@ -96,8 +96,6 @@ fn inherited_git_vars_ignored() {
 #[cfg(unix)]
 #[test]
 fn children_get_the_constructed_environment() {
-    use std::os::unix::fs::PermissionsExt;
-
     let mut scene = Scene::new();
     let real_git = std::env::split_paths(&std::env::var_os("PATH").unwrap())
         .map(|dir| dir.join("git"))
@@ -105,17 +103,15 @@ fn children_get_the_constructed_environment() {
         .expect("git on PATH");
     let log = scene.fx.path("git-env.log");
     let wrapper = scene.fx.path("git-wrapper");
-    std::fs::write(
+    scene.fx.scope().started_script(
         &wrapper,
-        format!(
-            "#!/bin/sh\nenv >> '{}'\necho --- >> '{}'\nexec '{}' \"$@\"\n",
+        &format!(
+            "env >> '{}'\necho --- >> '{}'\nexec '{}' \"$@\"\n",
             log.display(),
             log.display(),
             real_git.display()
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     scene.observe_config(&format!("git = '{}'", wrapper.display()));
 
     let decoy = scene.fx.init("decoy");

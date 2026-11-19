@@ -58,34 +58,19 @@ fn wait_or_kill(child: &mut Child) -> ExitStatus {
     panic!("cardinal did not end after the signal");
 }
 
-/// Whether this process ignores `sig`; cardinal inherits that and leaves the signal ignored.
-#[cfg(unix)]
-fn ignored(sig: i32) -> bool {
-    let mut current = std::mem::MaybeUninit::<libc::sigaction>::zeroed();
-    // SAFETY: without a new action, `sigaction` only writes the current one into `current`,
-    // which is valid for writes.
-    let read = unsafe { libc::sigaction(sig, std::ptr::null(), current.as_mut_ptr()) };
-    // SAFETY: `current` is zero-initialized, a valid `sigaction`, and filled on success.
-    read == 0 && unsafe { current.assume_init() }.sa_sigaction == libc::SIG_IGN
-}
-
 /// The git wrapper: starts `sleep` in the background, records its own PID and the sleep's,
 /// and waits.
 #[cfg(unix)]
 fn sleeping_git(scene: &mut Scene) -> std::path::PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-
     let pids = scene.fx.path("pids");
     let wrapper = scene.fx.path("git-wrapper");
-    std::fs::write(
+    scene.fx.scope().started_script(
         &wrapper,
-        format!(
-            "#!/bin/sh\nsleep 30 &\necho $$ $! > '{0}.tmp'\nmv '{0}.tmp' '{0}'\nwait\n",
+        &format!(
+            "sleep 30 &\necho $$ $! > '{0}.tmp'\nmv '{0}.tmp' '{0}'\nwait\n",
             pids.display()
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     scene.observe_config(&format!("git = '{}'", wrapper.display()));
     pids
 }
@@ -109,14 +94,12 @@ fn read_pids(file: &Path) -> Vec<u32> {
 fn a_terminated_cardinal_kills_its_children_and_dies_by_the_signal() {
     use std::os::unix::process::ExitStatusExt;
 
-    use cardinal_test_support::process::GroupGuard;
+    use cardinal_test_support::process::{GroupGuard, deliverable};
     use rustix::process::{Pid, Signal};
 
-    for sig in [Signal::TERM, Signal::INT, Signal::HUP] {
-        if ignored(sig.as_raw()) {
-            eprintln!("skipping signal {}: this process ignores it", sig.as_raw());
-            continue;
-        }
+    let signals = [Signal::TERM, Signal::INT, Signal::HUP];
+    deliverable(&signals.map(Signal::as_raw));
+    for sig in signals {
         let mut scene = Scene::new();
         let pids_file = sleeping_git(&mut scene);
         let mut cardinal = start_inventory(&scene);

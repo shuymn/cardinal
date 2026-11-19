@@ -9,10 +9,12 @@ mod support;
 
 use std::os::unix::process::ExitStatusExt as _;
 
-use cardinal::os::unix::{ChildState, Until, wait_unreaped};
+use cardinal::os::unix::{ChildState, SIGINT, SIGTERM, Until, wait_unreaped};
 use cardinal::testpoint::{ADMISSION_WAITING, RUN_BEFORE_STARTING};
 use cardinal_test_support::Command;
-use cardinal_test_support::process::{GroupGuard, is_stopped, wait_for, wait_for_file};
+use cardinal_test_support::process::{
+    GroupGuard, deliverable, is_stopped, wait_for, wait_for_file,
+};
 use cardinal_test_support::pty::Pty;
 use runner_support::{Env, WAIT, output};
 use support::helper::Mode;
@@ -39,6 +41,7 @@ fn shell(env: &Env) -> Command {
 
 #[test]
 fn same_signal_death() {
+    deliverable(&[SIGTERM]);
     let env = Env::with_budget(4);
     let runner = env.run(None, &[]);
     let runner_path = runner.get_program().to_str().unwrap().to_owned();
@@ -121,6 +124,7 @@ fn ignored_signals_stay_ignored() {
 /// ignored at entry in `trap` output (bash 3.2 does not).
 #[test]
 fn an_ignored_sigchld_is_reset_for_the_runner_and_kept_for_the_stage() {
+    deliverable(&[libc::SIGCHLD]);
     let env = Env::with_budget(4);
     // Writes SIGCHLD's disposition to the file `out` and exits 3.
     let stage = |out: &str| {
@@ -189,6 +193,7 @@ fn an_ignored_sigchld_is_reset_for_the_runner_and_kept_for_the_stage() {
 /// not die by its own forwarded copy, and exits with the stage's status.
 #[test]
 fn signals_are_forwarded_to_the_group() {
+    deliverable(&[SIGTERM]);
     let env = Env::with_budget(4);
     let ready = env.file("ready");
     let got = env.file("got");
@@ -221,6 +226,7 @@ fn signals_are_forwarded_to_the_group() {
 /// alone and leaves another member of the group running.
 #[test]
 fn a_runner_leading_its_callers_group_signals_only_its_stage() {
+    deliverable(&[SIGTERM]);
     let env = Env::with_budget(4);
     let ready = env.file("ready");
     let script = format!(
@@ -261,6 +267,7 @@ fn a_runner_leading_its_callers_group_signals_only_its_stage() {
 /// gets it once continued. (macOS also reports a stopped child to a wait for exits.)
 #[test]
 fn signals_reach_a_stopped_stage() {
+    deliverable(&[SIGTERM]);
     let env = Env::with_budget(4);
     let pid_file = env.file("pid");
     let script = format!(
@@ -286,6 +293,7 @@ fn signals_reach_a_stopped_stage() {
 /// itself; the runner ignores SIGINT, as `system()` does, and forwards SIGTERM.
 #[test]
 fn fail_open_ignores_sigint_and_forwards_sigterm() {
+    deliverable(&[SIGINT, SIGTERM]);
     let env = Env::with_budget(4);
     let ready = env.file("ready");
     let script = format!(
@@ -311,6 +319,7 @@ fn fail_open_ignores_sigint_and_forwards_sigterm() {
 /// nothing behind, and it dies by that signal.
 #[test]
 fn signal_before_the_spawn_cancels_the_run() {
+    deliverable(&[SIGTERM]);
     let env = Env::with_budget(1);
     let _full = env.hold_budget(1);
     let script = format!("echo run >> '{}'", env.file("counter").display());

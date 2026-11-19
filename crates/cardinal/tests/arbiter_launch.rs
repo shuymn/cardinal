@@ -18,7 +18,7 @@
 
 mod support;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -458,8 +458,10 @@ fn sleep_until(ms: u64) {
 }
 
 /// `timeout_s` of the tests that kill a launcher: long enough for the steps that must
-/// happen while its pass still counts as running.
-const KILLED_TIMEOUT_S: u64 = 3;
+/// happen while its pass still counts as running, and for a session that defers its items to
+/// finish, which took up to 2.8 s with eight test runs loading one Mac. The tests wait for
+/// the pass to end at `timeout_s` and assert when it ended, not how long that took.
+const KILLED_TIMEOUT_S: u64 = 10;
 const KILLED_TIMEOUT_MS: u64 = KILLED_TIMEOUT_S * 1000;
 
 /// The owner's kinds, never due for a pass.
@@ -1073,7 +1075,7 @@ fn a_pass_that_answers_nothing_fails() {
     e.raise("closed_pr_dirty:/b#1@1", InboxKind::ClosedPrDirty);
     let mut failed = Vec::new();
     for round in 1..=3 {
-        assert_eq!(failing_keys(&e), Vec::<String>::new(), "round {round}");
+        assert_eq!(failing_keys(&e), BTreeSet::new(), "round {round}");
         let (code, doc) = e.arbiter_run();
         assert_eq!(code, Some(0), "{doc}");
         let pass = pass_of(&doc);
@@ -1098,7 +1100,7 @@ fn a_pass_that_answers_nothing_fails() {
         failed.push(pass);
     }
     let key = failing_key(&failed[0]);
-    assert_eq!(failing_keys(&e), std::slice::from_ref(&key));
+    assert_eq!(failing_keys(&e), BTreeSet::from([key.clone()]));
 
     e.configure(pinned, &[Step::DeferAll]);
     let (code, doc) = e.arbiter_run();
@@ -1245,20 +1247,19 @@ fn failing_key(first: &ArbiterPass) -> String {
     format!("arbiter_failing:{}@{}", first.id, first.ended_ms.unwrap())
 }
 
-/// The keys of the `arbiter_failing` items, oldest first.
-fn failing_keys(e: &Env) -> Vec<String> {
+/// The keys of the `arbiter_failing` items, as a set: `created_ms` is the wall clock when an
+/// item was stored, which items stored within a millisecond share, so no order of the items
+/// is the order they were raised in.
+fn failing_keys(e: &Env) -> BTreeSet<String> {
     failing(e).into_iter().map(|item| item.key).collect()
 }
 
-/// The `arbiter_failing` items, oldest first.
+/// The `arbiter_failing` items.
 fn failing(e: &Env) -> Vec<InboxItem> {
-    let mut items: Vec<InboxItem> = e
-        .items()
+    e.items()
         .into_iter()
         .filter(|item| item.kind == InboxKind::ArbiterFailing)
-        .collect();
-    items.sort_by_key(|item| item.created_ms);
-    items
+        .collect()
 }
 
 /// A `last.json` that exists but cannot be read or parsed starts no pass and answers nothing:
@@ -1478,8 +1479,11 @@ fn answered_once() {
 /// before the write.
 #[test]
 fn late_answer_refused() {
+    // Shorter than the 5 s an answer waits for `inbox/.lock`, so the answer is still waiting
+    // when the deadline passes.
+    const TIMEOUT_S: u64 = 3;
     let pinned = Pinned {
-        timeout_s: KILLED_TIMEOUT_S,
+        timeout_s: TIMEOUT_S,
         min_interval_s: 0,
         retry_s: 3600,
     };
@@ -1492,7 +1496,7 @@ fn late_answer_refused() {
     e.session(&pass.id);
     // No launcher writes the pass's outcome or end: the pass runs until its deadline.
     launcher.kill();
-    let deadline = pass.started_ms + KILLED_TIMEOUT_MS;
+    let deadline = pass.started_ms + TIMEOUT_S * 1000;
 
     let held = state::lock(
         &e.state.inbox_lock(),
@@ -1566,13 +1570,12 @@ fn failing_raised_once() {
     assert_eq!(pass_of(&doc).failures_in_a_row, 4);
     let first = pass_of(&e.records(RecordKind::ArbiterPass)[0].data.clone().into());
     let key = failing_key(&first);
-    let raised = failing(&e);
     assert_eq!(
-        raised.iter().map(|item| &item.key).collect::<Vec<_>>(),
-        [&key],
+        failing_keys(&e),
+        BTreeSet::from([key.clone()]),
         "raised once, for the third failure"
     );
-    assert_eq!(raised[0].status, InboxStatus::Open);
+    assert_eq!(e.item(&key).status, InboxStatus::Open);
 
     e.configure(pinned, &[Step::DeferAll]);
     let (code, doc) = e.arbiter_run();
@@ -1591,13 +1594,12 @@ fn failing_raised_once() {
         streak.push(pass_of(&doc));
     }
     let second = failing_key(&streak[0]);
-    let raised = failing(&e);
     assert_eq!(
-        raised.iter().map(|item| &item.key).collect::<Vec<_>>(),
-        [&key, &second],
+        failing_keys(&e),
+        BTreeSet::from([key, second.clone()]),
         "a new occurrence for the second run of failures"
     );
-    assert_eq!(raised[1].status, InboxStatus::Open);
+    assert_eq!(e.item(&second).status, InboxStatus::Open);
 }
 
 /// A20: a completed pass whose launcher exits after it wrote the outcome into its items and
@@ -1619,7 +1621,7 @@ fn one_alert_per_run_of_failures() {
         failed.push(pass_of(&doc));
     }
     let key = failing_key(&failed[0]);
-    assert_eq!(failing_keys(&e), std::slice::from_ref(&key));
+    assert_eq!(failing_keys(&e), BTreeSet::from([key.clone()]));
 
     e.configure(pinned, &[Step::DeferAll]);
     let points = TestPoints::new(e.dirs.scope());
@@ -1638,7 +1640,7 @@ fn one_alert_per_run_of_failures() {
     );
     assert_eq!(
         failing_keys(&e),
-        std::slice::from_ref(&key),
+        BTreeSet::from([key.clone()]),
         "the alert is still open"
     );
 
@@ -1653,7 +1655,7 @@ fn one_alert_per_run_of_failures() {
     );
     assert_eq!(
         failing_keys(&e),
-        std::slice::from_ref(&key),
+        BTreeSet::from([key.clone()]),
         "no second alert"
     );
     assert_eq!(e.item(&key).status, InboxStatus::Open);
@@ -1678,7 +1680,7 @@ fn a_completed_pass_ends_the_alert() {
         failed.push(pass_of(&doc));
     }
     let key = failing_key(&failed[0]);
-    assert_eq!(failing_keys(&e), std::slice::from_ref(&key));
+    assert_eq!(failing_keys(&e), BTreeSet::from([key.clone()]));
 
     // The session answers, and the launcher, having read the answer, fails to write the
     // outcome into the item.
@@ -1701,7 +1703,7 @@ fn a_completed_pass_ends_the_alert() {
         run.push(pass_of(&doc));
     }
     let second = failing_key(&run[0]);
-    assert_eq!(failing_keys(&e), [key, second.clone()]);
+    assert_eq!(failing_keys(&e), BTreeSet::from([key, second.clone()]));
     assert_eq!(e.item(&second).status, InboxStatus::Open);
 }
 

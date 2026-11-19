@@ -18,6 +18,9 @@ sysinfo.workspace = true
 tempfile.workspace = true
 
 [target.'cfg(unix)'.dependencies]
+# Signal dispositions and the signal mask of a test's process (src/process.rs), which rustix
+# does not offer; a process's start time on macOS (src/process.rs).
+libc.workspace = true
 # Pseudo-terminals for a child's stdin (src/pty.rs).
 rustix = { workspace = true, features = ["pty"] }
 
@@ -28,9 +31,6 @@ rustix = { workspace = true, features = ["pty"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true
 rustix = { workspace = true, features = ["event", "fs", "mount", "thread"] }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-libc.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 process-wrap.workspace = true

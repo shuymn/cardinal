@@ -397,7 +397,7 @@ fn command_trace_matches_the_hook() {
 fn command_trace_reads_the_origin_as_the_hook_does() {
     let tools = cardinal_test_support::Scope::new();
     let git = tools.root().join("git-slow");
-    hook_support::executable(&git, "#!/bin/sh\nsleep 1\nexec git \"$@\"\n");
+    tools.started_script(&git, "sleep 1\nexec git \"$@\"\n");
     let mut scene = command_scene_with(&format!("git = '{}'\n", git.display()), "");
     scene.git_timeout_ms = 100;
     let command = "npx vitest run";
