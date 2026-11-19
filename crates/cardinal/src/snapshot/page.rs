@@ -13,8 +13,8 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 
 use crate::contract::{
-    ArbiterPass, DiskReport, DiskState, Error, ErrorCode, InboxItem, InboxKind, InboxStatus,
-    InboxSubject, ItemArbiter, Repo, ScopedError, Snapshot, Worktree,
+    ArbiterPass, DiskReport, DiskState, Error, ErrorCode, ExclusiveMeasure, InboxItem, InboxKind,
+    InboxStatus, InboxSubject, ItemArbiter, Repo, ReportTarget, ScopedError, Snapshot, Worktree,
 };
 
 /// The page's content security policy: its own inline style and script, nothing loaded or
@@ -553,6 +553,28 @@ impl Page<'_> {
         }
     }
 
+    /// A disk report target's cells after its path: its worktree, its plan, its bytes by
+    /// measure, and, once executed, its status and the bytes `act` expects it freed, which
+    /// are not verified (section 10.6).
+    fn target_cells(&mut self, t: &ReportTarget) {
+        self.td(|p| p.code(&t.worktree));
+        self.td(|p| p.code(&t.plan_id));
+        self.td_text(&by_measure(
+            Some(t.exclusive_bytes),
+            t.exclusive_measure.as_ref(),
+            Some(t.exclusive_bytes),
+        ));
+        self.td_text(
+            &t.status
+                .map_or_else(|| "listed".to_owned(), |s| name_of(&s)),
+        );
+        self.td_text(&match t.freed_bytes {
+            None => "not executed".to_owned(),
+            Some(None) => "unknown".to_owned(),
+            Some(Some(freed)) => format!("{} expected, not verified", bytes(freed)),
+        });
+    }
+
     fn disk_report(&mut self, report: &DiskReport) {
         self.el_text("h4", &[], "Disk report");
         self.el("dl", &[], |p| {
@@ -604,22 +626,7 @@ impl Page<'_> {
                 ],
                 |p| {
                     for t in &report.targets {
-                        p.row(
-                            |p| p.code(&t.target),
-                            |p| {
-                                p.td(|p| p.code(&t.worktree));
-                                p.td(|p| p.code(&t.plan_id));
-                                p.td_text(&bytes(t.exclusive_bytes));
-                                p.td_text(
-                                    &t.status
-                                        .map_or_else(|| "listed".to_owned(), |s| name_of(&s)),
-                                );
-                                p.td_text(&match t.freed_bytes {
-                                    None => "not executed".to_owned(),
-                                    Some(freed) => bytes_or_unknown(freed),
-                                });
-                            },
-                        );
+                        p.row(|p| p.code(&t.target), |p| p.target_cells(t));
                     }
                 },
             );
@@ -845,6 +852,7 @@ impl Page<'_> {
                     "Regenerable pattern",
                     "Allocated",
                     "Aliased",
+                    "Exclusive",
                 ],
                 |p| {
                     for (worktree, entry) in ignored {
@@ -856,6 +864,12 @@ impl Page<'_> {
                                 p.td_text(if entry.regenerable_match { "yes" } else { "no" });
                                 p.td_text(&bytes_or_unknown(entry.allocated_bytes));
                                 p.td_text(&bytes_or_unknown(entry.aliased_bytes));
+                                p.td_text(&by_measure(
+                                    entry.exclusive_bytes,
+                                    // An entry has no null measure: none is one read before the field.
+                                    entry.exclusive_measure.map(Some).as_ref(),
+                                    entry.allocated_bytes,
+                                ));
                             },
                         );
                     }
@@ -1206,6 +1220,34 @@ fn lines(lines: &crate::contract::DiskLines) -> String {
         bytes(lines.recovery_bytes),
         bytes(lines.critical_bytes)
     )
+}
+
+/// Bytes by their measure (section 10.6): under a measure that reads (`private_size`,
+/// `extents`, `links`), at least that many, and a 0 as counted nothing that may free more;
+/// under one that does not, or none, unknown, naming the measure; and without a measure, from
+/// a report or observation made before it, `allocated` as bytes that may overstate.
+fn by_measure(
+    exclusive: Option<u64>,
+    measure: Option<&Option<ExclusiveMeasure>>,
+    allocated: Option<u64>,
+) -> String {
+    match measure {
+        None => allocated.map_or_else(
+            || "unknown".to_owned(),
+            |n| format!("{} allocated, may overstate", bytes(n)),
+        ),
+        Some(Some(
+            m @ (ExclusiveMeasure::PrivateSize
+            | ExclusiveMeasure::Extents
+            | ExclusiveMeasure::Links),
+        )) => match exclusive {
+            Some(0) => "0 counted, may free more".to_owned(),
+            Some(n) => format!("at least {}", bytes(n)),
+            None => format!("unknown ({})", name_of(&m)),
+        },
+        Some(Some(m)) => format!("unknown ({})", name_of(&m)),
+        Some(None) => "unknown (not measured)".to_owned(),
+    }
 }
 
 fn bytes_or_unknown(n: Option<u64>) -> String {
