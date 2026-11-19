@@ -6,20 +6,22 @@ mod fnv_vectors;
 mod fs;
 mod id;
 mod lock;
+mod reserve;
 
 use std::io;
 use std::path::{Path, PathBuf};
 
 pub(crate) use fs::temp_name;
 pub use fs::{
-    Durability, append_line, create_new_durable, open_append, parse_jsonl, read_jsonl,
-    remove_temp_files_older_than, sync_parent, write_atomic,
+    Durability, Op, Staged, append_line, logged, logging, open_append, parse_jsonl, read_jsonl,
+    remove_temp_files_older_than, sync_dir, sync_file, sync_parent, write_atomic,
 };
 pub use id::{
     PrefixError, find_worktree_root, fnv1a64, is_id, key, new_id, now_ms, resolve_prefix,
     worktree_key,
 };
 pub use lock::{FileLock, LockError, LockMode, Probe, create_locked, lock, probe, try_lock};
+pub use reserve::{is_no_space, retry as retry_with_reserve};
 
 use crate::contract::{Error, ErrorCode};
 
