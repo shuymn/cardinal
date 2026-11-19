@@ -49,7 +49,7 @@ fn parent_exit_before_the_spawn_leaves_nothing() {
     assert_eq!(env.lines("counter"), Vec::<String>::new(), "never started");
     assert_eq!(env.reservations().len(), 1, "only the held reservation");
     assert_eq!(env.live_locks().len(), 1, "the runner's live lock is gone");
-    assert!(env.worktree_lock_free());
+    assert!(env.worktree_lock_freed());
     let finished = env.records_of(RecordKind::JobFinished);
     assert_eq!(finished.len(), 1);
     assert_eq!(finished[0].data["cancelled"], "parent_exited");
@@ -78,7 +78,7 @@ fn parent_exit_at_the_start_boundary_cancels() {
         assert_eq!(env.lines("counter"), Vec::<String>::new(), "{fail:?}");
         assert_eq!(env.reservations(), [], "{fail:?}");
         assert_eq!(env.live_locks(), Vec::<String>::new(), "{fail:?}");
-        assert!(env.worktree_lock_free());
+        assert!(env.worktree_lock_freed());
         let finished = env.records_of(RecordKind::JobFinished);
         assert_eq!(finished.len(), 1, "{fail:?}");
         assert_eq!(finished[0].data["cancelled"], "parent_exited", "{fail:?}");
@@ -150,7 +150,7 @@ fn parent_exit_after_the_spawn_stops_the_group() {
     wait_for("the group to empty", WAIT, || {
         (!cardinal::os::unix::group_exists(runner_pid)).then_some(())
     });
-    assert!(env.worktree_lock_free());
+    assert!(env.worktree_lock_freed());
     let finished = env.records_of(RecordKind::JobFinished);
     assert_eq!(finished.len(), 1, "recorded before SIGKILL");
     let views = list_reservations(&env.state(), &HostConfig::defaults()).unwrap();
@@ -278,7 +278,7 @@ fn parent_exit_after_the_child_exited_stops_its_descendants() {
     );
     wait_gone(runner_pid, runner_start);
     assert_eq!(env.reservations(), [], "released: the group is empty");
-    assert!(env.worktree_lock_free());
+    assert!(env.worktree_lock_freed());
     let finished = env.records_of(RecordKind::JobFinished);
     assert_eq!(finished[0].data["exit"], 0);
 }
@@ -495,7 +495,7 @@ impl StoppedJob {
             || (!cardinal::os::is_alive(self.stage, self.stage_start)).then_some(()),
         );
         wait_gone(self.runner, self.runner_start);
-        assert!(env.worktree_lock_free(), "{path}");
+        assert!(env.worktree_lock_freed(), "{path}");
         let finished = env.records_of(RecordKind::JobFinished);
         assert_eq!(finished[0].data["signal"], 15, "{path}: SIGTERM");
     }

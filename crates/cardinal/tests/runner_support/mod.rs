@@ -32,6 +32,13 @@ use cardinal_test_support::{Command, Scope, bin_exe};
 
 pub const WAIT: Duration = Duration::from_secs(20);
 
+/// How long a lock may stay held after the test saw its holder end without reaping it: macOS
+/// can report a process as exited (`waitid` with `WNOWAIT`) or stop listing it (`proc_pidinfo`
+/// fails) before it has closed its descriptors. On a development Mac at load 100 to 230, a
+/// killed runner's live lock was still held when `waitid` reported the runner exited and free
+/// 0.2 ms later, and locks of processes gone from the table stayed held for up to 34 ms.
+pub const TEARDOWN: Duration = Duration::from_secs(2);
+
 /// A state dir, a config dir, a test-point dir, and a worktree (a directory with a `.git`
 /// directory; no git runs), all in one scope.
 pub struct Env {
@@ -241,6 +248,23 @@ impl Env {
         .is_some()
     }
 
+    /// Whether the worktree's in-use lock is free now or within [`TEARDOWN`]: for a runner the
+    /// test saw end ([`wait_gone`]) without reaping it.
+    pub fn worktree_lock_freed(&self) -> bool {
+        within_teardown(|| self.worktree_lock_free())
+    }
+
+    /// Whether `job`'s live lock is free (or gone) now or within [`TEARDOWN`]: for a runner the
+    /// test killed without reaping it.
+    pub fn live_lock_freed(&self, job: &str) -> bool {
+        within_teardown(|| {
+            matches!(
+                state::probe(&self.state().live_lock(job)),
+                Ok(state::Probe::Free | state::Probe::Missing)
+            )
+        })
+    }
+
     /// Holds the worktree's in-use lock exclusively, as `act` does.
     pub fn hold_worktree_exclusive(&self) -> FileLock {
         state::try_lock(
@@ -370,7 +394,22 @@ pub fn output(command: &mut Command) -> Output {
     command.output_within(WAIT).expect("run the command")
 }
 
-/// Waits until `pid` is no longer alive with `start_s`.
+/// Whether `free` holds now or within [`TEARDOWN`], polling every 5 ms.
+fn within_teardown(mut free: impl FnMut() -> bool) -> bool {
+    let start = Instant::now();
+    loop {
+        if free() {
+            return true;
+        }
+        if start.elapsed() >= TEARDOWN {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Waits until `pid` is no longer alive with `start_s`. The locks it held may stay held for
+/// up to [`TEARDOWN`] after that.
 pub fn wait_gone(pid: u32, start_s: u64) {
     wait_for(&format!("process {pid} to end"), WAIT, || {
         (!cardinal::os::is_alive(pid, start_s)).then_some(())
