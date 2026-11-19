@@ -492,13 +492,27 @@ pub fn refresh_with(
         });
     }
 
-    let table = ProcessTable::snapshot(Detail::default())
-        .map_err(|err| Error::new(ErrorCode::Internal, err.to_string()))?;
-    let snapshots = read_sessions(state)?;
+    // Only the session snapshots need the process listing: when it fails, the reservation
+    // items are still applied, the snapshots are left for the next refresh, and the refresh
+    // fails with the listing's error.
+    let listed = testpoint::hit(testpoint::INBOX_LISTING)
+        .map_err(|err| err.to_string())
+        .and_then(|()| ProcessTable::snapshot(Detail::default()).map_err(|err| err.to_string()))
+        .map_err(|err| {
+            Error::new(
+                ErrorCode::Internal,
+                format!("{err}; the session snapshots were not read"),
+            )
+        });
+    let snapshots = match &listed {
+        Ok(_) => read_sessions(state)?,
+        Err(_) => Vec::new(),
+    };
     testpoint::hit(testpoint::INBOX_OBSERVED)
         .map_err(|err| Error::new(ErrorCode::Internal, err.to_string()))?;
     let mut sessions = BTreeSet::new();
     for (path, snapshot) in snapshots {
+        let Ok(table) = &listed else { break };
         sessions.insert(snapshot.session_id.clone());
         let key = outlived_key(&snapshot.session_id);
         // `clear` and `resume` keep the agent running: nothing has outlived it yet.
@@ -546,7 +560,8 @@ pub fn refresh_with(
     }
 
     changes.extend(ended_gone(state, &before, &reserved, &sessions, found_ms));
-    apply_recorded(config, state, &changes)
+    let applied = apply_recorded(config, state, &changes)?;
+    listed.map(|_| applied)
 }
 
 /// `inbox/.refresh.lock`, taken before the admission lock and held from a refresh's first read

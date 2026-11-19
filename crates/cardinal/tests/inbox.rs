@@ -446,6 +446,47 @@ fn refresh_failure_is_reported() {
     assert!(inbox::list(&e.config, &e.state, None, false).is_ok());
 }
 
+/// A refresh whose process listing fails still raises and clears `recovery_needed` from its
+/// recovery pass, leaves the session snapshots for the next refresh, and fails. The listing's
+/// failure is injected at `inbox.listing`.
+#[test]
+fn a_failed_listing_still_applies_the_reservation_items() {
+    let e = env();
+    refresh_reporting(&e, &["gone"]);
+    // Nothing of this session is alive: a refresh that lists the processes ends it.
+    session_snapshot(&e.state, "s", (std::process::id(), 1), &[]);
+    let points = support::testpoints::TestPoints::new(e.dirs.scope());
+    let mut command = e.refresh_command_reporting(Some(&["kept"]));
+    points.apply(&mut command, &[], Some(cardinal::testpoint::INBOX_LISTING));
+    let status = command.status().unwrap();
+    assert_eq!(status.code(), Some(1), "the refresh fails");
+
+    let items = list(&e, Some(StatusFilter::All));
+    let status_of = |key: &str| {
+        items
+            .iter()
+            .find(|i| inbox::occurrence_of(&i.key).0 == key)
+            .map(|i| (i.status, i.resolution.as_ref().map(|r| r.note.clone())))
+    };
+    assert_eq!(
+        status_of("recovery_needed:gone"),
+        Some((
+            InboxStatus::Resolved,
+            Some("the reservation is gone".to_owned())
+        )),
+        "{items:#?}"
+    );
+    assert_eq!(
+        status_of("recovery_needed:kept"),
+        Some((InboxStatus::Open, None)),
+        "{items:#?}"
+    );
+    assert!(e.state.session("s").exists(), "left for the next refresh");
+
+    refresh_reporting(&e, &["kept"]);
+    assert!(!e.state.session("s").exists(), "ended once listed");
+}
+
 fn json(stdout: &[u8]) -> serde_json::Value {
     serde_json::from_slice(stdout).unwrap()
 }

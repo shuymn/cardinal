@@ -68,8 +68,11 @@ pub const HOOK_CLASSIFIED: &str = "hook.classified";
 /// A record appender holds the shared records lock and the open current file, and has not
 /// written its line.
 pub const RECORD_OPENED: &str = "record.opened";
-/// The inbox refresh observed reservations, processes, and sessions, and has not raised or
-/// cleared anything.
+/// The inbox refresh ran its recovery pass and is about to list the processes; an injected
+/// failure stands for a process table that cannot be read.
+pub const INBOX_LISTING: &str = "inbox.listing";
+/// The inbox refresh observed reservations, and processes and sessions unless the listing
+/// failed, and has not raised or cleared anything.
 pub const INBOX_OBSERVED: &str = "inbox.observed";
 /// A refresh found `inbox/.refresh.lock` held and is about to wait for it.
 pub const INBOX_REFRESH_WAITING: &str = "inbox.refresh_waiting";
@@ -130,6 +133,7 @@ pub const POINTS: &[&str] = &[
     OBSERVE_FILTERS_LISTED,
     HOOK_CLASSIFIED,
     RECORD_OPENED,
+    INBOX_LISTING,
     INBOX_OBSERVED,
     INBOX_REFRESH_WAITING,
     ACT_LOCK_OPENED,
