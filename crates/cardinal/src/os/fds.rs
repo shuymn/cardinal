@@ -146,8 +146,8 @@ fn scan_pids(pids: Vec<u32>, sizes: Sizes) -> Result<Scan, String> {
             Err(Unread::Failed(err)) => read.failed.push(err),
             Err(Unread::Full(err)) => return Err(format!("process {pid}: {err}")),
         }
-        if !read.failed.is_empty() {
-            scan.unscanned.push((pid, read.failed.join("; ")));
+        if let Some(why) = why_unscanned(&read.failed) {
+            scan.unscanned.push((pid, why));
         }
         if !read.uses.is_empty() {
             scan.processes.push(Process {
@@ -157,6 +157,17 @@ fn scan_pids(pids: Vec<u32>, sizes: Sizes) -> Result<Scan, String> {
         }
     }
     Ok(scan)
+}
+
+/// Why a process is unscanned: the first read that failed, with how many more did, so a
+/// process whose every descriptor refuses its read gives one line.
+#[cfg(unix)]
+fn why_unscanned(failed: &[String]) -> Option<String> {
+    let first = failed.first()?;
+    Some(match failed.len() - 1 {
+        0 => first.clone(),
+        more => format!("{first} (and {more} more reads)"),
+    })
 }
 
 /// Reads a list with `read`, which fills the buffer it is given and returns how many entries
@@ -525,7 +536,7 @@ mod os {
 mod tests {
     use std::path::Path;
 
-    use super::{SIZES, Sizes, Unread, Way, read_list, scan, scan_pids, scan_with};
+    use super::{SIZES, Sizes, Unread, Way, read_list, scan, scan_pids, scan_with, why_unscanned};
 
     fn holder(scan: &super::Scan, pid: u32) -> &super::Process {
         scan.processes
@@ -642,5 +653,18 @@ mod tests {
         ));
         let failed = read_list(0, 8, 3, |_: &mut [u32]| Err::<usize, _>("EPERM"));
         assert!(matches!(failed, Err(Unread::Failed(err)) if err == "EPERM"));
+    }
+
+    /// An unscanned process names the first read that failed and counts the rest.
+    #[test]
+    fn an_unscanned_process_names_its_first_failed_read() {
+        let failed =
+            |n: usize| -> Vec<String> { (0..n).map(|fd| format!("fd {fd}: EPERM")).collect() };
+        assert_eq!(why_unscanned(&failed(0)), None);
+        assert_eq!(why_unscanned(&failed(1)).as_deref(), Some("fd 0: EPERM"));
+        assert_eq!(
+            why_unscanned(&failed(3)).as_deref(),
+            Some("fd 0: EPERM (and 2 more reads)")
+        );
     }
 }
