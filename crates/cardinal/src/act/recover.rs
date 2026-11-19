@@ -392,23 +392,30 @@ pub fn recover_held(
 }
 
 /// Raises `reclaim_stranded` for `claim`'s execution, which leaves data in the trash entry
-/// `trash` for `why`, with the entries it kept (section 10.1).
+/// `trash` for `why`, with the entries it kept (section 10.1). An item still open for the same
+/// trash entry, reason, and kept entries is left as it is: a recovery that strands again each
+/// pass neither sizes the entry again nor raises it again.
 pub fn stranded(state: &StateDir, claim: &ActClaim, trash: &Path, why: &str, kept: &[String]) {
+    let trash = trash.display().to_string();
+    let kept: Vec<String> = kept.iter().take(STRANDED_ENTRIES).cloned().collect();
+    let key = format!("reclaim_stranded:{}", claim.plan_id);
+    let raised = inbox::latest(state).ok().and_then(|mut l| l.remove(&key));
+    if let Some(item) = raised
+        && item.ended_ms.is_none()
+        && item.evidence.get("trash").and_then(|v| v.as_str()) == Some(trash.as_str())
+        && item.evidence.get("reason").and_then(|v| v.as_str()) == Some(why)
+        && item.evidence.get("kept") == Some(&serde_json::json!(kept))
+    {
+        return;
+    }
     let mut evidence = serde_json::Map::new();
     let target = Path::new(&claim.worktree.path).join(target_rel(claim));
     evidence.insert("target".into(), target.display().to_string().into());
-    evidence.insert("trash".into(), trash.display().to_string().into());
-    let (entries, bytes) = left(trash);
+    let (entries, bytes) = left(Path::new(&trash)).unzip();
+    evidence.insert("trash".into(), trash.into());
     evidence.insert("entries_left".into(), entries.into());
     evidence.insert("bytes_left".into(), bytes.into());
-    evidence.insert(
-        "kept".into(),
-        kept.iter()
-            .take(STRANDED_ENTRIES)
-            .cloned()
-            .collect::<Vec<_>>()
-            .into(),
-    );
+    evidence.insert("kept".into(), kept.into());
     evidence.insert("reason".into(), why.into());
     raise_stranded(state, &claim.plan_id, Some(&claim.worktree.path), evidence);
 }
@@ -436,29 +443,26 @@ fn raise_stranded(
     let _ = inbox::raise_occurrence(state, &item, state::now_ms());
 }
 
-/// The entries below `trash` and the bytes they allocate, read without following links; what
-/// cannot be read is left out.
-fn left(trash: &Path) -> (u64, u64) {
+/// The entries below `trash` and the bytes they allocate, read without following links;
+/// `None`, unknown, when a directory or an entry below it cannot be read.
+#[must_use]
+pub fn left(trash: &Path) -> Option<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
     let mut entries = 0;
     let mut bytes = 0;
     let mut dirs = vec![trash.to_path_buf()];
     while let Some(dir) = dirs.pop() {
-        let Ok(listed) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in listed.flatten() {
-            let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
-                continue;
-            };
+        for entry in std::fs::read_dir(&dir).ok()? {
+            let path = entry.ok()?.path();
+            let meta = std::fs::symlink_metadata(&path).ok()?;
             entries += 1;
             bytes += meta.blocks() * 512;
             if meta.is_dir() {
-                dirs.push(entry.path());
+                dirs.push(path);
             }
         }
     }
-    (entries, bytes)
+    Some((entries, bytes))
 }
 
 /// How a restore ([`restore`]) ended when it did not finish.
@@ -766,6 +770,14 @@ fn committed(
         }
         Err(err) => return Err(err),
     }
+    // The grant and the unit gate are decided before the manifest is read, so an execution
+    // whose caller lost them costs a pass a configuration load and no more.
+    let early = Config::load(config_dir)
+        .map_err(|err| format!("the configuration does not load: {err}"))
+        .and_then(|config| may_act(&config, claim, grant));
+    if let Err(why) = early {
+        return stranded(why);
+    }
     let manifest = match read_manifest(state, plan) {
         Ok(manifest) if manifest.len() as u64 == claim.manifest_entries => manifest,
         Ok(manifest) => {
@@ -783,17 +795,8 @@ fn committed(
     let Some(config) = watch.config() else {
         return stranded(loaded.err().unwrap_or_default());
     };
-    let caller = match claim.caller.parse::<Caller>() {
-        Ok(caller) => caller,
-        Err(err) => return stranded(err.to_string()),
-    };
-    if let Err(why) = grant(config, &caller) {
+    if let Err(why) = may_act(config, claim, grant) {
         return stranded(why);
-    }
-    if let Caller::Unit(name) = &caller
-        && !config.host.unit_may_act(name)
-    {
-        return stranded(format!("unit.{name}.act is false"));
     }
     if let Err(why) = loaded {
         return stranded(why);
@@ -842,6 +845,22 @@ fn committed(
 /// The check the result lists for the descriptor scans the deletion made: `not_in_use`,
 /// passed, since a use found stops the deletion, with the processes the scans could not read,
 /// which do not count (section 9.7), cut as `act` cuts them, the rest counted in `omitted`.
+/// Whether `claim`'s caller still holds its grant and, as a unit, its gate under `config`:
+/// `Err` says why not.
+fn may_act(config: &Config, claim: &ActClaim, grant: Grant<'_>) -> Result<(), String> {
+    let caller = claim
+        .caller
+        .parse::<Caller>()
+        .map_err(|err| err.to_string())?;
+    grant(config, &caller)?;
+    match &caller {
+        Caller::Unit(name) if !config.host.unit_may_act(name) => {
+            Err(format!("unit.{name}.act is false"))
+        }
+        _ => Ok(()),
+    }
+}
+
 fn unscanned_check(unscanned: &[(u32, String)]) -> Check {
     let entries: Vec<serde_json::Value> = unscanned
         .iter()

@@ -5,8 +5,8 @@
 //! evaluates the checks. An `act` that does not execute reports `expired`, `rejected`, or
 //! `dry_run`, with the reason it did not execute; it writes nothing but its record. Whether it
 //! executes is the grant decision ([`Run::grant`]): a `reclaim_dir` plan on macOS or Linux
-//! whose caller `[act] execute` grants that kind, without `--dry-run`. Only the owner executes
-//! until unit X2 brings `disk-reclaim`'s pass; the arbiter never does. An execution
+//! whose caller `[act] execute` grants that kind, without `--dry-run`, a unit only while its
+//! `[unit.<name>] act` is true; the arbiter never executes. An execution
 //! ([`execute`]) takes the plan's `act.lock` and the worktree's in-use lock, checks the target
 //! again after it moved it out of the worktree, and deletes it from the trash, or restores it.
 
@@ -32,6 +32,8 @@ use crate::state::{self, Probe, StateDir};
 use crate::testpoint;
 
 #[cfg(unix)]
+pub use execute::grant as recovery_grant;
+#[cfg(unix)]
 pub use execute::{
     BOUND_ELSEWHERE, CHANGED_DURING_ACT, CLAIM_UNREADABLE, IN_PROGRESS, IN_USE_WHILE_DELETING,
     NO_SPACE, NOT_DIRECTORY_EXCLUDED, NOT_ON_STATE_MOUNT, SPARSE_CHECKOUT, TRACKED_OVERLAP,
@@ -39,12 +41,11 @@ pub use execute::{
 };
 
 /// Why a plan whose checks pass and whose approval is met reports `dry_run` on a path that has
-/// no execution: a whole worktree, every plan on Windows, and, until unit X2, a unit's
-/// (section 9.3).
+/// no execution: a whole worktree and every plan on Windows (section 9.3).
 pub const EXECUTION_NOT_DESIGNED: &str = "execution_not_designed";
 
 /// Why such a plan reports `dry_run` when `[act] execute` does not grant its caller the plan's
-/// kind (section 9.7).
+/// kind, or, for a unit, while its `[unit.<name>] act` is false (section 9.7).
 pub const EXECUTION_NOT_GRANTED: &str = "execution_not_granted";
 
 /// Why such a plan reports `dry_run` when a granted caller passed `--dry-run`.
@@ -180,10 +181,10 @@ impl Run<'_> {
     }
 
     /// The grant decision (section 9.7, "Grants"): `Ok` when this run executes, else the
-    /// reason a plan whose checks pass reports `dry_run`. A whole worktree, every plan on
-    /// Windows, and a granted unit, whose execution comes with unit X2's pass, are not
-    /// designed; a caller `[act] execute` does not grant, the arbiter always, is not granted;
-    /// and a granted caller's `--dry-run` asks for the report.
+    /// reason a plan whose checks pass reports `dry_run`. A whole worktree and every plan on
+    /// Windows are not designed; a caller `[act] execute` does not grant, the arbiter always,
+    /// and a granted unit whose `act` is false (C16), are not granted; and a granted caller's
+    /// `--dry-run` asks for the report.
     fn grant(&self) -> Result<(), &'static str> {
         if cfg!(not(unix)) || self.plan.kind != PlanKind::ReclaimDir {
             return Err(EXECUTION_NOT_DESIGNED);
@@ -192,8 +193,10 @@ impl Run<'_> {
         if !self.config.host.grants(caller, PlanKind::ReclaimDir) {
             return Err(EXECUTION_NOT_GRANTED);
         }
-        if matches!(caller, Caller::Unit(_)) {
-            return Err(EXECUTION_NOT_DESIGNED);
+        if let Caller::Unit(name) = caller
+            && !self.config.host.unit_may_act(name)
+        {
+            return Err(EXECUTION_NOT_GRANTED);
         }
         if self.options.dry_run {
             return Err(DRY_RUN_REQUESTED);

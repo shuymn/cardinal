@@ -842,17 +842,37 @@ mod grants {
         assert_reports(&x, &arbiter(), "execution_not_granted");
     }
 
-    /// A granted `disk-reclaim` whose `act` is true reports `execution_not_designed`: its
-    /// execution comes with unit X2's pass (section 14.2).
+    /// `unit:disk-reclaim` executes only with its grant and its `act` true: granted with
+    /// `act` false, it reports `execution_not_granted` and records `planned` (C16), and with
+    /// both its `act` executes, as the pass runs it (section 9.7).
     #[test]
-    fn a_granted_unit_waits_for_its_pass() {
-        let host = "[unit.disk-reclaim]\nact = true\n[act]\nexecute = { \"unit:disk-reclaim\" = [\"reclaim_dir\"] }\n";
-        let x = Live::with_host(host, "unit", "target", &["debug/app"], |_, _| {});
-        let options = cardinal::act::ActOptions {
+    fn a_unit_needs_its_grant_and_its_gate() {
+        let unit = cardinal::act::ActOptions {
             caller: cardinal::contract::Caller::Unit("disk-reclaim".into()),
             ..owner()
         };
-        assert_reports(&x, &options, "execution_not_designed");
+        let grant = "[act]\nexecute = { \"unit:disk-reclaim\" = [\"reclaim_dir\"] }\n";
+        let gated = Live::with_host(
+            &format!("[unit.disk-reclaim]\nact = false\n{grant}"),
+            "gated",
+            "target",
+            &["debug/app"],
+            |_, _| {},
+        );
+        assert_reports(&gated, &unit, "execution_not_granted");
+
+        let x = Live::with_host(
+            &format!("[unit.disk-reclaim]\nact = true\n{grant}"),
+            "unit",
+            "target",
+            &["debug/app"],
+            |_, _| {},
+        );
+        let result = x.s.act(&x.plan.id, &unit).unwrap();
+        assert_eq!(result.status, ActStatus::Executed, "{result:#?}");
+        assert_eq!(result.caller, "unit:disk-reclaim");
+        assert!(!x.target().exists());
+        assert!(!x.entry().exists());
     }
 }
 

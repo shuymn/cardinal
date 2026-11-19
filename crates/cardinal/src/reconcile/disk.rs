@@ -19,6 +19,7 @@ use crate::record::Recorder;
 use crate::sensor::{self, Measure};
 use crate::state::{self, StateDir};
 
+use super::raise::Passed;
 use super::{read_json, scoped, write_json};
 
 /// Readings kept per volume.
@@ -47,6 +48,8 @@ pub struct Watched {
     pub state: DiskState,
     /// The pass's last successful reading.
     pub reading: Option<ReportReading>,
+    /// What the pass's readings found, for an episode that ends within it.
+    pub passed: Passed,
 }
 
 impl Watched {
@@ -100,6 +103,7 @@ pub fn read_watched(
             path,
             state: disk_state,
             reading: None,
+            passed: Passed::default(),
         };
         read(config, state, &mut volume, errors);
         watched.push(volume);
@@ -108,13 +112,14 @@ pub fn read_watched(
 }
 
 /// Reads `volume` once and keeps the reading; a successful one updates its state and becomes
-/// the pass's last successful reading. Writes `disk/<volume>.json`.
+/// the pass's last successful reading. Writes `disk/<volume>.json`. Whether the read
+/// succeeded.
 pub fn read(
     config: &Config,
     state: &StateDir,
     volume: &mut Watched,
     errors: &mut Vec<ScopedError>,
-) {
+) -> bool {
     let at_ms = state::now_ms();
     let scope = format!("disk:{}", volume.state.mount);
     let read = sensor::free_space(&volume.path, MEASURE);
@@ -139,6 +144,12 @@ pub fn read(
             if to != from {
                 volume.state.state = to;
                 volume.state.since_ms = at_ms;
+                if under_pressure(to) {
+                    volume.passed.low_ms.get_or_insert(at_ms);
+                }
+                if to == DiskLevel::Critical {
+                    volume.passed.critical_ms.get_or_insert(at_ms);
+                }
                 record(
                     &recorder,
                     &volume.state,
@@ -161,6 +172,47 @@ pub fn read(
     }
     let path = state.disk_state(&volume.state.volume);
     write_json(state, &path, &volume.state, &scope, errors);
+    volume
+        .state
+        .readings
+        .last()
+        .is_some_and(|r| r.free_bytes.is_some())
+}
+
+/// Step 4, last part (section 9.7, "Space"): writes `<state>/reserve` when it is missing and
+/// the state dir's volume, `disks`'s volume read from the state dir, read above its recovery
+/// line plus the reserve's size in this pass, so writing it never puts the volume under
+/// pressure. The file is written block by block, never sparse, synced, and renamed into
+/// place; a write that fails leaves no reserve and is reported in `errors`.
+pub fn write_reserve(
+    config: &Config,
+    state: &StateDir,
+    disks: &[Watched],
+    errors: &mut Vec<ScopedError>,
+) {
+    let size = config.host.disk.reserve_bytes();
+    let Some(volume) = disks.iter().find(|d| d.path == state.root()) else {
+        return;
+    };
+    let Some(reading) = volume.reading else {
+        return;
+    };
+    let line = volume.state.lines.recovery_bytes.saturating_add(size);
+    if reading.free_bytes <= line {
+        return;
+    }
+    let path = state.reserve_file();
+    match std::fs::symlink_metadata(&path) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => return,
+        Err(err) => {
+            errors.push(scoped("reserve", format!("{}: {err}", path.display())));
+            return;
+        }
+    }
+    if let Err(err) = state::write_reserve(&state.tmp_dir(), &path, size) {
+        errors.push(scoped("reserve", format!("{}: {err}", path.display())));
+    }
 }
 
 /// The state a successful reading of `free` bytes leads to from `current` (section 10.4):

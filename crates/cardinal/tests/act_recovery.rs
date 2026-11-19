@@ -5,9 +5,11 @@
 //! holds the plan's `act.lock` at `recover.locked`; and, through `act` (unit X1c), SIGKILL at
 //! every pause point of a live execution followed by `act` on the same plan, the `claimed`
 //! rows, an unreadable claim followed by a new plan that executes, and `act` kept out at
-//! `recover.locked`. X2 runs the crashes through a pass (section 14.2).
+//! `recover.locked`; and, through a `reconcile` pass (unit X2), the same crashes, a trash entry
+//! that no execution names, reported and kept, and the pass's reclaim budget.
 #![cfg(unix)]
 
+mod disk_support;
 mod execution_support;
 mod live_support;
 mod observe_common;
@@ -712,5 +714,455 @@ mod through_act {
 
     fn read(path: &std::path::Path) -> String {
         std::fs::read_to_string(path).unwrap()
+    }
+}
+
+/// The crashes of section 13.7 followed by a `reconcile` pass (unit X2): step 2 recovers each
+/// execution that died as `act` on its plan would, reports it in `recovered`, and leaves what
+/// it cannot account for with `reclaim_stranded`; a trash entry that no execution names is
+/// reported and kept; and a pass that has spent `reclaim_budget_s` starts no more recoveries.
+mod through_a_pass {
+    use cardinal::contract::{ActStatus, InboxKind, Reconcile, RecoveredExecution};
+    use live_support::{GRANT, Live};
+
+    use super::*;
+    use crate::disk_support;
+    use crate::support::testpoints::TestPoints;
+
+    /// A live execution as [`Live::new`] makes one, with the disk tests' configuration: the
+    /// volumes are never under pressure, and the arbiter's command does nothing.
+    fn live(name: &str, files: &[&str]) -> Live {
+        live_with(name, files, "")
+    }
+
+    fn live_with(name: &str, files: &[&str], extra: &str) -> Live {
+        let host = disk_support::host((0, 1, 2), &format!("{extra}{GRANT}"));
+        Live::with_host(&host, name, "target", files, |_, _| {})
+    }
+
+    /// One pass, with no error but those of `allowed` scopes.
+    fn pass(x: &Live) -> Reconcile {
+        let points = TestPoints::new(x.s.fx.scope());
+        let pass = disk_support::reconcile(&x.s, &points);
+        let errors: Vec<_> = pass
+            .errors
+            .iter()
+            .filter(|e| e.scope == "recover" || e.scope == "trash")
+            .collect();
+        assert!(errors.is_empty(), "{pass:#?}");
+        pass
+    }
+
+    fn recovered(x: &Live, status: ActStatus) -> Vec<RecoveredExecution> {
+        vec![RecoveredExecution {
+            plan_id: x.plan.id.clone(),
+            status,
+        }]
+    }
+
+    /// The result recovery wrote.
+    fn result(x: &Live) -> cardinal::contract::ActResult {
+        serde_json::from_slice(&std::fs::read(x.s.state.execution_result(&x.plan.id)).unwrap())
+            .unwrap()
+    }
+
+    /// At `act.excluded` and `act.publishing` no claim exists: the pass recovers nothing, and
+    /// the next `act` executes.
+    #[test]
+    fn nothing_claimed_nothing_recovered() {
+        for point in [testpoint::ACT_EXCLUDED, testpoint::ACT_PUBLISHING] {
+            let x = live("unclaimed", &["debug/app"]);
+            x.kill_at(point);
+            let pass = pass(&x);
+            assert_eq!(pass.recovered, [], "{point}");
+            assert!(x.target().exists(), "{point}");
+            assert_eq!(x.act().status, ActStatus::Executed, "{point}");
+        }
+    }
+
+    /// At `act.claimed`, `act.moved`, `act.checked`, and the publication of `committed`, the
+    /// pass restores the target whole and writes `rejected` (`interrupted`) with no trash
+    /// entry; the next `act` on the plan reports `already_executed`.
+    #[test]
+    fn claimed_executions_are_restored() {
+        for point in [
+            testpoint::ACT_CLAIMED,
+            testpoint::ACT_MOVED,
+            testpoint::ACT_CHECKED,
+        ] {
+            let x = live("claimed", &["debug/app", "debug/deps/lib"]);
+            let before = x.files();
+            x.kill_at(point);
+            let pass = pass(&x);
+            assert_eq!(
+                pass.recovered,
+                recovered(&x, ActStatus::Rejected),
+                "{point}"
+            );
+            assert_eq!(result(&x).reasons, ["interrupted"], "{point}");
+            assert_eq!(x.files(), before, "{point}");
+            assert!(!x.entry().exists(), "{point}");
+            assert_eq!(x.act().status, ActStatus::AlreadyExecuted, "{point}");
+        }
+
+        let x = live("publishing-committed", &["debug/app"]);
+        let before = x.files();
+        let mut paused = x.spawn(&[testpoint::ACT_PUBLISHING, testpoint::ACT_CHECKED], None);
+        paused.wait(testpoint::ACT_PUBLISHING);
+        paused.release(testpoint::ACT_PUBLISHING);
+        paused.wait(testpoint::ACT_CHECKED);
+        paused.rearm(testpoint::ACT_PUBLISHING);
+        paused.release(testpoint::ACT_CHECKED);
+        paused.wait(testpoint::ACT_PUBLISHING);
+        paused.child.kill();
+        let pass = pass(&x);
+        assert_eq!(pass.recovered, recovered(&x, ActStatus::Rejected));
+        assert_eq!(x.files(), before);
+    }
+
+    /// At `act.committed`, `act.taken`, `act.held`, and `act.finishing`, and after a failure
+    /// injected at `act.committed`, the pass finishes the execution: `executed`, the target
+    /// and its trash entry gone.
+    #[test]
+    fn committed_executions_are_finished() {
+        for point in [
+            testpoint::ACT_COMMITTED,
+            testpoint::ACT_TAKEN,
+            testpoint::ACT_HELD,
+            testpoint::ACT_FINISHING,
+        ] {
+            let x = live("committed", &["debug/app", "debug/log"]);
+            x.kill_at(point);
+            let pass = pass(&x);
+            assert_eq!(
+                pass.recovered,
+                recovered(&x, ActStatus::Executed),
+                "{point}"
+            );
+            let result = result(&x);
+            assert!(result.recovered, "{point}: {result:#?}");
+            assert!(!x.target().exists(), "{point}");
+            assert!(!x.entry().exists(), "{point}");
+        }
+
+        let x = live("sync-failed", &["debug/app", "debug/log"]);
+        let left = x.spawn(&[], Some(testpoint::ACT_COMMITTED)).finish(&[]);
+        assert_eq!(left.status, ActStatus::Partial, "{left:#?}");
+        let pass = pass(&x);
+        assert_eq!(pass.recovered, recovered(&x, ActStatus::Executed));
+        assert!(!x.entry().exists());
+    }
+
+    /// At `act.restored`, a restore renamed back and not synced, the pass syncs it and writes
+    /// `rejected` (`interrupted`), the target as the restore left it.
+    #[test]
+    fn a_restore_is_finished() {
+        let x = live("restoring", &["debug/app", "debug/log"]);
+        let mut paused = x.spawn(&[testpoint::ACT_MOVED, testpoint::ACT_RESTORED], None);
+        paused.wait(testpoint::ACT_MOVED);
+        std::fs::write(x.t().join("debug/log"), "changed").unwrap();
+        paused.release(testpoint::ACT_MOVED);
+        paused.wait(testpoint::ACT_RESTORED);
+        paused.child.kill();
+        let pass = pass(&x);
+        assert_eq!(pass.recovered, recovered(&x, ActStatus::Rejected));
+        assert_eq!(
+            std::fs::read_to_string(x.target().join("debug/log")).unwrap(),
+            "changed"
+        );
+        assert!(!x.entry().exists());
+    }
+
+    /// What recovery cannot account for stays, with `reclaim_stranded`: a `claimed` target
+    /// whose parent was renamed, an unreadable claim, and a committed execution whose
+    /// caller's grant was withdrawn. The pass reports none of them as recovered.
+    #[test]
+    fn what_cannot_be_accounted_for_stays() {
+        let x = Live::with_host(
+            &disk_support::host((0, 1, 2), GRANT),
+            "renamed",
+            "pkg/node_modules",
+            &["a/index.js"],
+            |_, _| {},
+        );
+        x.kill_at(testpoint::ACT_MOVED);
+        std::fs::rename(x.wt.join("pkg"), x.wt.join("pkg2")).unwrap();
+        let first = pass(&x);
+        assert_eq!(first.recovered, []);
+        assert!(x.t().join("a/index.js").exists());
+        assert!(x.stranded_items() >= 1);
+
+        let x = live("unreadable", &["debug/app"]);
+        x.kill_at(testpoint::ACT_CLAIMED);
+        std::fs::write(x.s.state.execution_claim(&x.plan.id), b"{ not json").unwrap();
+        let before = x.files();
+        assert_eq!(pass(&x).recovered, []);
+        assert_eq!(x.files(), before);
+        assert!(x.entry().is_dir());
+        assert!(x.stranded_items() >= 1);
+
+        let mut x = live("ungranted", &["debug/app", "debug/log"]);
+        x.kill_at(testpoint::ACT_COMMITTED);
+        x.s.scene.clear_observe_config();
+        x.s.scene.observe_config(&disk_support::host((0, 1, 2), ""));
+        assert_eq!(pass(&x).recovered, []);
+        assert!(x.t().join("debug/app").exists());
+        assert!(x.stranded_items() >= 1);
+    }
+
+    /// A trash entry that no execution directory names is reported with `reclaim_stranded`,
+    /// naming the entry, and kept, whatever it holds, pass after pass.
+    #[test]
+    fn a_trash_entry_no_execution_names_is_kept() {
+        let x = live("control", &["debug/app"]);
+        let entry = x.s.state.trash_dir().join("0123456789abcdef");
+        std::fs::create_dir_all(entry.join("t/sub")).unwrap();
+        std::fs::write(entry.join("t/sub/file"), "data").unwrap();
+        let before = plan_support::listing(&entry);
+        for _ in 0..2 {
+            let pass = pass(&x);
+            assert_eq!(pass.recovered, []);
+            assert_eq!(plan_support::listing(&entry), before);
+        }
+        let items = cardinal::inbox::list(
+            &x.s.config(),
+            &x.s.state,
+            Some(cardinal::inbox::StatusFilter::All),
+            false,
+        )
+        .unwrap()
+        .items;
+        let stranded: Vec<_> = items
+            .iter()
+            .filter(|i| i.kind == InboxKind::ReclaimStranded)
+            .collect();
+        assert_eq!(stranded.len(), 1, "{stranded:#?}");
+        assert!(
+            stranded[0]
+                .key
+                .starts_with("reclaim_stranded:0123456789abcdef@")
+        );
+        assert_eq!(
+            stranded[0].evidence["trash"],
+            entry.display().to_string(),
+            "{stranded:#?}"
+        );
+        assert_eq!(stranded[0].evidence["entries_left"], 3);
+        // The control: a live execution beside it still executes.
+        assert_eq!(x.act().status, ActStatus::Executed);
+        assert!(entry.join("t/sub/file").exists());
+    }
+
+    /// The `reclaim_stranded` items of the state's inbox, ended ones included.
+    fn stranded(x: &Live) -> Vec<cardinal::contract::InboxItem> {
+        cardinal::inbox::list(
+            &x.s.config(),
+            &x.s.state,
+            Some(cardinal::inbox::StatusFilter::All),
+            false,
+        )
+        .unwrap()
+        .items
+        .into_iter()
+        .filter(|i| i.kind == InboxKind::ReclaimStranded)
+        .collect()
+    }
+
+    /// A trash entry whose execution directory cannot be read is not taken for one no
+    /// execution names: the pass reports the error and raises nothing, and once the directory
+    /// reads as missing, the entry is reported.
+    #[test]
+    fn an_entry_whose_naming_cannot_be_read_raises_nothing() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let x = live("unnamed", &["debug/app"]);
+        let entry = x.s.state.trash_dir().join("0123456789abcdef");
+        std::fs::create_dir_all(entry.join("t")).unwrap();
+        let executions = x.s.state.executions_dir();
+        std::fs::create_dir_all(&executions).unwrap();
+        let mode = |m| std::fs::set_permissions(&executions, std::fs::Permissions::from_mode(m));
+        mode(0o000).unwrap();
+        let points = TestPoints::new(x.s.fx.scope());
+        let unread = disk_support::reconcile(&x.s, &points);
+        mode(0o755).unwrap();
+        assert!(
+            unread.errors.iter().any(|e| e.scope == "trash"),
+            "{unread:#?}"
+        );
+        assert_eq!(stranded(&x).len(), 0, "{unread:#?}");
+        pass(&x);
+        assert_eq!(stranded(&x).len(), 1);
+    }
+
+    /// The `reclaim_stranded` a pass's recovery raises for an unreadable claim stays open while
+    /// the claim cannot be read, with no trash entry left to list.
+    #[test]
+    fn an_unreadable_claim_keeps_its_item_open() {
+        let x = live("unreadable", &["debug/app"]);
+        x.kill_at(testpoint::ACT_CLAIMED);
+        std::fs::write(x.s.state.execution_claim(&x.plan.id), b"{ not json").unwrap();
+        std::fs::remove_dir_all(x.entry()).unwrap();
+        for _ in 0..2 {
+            let pass = pass(&x);
+            let items = stranded(&x);
+            assert_eq!(items.len(), 1, "{items:#?}");
+            assert_eq!(items[0].ended_ms, None, "{pass:#?}\n{items:#?}");
+        }
+    }
+
+    /// A committed execution whose caller lost its grant is stranded on the grant before its
+    /// manifest is read, and a pass that strands it again for the same reason leaves its item
+    /// as it is.
+    #[test]
+    fn a_stranded_execution_costs_a_pass_its_grant_check() {
+        let mut x = live("ungranted", &["debug/app", "debug/log"]);
+        x.kill_at(testpoint::ACT_COMMITTED);
+        x.s.scene.clear_observe_config();
+        x.s.scene.observe_config(&disk_support::host((0, 1, 2), ""));
+        std::fs::write(x.s.state.execution_manifest(&x.plan.id), b"{ cut").unwrap();
+        pass(&x);
+        let first = stranded(&x);
+        assert_eq!(first.len(), 1, "{first:#?}");
+        let reason = first[0].evidence["reason"].as_str().unwrap_or_default();
+        assert!(reason.contains("grant"), "{reason}");
+        pass(&x);
+        assert_eq!(stranded(&x), first);
+    }
+
+    /// A trash entry no execution names, part of which cannot be read, is reported with its
+    /// entries and bytes unknown.
+    #[test]
+    fn an_unreadable_trash_entry_is_sized_unknown() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let x = live("control", &["debug/app"]);
+        let entry = x.s.state.trash_dir().join("0123456789abcdef");
+        let locked = entry.join("t/locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::write(locked.join("file"), "data").unwrap();
+        let mode = |m| std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(m));
+        mode(0o000).unwrap();
+        let pass = pass(&x);
+        mode(0o755).unwrap();
+        let items = stranded(&x);
+        assert_eq!(items.len(), 1, "{pass:#?}");
+        assert_eq!(items[0].evidence["entries_left"], serde_json::Value::Null);
+        assert_eq!(items[0].evidence["bytes_left"], serde_json::Value::Null);
+    }
+
+    /// An execution with a result is recovered too: a result that does not read whole is
+    /// reported, where the presence of the file would have passed it over.
+    #[test]
+    fn a_result_is_read_whole() {
+        let x = live("finished", &["debug/app"]);
+        assert_eq!(x.act().status, ActStatus::Executed);
+        pass(&x);
+        std::fs::write(x.s.state.execution_result(&x.plan.id), b"{ \"cut\": ").unwrap();
+        let points = TestPoints::new(x.s.fx.scope());
+        let cut = disk_support::reconcile(&x.s, &points);
+        assert!(
+            cut.errors
+                .iter()
+                .any(|e| e.scope == "recover" && e.message.contains(&x.plan.id)),
+            "{cut:#?}"
+        );
+    }
+
+    /// A finished execution, its result read whole and synced, costs a pass none of its
+    /// `reclaim_budget_s`: one that sorts first and whose recovery is paused past the budget at
+    /// `recover.locked` still leaves the pass the recovery of an execution that died.
+    #[test]
+    fn finished_executions_cost_no_budget() {
+        let budget = "[reconcile]\nreclaim_budget_s = 1\n";
+        let x = live_with("first", &["debug/app"], budget);
+        let wt = x.s.worktree("second");
+        plan_support::write_synced(&wt, "target/debug/app", b"debug/app");
+        let other =
+            x.s.plan(cardinal::contract::PlanKind::ReclaimDir, &wt.join("target"));
+        let (done, died) = if x.plan.id < other.id {
+            (x.plan.id.clone(), other.id.clone())
+        } else {
+            (other.id.clone(), x.plan.id.clone())
+        };
+        let owner = live_support::owner();
+        assert_eq!(x.s.act(&done, &owner).unwrap().status, ActStatus::Executed);
+        let scope = cardinal_test_support::Scope::new();
+        let points = TestPoints::new(&scope);
+        let mut command = x.s.act_command(&died, &owner);
+        points.apply(&mut command, &[testpoint::ACT_MOVED], None);
+        let mut child = command
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        points.wait_reached(testpoint::ACT_MOVED, child.id(), WAIT);
+        child.kill();
+
+        let pass_points = TestPoints::new(x.s.fx.scope());
+        let mut command = disk_support::reconcile_command(&x.s, &pass_points);
+        pass_points.apply(&mut command, &[testpoint::RECOVER_LOCKED], None);
+        let running = command
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        pass_points.wait_reached(testpoint::RECOVER_LOCKED, running.id(), WAIT);
+        std::thread::sleep(Duration::from_millis(1200));
+        pass_points.release(testpoint::RECOVER_LOCKED);
+        let pass = disk_support::pass(&running.wait_with_output().unwrap());
+        assert_eq!(
+            pass.recovered,
+            [RecoveredExecution {
+                plan_id: died,
+                status: ActStatus::Rejected,
+            }],
+            "{pass:#?}"
+        );
+    }
+
+    /// Once a pass has spent `reclaim_budget_s`, it starts no more recoveries: the one under
+    /// way (paused past the budget at `recover.locked`) finishes, the next waits for a later
+    /// pass, which recovers it.
+    #[test]
+    fn the_budget_stops_further_recoveries() {
+        let budget = "[reconcile]\nreclaim_budget_s = 1\n";
+        let first = live_with("first", &["debug/app"], budget);
+        first.kill_at(testpoint::ACT_MOVED);
+        let wt = first.s.worktree("second");
+        plan_support::write_synced(&wt, "target/debug/app", b"debug/app");
+        let plan = first
+            .s
+            .plan(cardinal::contract::PlanKind::ReclaimDir, &wt.join("target"));
+        let scope = cardinal_test_support::Scope::new();
+        let points = TestPoints::new(&scope);
+        let mut command = first.s.act_command(&plan.id, &live_support::owner());
+        points.apply(&mut command, &[testpoint::ACT_MOVED], None);
+        let mut child = command
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        points.wait_reached(testpoint::ACT_MOVED, child.id(), WAIT);
+        child.kill();
+
+        let pass_points = TestPoints::new(first.s.fx.scope());
+        let mut command = disk_support::reconcile_command(&first.s, &pass_points);
+        pass_points.apply(&mut command, &[testpoint::RECOVER_LOCKED], None);
+        let running = command
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        pass_points.wait_reached(testpoint::RECOVER_LOCKED, running.id(), WAIT);
+        std::thread::sleep(Duration::from_millis(1200));
+        pass_points.release(testpoint::RECOVER_LOCKED);
+        let output = running.wait_with_output().unwrap();
+        let spent = disk_support::pass(&output);
+        assert_eq!(spent.recovered.len(), 1, "{spent:#?}");
+        assert!(
+            spent
+                .errors
+                .iter()
+                .any(|e| e.scope == "recover" && e.message.contains("reclaim_budget_s")),
+            "{spent:#?}"
+        );
+        let next = pass(&first);
+        assert_eq!(next.recovered.len(), 1, "{next:#?}");
+        assert!(first.target().exists());
+        assert!(wt.join("target/debug/app").exists());
     }
 }

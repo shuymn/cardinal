@@ -1,43 +1,64 @@
-//! `disk-reclaim` listing (`docs/architecture.md` section 10.4, C10): for each volume under
+//! `disk-reclaim` (`docs/architecture.md` section 10.4, C10, A31): for each volume under
 //! pressure, from the plans of step 5 and the pass's last successful reading, the eligible
-//! `reclaim_dir` targets in reclamation order until their bounds of the freed bytes would lift
-//! the reading above the recovery line, the shortfall when they would not, the entries held by a failed check or
-//! by aliased files, and the worktrees observed only in part. It runs no `act` and observes
-//! nothing again; each listed target gets a `planned` record with the checks and bytes it was
-//! listed by.
+//! `reclaim_dir` targets in reclamation order (those with a positive bound of the freed bytes
+//! first, oldest worktree first and the largest bound first, then those whose bound is 0 or
+//! null), the entries held by a failed check or by aliased files, and the worktrees observed
+//! only in part.
+//!
+//! Listing, it cuts the order where the bounds would lift the reading above the recovery
+//! line, reports the shortfall when they would not, runs no `act`, observes nothing again, and
+//! gives each listed target a `planned` record with the checks and bytes it was listed by.
+//! Executing, on the state dir's volume when `[unit.disk-reclaim] act` is true and
+//! `[act] execute` grants the unit `reclaim_dir` (section 9.7), it runs `act` as the unit on
+//! the targets in that order, reads the volume again after every `act`, and stops once a
+//! reading is above the recovery line, at a reading it cannot take, when the targets run out,
+//! or once the pass's reclaim budget is spent; the volume's readings, not the bounds, decide.
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde_json::json;
 
-use crate::act::EXECUTION_NOT_DESIGNED;
+use crate::act::{self, ActOptions, EXECUTION_NOT_DESIGNED, EXECUTION_NOT_GRANTED};
 use crate::config::Config;
 use crate::contract::{
-    ActStatus, Approval, CheckResult, ConfigKey, DiskReport, Plan, PlanKind, RecordKind,
+    ActStatus, Approval, Caller, CheckResult, ConfigKey, DiskReport, Plan, PlanKind, RecordKind,
     ReportBlocked, ReportIncomplete, ReportReading, ReportTarget, ScopedError,
 };
 use crate::plan;
 use crate::state::StateDir;
 
-use super::Observation;
 use super::disk::{self, Watched};
+use super::{Budget, Observation};
 
 /// The unit `disk-reclaim` runs as.
 pub const UNIT: &str = "disk-reclaim";
 
+/// Whether `disk-reclaim` executes on the state dir's volume: its `act` is true and
+/// `[act] execute` grants it `reclaim_dir` (section 9.7). Never off Unix.
+#[must_use]
+pub fn executes(config: &Config) -> bool {
+    cfg!(unix)
+        && config.host.unit_may_act(UNIT)
+        && config
+            .host
+            .grants(&Caller::Unit(UNIT.into()), PlanKind::ReclaimDir)
+}
+
 /// The reports of every volume under pressure with a successful reading in this pass; a
 /// volume whose readings all failed is skipped (A16), and one without an observation is
-/// reported in `errors`.
+/// reported in `errors`. On the state dir's volume, when [`executes`], the targets are
+/// executed within `budget`, each volume reading kept in `disks`.
 pub fn reports(
     config: &Config,
     state: &StateDir,
-    disks: &[Watched],
+    disks: &mut [Watched],
     observation: Option<&Observation>,
+    budget: &mut Budget,
     errors: &mut Vec<ScopedError>,
 ) -> Vec<DiskReport> {
     let mut reports = Vec::new();
-    for volume in disks.iter().filter(|d| d.under_pressure()) {
+    for volume in disks.iter_mut().filter(|d| d.under_pressure()) {
         let Some(reading) = volume.reading else {
             continue;
         };
@@ -51,37 +72,56 @@ pub fn reports(
             });
             continue;
         };
-        let report = report(volume, reading, observation);
-        if let Err(message) = record_planned(config, state, observation, &report) {
-            errors.push(ScopedError {
-                scope: "disk_reclaim".into(),
-                message,
-            });
-        }
-        reports.push(report);
+        let (order, blocked) = order(&volume.state.volume, observation);
+        let recovery = volume.state.lines.recovery_bytes;
+        let (targets, reading, shortfall_bytes) = if executes(config) && volume.path == state.root()
+        {
+            let targets = execute(config, state, volume, &order, budget, errors);
+            let reading = volume.reading.unwrap_or(reading);
+            let shortfall = recovery.saturating_sub(reading.free_bytes);
+            (targets, reading, shortfall)
+        } else {
+            let (targets, shortfall) = list(&order, reading, recovery);
+            if let Err(message) =
+                record_planned(config, state, observation, &volume.state.volume, &targets)
+            {
+                errors.push(ScopedError {
+                    scope: "disk_reclaim".into(),
+                    message,
+                });
+            }
+            (targets, reading, shortfall)
+        };
+        reports.push(DiskReport {
+            volume: volume.state.volume.clone(),
+            reading,
+            lines: volume.state.lines,
+            checks_ms: observation.checks_ms,
+            targets,
+            shortfall_bytes,
+            blocked,
+            incomplete: incomplete(&volume.state.volume, observation),
+        });
     }
     reports
 }
 
-/// The report on `volume` from `observation`'s plans and `reading`.
-fn report(volume: &Watched, reading: ReportReading, observation: &Observation) -> DiskReport {
-    let on_volume = plans_on(&volume.state.volume, &observation.plans);
+/// The eligible targets on `volume` in reclamation order (section 10.4), and the entries
+/// blocked by a failed check or aliased files, by worktree and path. Targets with a positive
+/// bound come first, worktrees by last activity, oldest first (unknown last), and within a
+/// worktree the largest bound first; then the targets whose bound is 0 or null, worktrees
+/// oldest first, and within a worktree the most bytes not aliased first.
+fn order<'a>(volume: &str, observation: &'a Observation) -> (Vec<&'a Plan>, Vec<ReportBlocked>) {
     let mut blocked = Vec::new();
-    // Eligible targets with the bytes they are ordered by, by worktree.
-    let mut by_worktree: BTreeMap<&str, Vec<(&Plan, u64)>> = BTreeMap::new();
-    for plan in on_volume {
+    let mut eligible: Vec<(&Plan, u64)> = Vec::new();
+    for plan in plans_on(volume, &observation.plans) {
         let own_file_bytes = observation.own_file_bytes.get(&plan.id).copied();
         match listed(plan, own_file_bytes) {
-            Ok(size) => by_worktree
-                .entry(plan.target.worktree.as_str())
-                .or_default()
-                .push((plan, size)),
+            Ok(unaliased) => eligible.push((plan, unaliased)),
             Err(Some(entry)) => blocked.push(entry),
             Err(None) => {}
         }
     }
-    // Oldest worktree first (one whose activity is unknown last), then the most bytes not
-    // aliased first.
     let activity = |worktree: &str| {
         observation
             .inventory
@@ -91,44 +131,118 @@ fn report(volume: &Watched, reading: ReportReading, observation: &Observation) -
             .find(|w| w.path == worktree)
             .and_then(|w| w.last_activity_ms)
     };
-    let mut worktrees: Vec<(&str, Vec<(&Plan, u64)>)> = by_worktree.into_iter().collect();
-    worktrees.sort_by_cached_key(|(path, _)| {
-        let last = activity(path);
-        (last.is_none(), last, *path)
+    eligible.sort_by_cached_key(|(plan, unaliased)| {
+        let bound = plan.exclusive_bytes.filter(|b| *b > 0);
+        let last = activity(&plan.target.worktree);
+        (
+            bound.is_none(),
+            last.is_none(),
+            last,
+            plan.target.worktree.clone(),
+            std::cmp::Reverse(bound.unwrap_or(*unaliased)),
+            plan.target.path.clone(),
+        )
     });
-    let recovery = volume.state.lines.recovery_bytes;
+    blocked.sort_by(|a, b| (&a.worktree, &a.target).cmp(&(&b.worktree, &b.target)));
+    (
+        eligible.into_iter().map(|(plan, _)| plan).collect(),
+        blocked,
+    )
+}
+
+/// The listing: the targets of `order` until their bounds would lift `reading` above the
+/// recovery line, counting nothing for a bound of 0 or null (section 10.4), with the
+/// shortfall the bounds leave.
+fn list(order: &[&Plan], reading: ReportReading, recovery: u64) -> (Vec<ReportTarget>, u64) {
     let mut lifted = reading.free_bytes;
     let mut targets = Vec::new();
-    'listing: for (_, mut plans) in worktrees {
-        plans.sort_by(|(a, x), (b, y)| y.cmp(x).then_with(|| a.target.path.cmp(&b.target.path)));
-        for (plan, _) in plans {
-            if lifted > recovery {
-                break 'listing;
+    for plan in order {
+        if lifted > recovery {
+            break;
+        }
+        let target = target_of(plan);
+        lifted = lifted.saturating_add(target.exclusive_bytes);
+        targets.push(target);
+    }
+    (targets, recovery.saturating_sub(lifted))
+}
+
+/// Executing (section 10.4, A31): `act` as the unit on each target of `order` while the
+/// volume's last reading is at or below the recovery line and `budget` is left, the volume
+/// read again after every `act`, a refused or `partial` one included; a reading that fails
+/// stops it. The configuration is loaded again before each `act`, which runs under it: one
+/// that does not load, or no longer lets the unit execute, stops it. Each target run is
+/// returned with its status and the bytes `act` expects it freed.
+fn execute(
+    config: &Config,
+    state: &StateDir,
+    volume: &mut Watched,
+    order: &[&Plan],
+    budget: &mut Budget,
+    errors: &mut Vec<ScopedError>,
+) -> Vec<ReportTarget> {
+    let options = ActOptions {
+        dry_run: false,
+        owner_approved: false,
+        squash_merged: false,
+        caller: Caller::Unit(UNIT.into()),
+    };
+    let recovery = volume.state.lines.recovery_bytes;
+    let mut targets = Vec::new();
+    for plan in order {
+        let above = volume.reading.is_none_or(|r| r.free_bytes > recovery);
+        if above || !budget.left() {
+            break;
+        }
+        let current = match Config::load(&config.dir) {
+            Ok(current) if executes(&current) => current,
+            Ok(_) => {
+                errors.push(ScopedError {
+                    scope: "disk_reclaim".into(),
+                    message: format!(
+                        "{}: disk-reclaim may no longer execute, so execution stops",
+                        volume.state.mount
+                    ),
+                });
+                break;
             }
-            // The plan's bound, which counts nothing where it is 0 or null (section 10.4).
-            let bound = plan.exclusive_bytes.unwrap_or(0);
-            lifted = lifted.saturating_add(bound);
-            targets.push(ReportTarget {
-                plan_id: plan.id.clone(),
-                worktree: plan.target.worktree.clone(),
-                target: plan.target.path.clone(),
-                exclusive_bytes: bound,
-                exclusive_measure: Some(plan.exclusive_measure),
-                status: None,
-                freed_bytes: None,
-            });
+            Err(err) => {
+                errors.push(ScopedError {
+                    scope: "disk_reclaim".into(),
+                    message: format!("the configuration does not load, so execution stops: {err}"),
+                });
+                break;
+            }
+        };
+        let mut target = target_of(plan);
+        match budget.spend(|| act::execute(&current, state, &plan.id, &options)) {
+            Ok(result) => {
+                target.status = Some(result.status);
+                target.freed_bytes = Some(result.freed_bytes);
+            }
+            Err(err) => errors.push(ScopedError {
+                scope: "disk_reclaim".into(),
+                message: format!("act {}: {}", plan.id, err.message),
+            }),
+        }
+        targets.push(target);
+        if !disk::read(config, state, volume, errors) {
+            break;
         }
     }
-    blocked.sort_by(|a, b| (&a.worktree, &a.target).cmp(&(&b.worktree, &b.target)));
-    DiskReport {
-        volume: volume.state.volume.clone(),
-        reading,
-        lines: volume.state.lines,
-        checks_ms: observation.checks_ms,
-        targets,
-        shortfall_bytes: recovery.saturating_sub(lifted),
-        blocked,
-        incomplete: incomplete(&volume.state.volume, observation),
+    targets
+}
+
+/// `plan` as a target of the report, with its bound, 0 where that is null.
+fn target_of(plan: &Plan) -> ReportTarget {
+    ReportTarget {
+        plan_id: plan.id.clone(),
+        worktree: plan.target.worktree.clone(),
+        target: plan.target.path.clone(),
+        exclusive_bytes: plan.exclusive_bytes.unwrap_or(0),
+        exclusive_measure: Some(plan.exclusive_measure),
+        status: None,
+        freed_bytes: None,
     }
 }
 
@@ -216,29 +330,54 @@ fn blocked_entry(plan: &Plan, check: String, bytes: u64) -> ReportBlocked {
     }
 }
 
-/// A `planned` record for each target of `report`, with the plan's checks and provenance as
-/// step 5 evaluated them, and the bytes it was listed by; the first record that cannot be
+/// A `planned` record for each listed target, with the plan's checks and provenance as step
+/// 5 evaluated them, the bytes it was listed by, and the reason it did not execute: not
+/// designed off Unix, not granted otherwise, naming `unit.disk-reclaim.act` while it is false
+/// and `act.execute` while it does not grant the unit (C16); the first record that cannot be
 /// appended is returned, the others still tried.
 fn record_planned(
     config: &Config,
     state: &StateDir,
     observation: &Observation,
-    report: &DiskReport,
+    volume: &str,
+    targets: &[ReportTarget],
 ) -> Result<(), String> {
     let mut failed = Ok(());
     let recorder = plan::recorder(config, state);
-    for target in &report.targets {
+    let reason = if cfg!(unix) {
+        EXECUTION_NOT_GRANTED
+    } else {
+        EXECUTION_NOT_DESIGNED
+    };
+    let file = config.dir.join("host.toml").display().to_string();
+    let mut keys = Vec::new();
+    if !config.host.unit_may_act(UNIT) {
+        keys.push(ConfigKey {
+            file: file.clone(),
+            key: format!("unit.{UNIT}.act"),
+            value: false.into(),
+        });
+    } else if !executes(config) && cfg!(unix) {
+        let unit = Caller::Unit(UNIT.into()).to_string();
+        let kinds = config
+            .host
+            .act
+            .execute
+            .get(&unit)
+            .cloned()
+            .unwrap_or_default();
+        keys.push(ConfigKey {
+            file,
+            key: "act.execute".to_owned(),
+            value: serde_json::to_value(kinds).unwrap_or_default(),
+        });
+    }
+    for target in targets {
         let Some(plan) = observation.plans.iter().find(|p| p.id == target.plan_id) else {
             continue;
         };
         let mut provenance = plan.provenance.clone();
-        if !config.host.unit_may_act(UNIT) {
-            provenance.config.push(ConfigKey {
-                file: config.dir.join("host.toml").display().to_string(),
-                key: format!("unit.{UNIT}.act"),
-                value: false.into(),
-            });
-        }
+        provenance.config.extend(keys.iter().cloned());
         let mut record = recorder.record(RecordKind::Planned);
         record.plan_id = Some(plan.id.clone());
         let data = json!({
@@ -246,10 +385,10 @@ fn record_planned(
             "kind": plan.kind,
             "target": plan.target.path,
             "status": ActStatus::DryRun,
-            "reasons": [EXECUTION_NOT_DESIGNED],
+            "reasons": [reason],
             "checks": plan.checks,
-            "checks_ms": report.checks_ms,
-            "volume": report.volume,
+            "checks_ms": observation.checks_ms,
+            "volume": volume,
             "allocated_bytes": plan.allocated_bytes,
             "aliased_bytes": plan.aliased_bytes,
             "exclusive_bytes": target.exclusive_bytes,

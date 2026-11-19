@@ -47,13 +47,9 @@ impl Disk {
     /// [`Disk::new`] with more `host.toml` after the `[disk]` table: other tables.
     pub fn with_host(lines: (u64, u64, u64), extra: &str) -> Self {
         let mut s = Setup::new();
-        let (critical, warning, recovery) = lines;
         let main = s.main.display().to_string();
-        // The arbiter's command does nothing should a pass start one.
-        s.scene.observe_config(&format!(
-            "repos = ['{main}']\n[disk]\ncritical_mib = {critical}\nwarning_mib = {warning}\n\
-             recovery_mib = {recovery}\n[arbiter]\ncommand = ['true']\n{extra}"
-        ));
+        s.scene
+            .observe_config(&format!("repos = ['{main}']\n{}", host(lines, extra)));
         let points = TestPoints::new(s.fx.scope());
         Self { s, points }
     }
@@ -81,10 +77,7 @@ impl Disk {
 
     /// `cardinal reconcile --trigger manual` with the test directory set.
     pub fn reconcile_command(&self) -> Command {
-        let mut command = self.s.cardinal();
-        command.args(["reconcile", "--trigger", "manual"]);
-        self.points.apply(&mut command, &[], None);
-        command
+        reconcile_command(&self.s, &self.points)
     }
 
     /// One pass, which must succeed; when it started an arbiter pass, once that pass has
@@ -93,32 +86,14 @@ impl Disk {
     /// not let a process leave it, the trigger starts none and records none (see
     /// [`refused_start`]).
     pub fn reconcile(&self) -> Reconcile {
-        let since_ms = state::now_ms();
-        let pass = pass(
-            &self
-                .reconcile_command()
-                .output_within(RUN_LIMIT)
-                .expect("run cardinal reconcile"),
-        );
-        if cfg!(windows) {
-            assert_ne!(pass.arbiter, ArbiterStart::Started, "{pass:#?}");
-            assert!(!self.s.state.arbiter_last().exists(), "{pass:#?}");
-        } else if pass.arbiter == ArbiterStart::Started {
-            self.arbiter_ended(since_ms);
-        }
-        pass
+        reconcile(&self.s, &self.points)
     }
 
     /// The arbiter pass a `reconcile` pass started at or after `since_ms` started, once it has
     /// ended and its launcher has let go of `arbiter/.lock`. The setup's `[arbiter] command`
     /// exits at once.
     pub fn arbiter_ended(&self, since_ms: u64) -> ArbiterPass {
-        wait_for("the arbiter pass to end", RUN_LIMIT, || {
-            let bytes = std::fs::read(self.s.state.arbiter_last()).ok()?;
-            let last: ArbiterPass = serde_json::from_slice(&bytes).ok()?;
-            let released = state::probe(&self.s.state.arbiter_lock()).ok()? != Probe::Held;
-            (last.started_ms >= since_ms && last.ended_ms.is_some() && released).then_some(last)
-        })
+        arbiter_ended(&self.s, since_ms)
     }
 
     /// The disk state files, in file name order.
@@ -173,6 +148,53 @@ impl Disk {
             .filter(|r| r.kind == kind)
             .collect()
     }
+}
+
+/// `host.toml` for the disk tests, after the `[observe]` table: lines in MiB as
+/// `(critical, warning, recovery)`, a reserve of 1 MiB, an arbiter command that does nothing
+/// should a pass start one, then `extra`, more tables.
+pub fn host(lines: (u64, u64, u64), extra: &str) -> String {
+    let (critical, warning, recovery) = lines;
+    format!(
+        "[disk]\ncritical_mib = {critical}\nwarning_mib = {warning}\nrecovery_mib = {recovery}\n\
+         reserve_mib = 1\n[arbiter]\ncommand = ['true']\n{extra}"
+    )
+}
+
+/// `cardinal reconcile --trigger manual` for `s`, with the test directory of `points` set.
+pub fn reconcile_command(s: &Setup, points: &TestPoints) -> Command {
+    let mut command = s.cardinal();
+    command.args(["reconcile", "--trigger", "manual"]);
+    points.apply(&mut command, &[], None);
+    command
+}
+
+/// One pass for `s`, as [`Disk::reconcile`] runs it.
+pub fn reconcile(s: &Setup, points: &TestPoints) -> Reconcile {
+    let since_ms = state::now_ms();
+    let pass = pass(
+        &reconcile_command(s, points)
+            .output_within(RUN_LIMIT)
+            .expect("run cardinal reconcile"),
+    );
+    if cfg!(windows) {
+        assert_ne!(pass.arbiter, ArbiterStart::Started, "{pass:#?}");
+        assert!(!s.state.arbiter_last().exists(), "{pass:#?}");
+    } else if pass.arbiter == ArbiterStart::Started {
+        arbiter_ended(s, since_ms);
+    }
+    pass
+}
+
+/// The arbiter pass of `s` a `reconcile` pass started at or after `since_ms`, once it has
+/// ended and its launcher has let go of `arbiter/.lock`.
+pub fn arbiter_ended(s: &Setup, since_ms: u64) -> ArbiterPass {
+    wait_for("the arbiter pass to end", RUN_LIMIT, || {
+        let bytes = std::fs::read(s.state.arbiter_last()).ok()?;
+        let last: ArbiterPass = serde_json::from_slice(&bytes).ok()?;
+        let released = state::probe(&s.state.arbiter_lock()).ok()? != Probe::Held;
+        (last.started_ms >= since_ms && last.ended_ms.is_some() && released).then_some(last)
+    })
 }
 
 /// The pass `output` printed, which must have exited 0; the errors of the steps these tests

@@ -120,7 +120,7 @@ pub fn create(
         _ => {}
     }
     let built = build(config, state, &sources, kind, &target, &observation);
-    store(config, state, built.plan)
+    store(config, state, built.plan, None)
 }
 
 /// `cardinal plan [--repo PATH]...`: a plan for every linked worktree and for every ignored
@@ -130,7 +130,7 @@ pub fn create_all(config: &Config, state: &StateDir, repos: &[PathBuf]) -> Resul
     housekeeping(state);
     let inventory = sources.inventory(repos)?;
     let mut errors = inventory.errors.clone();
-    let plans = create_from(config, state, &inventory, &|_| true, &mut errors)
+    let plans = create_from(config, state, &inventory, &|_| true, None, &mut errors)
         .into_iter()
         .map(|built| built.plan)
         .collect();
@@ -152,7 +152,10 @@ pub struct Built {
 /// Plans, stored and recorded, for every linked worktree of `inventory` and for every ignored
 /// entry matching a regenerable pattern in the worktrees `entries_in` picks, whatever their
 /// checks find; a plan that cannot be stored is reported in `errors` (section 9.2). `reconcile`
-/// builds its plans with this from the observation it holds (section 10.3).
+/// builds its plans with this from the observation it holds (section 10.3). With `reserve`,
+/// the path of the state dir's reserve file, a plan's write that fails for lack of space spends
+/// the reserve and is tried again at once, as a pass that executes writes its plans (section
+/// 9.7, "Space").
 ///
 /// The plans of one worktree are built together, those of up to [`BUILD_WORKERS`] worktrees at
 /// a time, and stored in the order of `inventory`, so the plans and their records come out as
@@ -162,6 +165,7 @@ pub fn create_from(
     state: &StateDir,
     inventory: &Inventory,
     entries_in: &dyn Fn(&Worktree) -> bool,
+    reserve: Option<&Path>,
     errors: &mut Vec<ScopedError>,
 ) -> Vec<Built> {
     let sources = Real { config, state };
@@ -212,7 +216,7 @@ pub fn create_from(
     let mut plans = Vec::new();
     for ((_, targets), built) in jobs.iter().zip(built) {
         for ((_, target), built) in targets.iter().zip(built) {
-            match store(config, state, built.plan) {
+            match store(config, state, built.plan, reserve) {
                 Ok(plan) => plans.push(Built { plan, ..built }),
                 Err(err) => errors.push(ScopedError {
                     scope: target.display().to_string(),
@@ -489,20 +493,43 @@ fn build_with(
     }
 }
 
-/// Claims a new plan ID by creating its directory, writes `plan.json`, and records it.
-fn store(config: &Config, state: &StateDir, mut plan: Plan) -> Result<Plan, Error> {
+/// Claims a new plan ID by creating its directory, writes `plan.json`, and records it. With
+/// `reserve`, each write goes through the reserve's retry; a test's fake fails it as `plan`
+/// (section 13.7).
+fn store(
+    config: &Config,
+    state: &StateDir,
+    mut plan: Plan,
+    reserve: Option<&Path>,
+) -> Result<Plan, Error> {
+    let written = |write: &mut dyn FnMut() -> std::io::Result<()>| match reserve {
+        Some(reserve) => state::retry_with_reserve(reserve, || {
+            crate::testpoint::fake_write("plan")?;
+            write()
+        }),
+        None => write(),
+    };
     let id = loop {
         let id = state::new_id();
-        match std::fs::create_dir(state.plan_dir(&id)) {
+        let dir = state.plan_dir(&id);
+        match written(&mut || std::fs::create_dir(&dir)) {
             Ok(()) => break id,
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(err) => return Err(state_error(&state.plan_dir(&id), &err)),
+            Err(err) => return Err(state_error(&dir, &err)),
         }
     };
     plan.id = id;
     let bytes = serde_json::to_vec(&plan)
         .map_err(|err| Error::new(ErrorCode::Internal, err.to_string()))?;
-    state.write_atomic(&state.plan_file(&plan.id), &bytes, Durability::Volatile)?;
+    let file = state.plan_file(&plan.id);
+    let tmp = state.tmp_dir();
+    if let Err(err) =
+        written(&mut || state::write_atomic(&tmp, &file, &bytes, Durability::Volatile))
+    {
+        // The plan's directory without its file is no plan; it goes with the failure.
+        let _ = std::fs::remove_dir(state.plan_dir(&plan.id));
+        return Err(state_error(&file, &err));
+    }
     let recorder = recorder(config, state);
     let mut record: Record = recorder.record(RecordKind::PlanCreated);
     record.plan_id = Some(plan.id.clone());
