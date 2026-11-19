@@ -1513,6 +1513,7 @@ impl Execution<'_, '_> {
             target_rel: &rel,
             measure: &measure,
             reserve: &reserve,
+            resumed: false,
         };
         let deleted = deletion.run(&mut watch);
         let kept = deleted.kept(&manifest);

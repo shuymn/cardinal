@@ -4,7 +4,9 @@
 //! (`tests/live_support`): at `act.lock_opened`, `act.claimed`, `act.moved`, `act.checked`,
 //! and `act.committed`, and with jobs meanwhile. The deletion's races at `act.taken` and
 //! `act.held` run through the library, as recovery of a `committed` execution that a test
-//! leaves as a crash leaves it (`tests/execution_support`).
+//! leaves as a crash leaves it (`tests/execution_support`), but for a directory moved out of
+//! `t` before it was entered, which only a live deletion can tell from one deleted before a
+//! crash.
 #![cfg(unix)]
 
 mod execution_support;
@@ -82,6 +84,34 @@ mod taken {
         assert!(kept.contains(&"a/f2".to_owned()), "{kept:?}");
         // The rest of `t` is deleted.
         assert!(!x.entry().exists());
+    }
+
+    /// In a live execution, a directory of `t` not yet entered, moved out of `t` into the
+    /// worktree's `fuzz/corpus`, took its entries with it: nothing was reclaimed for them, so
+    /// the result is `partial` and names them kept, never `executed` as if they were gone.
+    #[test]
+    fn a_directory_not_yet_entered_moved_out_is_kept() {
+        let x = Live::new("moved-out", "node_modules", &["a/f", "b/g1", "b/g2"]);
+        let moved = x.wt.join("fuzz/corpus/b");
+        std::fs::create_dir_all(moved.parent().unwrap()).unwrap();
+        let result = x.act_at(testpoint::ACT_TAKEN, || {
+            assert!(!x.t().join("a/f").exists(), "a/f is the first entry taken");
+            std::fs::rename(x.t().join("b"), &moved).unwrap();
+        });
+        assert_eq!(result.status, ActStatus::Partial, "{result:#?}");
+        assert_eq!(read(&moved.join("g1")), "b/g1");
+        assert_eq!(read(&moved.join("g2")), "b/g2");
+        for path in ["b", "b/g1", "b/g2"] {
+            assert!(
+                result.skipped_changed.contains(&path.to_owned()),
+                "{result:#?}"
+            );
+        }
+        assert!(
+            !result.skipped_changed.contains(&"a/f".to_owned()),
+            "{result:#?}"
+        );
+        assert!(!x.entry().exists(), "the rest of t is deleted");
     }
 
     /// A directory of `t` not yet entered, replaced by a symbolic link to a directory outside

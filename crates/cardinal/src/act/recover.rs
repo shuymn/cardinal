@@ -814,6 +814,7 @@ fn committed(
         target_rel: &rel,
         measure: &measure,
         reserve: &state.reserve_file(),
+        resumed: true,
     };
     let mut deleted = deletion.run(&mut watch);
     for pos in held {
