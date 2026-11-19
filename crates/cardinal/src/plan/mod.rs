@@ -176,6 +176,12 @@ pub fn create_from(
             let scope = format!("worktree:{}", worktree.path);
             let observation = WorktreeObservation {
                 repo: bare.clone(),
+                // Only whether `origin` was read matters here: an unread one fails `observed`,
+                // and an execution's claim takes the URL from `act`'s own observation.
+                remote: match &repo.gh_error {
+                    Some(err) if err.starts_with(crate::observe::REMOTE_UNREAD) => Err(err.clone()),
+                    _ => Ok(None),
+                },
                 worktree: worktree.clone(),
                 errors: inventory
                     .errors

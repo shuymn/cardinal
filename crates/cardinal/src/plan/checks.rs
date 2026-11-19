@@ -699,6 +699,10 @@ fn observed(i: &Inspection<'_>) -> Check {
             "status"
         });
     }
+    // An unread `origin` leaves the profiles it would select, and their protections, unknown.
+    if observation.remote.is_err() {
+        unknown.push("origin");
+    }
     if i.kind == PlanKind::ReclaimWorktree {
         for (name, value) in [
             ("has_upstream", facts.has_upstream),

@@ -43,6 +43,7 @@ use crate::testpoint;
 use data::DataPatterns;
 pub use data::{Bound, Counted, Exclusive, Measure};
 use git::ListedWorktree;
+pub use git::{IGNORE_KEYS, IgnoreRule, IgnoreValues, IndexEntry};
 
 /// `cardinal inventory` arguments.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -57,6 +58,11 @@ pub struct InventoryOptions {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorktreeObservation {
     pub repo: Repo,
+    /// The `origin` URL that selected the repository's profiles with its common dir (section
+    /// 3.3): `None` when the repository has no `origin`, an error when it could not be read,
+    /// which leaves the profiles `origin` would select unknown. An execution's claim records
+    /// it (section 9.7).
+    pub remote: Result<Option<String>, String>,
     pub worktree: Worktree,
     /// What observation of the worktree, or of its repository, could not read.
     pub errors: Vec<ScopedError>,
@@ -211,6 +217,204 @@ pub fn git<S: AsRef<OsStr>>(config: &Config, dir: &Path, args: &[S]) -> Result<O
     Observer::new(config).git(dir, args)
 }
 
+/// Whether the index file `index` is a split index (section 8.1), and the shared file found
+/// when it is. Without a `sharedindex.*` file in `dirs` (the git dir and the common dir)
+/// nothing can be linked, and the index is not read. With one, the index file is read as
+/// bytes for git's `link` extension ([`git::index_is_split`]), never through git, so a shared
+/// file that `git update-index --no-split-index` left behind does not count. A missing index
+/// links nothing; any other failed read, or an index that does not parse, is an error.
+pub fn split_index_file(index: &Path, dirs: &[PathBuf]) -> Result<Option<PathBuf>, String> {
+    let mut shared = None;
+    for dir in dirs {
+        let entries = std::fs::read_dir(dir).map_err(|err| format!("{}: {err}", dir.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|err| format!("{}: {err}", dir.display()))?;
+            if entry
+                .file_name()
+                .as_encoded_bytes()
+                .starts_with(b"sharedindex.")
+            {
+                shared.get_or_insert(entry.path());
+            }
+        }
+    }
+    let Some(shared) = shared else {
+        return Ok(None);
+    };
+    let bytes = match std::fs::read(index) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(format!("{}: {err}", index.display())),
+    };
+    let split = git::index_is_split(&bytes).map_err(|why| format!("{}: {why}", index.display()))?;
+    Ok(split.then_some(shared))
+}
+
+/// How the message of a failed `git remote get-url origin` begins: the profiles `origin` would
+/// select are unknown (section 3.3), and observation records it as the repository's `gh_error`.
+pub const REMOTE_UNREAD: &str = "git remote get-url origin failed";
+
+/// Runs one git command bound to a worktree: the directory it runs in and its argv after the
+/// program. [`BoundGit::new`] runs git as observation does; a test passes its own.
+pub type GitRunner<'a> = dyn Fn(&Path, &[OsString]) -> Result<Output, ChildError> + 'a;
+
+/// git bound to one worktree (section 9.7, "Pin and bound reads"): every command runs in the
+/// worktree root with `--git-dir` and `--work-tree` naming the git dir and the root the checks
+/// read, so none discovers a git dir through the root's `.git`, with observation's environment,
+/// no optional locks, and no filesystem monitor. A read decides only when it is complete: git
+/// ends with a status that answers, prints nothing on stderr, and prints output that parses to
+/// its end (section 9.7, "Reads that fail"); anything else is an error.
+pub struct BoundGit<'a> {
+    root: PathBuf,
+    git_dir: PathBuf,
+    run: Box<GitRunner<'a>>,
+}
+
+impl<'a> BoundGit<'a> {
+    /// git as `[observe] git` names it, with observation's constructed environment, bound to
+    /// the worktree `root` and its git dir `git_dir`.
+    #[must_use]
+    pub fn new(config: &'a Config, root: &Path, git_dir: &Path) -> Self {
+        let observer = Observer::new(config);
+        let observe = &config.host.observe;
+        Self::with_runner(
+            root,
+            git_dir,
+            Box::new(move |dir, argv| {
+                child::run(
+                    &observe.git,
+                    argv,
+                    &observer.env,
+                    dir,
+                    limits(observe.git_timeout_ms),
+                )
+            }),
+        )
+    }
+
+    /// git run by `run`, bound to `root` and `git_dir`.
+    #[must_use]
+    pub fn with_runner(root: &Path, git_dir: &Path, run: Box<GitRunner<'a>>) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            git_dir: git_dir.to_path_buf(),
+            run,
+        }
+    }
+
+    /// The argv of `args` bound to the worktree.
+    fn argv(&self, args: &[&OsStr]) -> Vec<OsString> {
+        let mut git_dir = OsString::from("--git-dir=");
+        git_dir.push(&self.git_dir);
+        let mut work_tree = OsString::from("--work-tree=");
+        work_tree.push(&self.root);
+        let mut bound = git_prefix(&self.root);
+        bound.extend([git_dir, work_tree]);
+        bound.extend(args.iter().map(|a| a.to_os_string()));
+        bound
+    }
+
+    /// Runs `args` and returns its output when the run is complete: a status in `codes` and
+    /// nothing on stderr.
+    fn complete(&self, args: &[&OsStr], codes: &[i32]) -> Result<Output, String> {
+        let what = format!(
+            "git {}",
+            args.iter()
+                .map(|a| a.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let out =
+            (self.run)(&self.root, &self.argv(args)).map_err(|err| format!("{what}: {err}"))?;
+        match out.code {
+            Some(code) if codes.contains(&code) => {}
+            Some(code) => return Err(format!("{what} exited with {code}: {}", out.stderr_line())),
+            None => return Err(format!("{what} was ended by a signal")),
+        }
+        if !out.stderr.is_empty() {
+            return Err(format!("{what} wrote to stderr: {}", out.stderr_line()));
+        }
+        Ok(out)
+    }
+
+    /// The index file of the worktree: `git rev-parse --git-path index`, relative to the root
+    /// when git names it relatively. Reads no index.
+    pub fn index_path(&self) -> Result<PathBuf, String> {
+        let out = self.complete(
+            &[
+                "rev-parse".as_ref(),
+                "--git-path".as_ref(),
+                "index".as_ref(),
+            ],
+            &[0],
+        )?;
+        Ok(self.root.join(git::parse_git_path(&out.stdout)?))
+    }
+
+    /// Every entry of the index as git's own commands see it: `git ls-files -z -t --sparse`.
+    pub fn index_entries(&self) -> Result<Vec<IndexEntry>, String> {
+        let args: [&OsStr; 4] = [
+            "ls-files".as_ref(),
+            "-z".as_ref(),
+            "-t".as_ref(),
+            "--sparse".as_ref(),
+        ];
+        git::parse_index_listing(&self.complete(&args, &[0])?.stdout)
+    }
+
+    /// The rule `git check-ignore -v` names for `rel`, a path relative to the root; `None`
+    /// when no rule matches (exit 1 with no output). Paths print unquoted but for control
+    /// characters, `"`, and `\`, which make the read fail ([`git::parse_check_ignore`]).
+    pub fn check_ignore(&self, rel: &Path) -> Result<Option<IgnoreRule>, String> {
+        let args: [&OsStr; 6] = [
+            "-c".as_ref(),
+            "core.quotePath=false".as_ref(),
+            "check-ignore".as_ref(),
+            "-v".as_ref(),
+            "--".as_ref(),
+            rel.as_os_str(),
+        ];
+        let out = self.complete(&args, &[0, 1])?;
+        let rule = git::parse_check_ignore(&out.stdout, rel)?;
+        match (out.code, &rule) {
+            (Some(0), Some(_)) | (Some(1), None) => Ok(rule),
+            _ => Err("git check-ignore's status does not match its output".into()),
+        }
+    }
+
+    /// The values git resolves in the worktree, includes and `config.worktree` included, of
+    /// [`IGNORE_KEYS`]: one `git config --null --type=path --get-regexp`, whose exit 1 with
+    /// no output means none is set.
+    pub fn ignore_values(&self) -> Result<IgnoreValues, String> {
+        let args: [&OsStr; 5] = [
+            "config".as_ref(),
+            "--null".as_ref(),
+            "--type=path".as_ref(),
+            "--get-regexp".as_ref(),
+            r"^core\.(excludesfile|ignorecase|precomposeunicode|splitindex)$".as_ref(),
+        ];
+        let out = self.complete(&args, &[0, 1])?;
+        if out.code == Some(1) && !out.stdout.is_empty() {
+            return Err("git config exited with 1 and printed values".into());
+        }
+        let values = git::parse_ignore_values(&out.stdout)?;
+        if out.code == Some(0) && values.values.is_empty() {
+            return Err("git config exited with 0 and printed no value".into());
+        }
+        Ok(values)
+    }
+
+    /// The URL of `origin`, which selects profiles with the common dir (section 3.3):
+    /// `git remote get-url origin`, `None` when git answers that there is no such remote (exit
+    /// 2, with nothing printed), and an error for any other answer, so a failed read is never
+    /// taken for an absent remote.
+    pub fn remote_url(&self) -> Result<Option<String>, String> {
+        let args: [&OsStr; 3] = ["remote".as_ref(), "get-url".as_ref(), "origin".as_ref()];
+        let out = (self.run)(&self.root, &self.argv(&args)).map_err(|err| err.to_string())?;
+        git::remote_answer(out.code, &out.stdout, &out.stderr)
+    }
+}
+
 /// Observation with its inputs: the configuration and the environment git and gh children
 /// are built from. Reservations are read through `admission::list_reservations`.
 pub struct Observer<'a> {
@@ -262,6 +466,8 @@ struct Shared<'a> {
 /// Repository-level facts every worktree of the repository uses.
 struct RepoContext {
     repo: Repo,
+    /// The `origin` URL the profiles were selected with, or why it could not be read.
+    remote: Result<Option<String>, String>,
     github: Option<gh::GithubRepo>,
     /// A repository-level step that failed (the base could not be read).
     failure: Option<String>,
@@ -581,6 +787,7 @@ impl<'a> Observer<'a> {
         }
         Ok(WorktreeObservation {
             repo,
+            remote: ctx.remote.clone(),
             worktree: result.worktree,
             errors,
         })
@@ -667,18 +874,12 @@ impl<'a> Observer<'a> {
         let listed = git::parse_worktree_list(&out.stdout)?;
         let main_worktree = canonical(&listed[0].path);
 
-        // Exit 2 is "no such remote"; any other failure leaves the remote unknown.
+        // Exit 2 is "no such remote"; any other answer leaves the remote unknown.
         let remote = match self.git(&dir, &["remote", "get-url", "origin"]) {
-            Ok(out) if out.code == Some(0) => {
-                Ok(Some(String::from_utf8_lossy(&out.stdout).trim().to_owned()))
-            }
-            Ok(out) if out.code == Some(2) => Ok(None),
-            Ok(out) => Err(format!(
-                "git remote get-url origin failed: {}",
-                out.stderr_line()
-            )),
+            Ok(out) => git::remote_answer(out.code, &out.stdout, &out.stderr),
             Err(err) => Err(err.to_string()),
-        };
+        }
+        .map_err(|err| format!("{REMOTE_UNREAD}: {err}"));
         let remote_url = remote.as_ref().ok().and_then(Option::as_deref);
         let selection: Selection<'_> = self.config.select(|profile| {
             profile.matches_common_dir(&common_dir)
@@ -719,6 +920,7 @@ impl<'a> Observer<'a> {
         };
 
         Ok(RepoContext {
+            remote,
             repo: Repo {
                 common_dir: display(&common_dir),
                 main_worktree: display(&main_worktree),
@@ -1403,27 +1605,16 @@ impl<'a> Observer<'a> {
         Ok(filtered)
     }
 
-    /// Whether the worktree at `path` uses a split index: a `sharedindex.*` file in its git
-    /// dir or the common dir, or `core.splitIndex` set. Reads only files and configuration,
-    /// never the index.
+    /// Whether the worktree at `path` uses a split index ([`split_index_file`] on its git dir's
+    /// `index`), or has `core.splitIndex` set. Reads files and configuration, never the index
+    /// through git.
     fn split_index(&self, path: &Path) -> Result<bool, String> {
         let git_dir = crate::config::git_dir(path)
             .ok_or_else(|| format!("cannot read the .git entry of {}", path.display()))?;
-        let mut dirs = vec![git_dir];
+        let mut dirs = vec![git_dir.clone()];
         dirs.extend(crate::config::git_common_dir(path));
-        for dir in &dirs {
-            let entries =
-                std::fs::read_dir(dir).map_err(|err| format!("{}: {err}", dir.display()))?;
-            for entry in entries {
-                let entry = entry.map_err(|err| format!("{}: {err}", dir.display()))?;
-                if entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with("sharedindex.")
-                {
-                    return Ok(true);
-                }
-            }
+        if split_index_file(&git_dir.join("index"), &dirs)?.is_some() {
+            return Ok(true);
         }
         let out = self
             .git(path, &["config", "--bool", "core.splitIndex"])
