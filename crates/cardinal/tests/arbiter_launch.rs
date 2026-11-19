@@ -33,7 +33,7 @@ use cardinal::testpoint::{
     ARBITER_ANSWERING, ARBITER_ITEMS_WRITING, ARBITER_OUTCOMES, ARBITER_RECORDED,
 };
 use cardinal_test_support::process::wait_for;
-use cardinal_test_support::{Child, Scope};
+use cardinal_test_support::{Child, Scope, bin_exe};
 use serde::{Deserialize, Serialize};
 use support::cardinal::Dirs;
 use support::helper::{self, Mode};
@@ -68,11 +68,13 @@ enum Step {
     Exit(i32),
 }
 
-/// The fake session's request: where it records, and its steps.
+/// The fake session's request: where it records, its steps, and the `cardinal` binary under
+/// test, which the session cannot look up itself (nextest names it only to the test process).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Script {
     dir: PathBuf,
     steps: Vec<Step>,
+    cardinal: PathBuf,
 }
 
 /// What the fake session recorded about itself, in `<dir>/<pass>.json`.
@@ -128,17 +130,19 @@ fn run_session_if_requested() {
                 }
             }
             Step::Run(args) => {
-                let ran = session_cardinal(args);
+                let ran = session_cardinal(&script.cardinal, args);
                 publish(&script.dir, &format!("{pass}.run{i}.json"), &ran);
             }
             Step::DeferAll => {
-                let listed = session_cardinal(&["inbox".into(), "--assigned".into()]);
+                let listed =
+                    session_cardinal(&script.cardinal, &["inbox".into(), "--assigned".into()]);
                 let listed: serde_json::Value =
                     serde_json::from_str(&listed.stdout).expect("the assigned items");
                 for item in listed["items"].as_array().into_iter().flatten() {
                     if item["status"] == "open" {
                         let key = item["key"].as_str().expect("a key").to_owned();
                         session_cardinal(
+                            &script.cardinal,
                             &[
                                 "inbox",
                                 "resolve",
@@ -162,9 +166,9 @@ fn run_session_if_requested() {
 
 /// Runs `cardinal ARGS` as the fake session's Bash tool does: with the session's own cardinal
 /// environment.
-fn session_cardinal(args: &[String]) -> Ran {
+fn session_cardinal(cardinal: &Path, args: &[String]) -> Ran {
     let scope = Scope::new();
-    let mut command = scope.command(env!("CARGO_BIN_EXE_cardinal"), scope.root());
+    let mut command = scope.command(cardinal, scope.root());
     command.args(args);
     for name in [
         "CARDINAL_STATE_DIR",
@@ -267,6 +271,7 @@ impl Env {
         let script = Script {
             dir: self.sessions.clone(),
             steps: steps.to_vec(),
+            cardinal: bin_exe("cardinal"),
         };
         let mode = Mode::Custom {
             name: SESSION,

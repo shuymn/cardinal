@@ -29,7 +29,7 @@ use cardinal::contract::{DerivedState, RunSpec, RunSpecSchema};
 use cardinal::state::StateDir;
 use cardinal::testpoint::{RUN_AFTER_SPAWN, RUN_BEFORE_STARTING};
 use cardinal_test_support::process::{GroupGuard, PidGuard, wait_for};
-use cardinal_test_support::{Child, Command, Scope};
+use cardinal_test_support::{Child, Command, Scope, bin_exe};
 
 use crate::support::testpoints::TestPoints;
 
@@ -168,7 +168,7 @@ impl<'a> Jobs<'a> {
         };
         let config = Config::load(&self.config).expect("load the jobs' configuration");
         let reach = cardinal::run::wait_cap(Some(&spec), &config.host) + WAIT;
-        let mut command = self.scope.command(env!("CARGO_BIN_EXE_cardinal"), cwd);
+        let mut command = self.scope.command(bin_exe("cardinal"), cwd);
         command
             .args(["run", "--spec-b64", &spec.encode_b64(), "--"])
             .args(STAGE)

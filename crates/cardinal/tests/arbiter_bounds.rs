@@ -190,10 +190,11 @@ fn raise_items(state: &StateDir) -> Vec<String> {
 /// holds exactly what a session reads, with `max_items` items at most.
 fn listing_host(max_items: usize) -> Dirs {
     let dirs = Dirs::new();
+    let cardinal = cardinal_test_support::bin_exe("cardinal");
     let host = format!(
         "[arbiter]\ncommand = {}\ntimeout_s = 60\nmin_interval_s = 0\nretry_s = 3600\nmax_items = {max_items}\n",
         serde_json::to_string(&[
-            env!("CARGO_BIN_EXE_cardinal"),
+            cardinal.to_str().expect("a UTF-8 path"),
             "inbox",
             "--assigned",
             "--brief"

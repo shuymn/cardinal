@@ -28,7 +28,7 @@ use cardinal::state::{self, FileLock, LockMode, StateDir};
 #[cfg(unix)]
 use cardinal_test_support::Child;
 use cardinal_test_support::process::{LeftoverGuard, wait_for};
-use cardinal_test_support::{Command, Scope};
+use cardinal_test_support::{Command, Scope, bin_exe};
 
 pub const WAIT: Duration = Duration::from_secs(20);
 
@@ -132,7 +132,7 @@ impl Env {
     /// `cardinal ARGS…` in `cwd` with its own state and config dirs, no test points, and
     /// stdin from /dev/null, leading its own process group.
     fn cardinal(&self, cwd: &Path, args: &[&str]) -> Command {
-        let mut command = self.scope().command(env!("CARGO_BIN_EXE_cardinal"), cwd);
+        let mut command = self.scope().command(bin_exe("cardinal"), cwd);
         command
             .args(args)
             .stdin(Stdio::null())

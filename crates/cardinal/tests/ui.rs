@@ -875,7 +875,7 @@ fn out_of_descriptors_the_oldest_record_files_are_lost() {
         .scope()
         .shell(r#"ulimit -n 32 && exec "$0" ui"#, dirs.scope().root());
     command
-        .arg(env!("CARGO_BIN_EXE_cardinal"))
+        .arg(cardinal_test_support::bin_exe("cardinal"))
         .env("CARDINAL_STATE_DIR", dirs.state())
         .env("CARDINAL_CONFIG_DIR", dirs.config());
 

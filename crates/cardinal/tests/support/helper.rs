@@ -18,7 +18,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use cardinal_test_support::{Child, Command, Scope};
+use cardinal_test_support::{Child, Command, Scope, bin_exe};
 
 /// Marks the arguments after libtest's `--` as a helper request. libtest reads them as name
 /// filters, which with `--exact` match no test but `helper`.
@@ -166,6 +166,7 @@ pub fn run_if_requested() {
             Path::new(&args[3]),
             args[4] == "via-shell",
             args[5] == "stray",
+            Path::new(&args[6]),
         ),
         #[cfg(windows)]
         "outside" => {
@@ -193,7 +194,15 @@ pub fn run_if_requested() {
 }
 
 /// The `agent` mode: see [`Mode::Agent`].
-fn agent(dir: &Path, event: &str, state: &Path, config: &Path, via_shell: bool, stray: bool) {
+fn agent(
+    dir: &Path,
+    event: &str,
+    state: &Path,
+    config: &Path,
+    via_shell: bool,
+    stray: bool,
+    cardinal: &Path,
+) {
     let scope = Scope::new();
     let background = spawn(&scope, &Mode::Sleep, scope.root());
     std::fs::write(dir.join("background.pid"), background.id().to_string()).expect("write the pid");
@@ -215,12 +224,12 @@ fn agent(dir: &Path, event: &str, state: &Path, config: &Path, via_shell: bool, 
     #[cfg(not(unix))]
     let _ = stray;
     let input = dir.join("input.json");
-    let cardinal = env!("CARGO_BIN_EXE_cardinal");
     let mut hook = if via_shell {
         // `; true` keeps the shell alive as the hook's parent.
         scope.shell(
             &format!(
-                "'{cardinal}' hook claude {event} < '{}'; true",
+                "'{}' hook claude {event} < '{}'; true",
+                cardinal.display(),
                 input.display()
             ),
             scope.root(),
@@ -381,6 +390,8 @@ pub fn args(mode: &Mode) -> Vec<String> {
                 config.to_string_lossy().into_owned(),
                 if *via_shell { "via-shell" } else { "" }.to_owned(),
                 if *stray { "stray" } else { "" }.to_owned(),
+                // Read in this process: the helper gets no nextest variable.
+                bin_exe("cardinal").to_string_lossy().into_owned(),
             ],
         ),
         #[cfg(windows)]

@@ -19,7 +19,7 @@ use std::process::{Output, Stdio};
 
 use cardinal::contract::{Record, RecordKind, RunSpec};
 use cardinal::state::StateDir;
-use cardinal_test_support::{Command, Scope};
+use cardinal_test_support::{Command, Scope, bin_exe};
 use serde_json::{Value, json};
 
 use crate::support::cardinal::Dirs;
@@ -86,7 +86,7 @@ pub fn input(command: &str, cwd: &Path) -> Value {
 /// `cardinal` in `dir` inside `scope`, with `dirs`' state and config dirs: for a hook that
 /// runs in a repository of a fixture.
 pub fn cardinal(scope: &Scope, dirs: &Dirs, dir: &Path) -> Command {
-    let mut command = scope.command(env!("CARGO_BIN_EXE_cardinal"), dir);
+    let mut command = scope.command(bin_exe("cardinal"), dir);
     command
         .env("CARDINAL_STATE_DIR", dirs.state())
         .env("CARDINAL_CONFIG_DIR", dirs.config());
@@ -171,7 +171,7 @@ pub fn executable(path: &Path, contents: &str) {
 #[cfg(unix)]
 pub fn real_runner(dir: &Path) -> PathBuf {
     let path = dir.join("cardinal");
-    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_cardinal"), &path).expect("link the runner");
+    std::os::unix::fs::symlink(bin_exe("cardinal"), &path).expect("link the runner");
     path
 }
 
