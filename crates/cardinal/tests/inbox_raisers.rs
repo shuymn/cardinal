@@ -100,10 +100,11 @@ impl Env {
 
     /// The items whose condition is `condition`, oldest first.
     fn occurrences(&self, condition: &str) -> Vec<InboxItem> {
-        self.items()
-            .into_iter()
-            .filter(|item| inbox::occurrence_of(&item.key).0 == condition)
-            .collect()
+        oldest_first(
+            self.items()
+                .into_iter()
+                .filter(|item| inbox::occurrence_of(&item.key).0 == condition),
+        )
     }
 
     fn resolve(&self, key: &str, outcome: ResolutionOutcome) {
@@ -577,13 +578,19 @@ fn with_ignored(path: &str, entries: &[(&str, &str, Option<u64>)]) -> Value {
 
 /// The `unclassifiable_data` items of the worktree at `path`, oldest first.
 fn unclassifiable(e: &Env, path: &str) -> Vec<InboxItem> {
-    e.items()
-        .into_iter()
-        .filter(|item| {
-            item.kind == InboxKind::UnclassifiableData
-                && item.subject.worktree.as_deref() == Some(path)
-        })
-        .collect()
+    oldest_first(e.items().into_iter().filter(|item| {
+        item.kind == InboxKind::UnclassifiableData && item.subject.worktree.as_deref() == Some(path)
+    }))
+}
+
+/// `items` in the order of their occurrence times, the observations that raised them. Not
+/// `inbox::list`'s order: that is by `created_ms`, the wall clock when the item was stored,
+/// then by key, so the items of two passes within one millisecond come in key order, which
+/// for `unclassifiable_data` is the order of the set hashes.
+fn oldest_first(items: impl Iterator<Item = InboxItem>) -> Vec<InboxItem> {
+    let mut items: Vec<InboxItem> = items.collect();
+    items.sort_by_key(|item| inbox::occurrence_of(&item.key).1);
+    items
 }
 
 /// A22: unclassifiable ignored data raises one item per worktree and set of entries: the

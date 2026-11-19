@@ -715,6 +715,15 @@ mod tests {
         String::from_utf8_lossy(&out.stdout).trim().to_owned()
     }
 
+    /// `<dir>/tool` in `scope`, a script that runs `body`, started once before a test runs it
+    /// within a deadline (`Scope::started_script`).
+    #[cfg(unix)]
+    fn started_tool(scope: &Scope, dir: &str, body: &str) {
+        let path = scope.path(dir).join("tool");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        scope.started_script(&path, body);
+    }
+
     /// Writes `body` to `<dir>/tool` in `scope` with the permission bits `mode`.
     #[cfg(unix)]
     fn tool(scope: &Scope, dir: &str, body: &str, mode: u32) {
@@ -735,9 +744,9 @@ mod tests {
         let scope = Scope::new();
         tool(&scope, "plain", "#!/bin/sh\necho plain\n", 0o644);
         std::fs::create_dir_all(scope.path("dir/tool")).unwrap();
-        tool(&scope, "first", "#!/bin/sh\necho \"$0\"\n", 0o755);
+        started_tool(&scope, "first", "echo \"$0\"\n");
         tool(&scope, "second", "#!/bin/sh\necho second\n", 0o755);
-        tool(&scope, "cwd", "#!/bin/sh\necho cwd\n", 0o755);
+        started_tool(&scope, "cwd", "echo cwd\n");
         let dirs = ["missing", "plain", "dir", "first", "second"].map(|d| scope.path(d));
         let limits = || limits(Duration::from_secs(10), 1024);
         let out = run(
@@ -767,6 +776,15 @@ mod tests {
     fn a_found_script_without_an_interpreter_line_runs_in_sh() {
         let scope = Scope::new();
         tool(&scope, "bin", "echo \"run by sh\"\n", 0o755);
+        // Started once before the deadline, as `Scope::started_script` does but without the
+        // `#!` line it writes: `sh` execs the file and, refused, runs it as `execvp` does.
+        let started = scope
+            .command("sh", scope.root())
+            .args(["-c", "exec \"$0\" > /dev/null"])
+            .arg(scope.path("bin").join("tool"))
+            .status()
+            .expect("start the script once");
+        assert!(started.success(), "{started}");
         let env = with_path(&scope, &[scope.path("bin")]);
         let out = run(
             "tool",
@@ -828,7 +846,7 @@ mod tests {
     #[test]
     fn a_directory_ending_in_a_slash_is_left_to_execvp() {
         let scope = Scope::new();
-        tool(&scope, "bin", "#!/bin/sh\necho \"$0\"\n", 0o755);
+        started_tool(&scope, "bin", "echo \"$0\"\n");
         let mut dir = scope.path("bin").into_os_string();
         dir.push("/");
         let env = with_path(&scope, &[dir.into()]);
@@ -851,7 +869,7 @@ mod tests {
     fn a_failed_start_by_path_is_retried_by_name_only_before_the_deadline() {
         let scope = Scope::new();
         tool(&scope, "broken", "#!/nonexistent/interpreter\n", 0o755);
-        tool(&scope, "next", "#!/bin/sh\necho next\n", 0o755);
+        started_tool(&scope, "next", "echo next\n");
         let env = with_path(&scope, &[scope.path("broken"), scope.path("next")]);
         let out = run(
             "tool",

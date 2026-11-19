@@ -42,6 +42,10 @@ pub use tmpfs::TMPFS_VAR;
 /// it to every child, so the harness can find what a test left running.
 pub const RUN_MARKER: &str = "CARDINAL_TEST_RUN";
 
+/// The argument on which a script of [`Scope::started_script`] exits before its body.
+#[cfg(unix)]
+const STARTED_ONCE: &str = "--started-once";
+
 /// Fixed identity and dates for every commit made inside a scope.
 const IDENTITY: &[(&str, &str)] = &[
     ("GIT_AUTHOR_NAME", "Fixture Author"),
@@ -263,6 +267,31 @@ impl Scope {
             command.args(["-c", script]);
         }
         command
+    }
+
+    /// Writes an executable `sh` script at `path`, inside the root, that runs `body`, and
+    /// starts it once with `--started-once` as its argument, on which it exits before `body`.
+    /// For a script the product starts within a deadline: the first start of a new executable
+    /// waits for the OS to check the file, on macOS a malware scan that takes seconds on a
+    /// loaded host where a file checked before starts in milliseconds, and this start takes
+    /// that wait out of the deadline.
+    #[cfg(unix)]
+    pub fn started_script(&self, path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt as _;
+        self.assert_inside(path, "script");
+        std::fs::write(
+            path,
+            format!("#!/bin/sh\n[ \"${{1-}}\" = {STARTED_ONCE} ] && exit 0\n{body}"),
+        )
+        .expect("write the script");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+            .expect("make the script executable");
+        let status = self
+            .command(path, &self.root)
+            .arg(STARTED_ONCE)
+            .status()
+            .expect("start the script once");
+        assert!(status.success(), "{}: {status}", path.display());
     }
 
     /// Panics unless `path` resolves inside the root.

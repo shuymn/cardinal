@@ -691,22 +691,38 @@ fn shipped_settings_grant_no_runner_execution() {
 #[cfg(unix)]
 mod repository {
     use std::path::{Path, PathBuf};
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-    use cardinal_test_support::Scope;
     use cardinal_test_support::fixture::Fixture;
     use cardinal_test_support::process::{PidGuard, wait_for};
+    use cardinal_test_support::{Command, Scope};
 
     use super::hook_support::{
-        PROFILE, RUNNER, cardinal, configure, executable, input, rewritten, run_hook, specs,
+        PROFILE, RUNNER, cardinal, configure, input, rewritten, run_hook, specs,
     };
     use super::support::cardinal::Dirs;
 
     const APP: &str = "[match]\nremotes = [\"github.com/o/app\"]\n[[rule]]\nid = \"build\"\ncommands = [\"make\"]\nclass = \"app-build\"\n";
 
-    /// The deadline of the tests whose git outlives it: long enough for a freshly written
-    /// script to start on a loaded host, which some OSes check before its first run.
+    /// The deadline of the tests whose git outlives it: long enough for git, a script started
+    /// once before (`Scope::started_script`), to start on a loaded host.
     const DEADLINE_MS: u64 = 3000;
+
+    /// How much longer than the deadline a hook may take as a test sees it: the start and the
+    /// exit of the hook process, which the deadline does not bound.
+    const BEYOND_DEADLINE_MS: u64 = 10_000;
+
+    /// How long after the deadline the hook may find it missed, as the hook measures it from
+    /// its own start: `os::child` wakes at the deadline, kills git's process group and reaps
+    /// git, which takes milliseconds; the rest is for a loaded host's scheduling. Neither the
+    /// first start of `cardinal`, before the hook's start, nor git's, which
+    /// `Scope::started_script` took before the hook ran, counts.
+    const KILL_MARGIN_MS: u64 = 2000;
+
+    /// How long the git of those tests runs, or keeps its output open, unless killed: past the
+    /// deadline and [`BEYOND_DEADLINE_MS`], so a hook that waits for it fails their bound.
+    const GIT_RUNS_S: u64 = 30;
+    const _: () = assert!(DEADLINE_MS + BEYOND_DEADLINE_MS < GIT_RUNS_S * 1000);
 
     fn host(git: &str, deadline_ms: u64) -> String {
         format!(
@@ -816,12 +832,9 @@ mod repository {
         ];
         for (name, body, expected) in cases {
             let git = dir.root().join(format!("git-{name}"));
-            executable(
+            dir.started_script(
                 &git,
-                &format!(
-                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n{body}\n",
-                    calls.display()
-                ),
+                &format!("printf '%s\\n' \"$*\" >> '{}'\n{body}\n", calls.display()),
             );
             let dirs = Dirs::new();
             configure(
@@ -867,10 +880,98 @@ mod repository {
         );
     }
 
-    fn pid_from(file: &Path) -> u32 {
-        wait_for("the pid file", Duration::from_secs(10), || {
-            std::fs::read_to_string(file).ok()?.trim().parse().ok()
-        })
+    /// A hook run of the tests whose git outlives the deadline, timed from the test's side.
+    struct Timed {
+        /// The wall clock at the start, which the records' times compare with.
+        started: SystemTime,
+        took: Duration,
+    }
+
+    impl Timed {
+        /// Runs `hook` with `input` and asserts that it printed nothing.
+        fn run(hook: Command, input: &serde_json::Value) -> Self {
+            let started = SystemTime::now();
+            let start = Instant::now();
+            assert_eq!(run_hook(hook, input), None);
+            Self {
+                started,
+                took: start.elapsed(),
+            }
+        }
+
+        /// Asserts that the hook returned within [`BEYOND_DEADLINE_MS`] of its deadline: it
+        /// did not wait for git, which runs [`GIT_RUNS_S`].
+        fn assert_bounded(&self, dirs: &Dirs, pid_file: &Path) {
+            assert!(
+                self.took < Duration::from_millis(DEADLINE_MS + BEYOND_DEADLINE_MS),
+                "the hook waited for git: {}",
+                self.timeline(dirs, pid_file)
+            );
+        }
+
+        /// Asserts that the hook's one record is the missed deadline, found within
+        /// [`KILL_MARGIN_MS`] after it by the hook's own clock: git was killed at the deadline.
+        fn assert_killed_at_the_deadline(&self, dirs: &Dirs, pid_file: &Path) {
+            let found = super::records(dirs);
+            let missed_ms = match &found[..] {
+                [record] if record.data["reason"] == "deadline_missed" => record.data["detail"]
+                    .as_str()
+                    .and_then(|detail| detail.strip_prefix("classification took "))
+                    .and_then(|detail| detail.strip_suffix(" ms"))
+                    .and_then(|ms| ms.parse::<u64>().ok()),
+                _ => None,
+            };
+            assert!(
+                missed_ms
+                    .is_some_and(|ms| (DEADLINE_MS..=DEADLINE_MS + KILL_MARGIN_MS).contains(&ms)),
+                "git was not killed at the deadline: {}",
+                self.timeline(dirs, pid_file)
+            );
+        }
+
+        /// The PID git wrote to `pid_file`. Read once: when the hook has returned, git has
+        /// ended or was killed and reaped, so nothing is written later.
+        fn written_pid(&self, dirs: &Dirs, pid_file: &Path) -> u32 {
+            std::fs::read_to_string(pid_file)
+                .ok()
+                .and_then(|text| text.trim().parse().ok())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "git wrote no PID before the deadline killed it: {}",
+                        self.timeline(dirs, pid_file)
+                    )
+                })
+        }
+
+        /// What happened when, from the start of the hook: what the hook recorded, when git
+        /// wrote `pid_file`, and when the hook returned.
+        fn timeline(&self, dirs: &Dirs, pid_file: &Path) -> String {
+            let at = |time: SystemTime| match time.duration_since(self.started) {
+                Ok(after) => format!("+{} ms", after.as_millis()),
+                Err(before) => format!("-{} ms", before.duration().as_millis()),
+            };
+            let records: Vec<String> = super::records(dirs)
+                .iter()
+                .map(|record| {
+                    let time = UNIX_EPOCH + Duration::from_millis(record.ts_ms);
+                    format!(
+                        "{} ({}) at {}",
+                        record.data["reason"],
+                        record.data["detail"],
+                        at(time)
+                    )
+                })
+                .collect();
+            let written = std::fs::metadata(pid_file)
+                .and_then(|meta| meta.modified())
+                .map_or_else(|_| "never".to_owned(), at);
+            format!(
+                "deadline {DEADLINE_MS} ms; the hook recorded {records:?}; git wrote {} at \
+                 {written}; the hook returned at +{} ms",
+                pid_file.display(),
+                self.took.as_millis()
+            )
+        }
     }
 
     /// A git that outlives the deadline is killed and reaped, and the hook rewrites nothing.
@@ -880,10 +981,10 @@ mod repository {
         let repo = bare_dot_git(dir.root());
         let pid_file = dir.root().join("git.pid");
         let git = dir.root().join("git-slow");
-        executable(
+        dir.started_script(
             &git,
             &format!(
-                "#!/bin/sh\necho $$ > '{}'\nexec sleep 30\n",
+                "echo $$ > '{}'\nexec sleep {GIT_RUNS_S}\n",
                 pid_file.display()
             ),
         );
@@ -893,18 +994,15 @@ mod repository {
             &host(git.to_str().unwrap(), DEADLINE_MS),
             &[("app", APP), ("generic", PROFILE)],
         );
-        let start = Instant::now();
-        assert_eq!(run_hook(dirs.cmd(), &input("make", &repo)), None);
-        assert!(start.elapsed() < Duration::from_secs(10));
-        let pid = pid_from(&pid_file);
+        let run = Timed::run(dirs.cmd(), &input("make", &repo));
+        run.assert_bounded(&dirs, &pid_file);
+        let pid = run.written_pid(&dirs, &pid_file);
         let _guard = PidGuard::new(dirs.scope(), pid);
         assert!(
             cardinal::os::process(pid, cardinal::os::Detail::default()).is_none(),
             "git {pid} survived the hook"
         );
-        let found = super::records(&dirs);
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0].data["reason"], "deadline_missed");
+        run.assert_killed_at_the_deadline(&dirs, &pid_file);
     }
 
     /// A descendant of git that keeps its stdout open does not hold the hook past the
@@ -917,10 +1015,10 @@ mod repository {
         let repo = bare_dot_git(dir.root());
         let pid_file = dir.root().join("grandchild.pid");
         let git = dir.root().join("git-detached");
-        executable(
+        dir.started_script(
             &git,
             &format!(
-                "#!/bin/sh\nsleep 30 &\necho $! > '{}'\nprintf 'https://github.com/o/app\\n'\nexit 0\n",
+                "sleep {GIT_RUNS_S} &\necho $! > '{}'\nprintf 'https://github.com/o/app\\n'\nexit 0\n",
                 pid_file.display()
             ),
         );
@@ -938,11 +1036,11 @@ mod repository {
             .expect("start the group leader");
         let mut hook = dirs.cmd();
         hook.join_group(&leader);
-        let start = Instant::now();
-        assert_eq!(run_hook(hook, &input("make", &repo)), None);
-        let pid = pid_from(&pid_file);
+        let run = Timed::run(hook, &input("make", &repo));
+        let pid = run.written_pid(&dirs, &pid_file);
         let _guard = PidGuard::new(dirs.scope(), pid);
-        assert!(start.elapsed() < Duration::from_secs(10));
+        run.assert_bounded(&dirs, &pid_file);
+        run.assert_killed_at_the_deadline(&dirs, &pid_file);
         wait_for(
             "the end of git's grandchild",
             Duration::from_secs(5),
