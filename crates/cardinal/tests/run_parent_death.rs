@@ -19,7 +19,7 @@ use cardinal::admission::{list_reservations, recovery_pass};
 use cardinal::config::HostConfig;
 use cardinal::contract::{DerivedState, RecordKind};
 use cardinal::os::unix::{SIGCONT, SIGHUP, SIGSTOP, SIGTERM, signal_process};
-use cardinal::testpoint::{ADMISSION_WAITING, RUN_AFTER_SPAWN, RUN_BEFORE_STARTING};
+use cardinal::testpoint::{ADMISSION_WAITING, RUN_AFTER_SPAWN, RUN_BEFORE_STARTING, RUN_FINISHED};
 use cardinal_test_support::Child;
 use cardinal_test_support::process::{
     GroupGuard, PidGuard, deliverable, is_stopped, wait_for, wait_for_file,
@@ -281,6 +281,60 @@ fn parent_exit_after_the_child_exited_stops_its_descendants() {
     assert!(env.worktree_lock_freed());
     let finished = env.records_of(RecordKind::JobFinished);
     assert_eq!(finished[0].data["exit"], 0);
+}
+
+/// The parent exits and is reaped, so the caller's group is gone and the runner cannot move
+/// back into it: `kill(-pgid, 0)` would count the runner itself, and the process table can miss
+/// a live member, so the runner leaves the reservation even though its stage left nothing, and
+/// the recovery pass releases it once `kill` reports the group gone (section 5.5).
+#[test]
+fn a_runner_that_cannot_rejoin_leaves_the_release_to_recovery() {
+    use cardinal::os::unix::{group_exists, pgid_of};
+
+    deliverable(&[SIGTERM]);
+    let env = Env::with_budget(1);
+    let runner = env.run_at(
+        None,
+        &["sh", "-c", "exit 0"],
+        &[RUN_AFTER_SPAWN, RUN_FINISHED],
+        None,
+    );
+    let mut parent = env.in_shell(&runner, "; exit $?").spawn().unwrap();
+    let runner_pid = env.wait_any_reached(RUN_AFTER_SPAWN);
+    let _group = GroupGuard::new(env.scope(), runner_pid);
+    let runner_start = cardinal::os::start_time_s(runner_pid).unwrap();
+    let child = env.reservations()[0].child.unwrap();
+    wait_gone(child.pid, child.start_s);
+
+    // The parent leads the caller's group, which the runner left for its own.
+    let parent_pid = parent.id();
+    assert_eq!(pgid_of(runner_pid), Some(runner_pid));
+    parent.kill_leader();
+    parent.wait().unwrap();
+    assert!(!group_exists(parent_pid), "the caller's group is gone");
+    wait_orphaned(runner_pid, parent_pid);
+    env.points.release(RUN_AFTER_SPAWN);
+
+    env.points.wait_reached(RUN_FINISHED, runner_pid, WAIT);
+    assert_eq!(
+        pgid_of(runner_pid),
+        Some(runner_pid),
+        "the runner could not move back"
+    );
+    assert_eq!(env.reservations().len(), 1, "left for recovery");
+    env.points.release(RUN_FINISHED);
+    wait_gone(runner_pid, runner_start);
+    assert_eq!(env.reservations().len(), 1, "left for recovery");
+    assert!(env.worktree_lock_freed());
+    let finished = env.records_of(RecordKind::JobFinished);
+    assert_eq!(finished[0].data["exit"], 0);
+
+    wait_for("the group to empty", WAIT, || {
+        (!group_exists(runner_pid)).then_some(())
+    });
+    let report = recovery_pass(&env.state(), &HostConfig::defaults()).unwrap();
+    assert_eq!(report.released, [finished[0].job_id.clone().unwrap()]);
+    assert_eq!(env.reservations(), []);
 }
 
 /// On the fail-open and TTY paths a stage that stops stops the runner too (job control). When
