@@ -17,7 +17,7 @@ pub use host::{
 pub use locations::{Base, config_dir, resolve, state_dir};
 pub use profile::{
     DataList, Matcher, Pattern, Profile, Rule, Selection, data_pattern_covers, data_patterns_cover,
-    git_common_dir, git_dir, normalize_remote,
+    git_common_dir, git_dir, normalize_remote, without_userinfo,
 };
 
 use crate::contract::{Error, ErrorCode};
