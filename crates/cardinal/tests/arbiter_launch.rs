@@ -458,8 +458,10 @@ fn sleep_until(ms: u64) {
 }
 
 /// `timeout_s` of the tests that kill a launcher: long enough for the steps that must
-/// happen while its pass still counts as running.
-const KILLED_TIMEOUT_S: u64 = 3;
+/// happen while its pass still counts as running, and for a session that defers its items to
+/// finish, which took up to 2.8 s with eight test runs loading one Mac. The tests wait for
+/// the pass to end at `timeout_s` and assert when it ended, not how long that took.
+const KILLED_TIMEOUT_S: u64 = 10;
 const KILLED_TIMEOUT_MS: u64 = KILLED_TIMEOUT_S * 1000;
 
 /// The owner's kinds, never due for a pass.
@@ -1477,8 +1479,11 @@ fn answered_once() {
 /// before the write.
 #[test]
 fn late_answer_refused() {
+    // Shorter than the 5 s an answer waits for `inbox/.lock`, so the answer is still waiting
+    // when the deadline passes.
+    const TIMEOUT_S: u64 = 3;
     let pinned = Pinned {
-        timeout_s: KILLED_TIMEOUT_S,
+        timeout_s: TIMEOUT_S,
         min_interval_s: 0,
         retry_s: 3600,
     };
@@ -1491,7 +1496,7 @@ fn late_answer_refused() {
     e.session(&pass.id);
     // No launcher writes the pass's outcome or end: the pass runs until its deadline.
     launcher.kill();
-    let deadline = pass.started_ms + KILLED_TIMEOUT_MS;
+    let deadline = pass.started_ms + TIMEOUT_S * 1000;
 
     let held = state::lock(
         &e.state.inbox_lock(),
