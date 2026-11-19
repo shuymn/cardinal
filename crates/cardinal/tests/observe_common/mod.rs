@@ -24,7 +24,8 @@ use cardinal_test_support::{Command, bin_exe};
 pub const GITHUB: &str = "acme/app";
 
 /// Disk lines below any free space (`docs/architecture.md` section 5.2).
-pub const QUIET_DISK: &str = "[disk]\nwarning_mib = 1\nrecovery_mib = 2\ncritical_mib = 0\n";
+pub const QUIET_DISK: &str =
+    "[disk]\nwarning_mib = 1\nrecovery_mib = 2\ncritical_mib = 0\nreserve_mib = 1\n";
 
 pub struct Scene {
     pub fx: Fixture,
