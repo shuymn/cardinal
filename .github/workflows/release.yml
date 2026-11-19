@@ -123,8 +123,9 @@ jobs:
       - name: Build
         run: mise exec -- cargo build --release --locked -p cardinal --bin cardinal
 
-      # The runner's host must be the target the archive is named for, and a
-      # release's binary must report the tagged version.
+      # The runner's host must be the target the archive is named for, and the
+      # binary must name the commit checked out, unchanged, and on a release the
+      # tagged version (`cardinal VERSION (COMMIT DATE)`, architecture section 11.2).
       - name: Package
         env:
           TARGET: ${{ matrix.target }}
@@ -139,7 +140,20 @@ jobs:
           fi
           version=$(target/release/cardinal --version)
           echo "$version"
-          if [ -n "$TAG" ] && [ "$version" != "cardinal ${TAG#v}" ]; then
+          # The ID as git abbreviates it in this clone, which build.rs read: 9 hex
+          # digits, or more where 9 are ambiguous.
+          head=$(git rev-parse --short=9 HEAD)
+          id=${version#* (}
+          id=${id%% *}
+          if [ "$id" = "$head-dirty" ]; then
+            echo "the binary was built from a tree that differs from $head" >&2
+            exit 1
+          fi
+          if [ "$id" != "$head" ]; then
+            echo "the binary reports '$version', not the commit $head" >&2
+            exit 1
+          fi
+          if [ -n "$TAG" ] && [ "${version%% (*}" != "cardinal ${TAG#v}" ]; then
             echo "the binary reports '$version', not the tag $TAG" >&2
             exit 1
           fi
