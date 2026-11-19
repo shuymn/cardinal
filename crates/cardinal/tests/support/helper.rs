@@ -62,6 +62,10 @@ pub enum Mode {
     /// Write this process's process group ID to `out`.
     #[cfg(unix)]
     Group { out: PathBuf },
+    /// Move this process into a process group of its own, write its PID to `out`, then sleep,
+    /// never reaping a child: one it leaves in the group it started in stays there as a zombie.
+    #[cfg(unix)]
+    OwnGroup { out: PathBuf },
     /// Stand in for an agent: start a sleeping helper (a process the agent leaves running)
     /// and write its PID to `dir/background.pid`; run `cardinal hook claude <event>` as this
     /// process's child, or with `via_shell` as the child of `sh -c` as Claude Code runs it,
@@ -158,6 +162,14 @@ pub fn run_if_requested() {
             // SAFETY: `getpgrp` cannot fail and touches no memory of this process.
             let group = unsafe { libc::getpgrp() };
             std::fs::write(&args[0], group.to_string()).expect("write the group");
+        }
+        #[cfg(unix)]
+        "own-group" => {
+            // SAFETY: `setpgid(0, 0)` changes only this process's group and touches no memory.
+            let moved = unsafe { libc::setpgid(0, 0) };
+            assert_eq!(moved, 0, "setpgid: {}", std::io::Error::last_os_error());
+            std::fs::write(&args[0], std::process::id().to_string()).expect("write the pid");
+            std::thread::sleep(LIFETIME);
         }
         "agent" => agent(
             Path::new(&args[0]),
@@ -374,6 +386,8 @@ pub fn args(mode: &Mode) -> Vec<String> {
         Mode::ChildSignal { out } => ("child-signal", vec![out.to_string_lossy().into_owned()]),
         #[cfg(unix)]
         Mode::Group { out } => ("group", vec![out.to_string_lossy().into_owned()]),
+        #[cfg(unix)]
+        Mode::OwnGroup { out } => ("own-group", vec![out.to_string_lossy().into_owned()]),
         Mode::Agent {
             dir,
             event,

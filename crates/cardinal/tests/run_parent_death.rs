@@ -161,6 +161,87 @@ fn parent_exit_after_the_spawn_stops_the_group() {
     assert_eq!(env.reservations(), []);
 }
 
+/// The SIGKILL due 5 s after SIGTERM is not put off by the runner's second look at a group
+/// `kill(-pgid, 0)` still reports (section 5.5): the stage's direct child leaves the group and
+/// outlives SIGTERM, and the member it leaves behind ends by SIGTERM and is never reaped, so
+/// `kill` keeps reporting the group while the process table lists no live member, the case
+/// in which a release asks `kill` again for up to `EMPTYING`. Here the runner asks once:
+/// it records the job, leaves the reservation for recovery, and sends SIGKILL at 5 s.
+#[test]
+fn a_due_sigkill_is_not_put_off_by_a_group_kill_still_reports() {
+    use cardinal::exec::PARENT_EXIT_KILL_AFTER;
+    use cardinal::os::unix::{EMPTYING, group_exists, pgid_of};
+
+    deliverable(&[SIGTERM]);
+    let env = Env::with_budget(1);
+    let member_file = env.file("member");
+    let helper_file = env.file("helper");
+    let exe = std::env::current_exe().unwrap();
+    let helper: Vec<String> = std::iter::once(quoted(exe.as_os_str()))
+        .chain(
+            helper::args(&Mode::OwnGroup {
+                out: helper_file.clone(),
+            })
+            .iter()
+            .map(|arg| quoted(arg.as_ref())),
+        )
+        .collect();
+    let script = format!(
+        "sleep 30 & echo $! > '{}'; exec {} >/dev/null",
+        member_file.display(),
+        helper.join(" ")
+    );
+    let runner = env.run_at(None, &["sh", "-c", &script], &[RUN_AFTER_SPAWN], None);
+    let mut parent = env.in_shell(&runner, "; exit $?").spawn().unwrap();
+    let runner_pid = env.wait_any_reached(RUN_AFTER_SPAWN);
+    let _group = GroupGuard::new(env.scope(), runner_pid);
+    let runner_start = cardinal::os::start_time_s(runner_pid).unwrap();
+    let pid_in = |file: &std::path::Path, what: &str| -> u32 {
+        wait_for(what, WAIT, || {
+            std::fs::read_to_string(file).ok()?.trim().parse().ok()
+        })
+    };
+    let member = pid_in(&member_file, "the member PID");
+    let member_start = cardinal::os::start_time_s(member).unwrap();
+    let child = PidGuard::new(env.scope(), pid_in(&helper_file, "the child PID"));
+    assert_eq!(pgid_of(child.pid()), Some(child.pid()), "the child left");
+    assert_eq!(pgid_of(member), Some(runner_pid));
+
+    let killed_at = Instant::now();
+    parent.kill_leader();
+    env.points.release(RUN_AFTER_SPAWN);
+    wait_gone(runner_pid, runner_start);
+    let stopped_after = killed_at.elapsed();
+    assert!(
+        !cardinal::os::is_alive(member, member_start),
+        "the member ended by SIGTERM"
+    );
+    assert!(group_exists(runner_pid), "kill still reports its group");
+    assert!(
+        stopped_after >= Duration::from_secs(4),
+        "SIGKILL comes 5 s after SIGTERM: {stopped_after:?}"
+    );
+    assert!(
+        stopped_after < PARENT_EXIT_KILL_AFTER + EMPTYING,
+        "the group was asked once, not for another {EMPTYING:?}: {stopped_after:?}"
+    );
+    let infra = env.records_of(RecordKind::JobInfraFailure);
+    assert_eq!(
+        infra[0].data["reason"],
+        "the command did not stop within 5 s of SIGTERM"
+    );
+    assert_eq!(env.reservations().len(), 1, "left for recovery");
+
+    // Once the child is gone, nothing holds the member unreaped and the group empties.
+    child.kill();
+    wait_for("the group to empty", WAIT, || {
+        (!group_exists(runner_pid)).then_some(())
+    });
+    let report = recovery_pass(&env.state(), &HostConfig::defaults()).unwrap();
+    assert_eq!(report.released.len(), 1);
+    assert_eq!(env.reservations(), []);
+}
+
 /// The direct child exited and left a descendant in the group when the parent exits: the
 /// runner takes in the parent's exit before it returns, stops the group with SIGTERM, and
 /// releases the reservation once the group is empty.
