@@ -42,7 +42,7 @@ pub struct ClaimWorktree {
 pub struct ClaimRepo {
     /// The repository's git common dir, canonical.
     pub common_dir: String,
-    /// `remote.origin.url`, when it is set.
+    /// `remote.origin.url`, when it is set, without the userinfo of a URL-form remote.
     pub remote: Option<String>,
 }
 

@@ -30,7 +30,7 @@ use super::delete::{self, Deletion, Stop, Watch};
 use super::recover::{self, ClaimRead, ExecutionLock, Locked, Published, Recovered, RestoreError};
 use super::unix::Target;
 use super::{EXECUTION_NOT_GRANTED, Evaluated, Outcome, Run};
-use crate::config::Config;
+use crate::config::{Config, without_userinfo};
 use crate::contract::{
     ActClaim, ActClaimSchema, ActResult, ActStatus, Caller, ChainDir, Check, CheckResult,
     ClaimRepo, ClaimStage, ClaimTarget, ClaimWorktree, EntryPath, EntryType, Error, ErrorCode,
@@ -1021,8 +1021,15 @@ impl Execution<'_, '_> {
             },
             repo: ClaimRepo {
                 common_dir: self.observation.repo.common_dir.clone(),
-                // `observed` passed, so the observation read `origin`.
-                remote: self.observation.remote.clone().ok().flatten(),
+                // `observed` passed, so the observation read `origin`; its userinfo, which may
+                // hold a credential, selects no profile and is not recorded.
+                remote: self
+                    .observation
+                    .remote
+                    .as_ref()
+                    .ok()
+                    .and_then(Option::as_deref)
+                    .map(without_userinfo),
             },
             chain,
             target: ClaimTarget {
@@ -1505,7 +1512,8 @@ impl Execution<'_, '_> {
         let mut watch = OriginWatch {
             watch: Watch::new(&self.r.config.dir, &claim.repo, &rel, &entry, &manifest),
             git,
-            remote: claim.repo.remote.clone(),
+            // The URL step 8 read, as git prints it: the claim's has no userinfo.
+            remote: self.observation.remote.clone().ok().flatten(),
         };
         let deletion = Deletion {
             entry: &entry,
@@ -1618,7 +1626,7 @@ fn origin_again(
 }
 
 /// The deleter's guard of a live execution: [`Watch`], and `origin` read before each batch,
-/// which stops the deletion when its URL is no longer the claim's, as the profiles it
+/// which stops the deletion when its URL is no longer the one step 8 read, as the profiles it
 /// selects could protect what the batch deletes.
 struct OriginWatch<'a> {
     watch: Watch,
