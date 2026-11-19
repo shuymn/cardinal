@@ -37,7 +37,8 @@ const ARBITER_PASS_VAR: &str = "CARDINAL_ARBITER_PASS";
 
 /// Local compute-resource arbitration and housekeeping for parallel coding agents.
 #[derive(Debug, Parser)]
-#[command(name = "cardinal", version)]
+// The package version, then the source commit when the build had one (`build.rs`).
+#[command(name = "cardinal", version = env!("CARDINAL_VERSION"))]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
@@ -635,7 +636,12 @@ mod tests {
             (&["explain", "command"], &["cwd"]),
         ];
         let root = Cli::command();
-        assert!(root.get_version().is_some());
+        let version = root.get_version().expect("a version");
+        let package = env!("CARGO_PKG_VERSION");
+        assert!(
+            version == package || version.starts_with(&format!("{package} (")),
+            "{version}"
+        );
         for (path, flags) in expected {
             let mut command = &root;
             for name in *path {

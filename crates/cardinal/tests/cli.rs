@@ -3,6 +3,8 @@
 
 mod support;
 
+use std::path::Path;
+
 use support::cardinal::Dirs;
 
 fn json(stdout: &[u8]) -> serde_json::Value {
@@ -47,20 +49,52 @@ fn help_lists_every_command() {
     }
 }
 
+/// `cardinal --version`: the package version, followed by the source commit in a build from a
+/// checkout (`build.rs`, `tests/version.rs`). The commit is part of the binary: with no
+/// program on `PATH` the output is the same.
 #[test]
-fn version_is_text() {
+fn version_names_the_source_commit() {
     let dirs = Dirs::new();
-    let output = dirs
-        .cmd()
-        .arg("--version")
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    assert_eq!(
-        String::from_utf8(output).unwrap().trim(),
-        format!("cardinal {}", env!("CARGO_PKG_VERSION"))
+    let version = |path: Option<&str>| {
+        let mut cmd = dirs.cmd();
+        if let Some(path) = path {
+            cmd.env("PATH", path);
+        }
+        let output = cmd.arg("--version").assert().success().get_output().clone();
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let text = version(None);
+    assert_eq!(version(Some("")), text);
+    let line = text.strip_suffix('\n').expect("one line");
+    let package = format!("cardinal {}", env!("CARGO_PKG_VERSION"));
+    let rest = line
+        .strip_prefix(&package)
+        .unwrap_or_else(|| panic!("{line:?} does not start with {package:?}"));
+    let checkout = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../.git")
+        .exists();
+    if !checkout {
+        assert_eq!(rest, "", "{line:?} names a commit, built from no checkout");
+        return;
+    }
+    let (id, date) = rest
+        .strip_prefix(" (")
+        .and_then(|r| r.strip_suffix(')'))
+        .and_then(|r| r.split_once(' '))
+        .unwrap_or_else(|| panic!("{line:?} names no commit, built from a checkout"));
+    let id = id.strip_suffix("-dirty").unwrap_or(id);
+    assert!(
+        id.len() >= 9
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        "{line:?}: {id:?} is no abbreviated commit ID"
+    );
+    let digits: Vec<&str> = date.split('-').collect();
+    assert!(
+        matches!(digits[..], [y, m, d] if y.len() == 4 && m.len() == 2 && d.len() == 2)
+            && digits.iter().all(|p| p.bytes().all(|b| b.is_ascii_digit())),
+        "{line:?}: {date:?} is no YYYY-MM-DD date"
     );
 }
 
