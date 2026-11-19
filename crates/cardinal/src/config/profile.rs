@@ -236,6 +236,28 @@ pub fn normalize_remote(url: &str) -> Option<String> {
     Some(format!("{host}/{}/{}", segments[0], segments[1]).to_ascii_lowercase())
 }
 
+/// `url` without the userinfo of a URL-form remote (`scheme://user[:password]@host/…`), which
+/// may hold a credential: the authority, up to the first `/`, keeps what follows its last `@`,
+/// the part [`normalize_remote`] reads its host from, so both normalize alike. Anything else,
+/// an scp-like `user@host:path` whose `user@` names the SSH login and holds no password,
+/// included, is returned as it is.
+#[must_use]
+pub fn without_userinfo(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_owned();
+    };
+    let (authority, path) = rest
+        .split_once('/')
+        .map_or((rest, None), |(a, p)| (a, Some(p)));
+    let Some((_, host)) = authority.rsplit_once('@') else {
+        return url.to_owned();
+    };
+    match path {
+        Some(path) => format!("{scheme}://{host}/{path}"),
+        None => format!("{scheme}://{host}"),
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 struct RawProfile {
@@ -481,6 +503,7 @@ mod tests {
 
     use super::{
         DataList, Profile, Selection, data_pattern_covers, git_common_dir, normalize_remote,
+        without_userinfo,
     };
 
     /// An absolute home directory on every OS.
@@ -624,6 +647,66 @@ mod tests {
         ] {
             assert_eq!(normalize_remote(url), None, "{url}");
         }
+    }
+
+    /// The userinfo of a URL-form remote goes, anything else stays, and the remote normalizes
+    /// and matches a profile as it did with it.
+    #[test]
+    fn userinfo_removed_as_normalization_ignores_it() {
+        // Built in parts, so no scanner takes the test's URLs for real credentials.
+        let token = ["s3", "cret"].concat();
+        let cases = [
+            (
+                String::from("https://user@github.com/o/app.git"),
+                "https://github.com/o/app.git",
+            ),
+            (
+                format!("https://user:{token}@github.com/o/app.git"),
+                "https://github.com/o/app.git",
+            ),
+            (
+                format!("https://x:{token}@a@github.com:8443/o/app"),
+                "https://github.com:8443/o/app",
+            ),
+            (
+                format!("https://user:{token}@github.com"),
+                "https://github.com",
+            ),
+            (
+                String::from("ssh://git@github.com:22/o/app.git"),
+                "ssh://github.com:22/o/app.git",
+            ),
+            (
+                String::from("file://user@host/srv/app.git"),
+                "file://host/srv/app.git",
+            ),
+            (
+                String::from("https://github.com/o/app.git"),
+                "https://github.com/o/app.git",
+            ),
+            (
+                String::from("https://github.com/o/a@b"),
+                "https://github.com/o/a@b",
+            ),
+            (
+                String::from("git@github.com:o/app.git"),
+                "git@github.com:o/app.git",
+            ),
+            (String::from("/srv/app.git"), "/srv/app.git"),
+            (String::from("../user@app"), "../user@app"),
+        ];
+        let profile = parse("app", "[match]\nremotes = [\"github.com/o/app\"]\n");
+        for (url, expected) in &cases {
+            let stripped = without_userinfo(url);
+            assert_eq!(stripped, *expected, "{url}");
+            assert_eq!(normalize_remote(&stripped), normalize_remote(url), "{url}");
+            assert_eq!(
+                profile.matches_remote(&stripped),
+                profile.matches_remote(url),
+                "{url}"
+            );
+        }
+        assert!(profile.matches_remote(&cases[1].0));
     }
 
     #[test]

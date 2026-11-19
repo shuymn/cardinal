@@ -245,6 +245,37 @@ fn a_target_made_protected_is_kept() {
     assert!(x.t().is_dir());
 }
 
+/// The claim's `origin` selects the profile that protects `node_modules/a` alike with its
+/// userinfo, as a claim from an earlier build records it, and without, as `act` records it
+/// now: recovery keeps `a` either way, and deletes it when `origin` names another repository.
+#[test]
+fn the_claimed_origin_selects_with_or_without_userinfo() {
+    // Built in parts, so no scanner takes the test's URL for a real credential.
+    let credential = ["https://u:", "s3cret", "@github.com/acme/app.git"].concat();
+    for (remote, kept) in [
+        (credential.as_str(), true),
+        ("https://github.com/acme/app.git", true),
+        ("https://github.com/acme/other.git", false),
+    ] {
+        let x = committed();
+        std::fs::write(
+            x.config.join("repos/acme.toml"),
+            "[match]\nremotes = [\"github.com/acme/app\"]\n[data]\nprotected = [\"node_modules/a\"]\n",
+        )
+        .unwrap();
+        let path = x.state.execution_claim(&x.plan);
+        let mut claim: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        claim["repo"]["remote"] = serde_json::json!(remote);
+        std::fs::write(&path, serde_json::to_vec(&claim).unwrap()).unwrap();
+        let result = result(&x, &x.recover(true));
+        assert_eq!(x.t().join("a/f1").exists(), kept, "{remote}: {result}");
+        assert!(!x.t().join("b").exists(), "{remote}: {result}");
+        let status = if kept { "partial" } else { "executed" };
+        assert_eq!(result["status"], status, "{remote}: {result}");
+    }
+}
+
 /// `t` replaced after the commit by an empty directory of another inode is not entered, not
 /// taken, and not removed; the original, moved away, keeps everything.
 #[test]

@@ -696,6 +696,44 @@ mod moved {
         );
         assert_names(&result, "origin changed");
         assert!(!format!("{result:?}").contains("s3cret"), "{result:#?}");
+        assert_no_credential(&x);
+    }
+
+    /// An `origin` that holds credentials from before the plan: the claim records it without
+    /// its userinfo, the deletion, which reads `origin` again before each batch, finishes, and
+    /// no file of the state dir holds the credential.
+    #[test]
+    fn a_credential_origin_is_claimed_without_it() {
+        let url = "https://github.com/acme/app.git";
+        // Built in parts, so no scanner takes the test's URL for a real credential.
+        let secret = ["https://u:", "s3cret", "@github.com/acme/app.git"].concat();
+        let x = Live::with_host(
+            GRANT,
+            "credential-claim",
+            "target",
+            &["debug/app"],
+            |s, _| {
+                let config = s.main.join(".git/config");
+                let text = std::fs::read_to_string(&config).unwrap();
+                assert!(text.contains(url), "{text}");
+                std::fs::write(&config, text.replace(url, &secret)).unwrap();
+            },
+        );
+        let claim = x.s.state.execution_claim(&x.plan.id);
+        let mut recorded = None;
+        let result = x.act_at(testpoint::ACT_COMMITTED, || {
+            let claim: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&claim).unwrap()).unwrap();
+            recorded = Some(claim["repo"]["remote"].clone());
+        });
+        assert_eq!(recorded, Some(serde_json::json!(url)));
+        assert_eq!(result.status, ActStatus::Executed, "{result:#?}");
+        assert!(!x.target().exists());
+        assert_no_credential(&x);
+    }
+
+    /// Asserts that no file of the state dir holds the tests' credential, `s3cret`.
+    fn assert_no_credential(x: &Live) {
         let mut dirs = vec![x.s.state_dir.clone()];
         while let Some(dir) = dirs.pop() {
             for entry in std::fs::read_dir(&dir).unwrap() {
@@ -705,7 +743,7 @@ mod moved {
                 } else {
                     let bytes = std::fs::read(&path).unwrap_or_default();
                     let found = bytes.windows(6).any(|w| w == b"s3cret");
-                    assert!(!found, "{} holds the URL", path.display());
+                    assert!(!found, "{} holds the credential", path.display());
                 }
             }
         }
