@@ -454,10 +454,15 @@ fn error_code(doc: &serde_json::Value) -> &str {
         .unwrap_or_else(|| panic!("{doc}"))
 }
 
-/// Sleeps until the wall clock reads at least `ms`.
+/// Sleeps until the wall clock, which the product compares a pass's deadline with, reads at
+/// least `ms`. A sleep ends by elapsed time, so when the clock is stepped back meanwhile (macOS
+/// `timed` steps it by tens of milliseconds when it syncs) it sleeps again.
 fn sleep_until(ms: u64) {
-    let now = state::now_ms();
-    if ms > now {
+    loop {
+        let now = state::now_ms();
+        if now >= ms {
+            return;
+        }
         std::thread::sleep(Duration::from_millis(ms - now));
     }
 }
