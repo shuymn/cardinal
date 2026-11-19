@@ -87,7 +87,7 @@ impl Config {
                         source,
                     })?;
                     let path = entry.path();
-                    if path.extension().is_some_and(|ext| ext == "toml") && is_profile(&path)? {
+                    if names_profile(&path) && is_profile(&path)? {
                         files.push(path);
                     }
                 }
@@ -140,6 +140,13 @@ impl HostConfig {
             locations::home_dir().as_deref(),
         )
     }
+}
+
+/// Whether `path`, an entry of `repos/`, is named as a profile: `*.toml`. [`Config::load`]
+/// reads each such entry that is a file, through a final symbolic link, and nothing else
+/// there.
+pub(crate) fn names_profile(path: &Path) -> bool {
+    path.extension().is_some_and(|ext| ext == "toml")
 }
 
 /// Whether the `*.toml` entry `path` of `repos/` is a profile: a regular file, a symbolic link

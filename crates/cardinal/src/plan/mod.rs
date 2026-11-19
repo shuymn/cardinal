@@ -16,6 +16,8 @@ pub use checks::{
     DataLists, Descriptors, FACT_ENTRIES, InUseFacts, Inspection, approval, bound_facts,
     descriptor_scan, evaluate, invariants_ok, processes_inside, provenance,
 };
+#[cfg(unix)]
+pub(crate) use checks::{Linked, descriptor_uses, processes_fact};
 pub use walk::{Entry, EntryKind, Mount, Tree, Walk, root_identity, walk};
 
 use std::sync::Mutex;
