@@ -435,7 +435,34 @@ impl StoppedJob {
         );
         let fail = (path == "fail_open").then_some(RUN_BEFORE_STARTING);
         let runner = env.run_at(None, &["sh", "-c", &script], &[], fail);
-        let parent = env.in_shell(&runner, "; exit $?");
+        // A job-control shell and its job both call `setpgid` for the job. On macOS the job's
+        // call can fail (EPERM) while the shell's is still moving the job, and a child the job
+        // starts meanwhile stays in the shell's group; so the parent starts the runner only
+        // once a helper it starts reports the parent's own group. (`ps` cannot run in the
+        // test's sandbox: macOS's is setuid.)
+        let group_file = env.file("group");
+        let group = helper::command(
+            env.scope(),
+            &Mode::Group {
+                out: group_file.clone(),
+            },
+            &env.worktree(),
+        );
+        let group_words: Vec<String> = std::iter::once(group.get_program())
+            .chain(group.get_args())
+            .map(quoted)
+            .collect();
+        let mut parent = env.in_worktree("sh");
+        parent
+            .arg("-c")
+            .arg(format!(
+                "until {} && [ \"$(cat '{}')\" = \"$$\" ]; do :; done; \"$0\" \"$@\"; exit $?",
+                group_words.join(" "),
+                group_file.display()
+            ))
+            .arg(runner.get_program())
+            .args(runner.get_args())
+            .copy_env(&runner);
         let member_file = env.file("member");
         // bash without startup files leads the session; `set -m` gives the job, started in the
         // background so the shell never hands it a terminal, a group of its own. The parent's
