@@ -87,7 +87,7 @@ impl Config {
                         source,
                     })?;
                     let path = entry.path();
-                    if path.extension().is_some_and(|ext| ext == "toml") && path.is_file() {
+                    if path.extension().is_some_and(|ext| ext == "toml") && is_profile(&path)? {
                         files.push(path);
                     }
                 }
@@ -142,6 +142,20 @@ impl HostConfig {
     }
 }
 
+/// Whether the `*.toml` entry `path` of `repos/` is a profile: a regular file, a symbolic link
+/// to one included. An entry whose `stat` fails is an error, never an absent profile, which
+/// would drop its `protected` list (section 3.1) for this load; that includes an entry removed
+/// since it was listed, as an editor that deletes a file and writes it again leaves it for a
+/// moment, which the next load reads again.
+fn is_profile(path: &Path) -> Result<bool, ConfigError> {
+    std::fs::metadata(path)
+        .map(|meta| meta.is_file())
+        .map_err(|source| ConfigError::Read {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
 fn read_optional(path: &Path) -> Result<Option<String>, ConfigError> {
     match std::fs::read_to_string(path) {
         Ok(text) => Ok(Some(text)),
@@ -182,6 +196,60 @@ mod tests {
         std::fs::write(repos.join("c.toml"), "[rule]\nbad = 1").unwrap();
         let err = Config::load_with(tmp.path(), 4, None).unwrap_err();
         assert!(err.to_string().contains("c.toml"), "{err}");
+    }
+
+    /// A profile that cannot be read is an error, never an absent profile: one whose `stat`
+    /// fails in a `repos/` without search permission (which `Path::is_file` reads as no file),
+    /// one whose content cannot be read, and a symbolic link to nothing. Its `protected` list
+    /// would otherwise be dropped.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_profile_is_an_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let repos = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos).unwrap();
+        let profile = repos.join("a.toml");
+        std::fs::write(&profile, "[data]\nprotected = [\"fuzz/corpus\"]\n").unwrap();
+        let loaded = Config::load_with(tmp.path(), 4, None).unwrap();
+        assert_eq!(loaded.profiles[0].protected, ["fuzz/corpus"]);
+
+        let mode = |path: &Path, mode| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        mode(&repos, 0o644);
+        let unsearchable = std::fs::metadata(&profile).is_err();
+        let result = Config::load_with(tmp.path(), 4, None);
+        mode(&repos, 0o755);
+        if unsearchable {
+            let err = result.unwrap_err();
+            assert!(err.to_string().contains("a.toml"), "{err}");
+        } else {
+            // Root reads past permissions, and so does the load.
+            assert_eq!(result.unwrap().profiles.len(), 1);
+        }
+
+        mode(&profile, 0o000);
+        let unreadable = std::fs::read(&profile).is_err();
+        let result = Config::load_with(tmp.path(), 4, None);
+        mode(&profile, 0o644);
+        if unreadable {
+            assert!(result.is_err(), "{result:?}");
+        }
+
+        std::os::unix::fs::symlink(repos.join("missing"), repos.join("b.toml")).unwrap();
+        let err = Config::load_with(tmp.path(), 4, None).unwrap_err();
+        assert!(err.to_string().contains("b.toml"), "{err}");
+    }
+
+    /// A `*.toml` entry removed between the listing of `repos/` and its `stat` is an error too:
+    /// the load is read again later, while skipping it would drop its `protected` list.
+    #[test]
+    fn a_profile_removed_since_it_was_listed_is_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = super::is_profile(&tmp.path().join("gone.toml")).unwrap_err();
+        assert!(err.to_string().contains("gone.toml"), "{err}");
     }
 
     #[test]
