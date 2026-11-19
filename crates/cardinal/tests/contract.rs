@@ -540,6 +540,7 @@ fn act_claim_document() {
         "schema": "cardinal.act-claim.v1", "plan_id": "fedcba9876543210", "caller": "owner",
         "stage": "claimed", "created_ms": 5, "updated_ms": 6,
         "worktree": {"path": "/w", "root": {"dev": 1, "ino": 2}},
+        "repo": {"common_dir": "/w/.git", "remote": "https://github.com/o/r.git"},
         "chain": [{"name": "packages", "dev": 1, "ino": 3}, {"name": "app", "dev": 1, "ino": 4}],
         "target": {"name": "node_modules", "dev": 1, "ino": 5, "type": "dir"},
         "manifest_entries": 120
@@ -548,8 +549,12 @@ fn act_claim_document() {
     let mut committed = doc.clone();
     committed["stage"] = json!("committed");
     committed["chain"] = json!([]);
+    committed["repo"]["remote"] = json!(null);
     round_trips::<ActClaim>(&committed);
     rejects_wrong_schema_and_missing::<ActClaim>(&doc, "chain");
+    rejects::<ActClaim>(&doc, "a claim without its repository", |d| {
+        d.as_object_mut().unwrap().remove("repo");
+    });
     rejects::<ActClaim>(&doc, "an unknown stage", |d| d["stage"] = json!("moved"));
     rejects::<ActClaim>(&doc, "an unknown target type", |d| {
         d["target"]["type"] = json!("fifo");

@@ -89,7 +89,7 @@ pub const ACT_CLAIMED: &str = "act.claimed";
 pub const ACT_MOVED: &str = "act.moved";
 /// Every check after the move passed; the commit's checks have not run.
 pub const ACT_CHECKED: &str = "act.checked";
-/// `committed` is durable and the in-use lock released; nothing taken.
+/// `committed` is renamed into place and not synced, the in-use lock held; nothing taken.
 pub const ACT_COMMITTED: &str = "act.committed";
 /// An entry is in the hold and not checked.
 pub const ACT_TAKEN: &str = "act.taken";
@@ -239,6 +239,65 @@ pub fn fake_entry_type(path: &Path) -> Option<String> {
         .iter()
         .find(|(_, at)| at == path)
         .map(|(ty, _)| ty.clone())
+}
+
+/// How far a test has moved the deleter's clock ahead (section 13.7), so the next batch of
+/// deletions is due without waiting: with `CARDINAL_TEST_DIR` set, `<dir>/clock` holds a
+/// number of milliseconds, read at each call, which the test raises while the deleter is
+/// paused. Zero outside tests and without the file.
+#[must_use]
+pub fn fake_clock_ahead() -> Duration {
+    let Some(settings) = settings() else {
+        return Duration::ZERO;
+    };
+    std::fs::read_to_string(settings.dir.join("clock"))
+        .ok()
+        .and_then(|text| text.trim().parse().ok())
+        .map_or(Duration::ZERO, Duration::from_millis)
+}
+
+/// A write of the kind `kind` that a test makes fail for lack of space (section 13.7): with
+/// `CARDINAL_TEST_DIR` set, `<dir>/write-failures` holds lines `<kind>\t<error>\t<times>`, the
+/// error `ENOSPC` or `EDQUOT` and the times `once` or `always`. An error when this call is
+/// one the file makes fail, counted per process; `Ok` outside tests and for any other kind.
+pub fn fake_write(kind: &str) -> std::io::Result<()> {
+    use std::collections::HashSet;
+    use std::io::{Error, ErrorKind};
+    use std::sync::Mutex;
+
+    static FAILED_ONCE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let Some(settings) = settings() else {
+        return Ok(());
+    };
+    let text = std::fs::read_to_string(settings.dir.join("write-failures")).unwrap_or_default();
+    for line in text.lines() {
+        let mut fields = line.split('\t');
+        let (Some(name), Some(error), Some(times)) = (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if name != kind {
+            continue;
+        }
+        if times == "once" {
+            let failed = FAILED_ONCE.get_or_init(Mutex::default);
+            let first = failed
+                .lock()
+                .is_ok_and(|mut failed| failed.insert(kind.to_owned()));
+            if !first {
+                continue;
+            }
+        }
+        let error_kind = match error {
+            "EDQUOT" => ErrorKind::QuotaExceeded,
+            _ => ErrorKind::StorageFull,
+        };
+        return Err(Error::new(
+            error_kind,
+            format!("injected {error} at the write of {kind}"),
+        ));
+    }
+    Ok(())
 }
 
 /// The `<value>\t<path>` lines of the fake file `name` in the test directory, which a test

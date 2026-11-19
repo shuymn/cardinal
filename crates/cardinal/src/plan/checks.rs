@@ -15,7 +15,7 @@ use crate::contract::{
     MergeEvidence, ObservedError, PlanKind, Provenance, Tri,
 };
 use crate::observe::WorktreeObservation;
-use crate::os::fds::{Scan, Way};
+use crate::os::fds::{Scan, Use, Way};
 use crate::os::{Detail, ProcessTable};
 
 use super::walk::{EntryKind, Mount, Walk};
@@ -205,7 +205,7 @@ fn merge_facts(i: &Inspection<'_>) -> Vec<CheckFact> {
 
 /// The fact `name` holding the first [`PROCESS_ENTRIES`] of `entries`, the rest counted in
 /// `omitted`.
-fn processes_fact<T: serde::Serialize>(
+pub(crate) fn processes_fact<T: serde::Serialize>(
     name: &str,
     entries: Option<&[T]>,
     source: &str,
@@ -481,32 +481,79 @@ struct DescriptorUser {
     path: Option<PathBuf>,
 }
 
-/// The uses of the target that the descriptor scan found (section 9.7): a working or root
-/// directory, executable, or descriptor that is an entry the walk recorded, by `dev` and
-/// `ino`, or whose path lies at or under the target. A file with more links than the walk
-/// found names for it does not count when the use's path is the name it was opened through
-/// ([`PATH_IS_OPENED_NAME`]), outside the target, and still names the file: removing the
-/// target leaves it to that name. A use through a name inside the target, or whose path cannot
-/// be read, decided, or no longer names the file, counts. `None` without a complete scan and a
-/// walk.
+/// What the descriptor-use decision reads of an entry of a target with an identity
+/// (`dev`, `ino`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Linked {
+    /// How many names the target's entries give it.
+    pub(crate) names: u64,
+    /// Its link count, as the entries read it.
+    pub(crate) nlink: u64,
+    /// Whether it is a directory.
+    pub(crate) dir: bool,
+}
+
+/// The uses that `scan` found of a target at `root` whose entries `ids` holds (section 9.7),
+/// each with the PID of its process: a working or root directory, executable, or descriptor
+/// that is one of the entries, by `dev` and `ino`, or whose path lies at or under `root`, as
+/// given or as the OS names it, through no symbolic link. A file with more links than the
+/// entries have names for it does not count when the use's path is the name it was opened
+/// through ([`PATH_IS_OPENED_NAME`]), outside `root`, and still names the file: removing the
+/// target leaves it to that name. A use through a name inside, or whose path cannot be read or
+/// no longer names the file, counts. `plan` and `act` ask it of the target before the move,
+/// and the deletion of the trash entry after it. An error when the path the OS names for
+/// `root` cannot be read, so nothing decides without it.
+pub(crate) fn descriptor_uses<'s>(
+    scan: &'s Scan,
+    ids: &HashMap<(u64, u64), Linked>,
+    root: &Path,
+) -> Result<Vec<(u32, &'s Use)>, String> {
+    let canonical =
+        std::fs::canonicalize(root).map_err(|err| format!("{}: {err}", root.display()))?;
+    let under = |path: &Path| path.starts_with(root) || path.starts_with(&canonical);
+    // A use's path that establishes it holds the file `id` through a name outside `root`.
+    let outside = |path: &Path, id: (u64, u64)| {
+        PATH_IS_OPENED_NAME && path.is_absolute() && !under(path) && names_file(path, id)
+    };
+    let mut found = Vec::new();
+    for process in &scan.processes {
+        for used in &process.uses {
+            let counts = match used.id.and_then(|id| Some((id, ids.get(&id)?))) {
+                Some((id, linked)) => {
+                    linked.dir
+                        || linked.nlink <= linked.names
+                        || !used.path.as_deref().is_some_and(|path| outside(path, id))
+                }
+                None => used.path.as_deref().is_some_and(under),
+            };
+            if counts {
+                found.push((process.pid, used));
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// The uses of the target that the descriptor scan found ([`descriptor_uses`]), each named by
+/// its path relative to the worktree, or by the entry it uses. `None` without a complete scan
+/// and a walk, or when the target's path as the OS names it cannot be read.
 fn descriptor_users(i: &Inspection<'_>) -> Option<Vec<DescriptorUser>> {
     let scan = scan(i)?;
     let walk = i.walk.ok()?;
-    let mut names: HashMap<(u64, u64), (u64, &super::Entry)> = HashMap::new();
+    let mut ids: HashMap<(u64, u64), Linked> = HashMap::new();
+    let mut entries: HashMap<(u64, u64), &super::Entry> = HashMap::new();
     for entry in walk.all() {
-        names
-            .entry((entry.dev, entry.ino))
-            .and_modify(|(n, _)| *n += 1)
-            .or_insert((1, entry));
+        let id = (entry.dev, entry.ino);
+        ids.entry(id)
+            .and_modify(|linked| linked.names += 1)
+            .or_insert(Linked {
+                names: 1,
+                nlink: entry.nlink,
+                dir: entry.kind == EntryKind::Dir,
+            });
+        entries.entry(id).or_insert(entry);
     }
-    // The OS names a path as the volume resolves it, through no symbolic link.
-    let canonical_target = std::fs::canonicalize(i.target).ok();
-    let under = |path: &Path| {
-        path.starts_with(i.target)
-            || canonical_target
-                .as_deref()
-                .is_some_and(|target| path.starts_with(target))
-    };
+    let uses = descriptor_uses(scan, &ids, i.target).ok()?;
     let canonical_worktree = std::fs::canonicalize(i.worktree).ok();
     let relative = |path: &Path| {
         path.strip_prefix(i.worktree)
@@ -515,37 +562,18 @@ fn descriptor_users(i: &Inspection<'_>) -> Option<Vec<DescriptorUser>> {
             .unwrap_or(path)
             .to_path_buf()
     };
-    // A use's path that establishes it holds the file `id` through a name outside the target.
-    let outside = |path: &Path, id: (u64, u64)| {
-        PATH_IS_OPENED_NAME && path.is_absolute() && !under(path) && names_file(path, id)
-    };
-    let mut found = Vec::new();
-    for process in &scan.processes {
-        for used in &process.uses {
-            let entry = used.id.and_then(|id| Some((id, names.get(&id)?)));
-            let counts = match entry {
-                Some((id, &(n, entry))) => {
-                    entry.kind == EntryKind::Dir
-                        || entry.nlink <= n
-                        || !used.path.as_deref().is_some_and(|path| outside(path, id))
-                }
-                None => used.path.as_deref().is_some_and(under),
-            };
-            if !counts {
-                continue;
-            }
-            found.push(DescriptorUser {
-                pid: process.pid,
+    Some(
+        uses.into_iter()
+            .map(|(pid, used)| DescriptorUser {
+                pid,
                 way: used.way,
-                path: used
-                    .path
-                    .as_deref()
-                    .map(relative)
-                    .or_else(|| entry.map(|(_, (_, e))| e.rel.clone())),
-            });
-        }
-    }
-    Some(found)
+                path: used.path.as_deref().map(relative).or_else(|| {
+                    let entry = entries.get(&used.id?)?;
+                    Some(entry.rel.clone())
+                }),
+            })
+            .collect(),
+    )
 }
 
 /// Whether the path the descriptor scan reads for a use is the name the file was opened
@@ -728,7 +756,8 @@ fn not_in_use(i: &Inspection<'_>, users: Option<&[DescriptorUser]>) -> Check {
     }
     match (&i.in_use.descriptors, users) {
         (Some(Err(err)), _) => unknown.push(format!("descriptor scan: {err}")),
-        (Some(Ok(_)), None) => unknown.push("descriptor scan: the target was not walked".into()),
+        (Some(Ok(_)), None) => unknown
+            .push("descriptor scan: the target was not walked or its path did not resolve".into()),
         (Some(Ok(_)), Some(users)) if !users.is_empty() => {
             let users: Vec<String> = users
                 .iter()

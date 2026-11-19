@@ -8,6 +8,10 @@
 //! which is why deletion waits for phase 1.
 
 #[cfg(unix)]
+pub mod delete;
+#[cfg(unix)]
+pub mod recover;
+#[cfg(unix)]
 mod unix;
 
 use std::path::{Path, PathBuf};

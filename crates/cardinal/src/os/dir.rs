@@ -9,15 +9,19 @@
 //! `getattrlistbulk`, which returns each entry's private size (`ATTR_CMNEXT_PRIVATESIZE`), and
 //! on Linux each regular file's data extents are read with `FIEMAP`. A read that fails is
 //! reported with the listing, which goes on without it.
+//!
+//! An execution's deleter (section 9.7) works through the same descriptors: it opens each
+//! level relative to its parent ([`open_at`]), moves entries with a rename that never replaces
+//! ([`rename_noreplace`]), and reads where a directory it holds is now ([`current_path`]).
 
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io;
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use rustix::fs::{AtFlags, FileType, Mode, OFlags};
+use rustix::fs::{AtFlags, FileType, Mode, OFlags, RenameFlags};
 use rustix::io::Errno;
 
 /// The type of an entry, as `lstat` reports it.
@@ -78,6 +82,80 @@ pub fn open(path: &Path) -> io::Result<Option<File>> {
         Ok(fd) => Ok(Some(File::from(fd))),
         Err(Errno::LOOP | Errno::NOTDIR) => Ok(None),
         Err(err) => Err(err.into()),
+    }
+}
+
+/// Opens the directory `name` in the open directory `dir` as std's `remove_dir_all` opens
+/// each level: relative to `dir`, with `O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`. `None` when
+/// the entry there is not a directory, a symbolic link included.
+pub fn open_at(dir: impl AsFd, name: &OsStr) -> io::Result<Option<File>> {
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    match rustix::fs::openat(dir, name, flags, Mode::empty()) {
+        Ok(fd) => Ok(Some(File::from(fd))),
+        Err(Errno::LOOP | Errno::NOTDIR) => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// What `lstat` reports of the entry `name` in the open directory `dir`, not following a
+/// final symbolic link.
+pub fn stat_at(dir: impl AsFd, name: &OsStr) -> io::Result<Stat> {
+    Ok(stat(&rustix::fs::statat(
+        dir,
+        name,
+        AtFlags::SYMLINK_NOFOLLOW,
+    )?))
+}
+
+/// What `fstat` reports of the open file `fd`.
+pub fn stat_fd(fd: impl AsFd) -> io::Result<Stat> {
+    Ok(stat(&rustix::fs::fstat(fd)?))
+}
+
+/// Renames `from` in the open directory `from_dir` to `to` in `to_dir` only when nothing is at
+/// `to`: `renameatx_np` with `RENAME_EXCL` on macOS and `renameat2` with `RENAME_NOREPLACE`
+/// on Linux (section 9.7, implementation notes), which fail with `EEXIST` when `to` is taken.
+/// Each name is resolved in its own directory, wherever that directory is now.
+pub fn rename_noreplace(
+    from_dir: impl AsFd,
+    from: &OsStr,
+    to_dir: impl AsFd,
+    to: &OsStr,
+) -> io::Result<()> {
+    Ok(rustix::fs::renameat_with(
+        from_dir,
+        from,
+        to_dir,
+        to,
+        RenameFlags::NOREPLACE,
+    )?)
+}
+
+/// Removes the entry `name` from the open directory `dir`: a directory only while it is empty
+/// (`unlinkat` with `AT_REMOVEDIR`), anything else by its name.
+pub fn remove_at(dir: impl AsFd, name: &OsStr, directory: bool) -> io::Result<()> {
+    let flags = if directory {
+        AtFlags::REMOVEDIR
+    } else {
+        AtFlags::empty()
+    };
+    Ok(rustix::fs::unlinkat(dir, name, flags)?)
+}
+
+/// The path the OS names now for the open file `fd`: `F_GETPATH` on macOS, which names it
+/// the same way whichever spelling opened it, and the link `/proc/self/fd/<n>` on Linux, which
+/// ends in ` (deleted)` once the file is removed. Both follow a file moved since it was
+/// opened (section 9.7, implementation notes).
+pub fn current_path(fd: impl AsFd) -> io::Result<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        let path = rustix::fs::getpath(fd)?;
+        Ok(PathBuf::from(OsStr::from_bytes(path.to_bytes())))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        use std::os::fd::AsRawFd as _;
+        std::fs::read_link(format!("/proc/self/fd/{}", fd.as_fd().as_raw_fd()))
     }
 }
 
@@ -614,6 +692,58 @@ mod tests {
         }
         let kinds: Vec<_> = entries.iter().map(|(_, st, _)| st.kind).collect();
         assert_eq!(kinds, [Kind::File, Kind::Symlink, Kind::Dir]);
+    }
+
+    /// The no-replace rename moves an entry between open directories and fails with `EEXIST`
+    /// when the name is taken, by a file or by an empty directory, leaving both as they were.
+    #[test]
+    fn a_rename_never_replaces() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(b.join("empty")).unwrap();
+        std::fs::write(a.join("f"), b"moved").unwrap();
+        std::fs::write(b.join("taken"), b"kept").unwrap();
+        let (da, db) = (
+            super::open(&a).unwrap().unwrap(),
+            super::open(&b).unwrap().unwrap(),
+        );
+        for taken in ["taken", "empty"] {
+            let err = super::rename_noreplace(&da, "f".as_ref(), &db, taken.as_ref()).unwrap_err();
+            assert_eq!(err.raw_os_error(), Some(libc::EEXIST), "{taken}: {err}");
+        }
+        assert_eq!(std::fs::read(b.join("taken")).unwrap(), b"kept");
+        assert!(b.join("empty").is_dir());
+        super::rename_noreplace(&da, "f".as_ref(), &db, "new".as_ref()).unwrap();
+        assert_eq!(std::fs::read(b.join("new")).unwrap(), b"moved");
+        assert!(!a.join("f").exists());
+    }
+
+    /// A descriptor's current path follows its directory when it is moved, and `open_at`
+    /// enters no symbolic link and no file.
+    #[test]
+    fn the_current_path_follows_a_moved_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir_all(root.join("one/sub")).unwrap();
+        std::fs::create_dir_all(root.join("two")).unwrap();
+        std::fs::write(root.join("one/file"), b"").unwrap();
+        std::os::unix::fs::symlink(root.join("two"), root.join("one/link")).unwrap();
+        let one = super::open(&root.join("one")).unwrap().unwrap();
+        assert!(super::open_at(&one, "link".as_ref()).unwrap().is_none());
+        assert!(super::open_at(&one, "file".as_ref()).unwrap().is_none());
+        let sub = super::open_at(&one, "sub".as_ref()).unwrap().unwrap();
+        assert_eq!(super::current_path(&sub).unwrap(), root.join("one/sub"));
+        std::fs::rename(root.join("one"), root.join("two/moved")).unwrap();
+        assert_eq!(
+            super::current_path(&sub).unwrap(),
+            root.join("two/moved/sub")
+        );
+        let st = super::stat_at(&one, "sub".as_ref()).unwrap();
+        assert_eq!((st.dev, st.ino), {
+            let own = super::stat_fd(&sub).unwrap();
+            (own.dev, own.ino)
+        });
     }
 
     /// A directory removed after it was opened lists as empty instead of failing the listing,

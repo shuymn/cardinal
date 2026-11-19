@@ -3,8 +3,9 @@
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use serde::de::DeserializeOwned;
@@ -14,8 +15,9 @@ use serde::de::DeserializeOwned;
 pub enum Durability {
     /// Not fsynced: reservations, live locks, records.
     Volatile,
-    /// fsync of the file, then of its parent directory on Unix: inbox items, and the plan
-    /// claims and act results of the deletion phase, which phase 0 never writes.
+    /// fsync of the file, then of its parent directory on Unix (`F_FULLFSYNC` on macOS, which
+    /// std's `File::sync_all` issues): inbox items, and an execution's manifest, claim, and
+    /// result (section 9.7).
     Durable,
 }
 
@@ -47,50 +49,183 @@ fn write_through(
     bytes: &[u8],
     durability: Durability,
 ) -> io::Result<()> {
-    let mut file = OpenOptions::new().write(true).create_new(true).open(tmp)?;
-    let written = (|| {
-        file.write_all(bytes)?;
-        file.flush()?;
-        if durability == Durability::Durable {
-            file.sync_all()?;
-        }
-        Ok(())
-    })();
-    drop(file);
-    if let Err(err) = written.and_then(|()| std::fs::rename(tmp, target)) {
-        let _ = std::fs::remove_file(tmp);
-        return Err(err);
-    }
+    Staged::write_through(tmp, target, bytes, durability)?.publish()?;
     if durability == Durability::Durable {
         sync_parent(target)?;
     }
     Ok(())
 }
 
-/// Creates `path` with `create_new`, writes `bytes`, and fsyncs file and parent: the
-/// claim-once write the deletion phase uses for plan claims; phase 0 never writes one. Fails
-/// with `AlreadyExists` if the file exists.
-pub fn create_new_durable(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    drop(file);
-    sync_parent(path)
+/// A file written under a temporary name and not yet renamed into place: the first half of
+/// an atomic replace (section 4.2). An execution publishes its claim in two steps, so the
+/// rename that publishes `committed` comes after the checks that follow the write (section
+/// 9.7, step 8): [`Staged::publish`] renames it into place, and the caller syncs the parent
+/// directory itself ([`sync_parent`]), so a failed sync is told apart from a failed rename.
+/// A rename that failed can be tried again, as the reserve's retry does (section 9.7,
+/// "Space"). A staged file dropped before it is published is removed; one left by a process
+/// that died stays for the cleanup of temporary files.
+#[derive(Debug)]
+pub struct Staged {
+    tmp: PathBuf,
+    target: PathBuf,
+    published: bool,
+}
+
+impl Staged {
+    /// Writes `bytes` to a new temporary file for `target` in `tmp_dir` and syncs it.
+    pub fn write(tmp_dir: &Path, target: &Path, bytes: &[u8]) -> io::Result<Self> {
+        let name = target.file_name().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "target has no file name")
+        })?;
+        Self::write_through(
+            &tmp_dir.join(temp_name(name)),
+            target,
+            bytes,
+            Durability::Durable,
+        )
+    }
+
+    /// Writes `bytes` to `tmp`, created new, flushes it, and syncs it when `durability` asks.
+    /// A `tmp` that exists already is another writer's and fails the write untouched; the file
+    /// this write created is removed when the write fails.
+    fn write_through(
+        tmp: &Path,
+        target: &Path,
+        bytes: &[u8],
+        durability: Durability,
+    ) -> io::Result<Self> {
+        let mut file = logged(
+            Op::Create,
+            tmp,
+            None,
+            OpenOptions::new().write(true).create_new(true).open(tmp),
+        )?;
+        let staged = Self {
+            tmp: tmp.to_path_buf(),
+            target: target.to_path_buf(),
+            published: false,
+        };
+        let write = file.write_all(bytes).and_then(|()| file.flush());
+        logged(Op::Write, tmp, None, write)?;
+        if durability == Durability::Durable {
+            logged(Op::Sync, tmp, None, file.sync_all())?;
+        }
+        Ok(staged)
+    }
+
+    /// The temporary file.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.tmp
+    }
+
+    /// Renames the file into place, which publishes it. A rename that fails leaves the
+    /// temporary file for another try, or for the drop to remove.
+    pub fn publish(&mut self) -> io::Result<()> {
+        logged(
+            Op::Rename,
+            &self.tmp,
+            Some(&self.target),
+            std::fs::rename(&self.tmp, &self.target),
+        )?;
+        self.published = true;
+        Ok(())
+    }
+}
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        if !self.published {
+            // The file this write created, which no other writer has.
+            let _ = logged(Op::Unlink, &self.tmp, None, std::fs::remove_file(&self.tmp));
+        }
+    }
 }
 
 /// fsyncs the directory containing `path` (Unix only; Windows flushes files only).
 pub fn sync_parent(path: &Path) -> io::Result<()> {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => sync_dir(parent),
+        _ => sync_dir(Path::new(".")),
+    }
+}
+
+/// fsyncs the directory `dir` (Unix only; Windows flushes files only): `F_FULLFSYNC` on
+/// macOS, which std's `File::sync_all` issues on directories too.
+pub fn sync_dir(dir: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
-        let parent = match path.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => parent,
-            _ => Path::new("."),
-        };
-        File::open(parent)?.sync_all()?;
+        let synced = File::open(dir).and_then(|file| file.sync_all());
+        logged(Op::Sync, dir, None, synced)?;
     }
     #[cfg(not(unix))]
-    let _ = path;
+    let _ = dir;
     Ok(())
+}
+
+/// fsyncs the file at `path`, opened read-only.
+pub fn sync_file(path: &Path) -> io::Result<()> {
+    let synced = File::open(path).and_then(|file| file.sync_all());
+    logged(Op::Sync, path, None, synced)
+}
+
+/// A file system operation the write log records (section 13.7).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Op {
+    /// A file created.
+    Create,
+    /// Bytes written to a file.
+    Write,
+    /// A directory created.
+    Mkdir,
+    /// An entry renamed: `path` to `to`.
+    Rename,
+    /// A file or a symbolic link removed.
+    Unlink,
+    /// A directory removed.
+    Rmdir,
+    /// A file or directory synced.
+    Sync,
+}
+
+/// Records `op` on `path` (and `to`, for a rename) with its result in the write log, and
+/// passes the result on. With `CARDINAL_TEST_DIR` set, the log is `<dir>/writes.log`: one JSON
+/// line per operation, with this process's ID, which the durability tests check against the
+/// durable order of section 9.7 (section 13.7). Outside tests it does nothing.
+pub fn logged<T>(op: Op, path: &Path, to: Option<&Path>, result: io::Result<T>) -> io::Result<T> {
+    if let Some(log) = write_log() {
+        let line = serde_json::json!({
+            "pid": std::process::id(),
+            "op": op,
+            "path": path,
+            "to": to,
+            "error": result.as_ref().err().map(ToString::to_string),
+        });
+        if let Ok(mut file) = log.lock() {
+            let mut bytes = line.to_string().into_bytes();
+            bytes.push(b'\n');
+            let _ = file.write_all(&bytes);
+        }
+    }
+    result
+}
+
+/// Whether [`logged`] writes the write log, so a caller can skip building the paths it names.
+#[must_use]
+pub fn logging() -> bool {
+    write_log().is_some()
+}
+
+/// The write log's open file, when `CARDINAL_TEST_DIR` is set and the log can be opened.
+fn write_log() -> Option<&'static Mutex<File>> {
+    static LOG: OnceLock<Option<Mutex<File>>> = OnceLock::new();
+    LOG.get_or_init(|| {
+        let dir = std::env::var_os("CARDINAL_TEST_DIR").filter(|dir| !dir.is_empty())?;
+        let file = open_append(&Path::new(&dir).join("writes.log")).ok()?;
+        Some(Mutex::new(file))
+    })
+    .as_ref()
 }
 
 /// Removes the temporary files of [`write_atomic`] in `dir` last modified more than `max_age`
@@ -231,8 +366,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        Durability, append_line, create_new_durable, open_append, read_jsonl,
-        remove_temp_files_older_than, temp_name, write_atomic, write_through,
+        Durability, Staged, append_line, open_append, read_jsonl, remove_temp_files_older_than,
+        temp_name, write_atomic, write_through,
     };
 
     /// A file at the temporary name fails the write and is left as it was; the write's own
@@ -255,6 +390,44 @@ mod tests {
         assert!(!own.exists());
     }
 
+    /// A staged file is synced under its temporary name and appears at its target only when
+    /// published; one dropped unpublished leaves nothing, and one whose rename fails keeps its
+    /// temporary file for another try, which publishes it, or for the drop to remove.
+    #[test]
+    fn a_staged_file_appears_only_when_published() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp_dir = tmp.path().join("tmp");
+        std::fs::create_dir(&tmp_dir).unwrap();
+        let target = tmp.path().join("claim");
+        std::fs::write(&target, b"claimed").unwrap();
+
+        let mut staged = Staged::write(&tmp_dir, &target, b"committed").unwrap();
+        assert_eq!(std::fs::read(staged.path()).unwrap(), b"committed");
+        assert_eq!(std::fs::read(&target).unwrap(), b"claimed");
+        staged.publish().unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"committed");
+        assert_eq!(std::fs::read_dir(&tmp_dir).unwrap().count(), 0);
+
+        drop(Staged::write(&tmp_dir, &target, b"dropped").unwrap());
+        assert_eq!(std::fs::read(&target).unwrap(), b"committed");
+        assert_eq!(std::fs::read_dir(&tmp_dir).unwrap().count(), 0);
+
+        let missing = tmp.path().join("missing/claim");
+        let mut staged = Staged::write(&tmp_dir, &missing, b"x").unwrap();
+        staged.publish().unwrap_err();
+        assert_eq!(std::fs::read(staged.path()).unwrap(), b"x");
+        std::fs::create_dir(missing.parent().unwrap()).unwrap();
+        staged.publish().unwrap();
+        assert_eq!(std::fs::read(&missing).unwrap(), b"x");
+        drop(staged);
+        assert_eq!(std::fs::read_dir(&tmp_dir).unwrap().count(), 0);
+
+        let mut staged = Staged::write(&tmp_dir, &tmp.path().join("gone/claim"), b"y").unwrap();
+        staged.publish().unwrap_err();
+        drop(staged);
+        assert_eq!(std::fs::read_dir(&tmp_dir).unwrap().count(), 0);
+    }
+
     #[test]
     fn atomic_write_replaces_and_leaves_no_temp_file() {
         let tmp = tempfile::tempdir().unwrap();
@@ -275,15 +448,6 @@ mod tests {
         let target = tmp.path().join("missing-dir/doc.json");
         assert!(write_atomic(&tmp_dir, &target, b"x", Durability::Volatile).is_err());
         assert_eq!(std::fs::read_dir(&tmp_dir).unwrap().count(), 0);
-    }
-
-    #[test]
-    fn durable_create_is_once_only() {
-        let tmp = tempfile::tempdir().unwrap();
-        let claim = tmp.path().join("claim");
-        create_new_durable(&claim, b"{}").unwrap();
-        let err = create_new_durable(&claim, b"{}").unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
     }
 
     #[test]
