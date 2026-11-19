@@ -835,7 +835,7 @@ Validation of `host.toml` refuses an `arbiter` entry, until a skill that execute
 
 **Trash.** A rename cannot leave its mount, so an execution moves its target into `<state>/trash/` (mode 0700), and only a target on that directory's mount is eligible (below). An execution owns `<state>/trash/<plan>/`: `t`, its target as moved, and `h`, the hold its entries pass through.
 
-**Records.** `executions/<plan>/` in the state dir holds `act.lock`, held by the `act` or the recovery working on the plan; `manifest` (`cardinal.act-manifest.v1`), every entry of the target as the snapshot read it; `claim` (`cardinal.act-claim.v1`), the stage and what recovery needs: the worktree root, the chain of directories above the target, and the target's identity; and `result.json` (section 11.3). A claim appears complete or not at all: the `act.lock`, checked as section 4.3 says, keeps every other writer out, and the `act` holding it finds no claim and writes one as section 4.2 replaces a file, durably; each later stage replaces it the same way. A plan whose execution directory holds a result reports `already_executed`.
+**Records.** `executions/<plan>/` in the state dir holds `act.lock`, held by the `act` or the recovery working on the plan; `manifest` (`cardinal.act-manifest.v1`), every entry of the target as the snapshot read it; `claim` (`cardinal.act-claim.v1`), the stage and what recovery needs: the worktree root, the repository's common dir and `origin` URL, which select its profiles (section 3.3) without git, the chain of directories above the target, and the target's identity; and `result.json` (section 11.3). A claim appears complete or not at all: the `act.lock`, checked as section 4.3 says, keeps every other writer out, and the `act` holding it finds no claim and writes one as section 4.2 replaces a file, durably; each later stage replaces it the same way. A plan whose execution directory holds a result reports `already_executed`.
 
 **Eligibility.** After the checks of section 9.5 pass, a granted `act` checks these rules (step 2 below) with the target present, running git as section 8.1 does and bound to the checked worktree (below), and reports `dry_run` with the reason of each rule that fails (section 9.3):
 
@@ -1281,6 +1281,7 @@ type ExclusiveMeasure = "private_size" | "extents" | "links" | "read_failed" | "
 // cardinal.act-claim.v1  (executions/<plan>/claim; published complete, replaced at each stage)
 { schema; plan_id: string; caller: string; stage: "claimed" | "committed"; created_ms: number; updated_ms: number;
   worktree: { path: string; root: { dev: number; ino: number } };
+  repo: { common_dir: string; remote: string | null };    // what selects the profiles (section 3.3), for recovery
   chain: { name: string; dev: number; ino: number }[];    // the worktree root's children down to the target's parent
   target: { name: string; dev: number; ino: number; type: "dir" | "file" | "symlink" };
   manifest_entries: number }

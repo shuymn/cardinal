@@ -1,6 +1,5 @@
 //! An execution's records in `executions/<plan>/` (`docs/architecture.md` section 9.7): the
-//! claim and the manifest. Unit X writes and reads them; the first release declares them and
-//! creates neither.
+//! claim and the manifest. Unit X writes and reads them; no released version creates either.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
@@ -36,6 +35,17 @@ pub struct ClaimWorktree {
     pub root: RootId,
 }
 
+/// What selects the repository's profiles (section 3.3), as the execution's observation read
+/// it: recovery reads git no more, so it applies these to the configuration it loads to find
+/// the patterns its deletion checks.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimRepo {
+    /// The repository's git common dir, canonical.
+    pub common_dir: String,
+    /// `remote.origin.url`, when it is set.
+    pub remote: Option<String>,
+}
+
 /// A directory between the worktree root and the target, by name and identity.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChainDir {
@@ -65,6 +75,7 @@ pub struct ActClaim {
     pub created_ms: u64,
     pub updated_ms: u64,
     pub worktree: ClaimWorktree,
+    pub repo: ClaimRepo,
     /// The worktree root's children down to the target's parent.
     pub chain: Vec<ChainDir>,
     pub target: ClaimTarget,

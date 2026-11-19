@@ -38,8 +38,8 @@ pub use disk::{
 };
 pub use error::{Error, ErrorBody, ErrorCode, ErrorDoc};
 pub use execution::{
-    ActClaim, ActManifest, ChainDir, ClaimStage, ClaimTarget, ClaimWorktree, EntryPath, EntryType,
-    ManifestEntry,
+    ActClaim, ActManifest, ChainDir, ClaimRepo, ClaimStage, ClaimTarget, ClaimWorktree, EntryPath,
+    EntryType, ManifestEntry,
 };
 pub use explain::{Explain, ExplainKind, ExplainSource, ExplainSubject};
 pub use inbox::{
