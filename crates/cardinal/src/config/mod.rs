@@ -11,8 +11,8 @@ mod profile;
 use std::path::{Path, PathBuf};
 
 pub use host::{
-    Admission, Arbiter, Disk, DiskLines, Hook, HostConfig, MAX_ITEMS, Managed, Observe, Reconcile,
-    Records, Unit, VolumeLines, logical_cpus, validate_runner,
+    Act, Admission, Arbiter, Disk, DiskLines, Hook, HostConfig, MAX_ITEMS, Managed, Observe,
+    Reconcile, Records, Unit, VolumeLines, logical_cpus, validate_runner,
 };
 pub use locations::{Base, config_dir, resolve, state_dir};
 pub use profile::{

@@ -49,6 +49,9 @@ pub const BATCH: Duration = Duration::from_secs(2);
 /// The name of the target in its trash entry.
 const T: &str = "t";
 
+/// How a guard's stop begins when it found a process using the trash entry.
+pub const IN_USE: &str = "in use: ";
+
 /// What the deletion's checks read beyond the manifest.
 pub trait Guard {
     /// Runs before each batch: scans the trash entry and loads the configuration again when
@@ -87,10 +90,12 @@ pub enum Fate {
     Left,
     /// Deleted from the hold.
     Deleted,
-    /// No longer at its name when it was taken, or its directory no longer there.
+    /// No longer at its name when it was taken, or, when a recovery resumes the deletion,
+    /// its directory no longer there.
     Gone,
     /// Kept: it failed its check and went back, stays in the hold, or is in a directory that
-    /// was not entered, holds a repository marker, or left its manifest path.
+    /// was not entered (in a live deletion, one gone from its name), holds a repository
+    /// marker, or left its manifest path.
     Kept,
 }
 
@@ -204,6 +209,11 @@ pub struct Deletion<'a> {
     pub measure: &'a Measure,
     /// The state dir's reserve file (section 9.7, "Space").
     pub reserve: &'a Path,
+    /// A recovery resumes a deletion that a dead execution began, which may have deleted a
+    /// directory before it died: a directory no longer at its name counts as gone. A live
+    /// deletion is the only one deleting from `t`, so such a directory was moved out of it
+    /// and is kept.
+    pub resumed: bool,
 }
 
 /// How a take, or the handling of a directory, ended.
@@ -322,15 +332,19 @@ impl Run<'_, '_> {
 
     /// Handles the directory at `pos`, named `name` in the last directory of `chain`: enters
     /// it with its recorded identity, handles its children, and then takes it, which deletes
-    /// it once it is empty. A directory it cannot enter is kept with everything below it.
+    /// it once it is empty. A directory it cannot enter is kept with everything below it, and
+    /// so, in a live deletion, is one no longer at its name: moved out of `t` before it was
+    /// entered, it took its entries with it, and nothing was reclaimed for them. A resumed
+    /// deletion counts such a directory gone, since the dead execution may have deleted it.
     fn dir(&mut self, chain: &mut Vec<Open>, pos: usize, name: &OsStr) -> Went {
         let fd = match dir::open_at(self.from(chain), name) {
             Ok(Some(fd)) if self.is(&fd, pos) => fd,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            Err(err) if self.del.resumed && err.kind() == io::ErrorKind::NotFound => {
                 self.gone_all(pos);
                 return Went::On;
             }
-            // Not the directory recorded, or one it cannot open or list: not entered.
+            // Not the directory recorded, gone from its name, or one it cannot open or list:
+            // not entered.
             Ok(_) | Err(_) => {
                 self.keep_all(pos);
                 return Went::On;
@@ -844,7 +858,7 @@ impl Guard for Watch {
         if users.is_empty() {
             Ok(())
         } else {
-            Err(format!("in use: {}", users.join(", ")))
+            Err(format!("{IN_USE}{}", users.join(", ")))
         }
     }
 

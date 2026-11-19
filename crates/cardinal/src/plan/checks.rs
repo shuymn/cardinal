@@ -102,42 +102,68 @@ const PROCESS_ENTRIES: usize = 3;
 /// Every check for the plan kind, in the order of section 9.2.
 #[must_use]
 pub fn evaluate(i: &Inspection<'_>) -> Vec<Check> {
+    evaluate_only(i, |_| true)
+}
+
+/// The checks of [`evaluate`] that `wanted` names, in the same order; no other check is
+/// evaluated.
+pub fn evaluate_only(i: &Inspection<'_>, wanted: impl Fn(&str) -> bool) -> Vec<Check> {
     let worktree = i.kind == PlanKind::ReclaimWorktree;
-    let users = descriptor_users(i);
-    let mut checks = vec![observed(i), not_in_use(i, users.as_deref()), not_managed(i)];
+    let users = if wanted("not_in_use") {
+        descriptor_users(i)
+    } else {
+        None
+    };
+    let mut checks = Vec::new();
+    let mut add = |name: &str, check: &dyn Fn() -> Check| {
+        if wanted(name) {
+            let check = check();
+            debug_assert_eq!(check.name, name);
+            checks.push(check);
+        }
+    };
+    add("observed", &|| observed(i));
+    add("not_in_use", &|| not_in_use(i, users.as_deref()));
+    add("not_managed", &|| not_managed(i));
     if worktree {
         let facts = i.observation.ok().map(|o| &o.worktree.facts);
-        checks.push(clean(i));
-        checks.push(tri(
-            "no_unpushed",
-            facts.map(|f| f.unpushed),
-            Tri::No,
-            "commits not on any remote",
-        ));
-        checks.push(tri(
-            "no_open_pr",
-            facts.map(|f| f.open_pr),
-            Tri::No,
-            "an open pull request",
-        ));
-        checks.push(tri(
-            "has_upstream",
-            facts.map(|f| f.has_upstream),
-            Tri::Yes,
-            "the branch has no upstream",
-        ));
+        add("clean", &|| clean(i));
+        add("no_unpushed", &|| {
+            tri(
+                "no_unpushed",
+                facts.map(|f| f.unpushed),
+                Tri::No,
+                "commits not on any remote",
+            )
+        });
+        add("no_open_pr", &|| {
+            tri(
+                "no_open_pr",
+                facts.map(|f| f.open_pr),
+                Tri::No,
+                "an open pull request",
+            )
+        });
+        add("has_upstream", &|| {
+            tri(
+                "has_upstream",
+                facts.map(|f| f.has_upstream),
+                Tri::Yes,
+                "the branch has no upstream",
+            )
+        });
     } else {
-        checks.push(regenerable(i));
+        add("regenerable", &|| regenerable(i));
     }
-    checks.push(plain_target(i));
-    checks.push(no_protected(i));
-    checks.push(no_unclassifiable(i));
-    checks.push(no_nested_repository(i));
+    add("plain_target", &|| plain_target(i));
+    add("no_protected", &|| no_protected(i));
+    add("no_unclassifiable", &|| no_unclassifiable(i));
+    add("no_nested_repository", &|| no_nested_repository(i));
     if !worktree && cfg!(unix) {
-        checks.push(local_volume(i));
+        add("local_volume", &|| local_volume(i));
     }
     if worktree {
-        checks.push(super::merge::merge_evidence(i));
+        add("merge_evidence", &|| super::merge::merge_evidence(i));
     }
     for check in &mut checks {
         check.facts = facts(&check.name, i, users.as_deref());
@@ -699,6 +725,10 @@ fn observed(i: &Inspection<'_>) -> Check {
             "status"
         });
     }
+    // An unread `origin` leaves the profiles it would select, and their protections, unknown.
+    if observation.remote.is_err() {
+        unknown.push("origin");
+    }
     if i.kind == PlanKind::ReclaimWorktree {
         for (name, value) in [
             ("has_upstream", facts.has_upstream),
@@ -793,16 +823,20 @@ fn way(way: Way) -> String {
 }
 
 fn not_managed(i: &Inspection<'_>) -> Check {
-    if let Some(managed) = i.managed.iter().find(|m| i.worktree.starts_with(&m.root)) {
-        return invariant(
-            "not_managed",
-            CheckResult::Fail,
-            format!(
-                "under the root of {} ({})",
-                managed.app,
-                managed.root.display()
-            ),
-        );
+    match Managed::covering(i.managed, i.worktree) {
+        Ok(Some(managed)) => {
+            return invariant(
+                "not_managed",
+                CheckResult::Fail,
+                format!(
+                    "under the root of {} ({})",
+                    managed.app,
+                    managed.root.display()
+                ),
+            );
+        }
+        Ok(None) => {}
+        Err(why) => return invariant("not_managed", CheckResult::Unknown, why),
     }
     match i.observation {
         Ok(o) => match &o.worktree.managed_by {

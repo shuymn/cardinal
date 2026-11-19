@@ -59,6 +59,9 @@ pub struct Target {
     worktree: PathBuf,
     /// The worktree root as opened.
     root: Entry,
+    /// The directories from the worktree root's child down to `parent`, each by name with the
+    /// `dev` and `ino` it was opened with: the chain an execution binds itself to (section 9.7).
+    chain: Vec<(OsString, u64, u64)>,
     /// The first component on the way that is a symbolic link; nothing below it is reached.
     link_in_path: Option<PathBuf>,
 }
@@ -103,6 +106,7 @@ impl Target {
                 rel,
                 worktree: worktree.to_path_buf(),
                 root,
+                chain: Vec::new(),
                 link_in_path: None,
             });
         };
@@ -114,10 +118,15 @@ impl Target {
         }
         let mut link_in_path = None;
         let mut walked = PathBuf::new();
+        let mut chain = Vec::new();
         for name in dirs {
             walked.push(name);
             match open_dir_at(&current, name) {
-                Ok(next) => current = next,
+                Ok(next) => {
+                    let st = dir::stat_fd(&next)?;
+                    chain.push((name.to_os_string(), st.dev, st.ino));
+                    current = next;
+                }
                 Err(err) => {
                     if lstat_at(&current, name)
                         .is_ok_and(|st| FileType::from_raw_mode(st.st_mode) == FileType::Symlink)
@@ -139,8 +148,34 @@ impl Target {
             rel,
             worktree: worktree.to_path_buf(),
             root,
+            chain,
             link_in_path,
         })
+    }
+
+    /// The directory that contains the target, opened through the chain.
+    #[must_use]
+    pub fn parent(&self) -> &OwnedFd {
+        &self.parent
+    }
+
+    /// The target's name in its parent.
+    #[must_use]
+    pub fn name(&self) -> &OsStr {
+        &self.name
+    }
+
+    /// The target's path relative to the worktree.
+    #[must_use]
+    pub fn rel(&self) -> &Path {
+        &self.rel
+    }
+
+    /// The directories from the worktree root's child down to the target's parent, each by
+    /// name with its `dev` and `ino` as opened.
+    #[must_use]
+    pub fn chain(&self) -> &[(OsString, u64, u64)] {
+        &self.chain
     }
 
     /// The worktree root's identity as opened.
@@ -240,6 +275,26 @@ impl Target {
             own,
         )
     }
+}
+
+/// The entries below the open directory `fd`, a moved target, walked as the snapshot walks
+/// (section 9.7, step 5): by paths relative to it, without following links or entering a
+/// directory on another device or mount than `dev` and `on_mount`, each entry read as the
+/// tests' fakes below `at` make it read; and the directories not entered.
+pub fn walk_moved(
+    fd: &OwnedFd,
+    (dev, on_mount): (u64, &[u8]),
+    at: &Path,
+) -> io::Result<(Vec<Entry>, Vec<PathBuf>)> {
+    let mut recorded = Recorded::default();
+    snapshot_dir(
+        fd,
+        Path::new(""),
+        (dev, on_mount),
+        (Own::Nothing, at),
+        &mut recorded,
+    )?;
+    Ok((recorded.entries, recorded.boundaries))
 }
 
 /// What [`snapshot_dir`] records: the entries, the directories not entered, and the reads of

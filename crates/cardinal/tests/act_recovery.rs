@@ -2,11 +2,16 @@
 //! the recovery table's decisions for absent, unreadable, and `committed` claims, run through
 //! the library in a helper process on the states the crashes of section 13.7 leave, which
 //! each test writes (`tests/execution_support`), and a second recovery kept out while one
-//! holds the plan's `act.lock` at `recover.locked`. Unit X1b's library is called by no
-//! command; X1c runs the same cases through `act` and X2 through a pass (section 14.2).
+//! holds the plan's `act.lock` at `recover.locked`; and, through `act` (unit X1c), SIGKILL at
+//! every pause point of a live execution followed by `act` on the same plan, the `claimed`
+//! rows, an unreadable claim followed by a new plan that executes, and `act` kept out at
+//! `recover.locked`. X2 runs the crashes through a pass (section 14.2).
 #![cfg(unix)]
 
 mod execution_support;
+mod live_support;
+mod observe_common;
+mod plan_support;
 mod support;
 
 use std::os::unix::fs::PermissionsExt;
@@ -451,4 +456,261 @@ fn no_execution_no_recovery() {
     let before = x.listing();
     assert_eq!(x.recover(true)["outcome"], "not_found");
     assert_eq!(x.listing(), before);
+}
+
+/// Crashes of a live execution (section 13.7, "Crashes"): SIGKILL at each pause point, then
+/// the owner's `act` on the same plan, which recovers the claim the dead execution left.
+mod through_act {
+    use cardinal::contract::ActStatus;
+    use live_support::{Live, assert_restored};
+
+    use super::*;
+
+    /// At `act.excluded` nothing changed, and the next `act` executes.
+    #[test]
+    fn killed_while_excluded() {
+        let x = Live::new("excluded", "target", &["debug/app"]);
+        x.kill_at(testpoint::ACT_EXCLUDED);
+        assert!(x.target().exists());
+        assert!(!x.s.state.execution_claim(&x.plan.id).exists());
+        assert_eq!(x.act().status, ActStatus::Executed);
+    }
+
+    /// At `act.publishing` no claim exists, the temporary file is left to the cleanup of
+    /// temp files, and the next `act` executes (A30).
+    #[test]
+    fn killed_while_publishing_the_claim() {
+        let x = Live::new("publishing", "target", &["debug/app"]);
+        x.kill_at(testpoint::ACT_PUBLISHING);
+        assert!(!x.s.state.execution_claim(&x.plan.id).exists());
+        assert!(x.target().exists());
+        assert_eq!(x.act().status, ActStatus::Executed);
+    }
+
+    /// At `act.claimed` the next `act` reports `rejected` (`interrupted`) with the target in
+    /// place and the empty trash entry removed.
+    #[test]
+    fn killed_once_claimed() {
+        let x = Live::new("claimed", "target", &["debug/app"]);
+        let before = x.files();
+        x.kill_at(testpoint::ACT_CLAIMED);
+        assert!(x.entry().join("h").is_dir());
+        let result = x.act();
+        assert_restored(&x, &result, ActStatus::Rejected, &["interrupted"], &before);
+        assert!(result.recovered, "{result:#?}");
+        assert_eq!(x.act().status, ActStatus::AlreadyExecuted);
+    }
+
+    /// At `act.moved` and `act.checked` the next `act` restores the target.
+    #[test]
+    fn killed_once_moved_or_checked() {
+        for point in [testpoint::ACT_MOVED, testpoint::ACT_CHECKED] {
+            let x = Live::new("moved", "target", &["debug/app", "debug/deps/lib"]);
+            let before = x.files();
+            x.kill_at(point);
+            assert!(!x.target().exists(), "{point}");
+            let result = x.act();
+            assert_restored(&x, &result, ActStatus::Rejected, &["interrupted"], &before);
+        }
+    }
+
+    /// At the publication of `committed` (its `act.publishing`, the second the execution
+    /// reaches), the next `act` restores the target: the claim is still `claimed` (A37).
+    #[test]
+    fn killed_publishing_committed() {
+        let x = Live::new("publishing-committed", "target", &["debug/app"]);
+        let before = x.files();
+        let mut paused = x.spawn(&[testpoint::ACT_PUBLISHING, testpoint::ACT_CHECKED], None);
+        paused.wait(testpoint::ACT_PUBLISHING);
+        paused.release(testpoint::ACT_PUBLISHING);
+        paused.wait(testpoint::ACT_CHECKED);
+        paused.rearm(testpoint::ACT_PUBLISHING);
+        paused.release(testpoint::ACT_CHECKED);
+        paused.wait(testpoint::ACT_PUBLISHING);
+        paused.child.kill();
+        let claim = std::fs::read_to_string(x.s.state.execution_claim(&x.plan.id)).unwrap();
+        assert!(claim.contains("\"claimed\""), "{claim}");
+        let result = x.act();
+        assert_restored(&x, &result, ActStatus::Rejected, &["interrupted"], &before);
+    }
+
+    /// At `act.committed`, `committed` renamed into place and not synced, the next `act`
+    /// finishes the execution: nothing is restored (A37).
+    #[test]
+    fn killed_before_committed_is_synced() {
+        let x = Live::new("committed", "target", &["debug/app", "debug/log"]);
+        x.kill_at(testpoint::ACT_COMMITTED);
+        let claim = std::fs::read_to_string(x.s.state.execution_claim(&x.plan.id)).unwrap();
+        assert!(claim.contains("\"committed\""), "{claim}");
+        let result = x.act();
+        assert_eq!(result.status, ActStatus::Executed, "{result:#?}");
+        assert!(result.recovered, "{result:#?}");
+        assert!(!x.target().exists());
+        assert!(!x.entry().exists());
+    }
+
+    /// A failure injected at `act.committed`, standing for a failed sync of `committed`,
+    /// leaves the claim to recovery with nothing restored or taken: `partial` with the trash
+    /// entry, and the next `act` finishes it (A37).
+    #[test]
+    fn committed_sync_failure_left_to_recovery() {
+        let x = Live::new("sync-failed", "target", &["debug/app", "debug/log"]);
+        let paused = x.spawn(&[], Some(testpoint::ACT_COMMITTED));
+        let result = paused.finish(&[]);
+        assert_eq!(result.status, ActStatus::Partial, "{result:#?}");
+        assert_eq!(result.trash, Some(x.entry().display().to_string()));
+        assert_eq!(read(&x.t().join("debug/app")), "debug/app");
+        assert_eq!(read(&x.t().join("debug/log")), "debug/log");
+        assert!(!x.s.state.execution_result(&x.plan.id).exists());
+        let result = x.act();
+        assert_eq!(result.status, ActStatus::Executed, "{result:#?}");
+        assert!(!x.entry().exists());
+    }
+
+    /// At `act.taken` and `act.held` the next `act` finishes the execution, the entry left in
+    /// the hold deleted.
+    #[test]
+    fn killed_while_deleting() {
+        for point in [testpoint::ACT_TAKEN, testpoint::ACT_HELD] {
+            let x = Live::new("deleting", "target", &["debug/app", "debug/log"]);
+            x.kill_at(point);
+            let result = x.act();
+            assert_eq!(result.status, ActStatus::Executed, "{point}: {result:#?}");
+            assert!(!x.entry().exists(), "{point}");
+        }
+    }
+
+    /// At `act.finishing` the next `act` removes `h` and the trash entry and writes the
+    /// result.
+    #[test]
+    fn killed_while_finishing() {
+        let x = Live::new("finishing", "target", &["debug/app"]);
+        x.kill_at(testpoint::ACT_FINISHING);
+        assert!(x.entry().join("h").exists());
+        let result = x.act();
+        assert_eq!(result.status, ActStatus::Executed, "{result:#?}");
+        assert!(!x.entry().exists());
+        assert!(x.s.state.execution_result(&x.plan.id).exists());
+    }
+
+    /// At `act.restored`, a restore renamed back and not synced, the next `act` syncs it and
+    /// writes the result.
+    #[test]
+    fn killed_while_restoring() {
+        let x = Live::new("restoring", "target", &["debug/app", "debug/log"]);
+        let mut paused = x.spawn(&[testpoint::ACT_MOVED, testpoint::ACT_RESTORED], None);
+        paused.wait(testpoint::ACT_MOVED);
+        std::fs::write(x.t().join("debug/log"), "changed").unwrap();
+        paused.release(testpoint::ACT_MOVED);
+        paused.wait(testpoint::ACT_RESTORED);
+        paused.child.kill();
+        assert_eq!(read(&x.target().join("debug/log")), "changed");
+        let result = x.act();
+        assert_eq!(result.status, ActStatus::Rejected, "{result:#?}");
+        assert_eq!(result.reasons, ["interrupted"], "{result:#?}");
+        assert!(!x.entry().exists());
+        assert_eq!(read(&x.target().join("debug/app")), "debug/app");
+    }
+
+    /// Under a `claimed` claim with the parent renamed, recovery through `act` touches
+    /// nothing and raises `reclaim_stranded`; `act` reports `rejected` (`interrupted`) with
+    /// the trash entry.
+    #[test]
+    fn a_renamed_parent_strands_the_target() {
+        let x = Live::new("stranded", "pkg/node_modules", &["a/index.js"]);
+        x.kill_at(testpoint::ACT_MOVED);
+        std::fs::rename(x.wt.join("pkg"), x.wt.join("pkg2")).unwrap();
+        let result = x.act();
+        assert_eq!(result.status, ActStatus::Rejected, "{result:#?}");
+        assert_eq!(result.reasons, ["interrupted"], "{result:#?}");
+        assert_eq!(result.trash, Some(x.entry().display().to_string()));
+        assert_eq!(read(&x.t().join("a/index.js")), "a/index.js");
+        assert!(x.stranded_items() >= 1);
+    }
+
+    /// Under a `claimed` claim with the owner's grant withdrawn, the owner's next `act`
+    /// restores the target, the safe direction, and reports `rejected` (`interrupted`); with
+    /// `--dry-run` first it only reports, recovering nothing.
+    #[test]
+    fn a_withdrawn_grant_still_restores() {
+        let mut x = Live::new("ungranted", "target", &["debug/app"]);
+        let before = x.files();
+        x.kill_at(testpoint::ACT_MOVED);
+        x.s.scene.clear_observe_config();
+        let dry = cardinal::act::ActOptions {
+            dry_run: true,
+            ..live_support::owner()
+        };
+        let reported = x.s.act(&x.plan.id, &dry).unwrap();
+        assert!(!reported.recovered, "{reported:#?}");
+        assert!(x.t().is_dir() && !x.target().exists(), "{reported:#?}");
+        let result = x.act();
+        assert_restored(&x, &result, ActStatus::Rejected, &["interrupted"], &before);
+        assert!(result.recovered, "{result:#?}");
+    }
+
+    /// Under a `claimed` claim with no `t`, recovery reports the execution `interrupted` only
+    /// when the target's name holds the claimed inode. With `t` moved out of the trash entry,
+    /// and the name empty or holding a new directory, the claimed target is nowhere recovery
+    /// can vouch for: `act` reports `rejected` (`interrupted`) with the trash entry, which
+    /// stays, and `reclaim_stranded`.
+    #[test]
+    fn a_claimed_target_found_nowhere_strands() {
+        for remade in [false, true] {
+            let x = Live::new("nowhere", "target", &["debug/app"]);
+            x.kill_at(testpoint::ACT_MOVED);
+            let away = x.wt.join("away");
+            std::fs::rename(x.t(), &away).unwrap();
+            if remade {
+                std::fs::create_dir(x.target()).unwrap();
+            }
+            let result = x.act();
+            assert_eq!(result.status, ActStatus::Rejected, "{remade}: {result:#?}");
+            assert_eq!(result.reasons, ["interrupted"], "{remade}: {result:#?}");
+            assert_eq!(
+                result.trash,
+                Some(x.entry().display().to_string()),
+                "{remade}"
+            );
+            assert!(x.entry().is_dir(), "{remade}");
+            assert!(x.stranded_items() >= 1, "{remade}");
+            assert_eq!(read(&away.join("debug/app")), "debug/app");
+        }
+    }
+
+    /// An unreadable claim, written by the test, leaves everything untouched with
+    /// `reclaim_stranded` (`already_executed`, `claim_unreadable`), and a new plan for the
+    /// same target executes.
+    #[test]
+    fn an_unreadable_claim_then_a_new_plan() {
+        let mut x = Live::new("unreadable", "target", &["debug/app"]);
+        x.kill_at(testpoint::ACT_CLAIMED);
+        std::fs::write(x.s.state.execution_claim(&x.plan.id), b"{ not json").unwrap();
+        let result = x.act();
+        assert_eq!(result.status, ActStatus::AlreadyExecuted, "{result:#?}");
+        assert_eq!(result.reasons, ["claim_unreadable"], "{result:#?}");
+        assert!(x.target().exists());
+        assert!(x.stranded_items() >= 1);
+        x.replan();
+        assert_eq!(x.act().status, ActStatus::Executed);
+    }
+
+    /// A recovery paused at `recover.locked` keeps an `act` on the plan out (`in_progress`).
+    #[test]
+    fn act_is_kept_out_at_recover_locked() {
+        let x = Live::new("locked", "target", &["debug/app"]);
+        x.kill_at(testpoint::ACT_MOVED);
+        let paused = x.spawn(&[testpoint::RECOVER_LOCKED], None);
+        paused.wait(testpoint::RECOVER_LOCKED);
+        let second = x.act();
+        assert_eq!(second.status, ActStatus::Rejected, "{second:#?}");
+        assert_eq!(second.reasons, ["in_progress"], "{second:#?}");
+        let first = paused.finish(&[testpoint::RECOVER_LOCKED]);
+        assert_eq!(first.reasons, ["interrupted"], "{first:#?}");
+        assert!(x.target().exists());
+    }
+
+    fn read(path: &std::path::Path) -> String {
+        std::fs::read_to_string(path).unwrap()
+    }
 }

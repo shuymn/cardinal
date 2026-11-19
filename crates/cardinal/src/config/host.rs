@@ -8,7 +8,7 @@ use serde::Deserialize;
 
 use super::ConfigError;
 use super::locations::expand_tilde;
-use crate::contract::Resources;
+use crate::contract::{Caller, PlanKind, Resources};
 
 /// `host.toml` with every default applied.
 #[derive(Clone, Debug, PartialEq)]
@@ -24,6 +24,7 @@ pub struct HostConfig {
     pub reconcile: Reconcile,
     /// `[unit.<name>]` tables, which honor only `act`.
     pub units: BTreeMap<String, Unit>,
+    pub act: Act,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -60,6 +61,37 @@ pub struct Observe {
 pub struct Managed {
     pub app: String,
     pub root: PathBuf,
+}
+
+impl Managed {
+    /// Whether `path` is at or below this root, both as the volume resolves them (section 8.4):
+    /// a root named through a symbolic link or an alias such as `/tmp` covers the worktree it
+    /// leads to. Observation and the checks decide through this one comparison. A root that
+    /// does not exist covers nothing; any other failure to resolve the root or `path` is an
+    /// error, since the path as written could miss what it leads to.
+    pub fn covers(&self, path: &Path) -> Result<bool, String> {
+        let root = match dunce::canonicalize(&self.root) {
+            Ok(root) => root,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => return Err(format!("the root {}: {err}", self.root.display())),
+        };
+        let path = dunce::canonicalize(path).map_err(|err| format!("{}: {err}", path.display()))?;
+        Ok(path.starts_with(root))
+    }
+
+    /// The first of `roots` that [`Managed::covers`] `path`; when none does, the first
+    /// failure to resolve one, if any. Observation and `not_managed` decide through it.
+    pub fn covering<'a>(roots: &'a [Self], path: &Path) -> Result<Option<&'a Self>, String> {
+        let mut unresolved = None;
+        for managed in roots {
+            match managed.covers(path) {
+                Ok(true) => return Ok(Some(managed)),
+                Ok(false) => {}
+                Err(why) => unresolved = unresolved.or(Some(why)),
+            }
+        }
+        unresolved.map_or(Ok(None), Err)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -149,9 +181,22 @@ pub struct Reconcile {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Unit {
     /// Whether the unit's runs are recorded as `act`; `false` records them as `planned`
-    /// (C16). Phase 1 executes nothing either way.
+    /// (C16), and the unit executes nothing (section 9.7).
     pub act: bool,
 }
+
+/// `[act]` (section 9.7): the plan kinds `act` executes on this host, per caller. Empty by
+/// default, so a host executes nothing until its owner grants a caller.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Act {
+    /// `execute`: the callers `owner` and `unit:disk-reclaim`, each with the kind
+    /// `reclaim_dir` or none.
+    pub execute: BTreeMap<String, Vec<PlanKind>>,
+}
+
+/// The callers `[act] execute` accepts (section 3.2). The arbiter holds no grant until a skill
+/// that executes ships (section 14.3).
+const GRANTABLE: [&str; 2] = ["owner", "unit:disk-reclaim"];
 
 /// The arbiter's prompt in the default `[arbiter] command`, as in
 /// `integrations/claude-code/README.md`.
@@ -193,6 +238,16 @@ impl HostConfig {
     #[must_use]
     pub fn unit_may_act(&self, name: &str) -> bool {
         self.units.get(name).is_some_and(|unit| unit.act)
+    }
+
+    /// Whether `[act] execute` grants `caller` the plan kind `kind` (section 9.7). A unit's
+    /// gate, `[unit.<name>] act`, is apart from its grant.
+    #[must_use]
+    pub fn grants(&self, caller: &Caller, kind: PlanKind) -> bool {
+        self.act
+            .execute
+            .get(&caller.to_string())
+            .is_some_and(|kinds| kinds.contains(&kind))
     }
 }
 
@@ -259,6 +314,7 @@ struct RawHost {
     arbiter: RawArbiter,
     reconcile: RawReconcile,
     unit: BTreeMap<String, RawUnit>,
+    act: RawAct,
 }
 
 #[derive(Debug, Deserialize)]
@@ -424,6 +480,55 @@ struct RawUnit {
     act: bool,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct RawAct {
+    execute: BTreeMap<String, Vec<String>>,
+}
+
+impl RawAct {
+    /// The grants, each caller one of [`GRANTABLE`] and each kind `reclaim_dir`: an `arbiter`
+    /// entry waits for a skill that executes, and a whole-worktree plan is never executed
+    /// (section 9.7).
+    fn resolve(self) -> Result<Act, String> {
+        let mut execute = BTreeMap::new();
+        for (caller, kinds) in self.execute {
+            if caller == "arbiter" {
+                return Err(
+                    "act.execute: the arbiter holds no grant; its skill only reports".into(),
+                );
+            }
+            if !GRANTABLE.contains(&caller.as_str()) {
+                return Err(format!(
+                    "act.execute: `{caller}` is not a caller that executes (owner, unit:disk-reclaim)"
+                ));
+            }
+            let mut granted = Vec::new();
+            for kind in kinds {
+                match kind.as_str() {
+                    "reclaim_dir" => {
+                        if !granted.contains(&PlanKind::ReclaimDir) {
+                            granted.push(PlanKind::ReclaimDir);
+                        }
+                    }
+                    "reclaim_worktree" => {
+                        return Err(format!(
+                            "act.execute.{caller}: reclaim_worktree plans are never executed"
+                        ));
+                    }
+                    other => {
+                        return Err(format!(
+                            "act.execute.{caller}: `{other}` is not a plan kind that executes (reclaim_dir)"
+                        ));
+                    }
+                }
+            }
+            execute.insert(caller, granted);
+        }
+        Ok(Act { execute })
+    }
+}
+
 impl RawHost {
     fn resolve(
         self,
@@ -497,6 +602,7 @@ impl RawHost {
 
         let disk = self.disk.resolve(home).map_err(invalid)?;
         let arbiter = self.arbiter.resolve().map_err(invalid)?;
+        let act = self.act.resolve().map_err(invalid)?;
 
         Ok(HostConfig {
             budget,
@@ -533,6 +639,7 @@ impl RawHost {
                 .into_iter()
                 .map(|(name, unit)| (name, Unit { act: unit.act }))
                 .collect(),
+            act,
         })
     }
 }
@@ -796,20 +903,73 @@ mod tests {
         }
     }
 
-    /// Unit X's settings (section 9.7) come with X: in the first release each is an unknown
-    /// key, so no host can grant a caller execution before anything executes.
+    /// The pass's settings of unit X come with X2 (section 14.2): until then each is an
+    /// unknown key.
     #[test]
-    fn execution_settings_are_unknown_in_the_first_release() {
+    fn the_pass_settings_are_unknown_before_x2() {
         for (text, expected) in [
-            (
-                "[act]\nexecute = { owner = [\"reclaim_dir\"] }",
-                "unknown field `act`",
-            ),
             ("[disk]\nreserve_mib = 64", "unknown field `reserve_mib`"),
             (
                 "[reconcile]\nreclaim_budget_s = 120",
                 "unknown field `reclaim_budget_s`",
             ),
+        ] {
+            let message = match parse(text) {
+                Ok(_) => panic!("accepted: {text}"),
+                Err(err) => err.to_string(),
+            };
+            assert!(message.contains(expected), "{text}: {message}");
+        }
+    }
+
+    /// `[act] execute` grants the owner and `unit:disk-reclaim` the kind `reclaim_dir`, and
+    /// nothing by default; an `arbiter` entry, the kind `reclaim_worktree`, any other caller or
+    /// kind, and an unknown key are invalid (section 9.7).
+    #[test]
+    fn execution_grants() {
+        use crate::contract::{Caller, PlanKind};
+        let owner = Caller::Owner;
+        let unit = Caller::Unit("disk-reclaim".into());
+        let none = parse("").unwrap();
+        for caller in [&owner, &unit, &Caller::Arbiter] {
+            assert!(!none.grants(caller, PlanKind::ReclaimDir), "{caller}");
+        }
+        let host = parse(
+            "[act]\nexecute = { owner = [\"reclaim_dir\", \"reclaim_dir\"], \"unit:disk-reclaim\" = [] }",
+        )
+        .unwrap();
+        assert!(host.grants(&owner, PlanKind::ReclaimDir));
+        assert!(!host.grants(&owner, PlanKind::ReclaimWorktree));
+        assert!(!host.grants(&unit, PlanKind::ReclaimDir));
+        assert!(!host.grants(&Caller::Unit("other".into()), PlanKind::ReclaimDir));
+        assert_eq!(host.act.execute["owner"], [PlanKind::ReclaimDir]);
+        let unit_granted =
+            parse("[act]\nexecute = { \"unit:disk-reclaim\" = [\"reclaim_dir\"] }").unwrap();
+        assert!(unit_granted.grants(&unit, PlanKind::ReclaimDir));
+        assert!(!unit_granted.grants(&owner, PlanKind::ReclaimDir));
+
+        for (text, expected) in [
+            (
+                "[act]\nexecute = { arbiter = [\"reclaim_dir\"] }",
+                "the arbiter holds no grant",
+            ),
+            (
+                "[act]\nexecute = { owner = [\"reclaim_worktree\"] }",
+                "never executed",
+            ),
+            (
+                "[act]\nexecute = { \"unit:other\" = [\"reclaim_dir\"] }",
+                "not a caller that executes",
+            ),
+            (
+                "[act]\nexecute = { owner = [\"reclaim_cache\"] }",
+                "not a plan kind that executes",
+            ),
+            (
+                "[act]\nexecute = { owner = \"reclaim_dir\" }",
+                "invalid type",
+            ),
+            ("[act]\ngrant = {}", "unknown field `grant`"),
         ] {
             let message = match parse(text) {
                 Ok(_) => panic!("accepted: {text}"),

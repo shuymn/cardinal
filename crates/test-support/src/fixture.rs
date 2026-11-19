@@ -26,6 +26,17 @@ use crate::scope::{Command, Scope, normalize};
 /// data elsewhere, or change which repository git uses.
 const CONFIG_SECTIONS: &[&str] = &["branch", "cardinal", "test"];
 
+/// The `core` keys a test may write with [`Fixture::config_core`]: those that decide git's
+/// classification of ignored files and the index's form, none of which runs a program.
+const CORE_KEYS: &[&str] = &[
+    "core.excludesFile",
+    "core.ignoreCase",
+    "core.precomposeUnicode",
+    "core.sparseCheckout",
+    "core.splitIndex",
+    "core.untrackedCache",
+];
+
 pub struct Fixture {
     scope: Scope,
 }
@@ -151,6 +162,25 @@ impl Fixture {
         self.git(repo, &["add", "--", rel]);
     }
 
+    /// `git add -f -- rel`: stages `rel` even where an ignore rule matches it.
+    pub fn add_force(&self, repo: &Path, rel: &str) {
+        self.file(repo, rel);
+        self.git(repo, &["add", "-f", "--", rel]);
+    }
+
+    /// `git reset -q rev -- rel`: the index entry of `rel` as `rev` records it, or none.
+    pub fn reset_path(&self, repo: &Path, rev: &str, rel: &str) {
+        let rev = checked_name("revision", rev);
+        self.file(repo, rel);
+        self.git(repo, &["reset", "-q", rev, "--", rel]);
+    }
+
+    /// `git update-index --skip-worktree -- rel`.
+    pub fn skip_worktree(&self, repo: &Path, rel: &str) {
+        self.file(repo, rel);
+        self.git(repo, &["update-index", "--skip-worktree", "--", rel]);
+    }
+
     /// `git commit -q -m message` of what is staged; returns the new HEAD.
     pub fn commit(&self, repo: &Path, message: &str) -> String {
         self.git(repo, &["commit", "-q", "-m", message]);
@@ -186,6 +216,15 @@ impl Fixture {
         self.assert_inside(worktree, "worktree");
         let target = worktree.to_string_lossy().into_owned();
         self.git(repo, &["worktree", "remove", "--force", "--", &target]);
+    }
+
+    /// `git worktree move from to`.
+    pub fn worktree_move(&self, repo: &Path, from: &Path, to: &Path) {
+        self.assert_inside(from, "worktree");
+        self.assert_inside(to, "worktree");
+        let from = from.to_string_lossy().into_owned();
+        let to = to.to_string_lossy().into_owned();
+        self.git(repo, &["worktree", "move", "--", &from, &to]);
     }
 
     /// `git worktree list --porcelain`.
@@ -405,6 +444,12 @@ impl Fixture {
         self.git(repo, &["update-index", "--split-index"]);
     }
 
+    /// `git update-index --no-split-index`: the index of `repo` holds its entries again, and
+    /// the `sharedindex.*` file a split left stays in the git dir until git expires it.
+    pub fn no_split_index(&self, repo: &Path) {
+        self.git(repo, &["update-index", "--no-split-index"]);
+    }
+
     /// `git update-index --add --cacheinfo 160000,oid,rel`: stages a gitlink at `rel` that
     /// records the commit `oid`, with nothing checked out there (an unpopulated submodule).
     pub fn stage_gitlink(&self, repo: &Path, rel: &str, oid: &str) {
@@ -472,6 +517,24 @@ impl Fixture {
                     .any(|allowed| section.eq_ignore_ascii_case(allowed)),
             "refusing git: config key {key} is outside the sections tests may set"
         );
+        self.git(repo, &["config", "--local", key, value]);
+    }
+
+    /// `git config --local key value` for a key of [`CORE_KEYS`]. The excludes file, absolute or
+    /// relative to `repo`, from which git reads a relative one, must lie inside the root; a `~`
+    /// path, which git reads from the home directory, is refused.
+    pub fn config_core(&self, repo: &Path, key: &str, value: &str) {
+        assert!(
+            CORE_KEYS.contains(&key),
+            "refusing git: config key {key} is not one tests may set in core"
+        );
+        if key == "core.excludesFile" {
+            assert!(
+                !value.starts_with('~'),
+                "refusing git: excludes file {value} is read from the home directory"
+            );
+            self.assert_inside(&repo.join(value), "excludes file");
+        }
         self.git(repo, &["config", "--local", key, value]);
     }
 

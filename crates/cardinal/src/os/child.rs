@@ -109,11 +109,15 @@ const ADDED: &[(&str, &str)] = &[
 
 /// The environment of a git child, built from `inherited`: only the allowlisted variables
 /// pass, so `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, and every other
-/// repository-location variable of the caller never reach git.
+/// repository-location variable of the caller never reach git, and `LC_ALL` is `C`.
 pub fn git_env(
     inherited: impl IntoIterator<Item = (OsString, OsString)>,
 ) -> Vec<(OsString, OsString)> {
-    build_env(inherited, GIT_INHERITED)
+    let mut env = build_env(inherited, GIT_INHERITED);
+    // git's messages in one locale, since a read compares one of them (section 8.1).
+    env.retain(|(name, _)| !same_name(name, "LC_ALL"));
+    env.push(("LC_ALL".into(), "C".into()));
+    env
 }
 
 /// The environment of a gh child, built from `inherited` like [`git_env`] with the gh

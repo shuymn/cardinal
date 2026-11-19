@@ -310,6 +310,28 @@ fn detail<'a>(result: &'a cardinal::contract::ActResult, name: &str) -> &'a str 
         .detail
 }
 
+/// An `origin` URL git prints as two lines is no answer: `observed` fails naming `origin`,
+/// as the profiles it would select, and their protections, are unknown; the same worktree
+/// passes with the URL as it was.
+#[cfg(unix)]
+#[test]
+fn an_unread_origin_is_unknown() {
+    let s = Setup::new();
+    let wt = s.worktree("origin");
+    write(&wt, "target/a.o", "obj");
+    let plan = s.plan(PlanKind::ReclaimDir, &wt.join("target"));
+    assert!(plan.invariants_ok, "{:#?}", plan.checks);
+    let config = s.main.join(".git/config");
+    let text = std::fs::read_to_string(&config).unwrap();
+    let url = format!("https://github.com/{}.git", observe_common::GITHUB);
+    assert!(text.contains(&url), "{text}");
+    std::fs::write(&config, text.replace(&url, &format!("\"{url}\\nx\""))).unwrap();
+    let plan = s.plan(PlanKind::ReclaimDir, &wt.join("target"));
+    let observed = plan.checks.iter().find(|c| c.name == "observed").unwrap();
+    assert_eq!(observed.result, CheckResult::Fail, "{:#?}", plan.checks);
+    assert!(observed.detail.contains("unknown: origin"), "{observed:#?}");
+}
+
 /// C13: `act` inspects the whole target at run time, descendants included. The protected
 /// data appears after the plan was made, so only `act`'s own inspection can find it, and is
 /// removed once `act` has recorded its snapshot, so the observation `act` runs after the

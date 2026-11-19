@@ -97,6 +97,19 @@ fn config_outside_the_allowed_sections_is_refused() {
     ] {
         refuses(key, || fixture.config_set(&repo, key, "always"));
     }
+    for key in [
+        "core.hooksPath",
+        "core.fsmonitor",
+        "core.sshCommand",
+        "branch",
+    ] {
+        refuses(key, || fixture.config_core(&repo, key, "always"));
+    }
+    for path in ["/tmp/ignore", "../../ignore", "~/ignore"] {
+        refuses(path, || {
+            fixture.config_core(&repo, "core.excludesFile", path);
+        });
+    }
     assert_eq!(state(&fixture, &repo), before);
 }
 

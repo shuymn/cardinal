@@ -8,7 +8,7 @@
 
 use std::ffi::OsStr;
 use std::os::fd::AsFd;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// What identifies a mount; compare with `==`.
 pub type MountId = Vec<u8>;
@@ -139,6 +139,146 @@ fn fs_type_name(magic: i64) -> Option<&'static str> {
     })
 }
 
+/// One line of `/proc/self/mountinfo` (`proc(5)`): the mount's ID (field 1), the device of
+/// its file system (field 3), the path in that file system it shows (its root, field 4), and
+/// where it is mounted (field 5), each path with the kernel's octal escapes undone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MountLine {
+    pub id: u64,
+    pub dev: (u32, u32),
+    pub root: PathBuf,
+    pub mount_point: PathBuf,
+}
+
+/// Parses `/proc/self/mountinfo`. Each row must hold every field `proc(5)` gives it: the
+/// mount and parent IDs, the device, the root, the mount point, the options, any optional
+/// fields, the `-` separator, and the file system type, source, and super options. A row cut
+/// short, or with a field that does not parse, is an error, so a listing that is not complete
+/// decides nothing.
+pub fn parse_mountinfo(text: &[u8]) -> Result<Vec<MountLine>, String> {
+    let bad = |line: &[u8]| format!("mountinfo line {:?}", String::from_utf8_lossy(line));
+    let mut lines = Vec::new();
+    // A last line without its line feed may be cut short.
+    let Some(body) = text.strip_suffix(b"\n") else {
+        return Err("mountinfo does not end in a line feed".into());
+    };
+    if body.is_empty() {
+        return Err("mountinfo lists no mount".into());
+    }
+    for line in body.split(|&b| b == b'\n') {
+        let fields: Vec<&[u8]> = line.split(|&b| b == b' ').collect();
+        let [id, parent, dev, root, mount_point, options, ..] = fields[..] else {
+            return Err(bad(line));
+        };
+        // The separator follows the optional fields; three fields follow it.
+        let complete = fields[6..]
+            .iter()
+            .position(|f| *f == b"-")
+            .is_some_and(|at| fields.len() == 6 + at + 4)
+            && fields.iter().all(|f| !f.is_empty())
+            && !options.is_empty();
+        let number = |field: &[u8]| std::str::from_utf8(field).ok()?.parse::<u64>().ok();
+        if !complete || number(parent).is_none() {
+            return Err(bad(line));
+        }
+        let id = number(id).ok_or_else(|| bad(line))?;
+        let dev = std::str::from_utf8(dev)
+            .ok()
+            .and_then(|dev| dev.split_once(':'))
+            .and_then(|(major, minor)| Some((major.parse().ok()?, minor.parse().ok()?)))
+            .ok_or_else(|| bad(line))?;
+        lines.push(MountLine {
+            id,
+            dev,
+            root: unescape(root).ok_or_else(|| bad(line))?,
+            mount_point: unescape(mount_point).ok_or_else(|| bad(line))?,
+        });
+    }
+    Ok(lines)
+}
+
+/// A mountinfo path with its `\ooo` escapes undone (space, tab, newline, backslash).
+fn unescape(field: &[u8]) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut out = Vec::with_capacity(field.len());
+    let mut at = 0;
+    while at < field.len() {
+        if field[at] == b'\\' {
+            let digits = field.get(at + 1..at + 4)?;
+            let value = std::str::from_utf8(digits).ok()?;
+            out.push(u8::from_str_radix(value, 8).ok()?);
+            at += 4;
+        } else {
+            out.push(field[at]);
+            at += 1;
+        }
+    }
+    (out.first() == Some(&b'/')).then(|| PathBuf::from(OsStr::from_bytes(&out)))
+}
+
+/// The mount points of the mounts in `lines` that show the target, or a directory in it,
+/// elsewhere (section 9.7, `bound_elsewhere`): the target is on the mount `mount_id` of the
+/// file system on `dev`, at `path` as this process sees it; a mount of that file system whose
+/// root is at or below the target's path in the file system keeps the moved tree reachable at
+/// its mount point. An error when the target's own mount is not listed or does not contain
+/// `path`.
+pub fn binds_of(
+    lines: &[MountLine],
+    (dev, mount_id): ((u32, u32), u64),
+    path: &Path,
+) -> Result<Vec<PathBuf>, String> {
+    let own = lines
+        .iter()
+        .find(|line| line.id == mount_id)
+        .ok_or_else(|| format!("mountinfo does not list the mount {mount_id}"))?;
+    let rel = path.strip_prefix(&own.mount_point).map_err(|_| {
+        format!(
+            "{} is not below its mount point {}",
+            path.display(),
+            own.mount_point.display()
+        )
+    })?;
+    let in_fs = own.root.join(rel);
+    Ok(lines
+        .iter()
+        .filter(|line| line.dev == dev && line.root.starts_with(&in_fs))
+        .map(|line| line.mount_point.clone())
+        .collect())
+}
+
+/// The mount points that show the entry `name` of the open directory `dir`, or a directory in
+/// it, elsewhere ([`binds_of`]), read from `/proc/self/mountinfo` (Linux). macOS has no bind
+/// mount that a user without root can make, so there it is none.
+#[cfg(target_os = "linux")]
+pub fn bound_elsewhere(dir: impl AsFd, name: &OsStr) -> Result<Vec<PathBuf>, String> {
+    use rustix::fs::{AtFlags, StatxFlags};
+    let st = rustix::fs::statx(
+        &dir,
+        name,
+        AtFlags::SYMLINK_NOFOLLOW | AtFlags::NO_AUTOMOUNT,
+        StatxFlags::MNT_ID,
+    )
+    .map_err(|err| format!("statx: {err}"))?;
+    if !StatxFlags::from_bits_retain(st.stx_mask).contains(StatxFlags::MNT_ID) {
+        return Err("statx reports no mount ID (Linux before 5.8)".to_owned());
+    }
+    let parent =
+        super::dir::current_path(&dir).map_err(|err| format!("the parent's path: {err}"))?;
+    let text = std::fs::read("/proc/self/mountinfo")
+        .map_err(|err| format!("/proc/self/mountinfo: {err}"))?;
+    binds_of(
+        &parse_mountinfo(&text)?,
+        ((st.stx_dev_major, st.stx_dev_minor), st.stx_mnt_id),
+        &parent.join(name),
+    )
+}
+
+/// See the Linux version: macOS has no bind mount that a user without root can make.
+#[cfg(not(target_os = "linux"))]
+pub fn bound_elsewhere(_dir: impl AsFd, _name: &OsStr) -> Result<Vec<PathBuf>, String> {
+    Ok(Vec::new())
+}
+
 #[cfg(target_os = "linux")]
 fn statx_mount<P: rustix::path::Arg>(
     dir: impl AsFd,
@@ -157,7 +297,54 @@ fn statx_mount<P: rustix::path::Arg>(
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
+
+    /// A mount of the target's file system whose root is at or below the target, or below a
+    /// directory in it, binds it elsewhere; mounts of other file systems, and the target's own
+    /// mount, do not. Escaped paths are read as the kernel wrote them.
+    #[test]
+    fn mountinfo_binds() {
+        let text = b"22 1 8:1 / / rw - ext4 /dev/sda1 rw\n\
+              30 22 8:1 /home/u/w/target /mnt/bound rw - ext4 /dev/sda1 rw\n\
+              31 22 8:1 /home/u/w/target/debug /mnt/deep\\040dir rw - ext4 /dev/sda1 rw\n\
+              32 22 8:1 /home/u/w/targets /mnt/sibling rw - ext4 /dev/sda1 rw\n\
+              33 22 8:2 /home/u/w/target /mnt/other-fs rw - ext4 /dev/sda2 rw\n\
+              40 22 8:1 /home /home rw - ext4 /dev/sda1 rw\n";
+        let lines = super::parse_mountinfo(text).unwrap();
+        assert_eq!(lines.len(), 6);
+        assert_eq!(lines[2].mount_point, PathBuf::from("/mnt/deep dir"));
+        let target = Path::new("/home/u/w/target");
+        assert_eq!(
+            super::binds_of(&lines, ((8, 1), 40), target).unwrap(),
+            [PathBuf::from("/mnt/bound"), PathBuf::from("/mnt/deep dir")]
+        );
+        assert_eq!(
+            super::binds_of(&lines, ((8, 1), 40), Path::new("/home/u/w/other")).unwrap(),
+            Vec::<PathBuf>::new()
+        );
+        assert!(super::binds_of(&lines, ((8, 1), 99), target).is_err());
+        assert!(super::binds_of(&lines, ((8, 1), 30), Path::new("/elsewhere")).is_err());
+        for bad in [
+            &b""[..],
+            b"22 1 8:1 /\n",
+            b"x 1 8:1 / / rw\n",
+            b"22 1 8 / / rw\n",
+            b"22 1 8:1 rel / rw\n",
+            b"22 1 8:1 /\\04 / rw\n",
+            // A row cut short after the mount point, or before its last fields.
+            b"22 1 8:1 / /\n",
+            b"22 1 8:1 / / rw\n",
+            b"22 1 8:1 / / rw -\n",
+            b"22 1 8:1 / / rw - ext4 /dev/sda1\n",
+            b"22 x 8:1 / / rw - ext4 /dev/sda1 rw\n",
+            b"22 1 8:1 / / rw - ext4 /dev/sda1 rw extra\n",
+            // A last row without its line feed, which a read cut short also gives.
+            b"22 1 8:1 / / rw - ext4 /dev/sda1 rw",
+            b"22 1 8:1 / / rw - ext4 /dev/sda1 rw\n23 22 8:2 / /a rw - ext4 /dev/sda2 rw",
+        ] {
+            assert!(super::parse_mountinfo(bad).is_err(), "{bad:?}");
+        }
+    }
 
     #[test]
     fn a_mount_point_has_another_identity_than_its_parent() {

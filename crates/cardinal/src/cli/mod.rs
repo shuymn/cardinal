@@ -206,7 +206,7 @@ pub struct ActArgs {
     /// The plan ID, or a unique prefix of at least 4 characters
     #[arg(value_name = "PLAN")]
     pub plan: String,
-    /// Accepted; every act reports and executes nothing
+    /// Report what a granted caller would execute, and execute nothing
     #[arg(long)]
     pub dry_run: bool,
     /// The owner approved a plan whose conditions fail (only with --caller owner)

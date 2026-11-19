@@ -36,8 +36,8 @@ pub struct ActResult {
     pub status: ActStatus,
     /// Failing check names, `"owner_approval_required"`, and `"identity_changed:<field>"`;
     /// why a `dry_run` did not execute: `"execution_not_granted"`, `"dry_run_requested"`,
-    /// `"execution_not_designed"` (whole worktrees, Windows, and every plan of the first
-    /// release), or an eligibility rule's `"not_on_state_mount"`, `"bound_elsewhere"`,
+    /// `"execution_not_designed"` (whole worktrees, Windows, and a granted unit
+    /// until unit X2), or an eligibility rule's `"not_on_state_mount"`, `"bound_elsewhere"`,
     /// `"sparse_checkout"`, `"tracked_overlap"`, `"not_directory_excluded"`; and an
     /// execution's `"changed_during_act"`, `"no_space"`, `"trash_occupied"`,
     /// `"interrupted"`, `"in_progress"`, `"claim_unreadable"`, `"in_use_while_deleting"`.
