@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use super::{Check, PlanListSchema, PlanSchema, ScopedError};
+use super::{Check, ExclusiveMeasure, PlanListSchema, PlanSchema, ScopedError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -54,6 +54,14 @@ pub struct Plan {
     /// 8.5). Absent in plans made before it was recorded, which read as null.
     #[serde(default)]
     pub aliased_bytes: Option<u64>,
+    /// A lower bound of the bytes deleting the target frees (section 8.5). Absent in plans
+    /// made before it was recorded, which read as null.
+    #[serde(default)]
+    pub exclusive_bytes: Option<u64>,
+    /// How `exclusive_bytes` was read; null when the walk failed. Absent in plans made before
+    /// it was recorded, which read as null.
+    #[serde(default)]
+    pub exclusive_measure: Option<ExclusiveMeasure>,
     pub checks: Vec<Check>,
     pub invariants_ok: bool,
     pub approval: Approval,

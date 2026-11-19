@@ -183,7 +183,12 @@ impl Run<'_> {
             // (section 9.3).
             outcome.status = ActStatus::DryRun;
             outcome.reasons = vec![EXECUTION_NOT_DESIGNED.into()];
-            outcome.freed_bytes = snapshot.walk.as_ref().ok().map(Walk::allocated);
+            // The lower bound of section 8.5, null where it is unknown.
+            outcome.freed_bytes = snapshot
+                .walk
+                .as_ref()
+                .ok()
+                .and_then(|walk| walk.exclusive().bytes);
         }
         outcome
     }

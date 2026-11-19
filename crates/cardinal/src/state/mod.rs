@@ -253,7 +253,7 @@ impl StateDir {
         self.execution_dir(plan).join("claim")
     }
 
-    /// `executions/<plan>/result.json` (`cardinal.act-result.v1`).
+    /// `executions/<plan>/result.json` (`cardinal.act-result.v2`).
     #[must_use]
     pub fn execution_result(&self, plan: &str) -> PathBuf {
         self.execution_dir(plan).join("result.json")

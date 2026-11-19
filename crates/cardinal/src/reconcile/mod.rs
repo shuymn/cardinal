@@ -238,7 +238,8 @@ fn observation_due(config: &Config, state: &StateDir, errors: &mut Vec<ScopedErr
     last.is_none_or(|last| state::now_ms().saturating_sub(last) >= every_ms)
 }
 
-/// The sizes of the `reclaim_dir` plans' walks, in the observation's ignored entries.
+/// The sizes of the `reclaim_dir` plans' walks, their bounds included, in the observation's
+/// ignored entries.
 fn fill_sizes(inventory: &mut Inventory, plans: &[Plan]) {
     let entries = inventory
         .repos
@@ -252,6 +253,8 @@ fn fill_sizes(inventory: &mut Inventory, plans: &[Plan]) {
         {
             entry.allocated_bytes = plan.allocated_bytes;
             entry.aliased_bytes = plan.aliased_bytes;
+            entry.exclusive_bytes = plan.exclusive_bytes;
+            entry.exclusive_measure = plan.exclusive_measure;
         }
     }
 }

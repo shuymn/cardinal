@@ -285,7 +285,7 @@ protected = ["fuzz/corpus", "fuzz/artifacts", "proptest-regressions"]
 | `sessions/<session>.json` | `cardinal.session-snapshot.v1` | `hook claude session-end` | inbox refresh |
 | `inbox/<key-hash>.json` | `cardinal.inbox-item.v1` | inbox raise, refresh, resolve, and the arbiter launcher's assignments and outcomes, all under `inbox/.lock` | `inbox`, `explain`, the arbiter trigger (under `inbox/.lock`) |
 | `plans/<plan>/plan.json` | `cardinal.plan.v1` | `plan` | `act`, `explain` |
-| `executions/<plan>/manifest`, `claim`, `result.json` | `cardinal.act-manifest.v1`, `cardinal.act-claim.v1`, `cardinal.act-result.v1` | the `act` or recovery holding the plan's `act.lock` (section 9.7) | `act`, recovery, `explain` |
+| `executions/<plan>/manifest`, `claim`, `result.json` | `cardinal.act-manifest.v1`, `cardinal.act-claim.v1`, `cardinal.act-result.v2` | the `act` or recovery holding the plan's `act.lock` (section 9.7) | `act`, recovery, `explain` |
 | `disk/<volume>.json` | `cardinal.disk-state.v1` | `reconcile`, under `reconcile.lock` | `reconcile`, `inventory`, the UI |
 | `reconcile/*.json` | `cardinal.reconcile-state.v1`, `cardinal.inventory.v1` | `reconcile`, under `reconcile.lock` | `reconcile`, the runner's job-end check (file time only), the UI |
 | `arbiter/last.json` | `cardinal.arbiter-pass.v1` | the launcher and, as it settles the last pass, the trigger, each under `arbiter/.lock` | the arbiter trigger, `inventory`, the UI |
@@ -731,7 +731,7 @@ A worktree is managed by another app when its path is under a `[observe] managed
 
 - `allocated_bytes`: blocks × 512 on Unix, file length on Windows, which overcounts a sparse or compressed file.
 - `aliased_bytes`: the part held by files with links outside the entry (an `st_nlink` above the names the walk found), which deleting the entry does not free: a `node_modules` hard-linked from a package store is mostly aliased.
-- `exclusive_bytes`: a lower bound of what deleting the entry frees, by which `disk-reclaim` ranks targets and projects recovery (section 10.4), with `exclusive_measure` naming how it was read. A file counts once per `dev` and `ino`, and only when the walk found all its links inside the entry (as many names as its `st_nlink`); a file with a link outside counts nothing, whatever it shares. The measure depends on the file system, whose type `local_volume` reads (section 9.2):
+- `exclusive_bytes`: a lower bound of what deleting the entry frees, by which `disk-reclaim` ranks targets and projects recovery (section 10.4), with `exclusive_measure` naming how it was read. A file counts once per `dev` and `ino`, and only when the walk found all its links inside the entry (as many names as its `st_nlink`); a file with a link outside counts nothing, whatever it shares, and so does a file whose names showed different link counts, as when a link was added while the walk ran. A directory at or below the entry that the walk does not list, because it cannot be opened or listed, is on another device or mount, or was replaced or removed while the walk ran, leaves the bound null (`read_failed` under a measure that reads), with the reason in the errors under every measure, rather than a number that leaves out what it holds. The measure depends on the file system, whose type `local_volume` reads (section 9.2):
   - **APFS** (`private_size`): the sum of each counted regular file's `ATTR_CMNEXT_PRIVATESIZE`, its bytes "not trapped inside a clone or snapshot" (`getattrlist(2)`). The walk lists each directory with `getattrlistbulk` on the descriptor it checked, with `FSOPT_ATTR_CMN_EXTENDED`, asking for `ATTR_CMN_RETURNED_ATTRS`, `ATTR_CMN_NAME`, and the private size: without `ATTR_CMN_NAME` the call fails with `EINVAL`. A call that fails leaves the entry's `exclusive_bytes` null (`read_failed`), with the error in the observation's errors; a read that succeeds but whose returned attributes lack the private size for a regular file leaves it null too (`not_measured`), since the link count cannot see clones.
   - **ext2, ext3, ext4** (`extents`): the sum of each counted regular file's data extents as `FIEMAP` reports them without `FIEMAP_FLAG_XATTR`, through a descriptor opened read-only on the file (`O_NOFOLLOW`), leaving out extents flagged `FIEMAP_EXTENT_UNKNOWN` (delayed allocation included), `FIEMAP_EXTENT_ENCODED`, or `FIEMAP_EXTENT_NOT_ALIGNED` (inline data); directories count nothing. These file systems never share data extents, having no reflink, but `st_blocks` also counts an extended-attribute block, which ext4 shares among files with the same attributes: a sparse file with no data and such a block shared with a file outside the target reads 4,096 allocated bytes and frees no file bytes. A `FIEMAP` that fails leaves the entry null (`read_failed`). Not probed here; X's Linux tests check it on CI (section 13.7).
   - **HFS+, tmpfs** (`links`): the allocated blocks of each counted file and of every directory. HFS+ has neither clones nor snapshots, and on it `getattrlistbulk` succeeds and returns none of the extended attributes (probed); tmpfs gives each file pages of its own, with neither reflinks nor snapshots.
@@ -1137,7 +1137,7 @@ Phase 1 builds A, which needs no account; B and C are not planned (section 14.5)
 | `cardinal inbox resolve KEY --outcome resolved\|escalated\|dismissed\|deferred [--note TEXT] [--assigned] [--brief]` | `cardinal.inbox-item.v1`, or `cardinal.inbox-brief.v1` with the item alone with `--brief`; with `--assigned`, the answer of the pass `CARDINAL_ARBITER_PASS` names, recorded in the item's `arbiter.answer`: an item not assigned to that pass, or any item once that pass has ended, is refused (`not_assigned`), and an item the pass already answered (`invalid_argument`), each left unchanged; `deferred`, which leaves the item open, only with `--assigned` (a usage error otherwise) |
 | `cardinal plan [--repo PATH]...` | `cardinal.plan-list.v1`: plans for every linked worktree and every ignored entry matching a regenerable pattern, failing ones included (section 9.2) |
 | `cardinal plan reclaim-worktree PATH \| reclaim-dir PATH` | `cardinal.plan.v1` |
-| `cardinal act PLAN [--dry-run] [--owner-approved] [--squash-merged] [--caller arbiter\|owner\|unit:NAME]` | `cardinal.act-result.v1` (default caller `arbiter`) |
+| `cardinal act PLAN [--dry-run] [--owner-approved] [--squash-merged] [--caller arbiter\|owner\|unit:NAME]` | `cardinal.act-result.v2` (default caller `arbiter`) |
 | `cardinal reconcile [--trigger timer\|job-end\|manual]` | `cardinal.reconcile.v1` (section 10.3) |
 | `cardinal arbiter run` | `cardinal.arbiter-pass.v1`: the pass it ran, or the running one (section 10.5); `not_found` when no item is due, `min_interval_s` has not passed, or every due item was closed before it was assigned; `state_unavailable` when `arbiter/last.json` exists but cannot be read, or `arbiter/.lock` stays held and no pass is running |
 | `cardinal ui` | The path of the written page as text (section 10.6) |
@@ -1254,7 +1254,7 @@ type ExclusiveMeasure = "private_size" | "extents" | "links" | "read_failed" | "
 // cardinal.plan-list.v1
 { schema; plans: Plan[]; errors: { scope: string; message: string }[] }
 
-// cardinal.act-result.v1  (stdout of act; executions/<plan>/result.json)
+// cardinal.act-result.v2  (stdout of act; executions/<plan>/result.json)
 { schema; plan_id: string; caller: string;
   status: "executed" | "partial" | "dry_run" | "rejected" | "expired" | "already_executed";  // first release: dry_run, rejected, expired
   reasons: string[];                                       // failing check names, "owner_approval_required", "identity_changed:<field>";
@@ -1265,11 +1265,11 @@ type ExclusiveMeasure = "private_size" | "extents" | "links" | "read_failed" | "
                                                            // execution (section 9.7): "changed_during_act", "no_space", "trash_occupied", "interrupted",
                                                            // "in_progress", "claim_unreadable", "in_use_while_deleting"
   checks: Check[]; freed_bytes: number | null;             // dry_run: the snapshot's exclusive_bytes, null where unknown
-                                                           // (the first release: its allocated bytes); executed, partial:
-                                                           // what this run's unlinks are expected to have freed, not
-                                                           // verified, null under a null measure
-                                                           // (section 9.7). Unit X raises this schema's version to 2:
-                                                           // the dry_run change alters the field's meaning (section 11.1)
+                                                           // (version 1, the first release: its allocated bytes); executed,
+                                                           // partial: what this run's unlinks are expected to have freed,
+                                                           // not verified, null under a null measure
+                                                           // (section 9.7). Version 2 since unit X1a, whose dry_run
+                                                           // change alters the field's meaning (section 11.1)
   skipped_changed: string[];                               // entries an execution kept, relative to the target
   trash: string | null;                                    // the trash entry holding what an execution kept or could not put back
   recovered: boolean;                                      // written by recovery (section 9.7)

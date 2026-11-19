@@ -212,6 +212,49 @@ pub fn hit(point: &'static str) -> Result<(), Injected> {
     Ok(())
 }
 
+/// The file system type a test makes the walks read for `path` (`docs/architecture.md`
+/// section 13.7): with `CARDINAL_TEST_DIR` set, `<dir>/fs-types` holds lines
+/// `<type>\t<prefix>`, and a path at or below a prefix reads that type, the longest prefix
+/// winning. `None` outside tests and for any other path.
+#[must_use]
+pub fn fake_fs_type(path: &Path) -> Option<String> {
+    static LINES: OnceLock<Vec<(String, PathBuf)>> = OnceLock::new();
+    LINES
+        .get_or_init(|| fake_lines("fs-types"))
+        .iter()
+        .filter(|(_, prefix)| path.starts_with(prefix))
+        .max_by_key(|(_, prefix)| prefix.components().count())
+        .map(|(ty, _)| ty.clone())
+}
+
+/// The type a test makes the walks read for the entry at `path` (section 13.7), since making
+/// a device needs root: with `CARDINAL_TEST_DIR` set, `<dir>/entry-types` holds lines
+/// `<type>\t<path>` (`fifo`, `socket`, or `device`). `None` outside tests and for any other
+/// path.
+#[must_use]
+pub fn fake_entry_type(path: &Path) -> Option<String> {
+    static LINES: OnceLock<Vec<(String, PathBuf)>> = OnceLock::new();
+    LINES
+        .get_or_init(|| fake_lines("entry-types"))
+        .iter()
+        .find(|(_, at)| at == path)
+        .map(|(ty, _)| ty.clone())
+}
+
+/// The `<value>\t<path>` lines of the fake file `name` in the test directory, which a test
+/// writes before it starts the process that reads them; none outside tests.
+fn fake_lines(name: &str) -> Vec<(String, PathBuf)> {
+    let text = settings()
+        .and_then(|settings| std::fs::read_to_string(settings.dir.join(name)).ok())
+        .unwrap_or_default();
+    text.lines()
+        .filter_map(|line| {
+            let (value, path) = line.split_once('\t')?;
+            Some((value.to_owned(), PathBuf::from(path)))
+        })
+        .collect()
+}
+
 /// `<dir>/<point>.<pid>.reached`
 #[must_use]
 pub fn reached_file(dir: &Path, point: &str, pid: u32) -> PathBuf {

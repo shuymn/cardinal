@@ -178,6 +178,32 @@ pub struct IgnoredEntry {
     pub allocated_bytes: Option<u64>,
     /// The part of `allocated_bytes` held by files with links outside the entry.
     pub aliased_bytes: Option<u64>,
+    /// A lower bound of what deleting the entry frees (section 8.5). Absent in observations
+    /// made before it was recorded, which read as null.
+    #[serde(default)]
+    pub exclusive_bytes: Option<u64>,
+    /// How `exclusive_bytes` was read; null without sizes. Absent in observations made before
+    /// it was recorded, which read as null.
+    #[serde(default)]
+    pub exclusive_measure: Option<ExclusiveMeasure>,
+}
+
+/// How a lower bound of the freed bytes was read (`docs/architecture.md` section 8.5): from
+/// the file system's private sizes (APFS), data extents (ext2–4), or allocated blocks with
+/// the link rule (HFS+, tmpfs); or why there is none, in which case the bound is null.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExclusiveMeasure {
+    PrivateSize,
+    Extents,
+    Links,
+    /// A read the measure needs failed.
+    ReadFailed,
+    /// Btrfs and XFS, whose shared extents are not read.
+    SharingUnread,
+    /// Windows, every other file system type, and an APFS read that returned no private size
+    /// for a regular file.
+    NotMeasured,
 }
 
 /// Whether a worktree is a whole-worktree reclaim candidate, with failing and unknown checks.

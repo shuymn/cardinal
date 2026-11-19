@@ -33,8 +33,9 @@ fn rejects_wrong_schema_and_missing<T: DeserializeOwned>(doc: &Value, required: 
     rejects::<T>(doc, "another schema", |d| {
         d["schema"] = json!("cardinal.other.v1");
     });
-    let name = doc["schema"].as_str().unwrap().replace(".v1", ".v2");
-    rejects::<T>(doc, "another version", |d| d["schema"] = json!(name));
+    let (base, version) = doc["schema"].as_str().unwrap().rsplit_once(".v").unwrap();
+    let next = format!("{base}.v{}", version.parse::<u32>().unwrap() + 1);
+    rejects::<T>(doc, "another version", |d| d["schema"] = json!(next));
     rejects::<T>(doc, "a missing field", |d| {
         d.as_object_mut().unwrap().remove(required);
     });
@@ -85,6 +86,7 @@ fn plan() -> Value {
                    "branch": "feature", "git_dir": "/r/.git/worktrees/w",
                    "root_id": {"dev": 1, "ino": 2}, "root_created_ms": null},
         "allocated_bytes": 4096, "aliased_bytes": 1024,
+        "exclusive_bytes": 2048, "exclusive_measure": "private_size",
         "checks": [clean, check("merge_evidence", "condition", "fail")],
         "invariants_ok": true, "approval": "owner",
         "provenance": {
@@ -122,9 +124,14 @@ fn worktree() -> Value {
                   "closed_pr": {"number": 9, "url": "https://example.invalid/pr/9"},
                   "in_use": {"value": true, "jobs": ["0123456789abcdef"]}},
         "ignored": [{"path": "/w/node_modules", "class": "regenerable", "regenerable_match": true,
-                     "allocated_bytes": 10, "aliased_bytes": 4},
+                     "allocated_bytes": 10, "aliased_bytes": 4,
+                     "exclusive_bytes": 3, "exclusive_measure": "links"},
+                    {"path": "/w/target", "class": "regenerable", "regenerable_match": true,
+                     "allocated_bytes": 10, "aliased_bytes": 0,
+                     "exclusive_bytes": null, "exclusive_measure": "read_failed"},
                     {"path": "/w/fuzz/corpus", "class": "protected", "regenerable_match": false,
-                     "allocated_bytes": null, "aliased_bytes": null}],
+                     "allocated_bytes": null, "aliased_bytes": null,
+                     "exclusive_bytes": null, "exclusive_measure": null}],
         "reclaim": {"candidate": false, "failed": ["not_managed"], "unknown": ["no_unpushed"]},
         "allocated_bytes": null
     })
@@ -159,11 +166,12 @@ fn disk_report() -> Value {
         "lines": {"warning_bytes": 300, "recovery_bytes": 400, "critical_bytes": 100},
         "checks_ms": 4,
         "targets": [{"plan_id": "fedcba9876543210", "worktree": "/w", "target": "/w/target",
-                     "exclusive_bytes": 120},
+                     "exclusive_bytes": 120, "exclusive_measure": "private_size"},
                     {"plan_id": "0123456789abcdef", "worktree": "/w", "target": "/w/dist",
                      "exclusive_bytes": 60, "status": "partial", "freed_bytes": 40},
                     {"plan_id": "0123456789abcdee", "worktree": "/w", "target": "/w/out",
-                     "exclusive_bytes": 20, "status": "rejected", "freed_bytes": null}],
+                     "exclusive_bytes": 0, "exclusive_measure": null, "status": "rejected",
+                     "freed_bytes": null}],
         "shortfall_bytes": 30,
         "blocked": [{"worktree": "/w2", "target": "/w2/node_modules", "check": "not_in_use",
                      "bytes": 80},
@@ -306,6 +314,19 @@ fn inventory_document() {
                 .remove(field);
         });
     }
+    // An observation made before the freed-bytes bound loads with it null.
+    let mut old = doc.clone();
+    let entry = old["repos"][0]["worktrees"][0]["ignored"][0]
+        .as_object_mut()
+        .unwrap();
+    entry.remove("exclusive_bytes");
+    entry.remove("exclusive_measure");
+    let loaded: Inventory = serde_json::from_value(old).unwrap();
+    let entry = &loaded.repos[0].worktrees[0].ignored[0];
+    assert_eq!(
+        (entry.exclusive_bytes, entry.exclusive_measure),
+        (None, None)
+    );
     rejects::<Inventory>(&doc, "an ignored entry without regenerable_match", |d| {
         d["repos"][0]["worktrees"][0]["ignored"][0]
             .as_object_mut()
@@ -447,14 +468,23 @@ fn snapshot_document() {
 fn plan_documents() {
     round_trips::<Plan>(&plan());
     rejects_wrong_schema_and_missing::<Plan>(&plan(), "target");
-    // A plan stored before `git_dir` and `aliased_bytes` were recorded still loads, with both
-    // null.
+    // A plan stored before `git_dir`, `aliased_bytes`, and the freed-bytes bound were recorded
+    // still loads, with each null.
     let mut old = plan();
     old["target"].as_object_mut().unwrap().remove("git_dir");
-    old.as_object_mut().unwrap().remove("aliased_bytes");
+    for field in ["aliased_bytes", "exclusive_bytes", "exclusive_measure"] {
+        old.as_object_mut().unwrap().remove(field);
+    }
     let loaded: Plan = serde_json::from_value(old).unwrap();
     assert_eq!(loaded.target.git_dir, None);
     assert_eq!(loaded.aliased_bytes, None);
+    assert_eq!(
+        (loaded.exclusive_bytes, loaded.exclusive_measure),
+        (None, None)
+    );
+    rejects::<Plan>(&plan(), "an unknown measure", |d| {
+        d["exclusive_measure"] = json!("blocks");
+    });
     rejects::<Plan>(&plan(), "an unknown kind", |d| {
         d["kind"] = json!("reclaim_cache");
     });
@@ -474,7 +504,7 @@ fn plan_documents() {
 #[test]
 fn act_result_document() {
     let doc = json!({
-        "schema": "cardinal.act-result.v1", "plan_id": "fedcba9876543210", "caller": "unit:disk",
+        "schema": "cardinal.act-result.v2", "plan_id": "fedcba9876543210", "caller": "unit:disk",
         "status": "already_executed", "reasons": ["identity_changed:head"],
         "checks": [check("not_in_use", "invariant", "unknown")], "freed_bytes": null,
         "skipped_changed": ["/w/new.txt"], "trash": null, "recovered": false, "error": null,
@@ -483,9 +513,13 @@ fn act_result_document() {
     round_trips::<ActResult>(&doc);
     rejects_wrong_schema_and_missing::<ActResult>(&doc, "status");
     rejects::<ActResult>(&doc, "an unknown status", |d| d["status"] = json!("done"));
+    // Version 1, whose dry run's `freed_bytes` meant allocated bytes.
+    rejects::<ActResult>(&doc, "version 1", |d| {
+        d["schema"] = json!("cardinal.act-result.v1");
+    });
     // A partial execution's result as recovery writes it to `executions/<plan>/result.json`.
     let partial = json!({
-        "schema": "cardinal.act-result.v1", "plan_id": "fedcba9876543210",
+        "schema": "cardinal.act-result.v2", "plan_id": "fedcba9876543210",
         "caller": "unit:disk-reclaim", "status": "partial", "reasons": ["in_use_while_deleting"],
         "checks": [], "freed_bytes": 4096, "skipped_changed": ["debug/app", "debug/app.d"],
         "trash": "/state/trash/fedcba9876543210", "recovered": true, "error": null,
@@ -740,7 +774,7 @@ const TESTED: &[&str] = &[
     "cardinal.inventory.v1",
     "cardinal.plan.v1",
     "cardinal.plan-list.v1",
-    "cardinal.act-result.v1",
+    "cardinal.act-result.v2",
     "cardinal.act-claim.v1",
     "cardinal.act-manifest.v1",
     "cardinal.inbox-item.v1",

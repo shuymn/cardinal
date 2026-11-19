@@ -76,6 +76,69 @@ pub fn of_path(path: &Path) -> Result<MountId, String> {
     }
 }
 
+/// The type of the file system the open directory `dir` is on, which `local_volume` and the
+/// freed-bytes bound read (`docs/architecture.md` sections 8.5 and 9.2): `f_fstypename` on
+/// macOS (`apfs`, `hfs`, `nfs`, `smbfs`, …), and on Linux the name of `f_type`'s magic number
+/// (`ext2/ext3/ext4`, which share one, `xfs`, `btrfs`, `tmpfs`, `nfs`, `fuse`, …, or the number
+/// in hexadecimal when it has no name here).
+#[cfg(target_os = "macos")]
+pub fn fs_type(dir: impl AsFd) -> Result<String, String> {
+    let st = rustix::fs::fstatfs(dir).map_err(|err| format!("fstatfs: {err}"))?;
+    let name: Vec<u8> = st
+        .f_fstypename
+        .iter()
+        .map(|c| u8::from_ne_bytes(c.to_ne_bytes()))
+        .take_while(|&b| b != 0)
+        .collect();
+    Ok(String::from_utf8_lossy(&name).into_owned())
+}
+
+/// The type of the file system the open directory `dir` is on (see the macOS version).
+#[cfg(target_os = "linux")]
+#[allow(
+    clippy::useless_conversion,
+    clippy::unnecessary_fallible_conversions,
+    reason = "the type of `f_type` differs between platforms"
+)]
+pub fn fs_type(dir: impl AsFd) -> Result<String, String> {
+    let st = rustix::fs::fstatfs(dir).map_err(|err| format!("fstatfs: {err}"))?;
+    // A 32-bit `f_type` may come sign-extended: the magic numbers are 32 bits.
+    let magic = i64::try_from(st.f_type).map_err(|err| format!("f_type: {err}"))? & 0xffff_ffff;
+    Ok(fs_type_name(magic).map_or_else(|| format!("{magic:#x}"), str::to_owned))
+}
+
+/// The type of the file system the open directory `dir` is on.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn fs_type(_dir: impl AsFd) -> Result<String, String> {
+    Err("the file system type is not read on this platform".to_owned())
+}
+
+/// The name of a Linux file system's magic number (`statfs(2)`, `<linux/magic.h>`).
+#[cfg(target_os = "linux")]
+fn fs_type_name(magic: i64) -> Option<&'static str> {
+    Some(match magic {
+        0xEF53 => "ext2/ext3/ext4",
+        0x5846_5342 => "xfs",
+        0x9123_683E => "btrfs",
+        0x0102_1994 => "tmpfs",
+        0x8584_58F6 => "ramfs",
+        0x6969 => "nfs",
+        0x6573_5546 => "fuse",
+        0x517B => "smb",
+        0xFF53_4D42 => "cifs",
+        0xFE53_4D42 => "smb2",
+        0x0102_1997 => "v9fs",
+        0x794C_7630 => "overlayfs",
+        0x2FC1_2FC1 => "zfs",
+        0xCA45_1A4E => "bcachefs",
+        0xF2F5_2010 => "f2fs",
+        0x7371_7368 => "squashfs",
+        0x4D44 => "msdos",
+        0x5346_544E => "ntfs",
+        _ => return None,
+    })
+}
+
 #[cfg(target_os = "linux")]
 fn statx_mount<P: rustix::path::Arg>(
     dir: impl AsFd,
@@ -109,6 +172,30 @@ mod tests {
             assert_ne!(parent.unwrap(), own.unwrap());
         } else {
             assert!(parent.is_err() && own.is_err(), "fails closed");
+        }
+    }
+
+    /// The type of the volume the tests run on is one of the local types, and another mount's
+    /// can differ from it.
+    #[test]
+    fn the_file_system_type_names_the_volume() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = std::fs::File::open(tmp.path()).unwrap();
+        let ty = super::fs_type(&dir);
+        if cfg!(target_os = "macos") {
+            assert!(["apfs", "hfs"].contains(&ty.as_deref().unwrap()), "{ty:?}");
+            let dev = std::fs::File::open("/dev").unwrap();
+            assert_eq!(super::fs_type(&dev).unwrap(), "devfs");
+        } else if cfg!(target_os = "linux") {
+            assert!(ty.is_ok(), "{ty:?}");
+            let proc = std::fs::File::open("/proc").unwrap();
+            assert_eq!(
+                super::fs_type(&proc).unwrap(),
+                "0x9fa0",
+                "procfs has no name here"
+            );
+        } else {
+            assert!(ty.is_err(), "not read on this platform");
         }
     }
 

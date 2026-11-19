@@ -24,8 +24,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crate::admission;
 use crate::config::Config;
 use crate::contract::{
-    Error, ErrorCode, InUse, Inventory, Plan, PlanKind, PlanList, PlanListSchema, PlanSchema,
-    PlanTarget, Record, RecordKind, Repo, ScopedError, Worktree,
+    Error, ErrorCode, InUse, Inventory, ObservedError, Plan, PlanKind, PlanList, PlanListSchema,
+    PlanSchema, PlanTarget, Record, RecordKind, Repo, ScopedError, Worktree,
 };
 use crate::observe::{self, InventoryOptions, WorktreeObservation};
 use crate::record::Recorder;
@@ -416,7 +416,14 @@ fn build_with(
         squash_merged: false,
     };
     let checks = evaluate(&inspection);
-    let provenance = provenance(config, &inspection);
+    let mut provenance = provenance(config, &inspection);
+    let exclusive = walked.ok().map(Walk::exclusive);
+    if let Some(error) = exclusive.as_ref().and_then(|e| e.error.clone()) {
+        provenance.errors.push(ObservedError {
+            source: "exclusive_bytes".to_owned(),
+            message: error,
+        });
+    }
     let plan = Plan {
         schema: PlanSchema,
         id: String::new(),
@@ -435,6 +442,8 @@ fn build_with(
         },
         allocated_bytes: walked.ok().map(Walk::allocated),
         aliased_bytes: walked.ok().map(Walk::aliased),
+        exclusive_bytes: exclusive.as_ref().and_then(|e| e.bytes),
+        exclusive_measure: exclusive.map(|e| e.measure),
         invariants_ok: invariants_ok(&checks),
         approval: approval(&checks),
         checks,

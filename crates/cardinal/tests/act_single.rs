@@ -81,7 +81,7 @@ fn cli_exit_codes() {
     plan_support::assert_plans_inside(s.fx.root(), &s.state, "abcdef");
     let assert = s.cardinal().args(["act", "abcdef"]).assert().code(3);
     let doc: serde_json::Value = serde_json::from_slice(&assert.get_output().stdout).unwrap();
-    assert_eq!(doc["schema"], "cardinal.act-result.v1");
+    assert_eq!(doc["schema"], "cardinal.act-result.v2");
     assert_eq!(doc["status"], "expired");
     assert_eq!(doc["caller"], "arbiter");
 }
