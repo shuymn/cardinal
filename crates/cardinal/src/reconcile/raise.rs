@@ -1,7 +1,9 @@
 //! Inbox items raised from a pass's observation and disk states (`docs/architecture.md`
 //! section 10.1): `reclaimable`, `merge_undecided`, `closed_pr_dirty`, `managed_merged`, and
 //! `unclassifiable_data` from the full observation, `disk_low` and `disk_critical` from the
-//! disk states with their disk reports. Each raises and ends occurrences through the inbox.
+//! disk states with their disk reports, and `reclaim_stranded` from the trash listing: raised
+//! for an entry no execution names, ended for every item whose trash entry is gone. Each
+//! raises and ends occurrences through the inbox.
 //!
 //! A raiser ends only the occurrences it read before it started observing (section 10.1):
 //! the pass takes [`snapshot`] before step 4 and hands it to both raisers, so an item changed
@@ -16,7 +18,7 @@
 //! leads into the repository's common dir, or that cannot be read, is not gone.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::config::Config;
 use crate::contract::{
@@ -25,7 +27,7 @@ use crate::contract::{
 };
 use crate::inbox::{self, NewItem, Occurrence};
 use crate::observe;
-use crate::state::StateDir;
+use crate::state::{self, StateDir};
 
 use super::Observation;
 
@@ -39,7 +41,7 @@ pub struct Before(BTreeMap<String, InboxItem>);
 /// Reads the items' latest occurrences for [`worktree_items`] and [`disk_items`]; the pass
 /// takes it before step 4. Without it, a pass passes [`Before::default`], which ends nothing.
 pub fn snapshot(state: &StateDir) -> Result<Before, Error> {
-    inbox::latest(state).map(Before)
+    inbox::latest_complete(state).map(Before)
 }
 
 /// Raises and ends the worktree items of section 10.1 from step 5's observation and plans,
@@ -57,15 +59,122 @@ pub fn worktree_items(
 /// with the volume's disk report from `disk-reclaim` (step 6), with the keys raised anew and
 /// ended. A volume whose state is `unknown` changes nothing; one under pressure without a
 /// report this pass (its reading or `disk-reclaim` failed) keeps its open items as they were.
-/// Only occurrences in `before` end.
+/// Only occurrences in `before` end. A volume whose readings in this pass entered pressure,
+/// by `passed` (by volume), and that its report's executions lifted out of it again within
+/// the pass gets the episode as an item raised with the report and ended at once.
 pub fn disk_items(
     config: &Config,
     state: &StateDir,
     before: &Before,
     disks: &[DiskState],
     reports: &[DiskReport],
+    passed: &[(String, Passed)],
 ) -> Result<InboxChanges, Error> {
-    inbox::apply_recorded(config, state, &disk_changes(&before.0, disks, reports))
+    inbox::apply_recorded(
+        config,
+        state,
+        &disk_changes(&before.0, disks, reports, passed),
+    )
+}
+
+/// When the readings of one pass first found a volume under pressure and critical, for an
+/// episode that ends within the pass.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Passed {
+    pub low_ms: Option<u64>,
+    pub critical_ms: Option<u64>,
+}
+
+/// What `<state>/trash/` held when the pass listed it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Trash {
+    pub entries: Vec<TrashEntry>,
+}
+
+/// One entry of `<state>/trash/`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrashEntry {
+    /// Its name, which is the plan ID of the execution that made it.
+    pub name: String,
+    pub path: PathBuf,
+    /// Whether an execution directory of that name exists; `None` when that could not be
+    /// read, which raises nothing.
+    pub named: Option<bool>,
+    /// The entries below it and the bytes they allocate, as `reclaim_stranded` reports them;
+    /// `None`, unknown, when part of it could not be read.
+    pub entries_left: Option<u64>,
+    pub bytes_left: Option<u64>,
+}
+
+/// Raises `reclaim_stranded` for each entry of `trash` that no execution directory names,
+/// which stays where it is (section 9.7), and ends every `reclaim_stranded` of `before`, whoever
+/// raised it, once its trash entry reads as missing: a listing that leaves it out ends
+/// nothing. An item whose execution's claim `claim_unreadable` says cannot be read stays open
+/// whatever the trash holds, as the alert of that claim. `before` is read after step 2's
+/// recoveries and before the listing.
+pub fn stranded_items(
+    config: &Config,
+    state: &StateDir,
+    before: &Before,
+    trash: &Trash,
+    claim_unreadable: &dyn Fn(&str) -> bool,
+) -> Result<InboxChanges, Error> {
+    let gone = |name: &str| {
+        !claim_unreadable(name)
+            && std::fs::symlink_metadata(state.trash_entry(name))
+                .is_err_and(|err| err.kind() == std::io::ErrorKind::NotFound)
+    };
+    inbox::apply_recorded(
+        config,
+        state,
+        &stranded_changes(&before.0, trash, &gone, state::now_ms()),
+    )
+}
+
+/// The key prefix of `reclaim_stranded`, followed by the trash entry's name, its plan ID.
+const STRANDED: &str = "reclaim_stranded:";
+
+fn stranded_changes(
+    before: &BTreeMap<String, InboxItem>,
+    trash: &Trash,
+    gone: &dyn Fn(&str) -> bool,
+    now_ms: u64,
+) -> Vec<Occurrence> {
+    let mut changes = Vec::new();
+    for entry in trash.entries.iter().filter(|e| e.named == Some(false)) {
+        let item = NewItem {
+            key: format!("{STRANDED}{}", entry.name),
+            kind: InboxKind::ReclaimStranded,
+            subject: InboxSubject::default(),
+            evidence: object(serde_json::json!({
+                "target": null,
+                "trash": entry.path.display().to_string(),
+                "entries_left": entry.entries_left,
+                "bytes_left": entry.bytes_left,
+                "kept": [],
+                "reason": "no execution names this trash entry",
+            })),
+        };
+        changes.push(Occurrence::Raise {
+            item,
+            since_ms: now_ms,
+        });
+    }
+    for (condition, item) in before {
+        let Some(name) = condition.strip_prefix(STRANDED) else {
+            continue;
+        };
+        if item.kind == InboxKind::ReclaimStranded && item.ended_ms.is_none() && gone(name) {
+            changes.push(Occurrence::End {
+                key: condition.clone(),
+                before: Some(Box::new(item.clone())),
+                ended_ms: now_ms,
+                note: "the trash entry is gone".to_owned(),
+                evidence: None,
+            });
+        }
+    }
+    changes
 }
 
 /// The worktrees of an observation by path, each with its repository.
@@ -113,6 +222,7 @@ fn worktree_changes(
                 before: Some(Box::new(item.clone())),
                 ended_ms: found_ms,
                 note,
+                evidence: None,
             });
         }
     }
@@ -384,6 +494,7 @@ fn disk_changes(
     before: &BTreeMap<String, InboxItem>,
     disks: &[DiskState],
     reports: &[DiskReport],
+    passed: &[(String, Passed)],
 ) -> Vec<Occurrence> {
     let mut changes = Vec::new();
     for disk in disks {
@@ -394,33 +505,42 @@ fn disk_changes(
             DiskLevel::Critical => (true, true),
         };
         let report = reports.iter().find(|report| report.volume == disk.volume);
-        for (kind, prefix, present, note) in [
+        let passed = passed
+            .iter()
+            .find(|(volume, _)| *volume == disk.volume)
+            .map_or_else(Passed::default, |(_, passed)| *passed);
+        for (kind, prefix, present, entered_ms, note) in [
             (
                 InboxKind::DiskLow,
                 "disk_low",
                 low,
+                passed.low_ms,
                 "the volume is back to ok",
             ),
             (
                 InboxKind::DiskCritical,
                 "disk_critical",
                 critical,
+                passed.critical_ms,
                 "the volume left critical",
             ),
         ] {
             let condition = format!("{prefix}:{}", disk.volume);
+            let item = NewItem {
+                key: condition.clone(),
+                kind,
+                subject: InboxSubject::default(),
+                evidence: object(serde_json::json!({
+                    "volume": disk.volume,
+                    "mount": disk.mount,
+                    "disk": disk,
+                    "report": report,
+                })),
+            };
+            let open = before
+                .get(&condition)
+                .filter(|item| item.ended_ms.is_none());
             if present {
-                let item = NewItem {
-                    key: condition,
-                    kind,
-                    subject: InboxSubject::default(),
-                    evidence: object(serde_json::json!({
-                        "volume": disk.volume,
-                        "mount": disk.mount,
-                        "disk": disk,
-                        "report": report,
-                    })),
-                };
                 let since_ms = disk.since_ms;
                 // Without a report this pass, an occurrence that has not ended keeps the one it
                 // has; the store decides that under its lock.
@@ -428,13 +548,21 @@ fn disk_changes(
                     Some(_) => Occurrence::Raise { item, since_ms },
                     None => Occurrence::RaiseUnlessActive { item, since_ms },
                 });
-            } else if let Some(item) = before
-                .get(&condition)
-                .filter(|item| item.ended_ms.is_none())
-            {
+            } else if let Some(open) = open {
+                // The ended item keeps this pass's report, the executions that ended it.
                 changes.push(Occurrence::End {
                     key: condition,
-                    before: Some(Box::new(item.clone())),
+                    before: Some(Box::new(open.clone())),
+                    ended_ms: disk.since_ms,
+                    note: note.to_owned(),
+                    evidence: report.is_some().then_some(item.evidence),
+                });
+            } else if let (Some(since_ms), Some(_)) = (entered_ms, report) {
+                // The episode began and ended within this pass: raised with its report and
+                // ended at the reading that ended it.
+                changes.push(Occurrence::RaiseEnded {
+                    item,
+                    since_ms,
                     ended_ms: disk.since_ms,
                     note: note.to_owned(),
                 });

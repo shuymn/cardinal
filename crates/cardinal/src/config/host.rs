@@ -133,6 +133,16 @@ pub struct Disk {
     pub lines: DiskLines,
     /// Per-mount lines, matched against the mount point a path resolves to.
     pub volumes: Vec<VolumeLines>,
+    /// The size of the reserve file on the state dir's volume, in MiB (section 9.7, "Space").
+    pub reserve_mib: u64,
+}
+
+impl Disk {
+    /// The reserve file's size in bytes.
+    #[must_use]
+    pub fn reserve_bytes(&self) -> u64 {
+        self.reserve_mib.saturating_mul(1024 * 1024)
+    }
 }
 
 impl Disk {
@@ -176,6 +186,9 @@ pub struct Reconcile {
     /// A full observation (git, gh) runs at most this often, unless a volume is under
     /// pressure.
     pub observe_every_s: u64,
+    /// A pass starts no recovery or execution once it has spent this long on them (section
+    /// 9.7, "Starters").
+    pub reclaim_budget_s: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -409,6 +422,7 @@ struct RawDisk {
     recovery_mib: u64,
     critical_mib: u64,
     volumes: Vec<RawVolume>,
+    reserve_mib: u64,
 }
 
 impl Default for RawDisk {
@@ -418,6 +432,7 @@ impl Default for RawDisk {
             recovery_mib: 30 * 1024,
             critical_mib: 5 * 1024,
             volumes: Vec::new(),
+            reserve_mib: 64,
         }
     }
 }
@@ -464,12 +479,15 @@ impl Default for RawArbiter {
 #[serde(deny_unknown_fields, default)]
 struct RawReconcile {
     observe_every_s: u64,
+    reclaim_budget_s: u64,
 }
 
 impl Default for RawReconcile {
     fn default() -> Self {
         Self {
             observe_every_s: 3600,
+            // Provisional until section 14.4's report week sets it (section 14.5).
+            reclaim_budget_s: 120,
         }
     }
 }
@@ -601,6 +619,7 @@ impl RawHost {
         }
 
         let disk = self.disk.resolve(home).map_err(invalid)?;
+        let reconcile = self.reconcile.resolve().map_err(invalid)?;
         let arbiter = self.arbiter.resolve().map_err(invalid)?;
         let act = self.act.resolve().map_err(invalid)?;
 
@@ -631,9 +650,7 @@ impl RawHost {
             },
             disk,
             arbiter,
-            reconcile: Reconcile {
-                observe_every_s: self.reconcile.observe_every_s,
-            },
+            reconcile,
             units: self
                 .unit
                 .into_iter()
@@ -648,6 +665,9 @@ impl RawDisk {
     /// The lines, each set checked for `critical < warning < recovery`, and the volume
     /// mounts made absolute.
     fn resolve(self, home: Option<&Path>) -> Result<Disk, String> {
+        if self.reserve_mib == 0 {
+            return Err("disk.reserve_mib must be positive".into());
+        }
         let lines = checked_lines(
             "disk",
             DiskLines {
@@ -673,7 +693,24 @@ impl RawDisk {
             )?;
             volumes.push(VolumeLines { mount, lines });
         }
-        Ok(Disk { lines, volumes })
+        Ok(Disk {
+            lines,
+            volumes,
+            reserve_mib: self.reserve_mib,
+        })
+    }
+}
+
+impl RawReconcile {
+    /// The pass's settings, with a positive reclaim budget.
+    fn resolve(self) -> Result<Reconcile, String> {
+        if self.reclaim_budget_s == 0 {
+            return Err("reconcile.reclaim_budget_s must be positive".into());
+        }
+        Ok(Reconcile {
+            observe_every_s: self.observe_every_s,
+            reclaim_budget_s: self.reclaim_budget_s,
+        })
     }
 }
 
@@ -784,6 +821,8 @@ mod tests {
             }
         );
         assert_eq!(host.disk.volumes, []);
+        assert_eq!(host.disk.reserve_mib, 64);
+        assert_eq!(host.disk.reserve_bytes(), 64 * 1024 * 1024);
         assert_eq!(host.arbiter.command[..2], ["claude", "-p"]);
         assert_eq!(host.arbiter.command[3], "--allowedTools");
         assert_eq!(host.arbiter.timeout_s, 1200);
@@ -791,6 +830,7 @@ mod tests {
         assert_eq!(host.arbiter.retry_s, 7200);
         assert_eq!(host.arbiter.max_items, MAX_ITEMS);
         assert_eq!(host.reconcile.observe_every_s, 3600);
+        assert_eq!(host.reconcile.reclaim_budget_s, 120);
         assert!(!host.unit_may_act("anything"));
     }
 
@@ -824,6 +864,7 @@ mod tests {
             recovery_mib = 400
             critical_mib = 100
             volumes = [{ mount = "~/Scratch", warning_mib = 600, recovery_mib = 900, critical_mib = 200 }]
+            reserve_mib = 8
             [arbiter]
             command = ["/bin/arbiter"]
             timeout_s = 5
@@ -831,6 +872,7 @@ mod tests {
             retry_s = 0
             [reconcile]
             observe_every_s = 60
+            reclaim_budget_s = 30
             "#,
         )
         .unwrap();
@@ -844,6 +886,8 @@ mod tests {
         assert_eq!(scratch.to_bytes().critical_bytes, 200 * 1024 * 1024);
         assert_eq!(host.arbiter.command, ["/bin/arbiter"]);
         assert_eq!(host.reconcile.observe_every_s, 60);
+        assert_eq!(host.reconcile.reclaim_budget_s, 30);
+        assert_eq!(host.disk.reserve_mib, 8);
     }
 
     /// Each invalid case fails its own check, which the message names. Mounts start at `~`,
@@ -885,6 +929,11 @@ mod tests {
             ),
             ("[disk]\nwarning = 1", "unknown field"),
             ("[disk]\nwarning_mib = -1", "invalid value"),
+            (
+                "[disk]\nreserve_mib = 0",
+                "disk.reserve_mib must be positive",
+            ),
+            ("[disk]\nreserve_mib = -1", "invalid value"),
             // An empty command, an empty program, a shell string, a zero timeout, unknown
             // keys.
             ("[arbiter]\ncommand = []", "first word"),
@@ -894,24 +943,9 @@ mod tests {
             ("[arbiter]\nmax_items = 0", "must be positive"),
             ("[arbiter]\ninterval = 1", "unknown field"),
             ("[reconcile]\nobserve_every = 1", "unknown field"),
-        ] {
-            let message = match parse(text) {
-                Ok(_) => panic!("accepted: {text}"),
-                Err(err) => err.to_string(),
-            };
-            assert!(message.contains(expected), "{text}: {message}");
-        }
-    }
-
-    /// The pass's settings of unit X come with X2 (section 14.2): until then each is an
-    /// unknown key.
-    #[test]
-    fn the_pass_settings_are_unknown_before_x2() {
-        for (text, expected) in [
-            ("[disk]\nreserve_mib = 64", "unknown field `reserve_mib`"),
             (
-                "[reconcile]\nreclaim_budget_s = 120",
-                "unknown field `reclaim_budget_s`",
+                "[reconcile]\nreclaim_budget_s = 0",
+                "reconcile.reclaim_budget_s must be positive",
             ),
         ] {
             let message = match parse(text) {

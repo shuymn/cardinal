@@ -304,6 +304,7 @@ fn failing(config: &Config, state: &StateDir, last: &ArbiterPass) -> Result<(), 
                 before: Some(Box::new(item)),
                 ended_ms,
                 note: format!("arbiter pass {} completed", last.id),
+                evidence: None,
             })
             .collect()
     } else if open.is_empty() {

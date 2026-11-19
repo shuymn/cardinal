@@ -4,9 +4,11 @@
 //! the claim to a later recovery. Unit X1b injects the failures at a put-back and at the
 //! result through the fake of section 13.7, in recovery of a `committed` execution
 //! (`tests/execution_support`); X1c adds the execution's own writes through a granted
-//! owner's `act` (`tests/live_support`), and X2 the pass and the real volumes (section 14.2).
+//! owner's `act` (`tests/live_support`), and X2 a pass's plans, its observation's write, and
+//! the reserve the pass writes; the real volumes are `tests/disk_volume_execute.rs`.
 #![cfg(unix)]
 
+mod disk_support;
 mod execution_support;
 mod live_support;
 mod observe_common;
@@ -224,5 +226,135 @@ mod live {
             );
             assert!(!x.entry().exists());
         }
+    }
+}
+
+/// A pass's writes (section 9.7, "Space"; C11): with `disk-reclaim` granted and the state
+/// dir's volume under pressure (the readings fake, lines at 1, 2, and 3 MiB, a reserve of
+/// 1 MiB), a plan of the pass that fails for lack of space spends the reserve and is written
+/// at once, so its target executes; without a reserve it is not written and not executed. The
+/// observation's write failing changes nothing about executing, which goes on from the
+/// observation in memory. A pass writes a missing reserve only above its recovery line plus
+/// the reserve's size, and that reserve is what a later pass spends.
+mod pass {
+    use cardinal::contract::{ActStatus, Reconcile};
+    use disk_support::{Disk, MIB, fill};
+
+    use super::ERRORS;
+    use crate::disk_support;
+
+    const UNDER: Option<u64> = Some(3 * MIB / 2);
+
+    /// A setup whose `disk-reclaim` executes, with a linked worktree holding `target/`, and
+    /// the write of `kind` failing with `error` `times`.
+    fn granted(kind: &str, error: &str, times: &str) -> (Disk, std::path::PathBuf) {
+        let d = Disk::with_host(
+            (1, 2, 3),
+            "[unit.disk-reclaim]\nact = true\n\
+             [act]\nexecute = { \"unit:disk-reclaim\" = [\"reclaim_dir\"] }\n",
+        );
+        let wt = d.s.worktree("full");
+        fill(&wt, "target/debug/app", 64 * 1024);
+        std::fs::write(
+            d.points.dir().join("write-failures"),
+            format!("{kind}\t{error}\t{times}\n"),
+        )
+        .unwrap();
+        (d, wt)
+    }
+
+    fn statuses(pass: &Reconcile) -> Vec<Option<ActStatus>> {
+        pass.disk_reports
+            .iter()
+            .flat_map(|r| &r.targets)
+            .map(|t| t.status)
+            .collect()
+    }
+
+    /// With the reserve present, the pass's first plan write fails once, deletes the reserve,
+    /// and is retried at once: the plan is written and its target executes.
+    #[test]
+    fn a_plan_of_the_pass_spends_the_reserve() {
+        for error in ERRORS {
+            let (d, wt) = granted("plan", error, "once");
+            std::fs::write(d.s.state.reserve_file(), vec![0_u8; 64 * 1024]).unwrap();
+            d.fixture_reads(&[UNDER]);
+            let pass = d.reconcile();
+            assert_eq!(
+                statuses(&pass),
+                [Some(ActStatus::Executed)],
+                "{error}: {pass:#?}"
+            );
+            assert!(!wt.join("target").exists(), "{error}");
+            assert!(!d.s.state.reserve_file().exists(), "{error}");
+        }
+    }
+
+    /// Without a reserve, a plan the pass could not write is not executed at all: the failure
+    /// is in the pass's errors and the target stays.
+    #[test]
+    fn a_plan_not_written_is_not_executed() {
+        for error in ERRORS {
+            let (d, wt) = granted("plan", error, "always");
+            d.fixture_reads(&[UNDER]);
+            let pass = d.reconcile();
+            assert_eq!(statuses(&pass), [], "{error}: {pass:#?}");
+            assert!(
+                pass.errors.iter().any(|e| e.message.contains("injected")),
+                "{error}: {pass:#?}"
+            );
+            assert!(wt.join("target/debug/app").exists(), "{error}");
+            assert!(d.s.state.executions_dir().read_dir().is_err(), "{error}");
+        }
+    }
+
+    /// The observation's write failing is reported, and the pass executes from the
+    /// observation in memory.
+    #[test]
+    fn the_observation_write_failing_still_executes() {
+        for error in ERRORS {
+            let (d, wt) = granted("observation", error, "always");
+            d.fixture_reads(&[UNDER]);
+            let pass = d.reconcile();
+            assert!(
+                pass.errors.iter().any(|e| e.scope == "observe"),
+                "{error}: {pass:#?}"
+            );
+            assert!(!d.s.state.reconcile_observation().exists(), "{error}");
+            assert_eq!(statuses(&pass), [Some(ActStatus::Executed)], "{error}");
+            assert!(!wt.join("target").exists(), "{error}");
+        }
+    }
+
+    /// The reserve is written only when the state dir's volume reads above its recovery line
+    /// plus the reserve's size: at that sum exactly no reserve, one byte above it 1 MiB of
+    /// written blocks. A later pass under pressure spends it on a plan's write.
+    #[test]
+    fn the_reserve_the_pass_writes_is_spent() {
+        use std::os::unix::fs::MetadataExt as _;
+        let (d, wt) = granted("plan", "ENOSPC", "once");
+        let line = 3 * MIB + MIB;
+        d.fixture_reads(&[Some(line)]);
+        d.reconcile();
+        assert!(!d.s.state.reserve_file().exists());
+        d.fixture_reads(&[Some(line + 1)]);
+        d.reconcile();
+        let reserve = std::fs::metadata(d.s.state.reserve_file()).unwrap();
+        assert_eq!(reserve.len(), MIB);
+        assert!(reserve.blocks() * 512 >= MIB, "{} blocks", reserve.blocks());
+        let tmp: Vec<_> = std::fs::read_dir(d.s.state.tmp_dir())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(
+            tmp.iter().all(|n| !n.to_string_lossy().contains("reserve")),
+            "{tmp:?}"
+        );
+
+        d.fixture_reads(&[UNDER]);
+        let pass = d.reconcile();
+        assert_eq!(statuses(&pass), [Some(ActStatus::Executed)], "{pass:#?}");
+        assert!(!wt.join("target").exists());
+        assert!(!d.s.state.reserve_file().exists());
     }
 }

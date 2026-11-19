@@ -21,7 +21,7 @@ pub use id::{
     worktree_key,
 };
 pub use lock::{FileLock, LockError, LockMode, Probe, create_locked, lock, probe, try_lock};
-pub use reserve::{is_no_space, retry as retry_with_reserve};
+pub use reserve::{is_no_space, retry as retry_with_reserve, write as write_reserve};
 
 use crate::contract::{Error, ErrorCode};
 

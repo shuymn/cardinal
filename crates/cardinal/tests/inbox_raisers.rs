@@ -1,7 +1,8 @@
 //! Items raised from a pass's observation and disk states (`docs/architecture.md` sections
 //! 10.1 and 10.4; C19, A22, A23): `reclaimable`, `merge_undecided`, `closed_pr_dirty`,
-//! `managed_merged`, and `unclassifiable_data` from step 5's observation and plans, and
-//! `disk_low` and `disk_critical` from the disk states with their disk reports.
+//! `managed_merged`, and `unclassifiable_data` from step 5's observation and plans,
+//! `disk_low` and `disk_critical` from the disk states with their disk reports, and
+//! `reclaim_stranded` from step 2's trash listing.
 //!
 //! The raisers run against fixed observations, plans, disk states, and disk reports built from
 //! the contract types (section 11.3), as step 5 and step 6 of a pass hand them over. Each test
@@ -89,7 +90,7 @@ impl Env {
         disks: &[DiskState],
         reports: &[DiskReport],
     ) -> cardinal::contract::InboxChanges {
-        raise::disk_items(&self.config, &self.state, before, disks, reports).unwrap()
+        raise::disk_items(&self.config, &self.state, before, disks, reports, &[]).unwrap()
     }
 
     fn items(&self) -> Vec<InboxItem> {
@@ -1147,4 +1148,109 @@ fn a_resolved_disk_item_returns_only_with_a_new_episode() {
     assert_eq!(low[0].ended_ms, Some(300));
     assert_eq!(low[0].status, InboxStatus::Resolved);
     assert_open(&low[1]);
+}
+
+/// `<state>/trash/` as the pass lists it: each entry by name, with whether an execution
+/// directory names it, `None` when that could not be read.
+fn trash(e: &Env, entries: &[(&str, Option<bool>)]) -> raise::Trash {
+    raise::Trash {
+        entries: entries
+            .iter()
+            .map(|(name, named)| raise::TrashEntry {
+                name: (*name).to_owned(),
+                path: e.state.trash_entry(name),
+                named: *named,
+                entries_left: Some(2),
+                bytes_left: Some(4096),
+            })
+            .collect(),
+    }
+}
+
+/// Sections 9.7 and 10.1: `reclaim_stranded`, raised by an execution or its recovery for the
+/// data it left in the trash, ends once its trash entry reads as missing, whoever raised it;
+/// while the entry is there it stays open, even when the listing leaves it out. A trash entry
+/// no execution names raises its own item, naming the entry, which ends the same way; one
+/// whose naming could not be read raises nothing. A listing read before the item was raised
+/// ends nothing, and neither does a missing entry whose execution's claim cannot be read.
+#[test]
+fn reclaim_stranded_raised_and_ended() {
+    let e = env();
+    let plan = "a1b2c3d4e5f60718";
+    let stranded = cardinal::inbox::NewItem {
+        key: format!("reclaim_stranded:{plan}"),
+        kind: InboxKind::ReclaimStranded,
+        subject: cardinal::contract::InboxSubject::default(),
+        evidence: json!({ "trash": e.state.trash_entry(plan).display().to_string(),
+                          "reason": "entries kept" })
+        .as_object()
+        .unwrap()
+        .clone(),
+    };
+    let condition = format!("reclaim_stranded:{plan}");
+    let stray = "0123456789abcdef";
+    let stray_condition = format!("reclaim_stranded:{stray}");
+    let before_raise = e.before();
+    inbox::raise_occurrence(&e.state, &stranded, 1_000).unwrap();
+    let pass = |before: &raise::Before, listing: &raise::Trash| {
+        raise::stranded_items(&e.config, &e.state, before, listing, &|_| false).unwrap()
+    };
+    std::fs::create_dir_all(e.state.trash_entry(plan)).unwrap();
+
+    // The control: the entry is still there, so the item stays open.
+    let changes = pass(&e.before(), &trash(&e, &[(plan, Some(true))]));
+    assert_eq!(changes.cleared, Vec::<String>::new());
+    assert_open(&e.occurrences(&condition)[0]);
+
+    // A listing that leaves out an entry still there ends nothing.
+    pass(&e.before(), &trash(&e, &[]));
+    assert_open(&e.occurrences(&condition)[0]);
+
+    // An entry gone ends nothing while its execution's claim cannot be read.
+    std::fs::remove_dir(e.state.trash_entry(plan)).unwrap();
+    let unreadable =
+        raise::stranded_items(&e.config, &e.state, &e.before(), &trash(&e, &[]), &|p| {
+            p == plan
+        })
+        .unwrap();
+    assert_eq!(unreadable.cleared, Vec::<String>::new());
+    assert_open(&e.occurrences(&condition)[0]);
+
+    // A listing read before the item was raised ends nothing.
+    pass(&before_raise, &trash(&e, &[]));
+    assert_open(&e.occurrences(&condition)[0]);
+
+    // The plan's entry gone ends the plan's item; a stray entry whose naming could not be read
+    // raises nothing.
+    let changes = pass(&e.before(), &trash(&e, &[(stray, None)]));
+    let ended = e.occurrences(&condition);
+    assert_eq!(changes.cleared, [ended[0].key.clone()]);
+    assert_resolved_by_cardinal(&ended[0], "the trash entry is gone");
+    assert_eq!(changes.raised, Vec::<String>::new());
+    assert_eq!(e.occurrences(&stray_condition).len(), 0);
+
+    // Read as named by no execution, the stray entry raises its own item.
+    std::fs::create_dir_all(e.state.trash_entry(stray)).unwrap();
+    let changes = pass(&e.before(), &trash(&e, &[(stray, Some(false))]));
+    let raised = e.occurrences(&stray_condition);
+    assert_eq!(raised.len(), 1, "{raised:#?}");
+    assert_eq!(changes.raised, [raised[0].key.clone()]);
+    assert_open(&raised[0]);
+    assert_eq!(
+        raised[0].evidence["trash"],
+        e.state.trash_entry(stray).display().to_string()
+    );
+    assert_eq!(raised[0].evidence["target"], Value::Null);
+    assert_eq!(raised[0].evidence["entries_left"], 2);
+
+    // Listed again, it stays one occurrence; gone, it ends.
+    pass(&e.before(), &trash(&e, &[(stray, Some(false))]));
+    assert_eq!(e.occurrences(&stray_condition).len(), 1);
+    assert_open(&e.occurrences(&stray_condition)[0]);
+    std::fs::remove_dir(e.state.trash_entry(stray)).unwrap();
+    pass(&e.before(), &trash(&e, &[]));
+    assert_resolved_by_cardinal(
+        &e.occurrences(&stray_condition)[0],
+        "the trash entry is gone",
+    );
 }

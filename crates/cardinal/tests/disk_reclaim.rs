@@ -87,10 +87,13 @@ fn order_and_stop() {
     for record in &planned {
         assert_eq!(record.data["caller"], "unit:disk-reclaim");
         assert_eq!(record.data["status"], "dry_run");
-        assert_eq!(
-            record.data["reasons"],
-            serde_json::json!(["execution_not_designed"])
-        );
+        // Without the unit's grant, not granted; Windows executes nothing (section 9.7).
+        let reason = if cfg!(windows) {
+            "execution_not_designed"
+        } else {
+            "execution_not_granted"
+        };
+        assert_eq!(record.data["reasons"], serde_json::json!([reason]));
         assert_eq!(record.data["checks_ms"], report.checks_ms);
         let keys = &record.data["provenance"]["config"];
         assert!(
@@ -210,6 +213,65 @@ fn a_bound_of_0_or_null_lifts_nothing() {
         "{report:#?}"
     );
     assert_eq!(report.shortfall_bytes, RECOVERY - last, "{report:#?}");
+}
+
+/// Targets with a positive bound come first, whatever their worktree's age; those whose
+/// bound is 0 or null follow, oldest worktree first (C10): a newer worktree's directory
+/// written in place before an older worktree's target cloned from outside (macOS, bound 0)
+/// or on a file system whose sharing is not read (Linux, an injected `xfs`, null), and an
+/// older worktree's own positive target before both. Windows reads no bound, so there every
+/// target is ordered by worktree age alone.
+#[test]
+fn unknown_bounds_last() {
+    let d = Disk::new(LINES);
+    let root = d.s.fx.root().to_path_buf();
+    let oldest = d.s.worktree("oldest");
+    let old = d.s.worktree("old");
+    let new = d.s.worktree("new");
+    #[cfg(target_os = "macos")]
+    {
+        let store = d.s.fx.path("store");
+        fill(&store, "big.bin", MIB);
+        std::fs::create_dir_all(old.join("target")).unwrap();
+        let c_path = |path: std::path::PathBuf| {
+            std::ffi::CString::new(path.into_os_string().into_encoded_bytes()).unwrap()
+        };
+        let (from, to) = (
+            c_path(store.join("big.bin")),
+            c_path(old.join("target/big.bin")),
+        );
+        // SAFETY: both are NUL-terminated paths.
+        let cloned = unsafe { libc::clonefile(from.as_ptr(), to.as_ptr(), 0) };
+        assert_eq!(cloned, 0, "clonefile: {}", std::io::Error::last_os_error());
+    }
+    #[cfg(not(target_os = "macos"))]
+    fill(&old, "target/big.bin", MIB);
+    #[cfg(target_os = "linux")]
+    std::fs::write(
+        d.points.dir().join("fs-types"),
+        format!("xfs\t{}\n", old.join("target").display()),
+    )
+    .unwrap();
+    fill(&new, "target/out.bin", 128 * KIB);
+    fill(&oldest, "target/out.bin", 64 * KIB);
+    disk_support::age(&oldest, Duration::from_hours(3));
+    disk_support::age(&old, Duration::from_hours(2));
+    d.fixture_reads(&[Some(MIB)]);
+
+    let pass = d.reconcile();
+    assert_eq!(own_errors(&pass), Vec::<String>::new());
+    let report = report(&pass);
+    let expected: &[&str] = if cfg!(windows) {
+        &["oldest/target", "old/target", "new/target"]
+    } else {
+        &["oldest/target", "new/target", "old/target"]
+    };
+    assert_eq!(targets(report, &root), expected, "{report:#?}");
+    if !cfg!(windows) {
+        assert!(report.targets[0].exclusive_bytes > 0, "{report:#?}");
+        assert!(report.targets[1].exclusive_bytes > 0, "{report:#?}");
+        assert_eq!(report.targets[2].exclusive_bytes, 0, "{report:#?}");
+    }
 }
 
 /// A target in a worktree in use and one holding protected data are skipped, each counted in

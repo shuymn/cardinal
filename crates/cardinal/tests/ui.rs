@@ -980,6 +980,93 @@ fn a_disk_report_shows_what_its_pass_could_not_see() {
     );
 }
 
+/// Bytes by measure (section 10.6): a disk report's target under `private_size` shows as at
+/// least its bytes, one with 0 counted as "0 counted, may free more", one under
+/// `sharing_unread` as unknown naming the measure, and one from a report made before the field
+/// as allocated bytes that may overstate; an executed target's `freed_bytes` shows as expected,
+/// not verified. An ignored entry shows its exclusive bytes the same way.
+#[test]
+fn bytes_by_measure() {
+    let mut snapshot = fixed_snapshot();
+    let target = |plan: &str, name: &str, bytes: u64| {
+        json!({ "plan_id": plan, "worktree": "/src/app/wt/old",
+                "target": format!("/src/app/wt/old/{name}"), "exclusive_bytes": bytes })
+    };
+    let mut private = target("a1b2c3d4e5f60711", "private", 3 * 1024 * 1024);
+    private["exclusive_measure"] = json!("private_size");
+    let mut zero = target("a1b2c3d4e5f60712", "zero", 0);
+    zero["exclusive_measure"] = json!("extents");
+    let mut unread = target("a1b2c3d4e5f60713", "unread", 0);
+    unread["exclusive_measure"] = json!("sharing_unread");
+    let old = target("a1b2c3d4e5f60714", "old", 5 * 1024 * 1024);
+    let mut executed = target("a1b2c3d4e5f60715", "executed", 1024 * 1024);
+    executed["exclusive_measure"] = json!("links");
+    executed["status"] = json!("executed");
+    executed["freed_bytes"] = json!(2 * 1024 * 1024);
+    snapshot.inbox[2].item.evidence["report"]["targets"] =
+        json!([private, zero, unread, old, executed]);
+    let entry = &mut snapshot.observation.as_mut().unwrap().repos[0].worktrees[1].ignored[0];
+    entry.exclusive_bytes = Some(0);
+    entry.exclusive_measure = Some(cardinal::contract::ExclusiveMeasure::PrivateSize);
+    let open = r#"<article class="item owner" aria-labelledby="item-3">"#;
+
+    let page = render(&snapshot);
+
+    let article = element(section(&page, "owner"), open, "</article>");
+    let table = element(
+        article,
+        ">Targets, in reclamation order</caption>",
+        "</table>",
+    );
+    let row = |name: &str| {
+        let path = format!("old/<wbr>{name}</code>");
+        let found = table.split("<tr").find(|row| row.contains(&path));
+        text(found.unwrap_or_else(|| panic!("no row of {name}: {table}")))
+    };
+    assert!(
+        row("private").contains("at least 3.0 MiB"),
+        "{}",
+        row("private")
+    );
+    assert!(
+        row("zero").contains("0 counted, may free more"),
+        "{}",
+        row("zero")
+    );
+    assert!(
+        row("unread").contains("unknown (sharing unread)"),
+        "{}",
+        row("unread")
+    );
+    assert!(
+        row("old").contains("5.0 MiB allocated, may overstate"),
+        "{}",
+        row("old")
+    );
+    let executed = row("executed");
+    assert!(executed.contains("at least 1.0 MiB"), "{executed}");
+    assert!(
+        executed.contains("2.0 MiB expected, not verified"),
+        "{executed}"
+    );
+    let not_run = row("private");
+    assert!(
+        not_run.contains("listed") && not_run.contains("not executed"),
+        "{not_run}"
+    );
+
+    let ignored = text(element(
+        &page,
+        ">Ignored data in /src/app</caption>",
+        "</table>",
+    ));
+    assert!(ignored.contains("0 counted, may free more"), "{ignored}");
+    assert!(
+        ignored.contains("3.0 GiB allocated, may overstate"),
+        "{ignored}"
+    );
+}
+
 /// On a real pass under pressure, step 8 writes the page with the `disk_low` item the pass
 /// raised: the disk report from the item's evidence, with its final reading, its target, and
 /// the worktree observation read only in part (a directory git status cannot open) under

@@ -3,21 +3,27 @@
 //!
 //! [`run`] calls one function per step of section 10.3, in order. A step that fails is
 //! recorded in the pass's `errors` and the next one runs; only step 1, which takes
-//! `reconcile.lock`, ends the pass. The disk states are in `disk.rs`, `disk-reclaim`'s
-//! listing in `reclaim.rs`, the items raised from observation and disk states in [`raise`],
-//! and the arbiter's trigger and launcher in `arbiter.rs` (`docs/architecture.md` section
-//! 14.2). Everything a pass writes under the state dir is written under `reconcile.lock`.
+//! `reconcile.lock`, ends the pass. The recovery of executions that died and the trash
+//! listing are in `recovery.rs`, the disk states and the reserve file in `disk.rs`,
+//! `disk-reclaim`'s order, listing, and execution in `reclaim.rs`, the items raised from
+//! observation, disk states, and the trash in [`raise`], and the arbiter's trigger and launcher
+//! in `arbiter.rs` (`docs/architecture.md` section 14.2). Everything a pass writes under the
+//! state dir is written under `reconcile.lock`. Recovery and executions share one budget,
+//! `[reconcile] reclaim_budget_s` ([`Budget`]).
 
 mod arbiter;
 mod disk;
 pub mod raise;
 mod reclaim;
+#[cfg(unix)]
+mod recovery;
 
 pub use arbiter::run as run_arbiter;
 pub use disk::TIMER_INTERVAL_MS;
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -61,6 +67,9 @@ pub fn run(config: &Config, state: &StateDir, trigger: Trigger) -> Result<Reconc
 
     // 2.
     pass.step("tmp", remove_temp_files(state));
+    let mut budget = Budget::new(config);
+    #[cfg(unix)]
+    recover_and_list_trash(config, state, &mut budget, &mut pass);
     // 3.
     if let Some(changes) = pass.step("inbox", refresh_inbox(config, state)) {
         pass.add(changes);
@@ -70,6 +79,7 @@ pub fn run(config: &Config, state: &StateDir, trigger: Trigger) -> Result<Reconc
         .step("inbox_before", raise::snapshot(state))
         .unwrap_or_default();
     let mut watched = disk::read_watched(config, state, &mut pass.errors);
+    disk::write_reserve(config, state, &watched, &mut pass.errors);
     // 5.
     let observation = observe(config, state, &watched, &mut pass.errors);
     if let Some(observation) = &observation {
@@ -92,8 +102,9 @@ pub fn run(config: &Config, state: &StateDir, trigger: Trigger) -> Result<Reconc
     let reports = reclaim::reports(
         config,
         state,
-        &watched,
+        &mut watched,
         observation.as_ref(),
+        &mut budget,
         &mut pass.errors,
     );
     let disks: Vec<DiskState> = watched
@@ -101,10 +112,14 @@ pub fn run(config: &Config, state: &StateDir, trigger: Trigger) -> Result<Reconc
         .filter(|d| d.reading.is_some())
         .map(|d| d.state.clone())
         .collect();
+    let passed: Vec<_> = watched
+        .iter()
+        .map(|d| (d.state.volume.clone(), d.passed))
+        .collect();
 
     if let Some(changes) = pass.step(
         "disk_items",
-        raise::disk_items(config, state, &before, &disks, &reports),
+        raise::disk_items(config, state, &before, &disks, &reports, &passed),
     ) {
         pass.add(changes);
     }
@@ -153,6 +168,81 @@ impl Reconcile {
     fn add(&mut self, changes: InboxChanges) {
         self.inbox.raised.extend(changes.raised);
         self.inbox.cleared.extend(changes.cleared);
+    }
+}
+
+/// The time a pass may spend on recovery and executions, `[reconcile] reclaim_budget_s`
+/// (section 9.7, "Starters"): once it is spent, the pass starts neither, and the one under way
+/// finishes.
+pub struct Budget {
+    limit: Duration,
+    spent: Duration,
+}
+
+impl Budget {
+    fn new(config: &Config) -> Self {
+        Self {
+            limit: Duration::from_secs(config.host.reconcile.reclaim_budget_s),
+            spent: Duration::ZERO,
+        }
+    }
+
+    /// Whether the pass may start another recovery or execution.
+    #[must_use]
+    pub fn left(&self) -> bool {
+        self.spent < self.limit
+    }
+
+    /// Runs `work`, counting its time as spent.
+    pub fn spend<T>(&mut self, work: impl FnOnce() -> T) -> T {
+        self.spend_unless(work, |_| false)
+    }
+
+    /// Runs `work`, counting its time as spent unless `free` says what it did costs nothing.
+    pub fn spend_unless<T>(
+        &mut self,
+        work: impl FnOnce() -> T,
+        free: impl FnOnce(&T) -> bool,
+    ) -> T {
+        let start = Instant::now();
+        let done = work();
+        if !free(&done) {
+            self.spent = self.spent.saturating_add(start.elapsed());
+        }
+        done
+    }
+}
+
+/// Step 2, after the temp files: the executions that died, recovered within `budget`, then
+/// `<state>/trash/` listed, raising `reclaim_stranded` for an entry no execution names and
+/// ending each one whose trash entry is gone, from the items read after the recoveries.
+#[cfg(unix)]
+fn recover_and_list_trash(
+    config: &Config,
+    state: &StateDir,
+    budget: &mut Budget,
+    pass: &mut Reconcile,
+) {
+    pass.recovered = recovery::recover_executions(config, state, budget, &mut pass.errors);
+    let Some(before) = pass.step("trash", raise::snapshot(state)) else {
+        return;
+    };
+    let listed = recovery::list_trash(state, &mut pass.errors).map_err(|err| {
+        Error::new(
+            ErrorCode::StateUnavailable,
+            format!("{}: {err}", state.trash_dir().display()),
+        )
+    });
+    let Some(trash) = pass.step("trash", listed) else {
+        return;
+    };
+    if let Some(changes) = pass.step(
+        "trash",
+        raise::stranded_items(config, state, &before, &trash, &|plan| {
+            recovery::claim_unreadable(state, plan)
+        }),
+    ) {
+        pass.add(changes);
     }
 }
 
@@ -209,20 +299,38 @@ fn observe(
     let on_pressure = |worktree: &crate::contract::Worktree| {
         disk::key_of(Path::new(&worktree.path)).is_some_and(|key| pressured.contains(&key.as_str()))
     };
-    let built = plan::create_from(config, state, &inventory, &on_pressure, errors);
+    // A pass that executes on the state dir's volume writes its plans through the reserve's
+    // retry (section 9.7, "Space").
+    let state_key = disk::key_of(state.root());
+    let executing =
+        reclaim::executes(config) && state_key.is_some_and(|key| pressured.contains(&key.as_str()));
+    let reserve = state.reserve_file();
+    let built = plan::create_from(
+        config,
+        state,
+        &inventory,
+        &on_pressure,
+        executing.then_some(reserve.as_path()),
+        errors,
+    );
     let own_file_bytes = built
         .iter()
         .filter_map(|b| Some((b.plan.id.clone(), b.own_file_bytes?)))
         .collect();
     let plans: Vec<Plan> = built.into_iter().map(|b| b.plan).collect();
     fill_sizes(&mut inventory, &plans);
-    write_json(
-        state,
-        &state.reconcile_observation(),
-        &inventory,
-        "observe",
-        errors,
-    );
+    // Reclamation does not wait for this write: a test's fake fails it as `observation`
+    // (section 13.7), and the pass goes on from the observation in memory.
+    match testpoint::fake_write("observation") {
+        Ok(()) => write_json(
+            state,
+            &state.reconcile_observation(),
+            &inventory,
+            "observe",
+            errors,
+        ),
+        Err(err) => errors.push(scoped("observe", err.to_string())),
+    }
     Some(Observation {
         inventory,
         plans,

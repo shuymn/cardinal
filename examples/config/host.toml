@@ -29,3 +29,15 @@
 [records]
 # max_bytes = 8388608
 # keep = 4
+
+[disk]
+# reserve_mib = 64         # reserve file on the state dir's volume, spent when a write of an execution finds the volume full
+
+[reconcile]
+# reclaim_budget_s = 120   # a pass starts no recovery or execution after this
+
+[unit.disk-reclaim]
+# act = false              # true lets disk-reclaim execute under pressure, once [act] grants it
+
+[act]                      # executing plans; nothing executes by default
+# execute = { owner = ["reclaim_dir"], "unit:disk-reclaim" = ["reclaim_dir"] }  # plan kinds each caller executes

@@ -195,8 +195,8 @@ fn finish_earlier(r: &Run<'_>, lock: &ExecutionLock) -> Option<ActResult> {
 }
 
 /// The grant recovery checks before it finishes a committed execution: `[act] execute` lists
-/// the caller with `reclaim_dir`.
-fn grant(config: &Config, caller: &Caller) -> Result<(), String> {
+/// the caller with `reclaim_dir`. Recovery checks a unit's gate itself.
+pub fn grant(config: &Config, caller: &Caller) -> Result<(), String> {
     if config.host.grants(caller, PlanKind::ReclaimDir) {
         Ok(())
     } else {

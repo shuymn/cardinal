@@ -159,6 +159,16 @@ pub fn latest(state: &StateDir) -> Result<BTreeMap<String, InboxItem>, Error> {
         .collect())
 }
 
+/// [`latest`], read whole: an item file that is listed but cannot be read or parsed is an
+/// error, so a raiser that ends only what it read never takes a missing item for an absent
+/// one.
+pub fn latest_complete(state: &StateDir) -> Result<BTreeMap<String, InboxItem>, Error> {
+    Ok(latest_with_paths(read_all_strict(state)?)
+        .into_iter()
+        .map(|(condition, (_, item))| (condition, item))
+        .collect())
+}
+
 /// [`latest`] from items already read, each with its file.
 fn latest_with_paths(items: Vec<(PathBuf, InboxItem)>) -> BTreeMap<String, (PathBuf, InboxItem)> {
     let mut latest: BTreeMap<String, (PathBuf, InboxItem)> = BTreeMap::new();
@@ -195,6 +205,18 @@ pub enum Occurrence {
         before: Option<Box<InboxItem>>,
         ended_ms: u64,
         note: String,
+        /// The evidence the ended item keeps in place of its own, written with the end.
+        evidence: Option<serde_json::Map<String, serde_json::Value>>,
+    },
+    /// A condition found at `since_ms` whose clearing condition was observed at `ended_ms`
+    /// before the raiser could raise it: a new occurrence written once, already ended, applied
+    /// as a [`Occurrence::Raise`] and an [`Occurrence::End`]. While the condition has an
+    /// occurrence that has not ended, nothing is written.
+    RaiseEnded {
+        item: NewItem,
+        since_ms: u64,
+        ended_ms: u64,
+        note: String,
     },
 }
 
@@ -207,15 +229,16 @@ pub enum Applied {
     Ended(Option<(InboxItem, bool)>),
 }
 
-/// Applies `changes` in order under one hold of `inbox/.lock`, reading the store once. An item
-/// file that cannot be read or parsed fails the whole call with `state_unavailable`, since the
-/// occurrence it may hold could not be found.
+/// Applies `changes` in order under one hold of `inbox/.lock`, reading the store once, with
+/// what each did, two for an [`Occurrence::RaiseEnded`] that wrote its occurrence. An item file that cannot be read or
+/// parsed fails the whole call with `state_unavailable`, since the occurrence it may hold
+/// could not be found.
 pub fn apply(state: &StateDir, changes: &[Occurrence]) -> Result<Vec<Applied>, Error> {
     let _lock = lock(state)?;
     let mut latest = latest_with_paths(read_all_strict(state)?);
     let mut applied = Vec::with_capacity(changes.len());
     for change in changes {
-        applied.push(match change {
+        let one = match change {
             Occurrence::Raise { item, since_ms } => {
                 let (stored, raised) = raise_in(state, &mut latest, item, *since_ms, true)?;
                 Applied::Raised(stored, raised)
@@ -229,15 +252,39 @@ pub fn apply(state: &StateDir, changes: &[Occurrence]) -> Result<Vec<Applied>, E
                 before,
                 ended_ms,
                 note,
+                evidence,
             } => Applied::Ended(end_in(
                 state,
                 &mut latest,
                 key,
                 before.as_deref(),
-                *ended_ms,
-                note,
+                (*ended_ms, note),
+                evidence.as_ref(),
             )?),
-        });
+            Occurrence::RaiseEnded {
+                item,
+                since_ms,
+                ended_ms,
+                note,
+            } => {
+                if latest
+                    .get(&item.key)
+                    .is_some_and(|(_, current)| current.ended_ms.is_none())
+                {
+                    Applied::Ended(None)
+                } else {
+                    let (path, key) = new_occurrence(state, &latest, item, *since_ms)?;
+                    let now = state::now_ms();
+                    let raised = new_item(key, item, now);
+                    let (ended, resolves) = ended_item(&raised, *ended_ms, note, now);
+                    write_ended(state, &path, &ended)?;
+                    latest.insert(item.key.clone(), (path, ended.clone()));
+                    applied.push(Applied::Raised(raised, Raised::New));
+                    Applied::Ended(Some((ended, resolves)))
+                }
+            }
+        };
+        applied.push(one);
     }
     Ok(applied)
 }
@@ -305,6 +352,7 @@ pub fn end_occurrence(
         before: before.cloned().map(Box::new),
         ended_ms,
         note: note.to_owned(),
+        evidence: None,
     };
     match apply(state, &[change])?.pop() {
         Some(Applied::Ended(ended)) => Ok(ended.map(|(item, _)| item)),
@@ -322,41 +370,54 @@ fn raise_in(
     update: bool,
 ) -> Result<(InboxItem, Raised), Error> {
     let now = state::now_ms();
-    let mut since = since_ms;
-    if let Some((path, current)) = latest.get_mut(&item.key) {
-        if current.ended_ms.is_none() {
-            let mut updated = current.clone();
-            if !update || !update_pending(&mut updated, item, now) {
-                return Ok((updated, Raised::Unchanged));
-            }
-            write(state, path, &updated)?;
-            *current = updated.clone();
-            return Ok((updated, Raised::Updated));
+    if let Some((path, current)) = latest.get_mut(&item.key)
+        && current.ended_ms.is_none()
+    {
+        let mut updated = current.clone();
+        if !update || !update_pending(&mut updated, item, now) {
+            return Ok((updated, Raised::Unchanged));
         }
-        // A new occurrence comes after the one that ended, so the keys stay apart.
-        since = since.max(found_ms(current) + 1);
+        write(state, path, &updated)?;
+        *current = updated.clone();
+        return Ok((updated, Raised::Updated));
     }
-    let (path, key) = loop {
-        let key = format!("{}@{since}", item.key);
-        match find(state, &key)? {
-            (path, None) => break (path, key),
-            (_, Some(_)) => since += 1,
-        }
-    };
+    let (path, key) = new_occurrence(state, latest, item, since_ms)?;
     let stored = new_item(key, item, now);
     write(state, &path, &stored)?;
     latest.insert(item.key.clone(), (path, stored.clone()));
     Ok((stored, Raised::New))
 }
 
-/// One end inside [`apply`]; `latest` is kept current.
+/// The file and key of a new occurrence of `item.key` found at `since_ms`: after the latest
+/// one, which has ended, so the keys stay apart, and at a key no file holds.
+fn new_occurrence(
+    state: &StateDir,
+    latest: &BTreeMap<String, (PathBuf, InboxItem)>,
+    item: &NewItem,
+    since_ms: u64,
+) -> Result<(PathBuf, String), Error> {
+    let mut since = since_ms;
+    if let Some((_, current)) = latest.get(&item.key) {
+        since = since.max(found_ms(current) + 1);
+    }
+    loop {
+        let key = format!("{}@{since}", item.key);
+        match find(state, &key)? {
+            (path, None) => return Ok((path, key)),
+            (_, Some(_)) => since += 1,
+        }
+    }
+}
+
+/// One end inside [`apply`], with `evidence` in place of the item's when given; `latest` is
+/// kept current.
 fn end_in(
     state: &StateDir,
     latest: &mut BTreeMap<String, (PathBuf, InboxItem)>,
     key: &str,
     before: Option<&InboxItem>,
-    ended_ms: u64,
-    note: &str,
+    (ended_ms, note): (u64, &str),
+    evidence: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> Result<Option<(InboxItem, bool)>, Error> {
     let Some((path, current)) = latest.get_mut(key) else {
         return Ok(None);
@@ -365,7 +426,18 @@ fn end_in(
     if current.ended_ms.is_some() || before != Some(&*current) {
         return Ok(None);
     }
-    let now = state::now_ms();
+    let (mut ended, resolves) = ended_item(current, ended_ms, note, state::now_ms());
+    if let Some(evidence) = evidence {
+        ended.evidence.clone_from(evidence);
+    }
+    write_ended(state, path, &ended)?;
+    *current = ended.clone();
+    Ok(Some((ended, resolves)))
+}
+
+/// `current` ended at `ended_ms`, and resolved by cardinal with `note` when it was open or
+/// escalated, with whether it was.
+fn ended_item(current: &InboxItem, ended_ms: u64, note: &str, now: u64) -> (InboxItem, bool) {
     let mut ended = current.clone();
     ended.ended_ms = Some(ended_ms);
     let resolves = matches!(ended.status, InboxStatus::Open | InboxStatus::Escalated);
@@ -379,9 +451,7 @@ fn end_in(
         });
     }
     ended.updated_ms = now;
-    write(state, path, &ended)?;
-    *current = ended.clone();
-    Ok(Some((ended, resolves)))
+    (ended, resolves)
 }
 
 /// `--status`: one status, or `all`.
@@ -535,6 +605,7 @@ pub fn refresh_with(
                 key,
                 ended_ms: found_ms,
                 note: "none of the session's processes is alive".to_owned(),
+                evidence: None,
             });
             continue;
         }
@@ -616,6 +687,7 @@ fn ended_gone(
                 before: Some(Box::new(item.clone())),
                 ended_ms,
                 note: note.to_owned(),
+                evidence: None,
             })
         })
         .collect()
@@ -770,6 +842,13 @@ fn read_strictly(state: &StateDir, key: &str) -> Result<(PathBuf, InboxItem), Er
         ErrorCode::NotFound,
         format!("no inbox item `{key}`"),
     ))
+}
+
+/// [`write`] of an item that has ended, which a test can make fail for lack of space
+/// ([`testpoint::fake_write`], kind `inbox-end`).
+fn write_ended(state: &StateDir, path: &Path, item: &InboxItem) -> Result<(), Error> {
+    testpoint::fake_write("inbox-end").map_err(|err| state_error(path, &err))?;
+    write(state, path, item)
 }
 
 fn write(state: &StateDir, path: &Path, item: &InboxItem) -> Result<(), Error> {

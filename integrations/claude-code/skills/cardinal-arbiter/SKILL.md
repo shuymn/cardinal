@@ -7,7 +7,7 @@ description: Arbitrate cardinal's inbox and reclaim plans through the cardinal C
 
 You decide what cardinal's code could not: inbox items and reclaim plans. You work only through the `cardinal` commands below. cardinal re-checks every operation itself; your job is to pick the safe ones, record your decisions, and hand the rest to the owner with what they must decide.
 
-In phase 1, `act` only reports: it evaluates a plan and returns `dry_run` when it would reclaim the target, or a refusal with the reasons it would not. Nothing you run deletes anything, so your report lists what would be reclaimed and never says you reclaimed or freed anything.
+`act` run as the arbiter only reports: it evaluates a plan and returns `dry_run` when it would reclaim the target, or a refusal with the reasons it would not. Nothing you run deletes anything, so your report lists what would be reclaimed and never says you reclaimed or freed anything. Where the owner granted it, cardinal's own `disk-reclaim` deletes regenerable data under disk pressure; that is not yours, and you report it only from a disk item's evidence.
 
 ## Ground rules
 
@@ -81,10 +81,10 @@ A note is one line: the decision, the IDs (job, session, plan, PIDs), and for an
 | `unclassifiable_data` | Escalate with its paths and the question whether each is `regenerable` or `protected` in the repository's profile |
 | `recovery_needed` | With `verified: true`, leave it open with the job ID as the note: cardinal never signals the group, releases the reservation once its members have exited, and resolves the item itself, and a later pass reads it again. With `verified: false`, escalate with the job ID and each member's PID and name |
 | `outlived_processes` | Escalate: the owner decides whether the processes may keep running. Note the session ID and each process's PID, name, and command |
-| `disk_low` | The owner's, never assigned to a pass. On the owner's request, report the volume's disk report from the item's evidence (the reading, the lines, the targets, the shortfall, and the blocked entries), never the inventory's `disk`; leave the item as it is |
+| `disk_low` | The owner's, never assigned to a pass. On the owner's request, report the volume's disk report from the item's evidence (the reading, the lines, the targets in order, each with its `exclusive_bytes` by its `exclusive_measure` (Bytes) and, where `disk-reclaim` executed it, its `status` and `freed_bytes`, the shortfall, and the blocked entries), never the inventory's `disk`; leave the item as it is |
 | `disk_critical` | As `disk_low` |
 | `arbiter_failing` | The owner's, never assigned to a pass. On the owner's request, report the failed passes and their logs from its evidence; leave the item as it is |
-| `reclaim_stranded` | The owner's, never assigned to a pass. On the owner's request, report the trash entry, the target's original path, and what is left; leave the item as it is |
+| `reclaim_stranded` | The owner's, never assigned to a pass. On the owner's request, report the trash entry, the target's original path (`target`, null for a trash entry no execution names), what is left (`entries_left`, `bytes_left`), and `reason`; leave the item as it is |
 
 Resolve an item whose evidence shows nothing left to decide (the reservation or the processes are gone), noting what you saw. Escalate an item you cannot decide from its evidence, with what is unknown.
 
@@ -101,7 +101,7 @@ Resolve an item whose evidence shows nothing left to decide (the reservation or 
 
 | `status` | Report |
 | --- | --- |
-| `dry_run` | Under Reclaimable: plan ID, target, `freed_bytes` as the bytes reclaiming it would free, and `reasons`, which say why it did not execute (`execution_not_designed` in phase 1). Nothing was deleted |
+| `dry_run` | Under Reclaimable: plan ID, target, `freed_bytes` as the bytes reclaiming it would free (Bytes), and `reasons`, which say why it did not execute: `execution_not_granted` for regenerable data, since the arbiter holds no grant, and `execution_not_designed` for a whole worktree and on Windows. Nothing was deleted |
 | `rejected` | Under Refused: plan ID, target, and every entry of `reasons` |
 | `expired` | Under Refused: plan ID, target, and `reasons`; the target changed after planning, and the next pass plans it afresh |
 | `already_executed` | Under Refused: plan ID, target, and `reasons`; the plan ran before, and a new plan shows what is left |
@@ -110,11 +110,20 @@ Resolve an item whose evidence shows nothing left to decide (the reservation or 
 
 Report any other `status` under Errors with the plan ID. Whatever the `status`, a non-null `error` goes under Errors with the plan ID and target.
 
+## Bytes
+
+Report bytes as cardinal's page shows them, by the measure they were read with:
+
+- A plan's or a disk report target's `exclusive_bytes`, and a `dry_run`'s `freed_bytes`, under the measure `private_size`, `extents`, or `links`: at least that many bytes; a 0 as "0 counted, may free more".
+- Under `read_failed`, `sharing_unread`, or `not_measured`, or a null: unknown, naming the measure.
+- A disk report target without `exclusive_measure`, or a result from an `act` before cardinal executed anything: allocated bytes that may overstate.
+- An executed target's `freed_bytes` (a disk report's, or an `executed` or `partial` result's): expected, not verified; only the volume's readings show what was recovered.
+
 ## Report
 
 End with these sections, each a list (write "none" when empty):
 
-1. **Reclaimable**: plans whose `act` reported `dry_run`, with the bytes each would free. Nothing was deleted.
+1. **Reclaimable**: plans whose `act` reported `dry_run`, with the bytes each would free (Bytes). Nothing was deleted.
 2. **Refused**: refused `act` results, and plans with `invariants_ok: false`.
 3. **Owner decisions**: escalated items, plans needing approval, and `act` results that finished an execution that had died, each with its inbox key, job ID, or plan ID and the question to answer.
 4. **Inbox**: every item and the decision you applied, with why each item left open stays open.
