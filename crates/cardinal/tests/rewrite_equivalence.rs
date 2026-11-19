@@ -19,8 +19,8 @@ use hook_support::{
     PROFILE, configure, executable, host, input, probe, real_runner, rewritten, run_hook,
     runner_path, started_jobs,
 };
-use proptest::prelude::{Just, Strategy, prop, prop_assert_eq, prop_oneof, proptest};
-use proptest::test_runner::Config as ProptestConfig;
+use proptest::prelude::{Just, Strategy, prop, prop_assert_eq, prop_oneof};
+use proptest::test_runner::{Config as ProptestConfig, TestRunner, contextualize_config};
 use support::cardinal::Dirs;
 
 /// Printed by the outer shell after the command: its status, its cwd (what Claude Code
@@ -145,13 +145,18 @@ impl Bench {
             .map_or_else(|| command.to_owned(), |doc| rewritten(&doc).to_owned())
     }
 
-    /// Runs `setup` and `command` in `shell` in a fresh work dir with `dirs`' state and config
-    /// dir exported; returns what it printed and how many jobs the runner started.
-    fn run(&self, shell: &Shell, dirs: &Dirs, setup: &str, command: &str) -> (Outcome, usize) {
+    /// Removes everything a run changed, the work dir included.
+    fn clear(&self) {
         let play = self.play();
         if play.exists() {
             std::fs::remove_dir_all(&play).unwrap();
         }
+    }
+
+    /// Runs `setup` and `command` in `shell` in a fresh work dir with `dirs`' state and config
+    /// dir exported; returns what it printed and how many jobs the runner started.
+    fn run(&self, shell: &Shell, dirs: &Dirs, setup: &str, command: &str) -> (Outcome, usize) {
+        self.clear();
         let work = self.work();
         std::fs::create_dir_all(work.join("sub")).unwrap();
         for (name, contents) in [
@@ -896,16 +901,30 @@ fn setup() -> impl Strategy<Value = &'static str> {
     ]
 }
 
-proptest! {
-    #![proptest_config(ProptestConfig { cases: 48, failure_persistence: None, ..ProptestConfig::default() })]
-
-    /// Random lists of pipelines of classified and unclassified stages keep their meaning in
-    /// every shell.
-    #[test]
-    fn generated_commands_keep_their_meaning(
-        setup in setup(),
-        parts in prop::collection::vec((pipeline(), separator()), 1..5),
-    ) {
+/// Random lists of pipelines of classified and unclassified stages keep their meaning in
+/// every shell. One bench serves every case, as it serves the fixed cases, because the tools in
+/// `bin/` are new files, which macOS checks at their first start for seconds on a loaded host;
+/// each case starts without a work dir, as on a fresh bench, and each run in a fresh one. The
+/// configuration is the `proptest!` macro's: the environment's overrides and the test's name.
+#[test]
+fn generated_commands_keep_their_meaning() {
+    let bench = Bench::new();
+    let mut config = contextualize_config(ProptestConfig {
+        cases: 48,
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    });
+    config.test_name = Some(concat!(
+        module_path!(),
+        "::",
+        "generated_commands_keep_their_meaning"
+    ));
+    let mut runner = TestRunner::new(config);
+    let inputs = (
+        setup(),
+        prop::collection::vec((pipeline(), separator()), 1..5),
+    );
+    let result = runner.run(&inputs, |(setup, parts)| {
         let mut command = String::new();
         for (i, (pipeline, sep)) in parts.iter().enumerate() {
             command.push_str(pipeline);
@@ -913,13 +932,29 @@ proptest! {
                 command.push_str(sep);
             }
         }
-        let bench = Bench::new();
+        bench.clear();
         let rewritten = bench.rewrite(&bench.present, &command);
-        for shell in bench.shells.iter().filter(|s| s.pipefail || !setup.contains("pipefail")) {
+        for shell in bench
+            .shells
+            .iter()
+            .filter(|s| s.pipefail || !setup.contains("pipefail"))
+        {
             let (original, _) = bench.run(shell, &bench.present, setup, &command);
             let (outcome, _) = bench.run(shell, &bench.present, setup, &rewritten);
-            prop_assert_eq!(outcome, original, "{} in {}:\n{}\n{}", command, shell.name, rewritten, setup);
+            prop_assert_eq!(
+                outcome,
+                original,
+                "{} in {}:\n{}\n{}",
+                command,
+                shell.name,
+                rewritten,
+                setup
+            );
         }
+        Ok(())
+    });
+    if let Err(err) = result {
+        panic!("{err}");
     }
 }
 
