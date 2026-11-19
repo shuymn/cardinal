@@ -357,6 +357,11 @@ impl Fixture {
         );
     }
 
+    /// `git pack-refs --all`: moves every ref into `packed-refs` and removes its loose file.
+    pub fn pack_refs(&self, repo: &Path) {
+        self.git(repo, &["pack-refs", "--all"]);
+    }
+
     /// `git symbolic-ref name target`: points the ref `name` at the ref `target`.
     pub fn symbolic_ref(&self, repo: &Path, name: &str, target: &str) {
         self.git(

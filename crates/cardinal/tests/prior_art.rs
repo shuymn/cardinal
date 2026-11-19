@@ -1,8 +1,8 @@
-//! `docs/prior-art.md` records, per module and per piece of the test harness, the prior art
-//! compared, the decision, and the checks borrowed. This test keeps it complete: every module
-//! that `tests/layering.rs` knows has a row, every row names a module or a harness path that
-//! exists, every script in `scripts/` and every crate but `cardinal` is named by a harness row,
-//! and every row has a kind, a decision with its reason, and borrowed checks: the existing test
+//! `docs/prior-art.md` records, per module, per piece of the test harness, and per build
+//! script, the prior art compared, the decision, and the checks borrowed. This test keeps it
+//! complete: every module that `tests/layering.rs` knows has a row, every row names a module
+//! or a path that exists, every script in `scripts/` and every crate but `cardinal` is named
+//! by a harness row, every crate's `build.rs` by a build row, and every row has a kind, a decision with its reason, and borrowed checks: the existing test
 //! file or suite directory that reuses another project's checks, or an exception (`none found:`
 //! or `not ported:`) with at least one link upstream and a reason. Every repository path a
 //! borrowed-checks cell names outside a link exists.
@@ -26,6 +26,7 @@ const LAYERING: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/
 
 const MODULES: &str = "Modules";
 const HARNESS: &str = "Test harness";
+const BUILD: &str = "Build";
 const COLUMNS: [&str; 5] = [
     "Kind",
     "Mechanisms",
@@ -330,12 +331,46 @@ fn harness_paths(root: &Path) -> BTreeSet<String> {
         .collect()
 }
 
-/// Every problem with `doc` against the modules `modules`, the repository at `root`, and the
-/// harness pieces `harness`.
+/// The build scripts a build row must name: the `build.rs` of every crate that has one.
+fn build_scripts(root: &Path) -> BTreeSet<String> {
+    std::fs::read_dir(root.join("crates"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .map(|name| format!("crates/{name}/build.rs"))
+        .filter(|path| root.join(path).is_file())
+        .collect()
+}
+
+/// The paths the rows of a table of pieces name in their first cells, each checked to exist,
+/// after checking every row's cells.
+fn pieces(rows: &[Row], root: &Path, problems: &mut Vec<String>) -> BTreeSet<String> {
+    let mut pieces = BTreeSet::new();
+    for row in rows {
+        let paths = row.cells.first().map_or_default(|c| c.codes.clone());
+        if paths.is_empty() {
+            problems.push(format!("line {}: no path in a code span", row.line));
+        }
+        for path in paths {
+            if !root.join(&path).exists() {
+                problems.push(format!(
+                    "line {}: `{path}` does not exist in the repository",
+                    row.line
+                ));
+            }
+            pieces.insert(path);
+        }
+        check_cells(row, root, problems);
+    }
+    pieces
+}
+
+/// Every problem with `doc` against the modules `modules`, the repository at `root`, the
+/// harness pieces `harness`, and the build scripts `builds`.
 fn problems(
     doc: &str,
     modules: &BTreeSet<String>,
     harness: &BTreeSet<String>,
+    builds: &BTreeSet<String>,
     root: &Path,
 ) -> Vec<String> {
     let tables = tables(doc);
@@ -358,25 +393,15 @@ fn problems(
     for module in modules.difference(&named) {
         problems.push(format!("no row for module `{module}`"));
     }
-    let mut pieces = BTreeSet::new();
-    for row in table(&tables, HARNESS, "Piece", &mut problems) {
-        let paths = row.cells.first().map_or_default(|c| c.codes.clone());
-        if paths.is_empty() {
-            problems.push(format!("line {}: no harness path in a code span", row.line));
-        }
-        for path in paths {
-            if !root.join(&path).exists() {
-                problems.push(format!(
-                    "line {}: `{path}` does not exist in the repository",
-                    row.line
-                ));
-            }
-            pieces.insert(path);
-        }
-        check_cells(row, root, &mut problems);
-    }
-    for piece in harness.difference(&pieces) {
+    let rows = table(&tables, HARNESS, "Piece", &mut problems);
+    let named = pieces(rows, root, &mut problems);
+    for piece in harness.difference(&named) {
         problems.push(format!("no harness row names `{piece}`"));
+    }
+    let rows = table(&tables, BUILD, "Piece", &mut problems);
+    let named = pieces(rows, root, &mut problems);
+    for script in builds.difference(&named) {
+        problems.push(format!("no build row names `{script}`"));
     }
     problems
 }
@@ -387,6 +412,7 @@ fn real_problems(doc: &str) -> Vec<String> {
         doc,
         &layering_modules(LAYERING),
         &harness_paths(&root),
+        &build_scripts(&root),
         &root,
     )
 }
@@ -471,6 +497,14 @@ fn a_harness_row_for_a_path_that_does_not_exist_fails() {
     assert_problem(
         &edited(HARNESS, "scripts/repo-guard", Some((0, "`scripts/guard`"))),
         "`scripts/guard` does not exist",
+    );
+}
+
+#[test]
+fn a_build_script_without_a_row_fails() {
+    assert_eq!(
+        real_problems(&edited(BUILD, "crates/cardinal/build.rs", None)),
+        ["no build row names `crates/cardinal/build.rs`"]
     );
 }
 
