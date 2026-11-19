@@ -608,6 +608,53 @@ fn the_report_never_claims_a_reclamation() {
     }
 }
 
+/// Section 10.6: the skill reports bytes as the page shows them, naming every measure: under a
+/// measure that reads, at least that many, and a 0 as "0 counted, may free more"; under one
+/// that does not, unknown; without a measure, allocated bytes that may overstate; and an
+/// executed target's freed bytes as expected, not verified.
+#[test]
+fn bytes_are_reported_by_measure() {
+    use cardinal::contract::ExclusiveMeasure;
+    let bytes = section(SKILL, "Bytes");
+    let rule = |words: &[&str]| {
+        bytes
+            .lines()
+            .find(|line| words.iter().all(|w| line.contains(w)))
+            .unwrap_or_else(|| panic!("no rule names {words:?}: {bytes}"))
+    };
+    let reading = [
+        ExclusiveMeasure::PrivateSize,
+        ExclusiveMeasure::Extents,
+        ExclusiveMeasure::Links,
+    ];
+    let unread = [
+        ExclusiveMeasure::ReadFailed,
+        ExclusiveMeasure::SharingUnread,
+        ExclusiveMeasure::NotMeasured,
+    ];
+    for measure in reading {
+        let line = rule(&[&format!("`{}`", name(measure))]);
+        assert!(line.contains("at least"), "{line}");
+        assert!(line.contains("0 counted, may free more"), "{line}");
+    }
+    for measure in unread {
+        let line = rule(&[&format!("`{}`", name(measure))]);
+        assert!(line.contains("unknown"), "{line}");
+    }
+    assert!(rule(&["without `exclusive_measure`"]).contains("may overstate"));
+    assert!(rule(&["executed target"]).contains("expected, not verified"));
+    for (section_name, row) in [
+        ("Act results", "| `dry_run` |"),
+        ("Inbox items", "| `disk_low` |"),
+    ] {
+        let line = section(SKILL, section_name)
+            .lines()
+            .find(|l| l.starts_with(row))
+            .unwrap_or_else(|| panic!("no {row} row"));
+        assert!(line.contains("(Bytes)"), "{line}");
+    }
+}
+
 #[test]
 fn extraction_finds_fenced_and_inline_commands() {
     let text = "Run `cardinal inbox` first.\n\n```sh\ncardinal act PLAN --caller arbiter\n```\n\n`cardinal.error.v1` is not a command.\n";
