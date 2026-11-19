@@ -476,22 +476,30 @@ fn a_failed_git_step_fails_observed() {
             "*\" symbolic-ref \"*) echo 'not a ref'; exit 0;;",
         ),
     ];
-    for (name, arm) in cases {
-        let mut scene = Scene::new();
-        let wt = scene.worktree("feat", "feat");
+    // One wrapper and one fake gh for every case, so no case starts a new executable (macOS
+    // checks one at its first start, for seconds on a loaded host): the wrapper reads the
+    // case's arm from a file it sources. Each case observes a repository of its own, so no
+    // case sees what an earlier case's observation of the same repository could leave behind.
+    let mut scene = Scene::new();
+    let arm_file = scene.fx.path("git-arm");
+    std::fs::write(&arm_file, "").unwrap();
+    let wrapper = scene.fx.path("git-wrapper");
+    scene.fx.scope().started_script(
+        &wrapper,
+        &format!(
+            ". '{}'\nexec '{}' \"$@\"\n",
+            arm_file.display(),
+            real_git.display()
+        ),
+    );
+    scene.observe_config(&format!("git = '{}'", wrapper.display()));
+    for (i, (name, arm)) in cases.into_iter().enumerate() {
+        scene.observe_new_repo(&format!("repo-{i}"));
+        let wt = scene.worktree(&format!("feat-{i}"), "feat");
         let head = scene.commit(&wt, "feature.txt");
         scene.push(&wt, "feat");
         scene.set_merged(&head, &merged_json(42, &head));
-        let wrapper = scene.fx.path("git-wrapper");
-        scene.fx.scope().started_script(
-            &wrapper,
-            &format!(
-                "case \" $* \" in {arm} esac\nexec '{}' \"$@\"\n",
-                real_git.display()
-            ),
-        );
-        scene.observe_config(&format!("git = '{}'", wrapper.display()));
-
+        std::fs::write(&arm_file, format!("case \" $* \" in {arm} esac\n")).unwrap();
         let inv = scene.inventory();
         let w = worktree(&inv, &wt);
         assert_eq!(w.facts.merge_evidence, MergeEvidence::MergedPr, "{name}");

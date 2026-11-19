@@ -45,18 +45,15 @@ impl Scene {
     /// `origin/main` (also `origin/HEAD`) at that commit as `main`'s upstream.
     pub fn new() -> Self {
         let fx = Fixture::new();
-        let repo = fx.init("repo");
-        fx.commit_file(&repo, "README.md", "hello\n", "initial");
-        fx.remote_add_url(&repo, "origin", &format!("https://github.com/{GITHUB}.git"));
         let gh_dir = fx.path("gh");
         let config_dir = fx.path("config");
         let state_dir = fx.path("state");
         std::fs::create_dir_all(&gh_dir).unwrap();
         std::fs::write(fx.path("observe.gitconfig"), "").unwrap();
         std::fs::create_dir_all(config_dir.join("repos")).unwrap();
-        let scene = Self {
+        let mut scene = Self {
             fx,
-            repo,
+            repo: PathBuf::new(),
             gh_dir,
             config_dir,
             state_dir,
@@ -64,17 +61,29 @@ impl Scene {
             gh_timeout_ms: 15_000,
             git_timeout_ms: 15_000,
         };
-        scene.push(&scene.repo, "main");
-        scene.fx.symbolic_ref(
-            &scene.repo,
-            "refs/remotes/origin/HEAD",
-            "refs/remotes/origin/main",
-        );
+        scene.observe_new_repo("repo");
         scene.write_gh();
         scene.set_open("[]");
         scene.set_merged_default("[]");
         scene.set_closed("[]");
         scene
+    }
+
+    /// Makes `name` the scene's repository, set up as [`Scene::new`] describes: for a test
+    /// that needs fresh repository state while it keeps the scene's fake gh and configuration.
+    pub fn observe_new_repo(&mut self, name: &str) {
+        let repo = self.fx.init(name);
+        self.fx
+            .commit_file(&repo, "README.md", "hello\n", "initial");
+        self.fx
+            .remote_add_url(&repo, "origin", &format!("https://github.com/{GITHUB}.git"));
+        self.push(&repo, "main");
+        self.fx.symbolic_ref(
+            &repo,
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        );
+        self.repo = repo;
     }
 
     /// The HEAD object ID of `dir`.

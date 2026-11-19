@@ -128,17 +128,32 @@ fn system() -> Result<System, OsError> {
 }
 
 impl ProcessTable {
-    /// Reads every process.
+    /// Reads every process. A table that does not list this process is an error: the
+    /// enumeration failed (`proc_listallpids` returns 0 when it fails) or was cut short, and
+    /// read as complete it would answer "no such process" for live ones.
     pub fn snapshot(detail: Detail) -> Result<Self, OsError> {
         let mut system = system()?;
         system.refresh_processes_specifics(ProcessesToUpdate::All, true, refresh_kind(detail));
-        let processes = system
-            .processes()
-            .iter()
-            .filter_map(|(pid, process)| convert(*pid, process))
-            .map(|info| (info.pid, info))
-            .collect();
-        Ok(Self { processes })
+        Self::listing_this_process(
+            system
+                .processes()
+                .iter()
+                .filter_map(|(pid, process)| convert(*pid, process)),
+        )
+    }
+
+    /// The table of `processes`, or an error when it does not list this process.
+    fn listing_this_process(
+        processes: impl IntoIterator<Item = ProcessInfo>,
+    ) -> Result<Self, OsError> {
+        let table = Self::from_processes(processes);
+        if table.get(current_pid()).is_none() {
+            return Err(OsError(format!(
+                "the table of {} processes does not list this process",
+                table.processes.len()
+            )));
+        }
+        Ok(table)
     }
 
     /// A table built from given processes, for tests of code that reads the table.
@@ -374,6 +389,21 @@ mod tests {
         );
         assert!(!table.is_alive(13, 113), "zombies are not alive");
         assert!(!table.is_alive(99, 199));
+    }
+
+    /// An enumeration that failed or was cut short is an error, never a table without those
+    /// processes.
+    #[test]
+    fn a_table_without_this_process_is_an_error() {
+        let me = super::current_pid();
+        let empty = ProcessTable::listing_this_process([]);
+        assert!(empty.is_err(), "{empty:?}");
+        let without_me = ProcessTable::listing_this_process([proc(me + 1, None)]);
+        assert!(without_me.is_err(), "{without_me:?}");
+        let with_me = ProcessTable::listing_this_process([proc(me, None)]).unwrap();
+        assert!(with_me.get(me).is_some());
+        let snapshot = ProcessTable::snapshot(super::Detail::default()).unwrap();
+        assert!(snapshot.get(me).is_some());
     }
 
     #[test]

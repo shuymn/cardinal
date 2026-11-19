@@ -771,22 +771,24 @@ impl Runner {
     /// `kill` still reports while the process table lists no live member is asked about again
     /// for up to [`os::unix::EMPTYING`] ([`os::unix::group_emptied`]): macOS can report the
     /// group of a child the runner has just reaped. Once the SIGKILL after the parent's exit is
-    /// due, it is asked once, so the SIGKILL keeps its time. When the runner cannot move, it
-    /// reads the process table instead. A group that cannot be read counts as not empty.
+    /// due, it is asked once, so the SIGKILL keeps its time. When the runner cannot move (the
+    /// caller's group is gone), `kill` would count the runner itself, and the process table can
+    /// miss a live member, so the group counts as not empty: the recovery pass releases the
+    /// reservation once `kill` reports the group gone. A group that cannot be read counts as
+    /// not empty.
     #[cfg(unix)]
     fn group_is_empty(&self, job: &Job) -> bool {
         let GroupIdentity::Pgid { pgid, .. } = job.reservation().group;
-        if self.executor.restore_group() {
-            let now = Instant::now();
-            let until = if self.watch.group_kill_due() {
-                now
-            } else {
-                now + os::unix::EMPTYING
-            };
-            os::unix::group_emptied(pgid, until)
-        } else {
-            os::unix::other_group_members(pgid).is_ok_and(|members| members.is_empty())
+        if !self.executor.restore_group() {
+            return false;
         }
+        let now = Instant::now();
+        let until = if self.watch.group_kill_due() {
+            now
+        } else {
+            now + os::unix::EMPTYING
+        };
+        os::unix::group_emptied(pgid, until)
     }
 
     #[cfg(not(unix))]

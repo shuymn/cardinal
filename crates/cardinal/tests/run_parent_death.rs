@@ -19,7 +19,7 @@ use cardinal::admission::{list_reservations, recovery_pass};
 use cardinal::config::HostConfig;
 use cardinal::contract::{DerivedState, RecordKind};
 use cardinal::os::unix::{SIGCONT, SIGHUP, SIGSTOP, SIGTERM, signal_process};
-use cardinal::testpoint::{ADMISSION_WAITING, RUN_AFTER_SPAWN, RUN_BEFORE_STARTING};
+use cardinal::testpoint::{ADMISSION_WAITING, RUN_AFTER_SPAWN, RUN_BEFORE_STARTING, RUN_FINISHED};
 use cardinal_test_support::Child;
 use cardinal_test_support::process::{
     GroupGuard, PidGuard, deliverable, is_stopped, wait_for, wait_for_file,
@@ -101,8 +101,9 @@ fn parent_exit_after_the_spawn_stops_the_group() {
     deliverable(&[SIGTERM]);
     let env = Env::with_budget(1);
     let grandchild_file = env.file("grandchild");
+    // The grandchild writes its PID once it ignores SIGTERM, so the test signals no sooner.
     let script = format!(
-        "(trap '' TERM; exec sleep 30) & echo $! > '{}'; wait",
+        "sh -c 'trap \"\" TERM; echo $$ > \"$0\"; exec sleep 30' '{}' & wait",
         grandchild_file.display()
     );
     let runner = env.run_at(None, &["sh", "-c", &script], &[RUN_AFTER_SPAWN], None);
@@ -283,6 +284,60 @@ fn parent_exit_after_the_child_exited_stops_its_descendants() {
     assert_eq!(finished[0].data["exit"], 0);
 }
 
+/// The parent exits and is reaped, so the caller's group is gone and the runner cannot move
+/// back into it: `kill(-pgid, 0)` would count the runner itself, and the process table can miss
+/// a live member, so the runner leaves the reservation even though its stage left nothing, and
+/// the recovery pass releases it once `kill` reports the group gone (section 5.5).
+#[test]
+fn a_runner_that_cannot_rejoin_leaves_the_release_to_recovery() {
+    use cardinal::os::unix::{group_exists, pgid_of};
+
+    deliverable(&[SIGTERM]);
+    let env = Env::with_budget(1);
+    let runner = env.run_at(
+        None,
+        &["sh", "-c", "exit 0"],
+        &[RUN_AFTER_SPAWN, RUN_FINISHED],
+        None,
+    );
+    let mut parent = env.in_shell(&runner, "; exit $?").spawn().unwrap();
+    let runner_pid = env.wait_any_reached(RUN_AFTER_SPAWN);
+    let _group = GroupGuard::new(env.scope(), runner_pid);
+    let runner_start = cardinal::os::start_time_s(runner_pid).unwrap();
+    let child = env.reservations()[0].child.unwrap();
+    wait_gone(child.pid, child.start_s);
+
+    // The parent leads the caller's group, which the runner left for its own.
+    let parent_pid = parent.id();
+    assert_eq!(pgid_of(runner_pid), Some(runner_pid));
+    parent.kill_leader();
+    parent.wait().unwrap();
+    assert!(!group_exists(parent_pid), "the caller's group is gone");
+    wait_orphaned(runner_pid, parent_pid);
+    env.points.release(RUN_AFTER_SPAWN);
+
+    env.points.wait_reached(RUN_FINISHED, runner_pid, WAIT);
+    assert_eq!(
+        pgid_of(runner_pid),
+        Some(runner_pid),
+        "the runner could not move back"
+    );
+    assert_eq!(env.reservations().len(), 1, "left for recovery");
+    env.points.release(RUN_FINISHED);
+    wait_gone(runner_pid, runner_start);
+    assert_eq!(env.reservations().len(), 1, "left for recovery");
+    assert!(env.worktree_lock_freed());
+    let finished = env.records_of(RecordKind::JobFinished);
+    assert_eq!(finished[0].data["exit"], 0);
+
+    wait_for("the group to empty", WAIT, || {
+        (!group_exists(runner_pid)).then_some(())
+    });
+    let report = recovery_pass(&env.state(), &HostConfig::defaults()).unwrap();
+    assert_eq!(report.released, [finished[0].job_id.clone().unwrap()]);
+    assert_eq!(env.reservations(), []);
+}
+
 /// On the fail-open and TTY paths a stage that stops stops the runner too (job control). When
 /// the parent exits while both are stopped in a group that another member keeps from becoming
 /// orphaned, nothing continues them, and cardinal never signals the caller's group: an
@@ -380,7 +435,34 @@ impl StoppedJob {
         );
         let fail = (path == "fail_open").then_some(RUN_BEFORE_STARTING);
         let runner = env.run_at(None, &["sh", "-c", &script], &[], fail);
-        let parent = env.in_shell(&runner, "; exit $?");
+        // A job-control shell and its job both call `setpgid` for the job. On macOS the job's
+        // call can fail (EPERM) while the shell's is still moving the job, and a child the job
+        // starts meanwhile stays in the shell's group; so the parent starts the runner only
+        // once a helper it starts reports the parent's own group. (`ps` cannot run in the
+        // test's sandbox: macOS's is setuid.)
+        let group_file = env.file("group");
+        let group = helper::command(
+            env.scope(),
+            &Mode::Group {
+                out: group_file.clone(),
+            },
+            &env.worktree(),
+        );
+        let group_words: Vec<String> = std::iter::once(group.get_program())
+            .chain(group.get_args())
+            .map(quoted)
+            .collect();
+        let mut parent = env.in_worktree("sh");
+        parent
+            .arg("-c")
+            .arg(format!(
+                "until {} && [ \"$(cat '{}')\" = \"$$\" ]; do :; done; \"$0\" \"$@\"; exit $?",
+                group_words.join(" "),
+                group_file.display()
+            ))
+            .arg(runner.get_program())
+            .args(runner.get_args())
+            .copy_env(&runner);
         let member_file = env.file("member");
         // bash without startup files leads the session; `set -m` gives the job, started in the
         // background so the shell never hands it a terminal, a group of its own. The parent's
@@ -489,11 +571,20 @@ impl StoppedJob {
     /// Waits for the runner to end the stage by SIGTERM within the bound and to exit, and
     /// checks that the in-use lock is free.
     fn wait_cancelled(&self, env: &Env, path: &str) {
-        wait_for(
-            &format!("{path}: the stopped stage to end"),
-            Duration::from_secs(6),
-            || (!cardinal::os::is_alive(self.stage, self.stage_start)).then_some(()),
-        );
+        let bound = Duration::from_secs(6);
+        let start = Instant::now();
+        while cardinal::os::is_alive(self.stage, self.stage_start) {
+            assert!(
+                start.elapsed() < bound,
+                "{path}: the stopped stage did not end within {bound:?}; {}; records {:?}",
+                self.layout(),
+                env.records()
+                    .iter()
+                    .map(|r| (&r.kind, &r.data))
+                    .collect::<Vec<_>>()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         wait_gone(self.runner, self.runner_start);
         assert!(env.worktree_lock_freed(), "{path}");
         let finished = env.records_of(RecordKind::JobFinished);
