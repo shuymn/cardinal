@@ -8,7 +8,7 @@ mod support;
 
 use cardinal::act::ActOptions;
 use cardinal::contract::{ActStatus, Caller, PlanKind, RecordKind};
-use plan_support::{Setup, write};
+use plan_support::{Setup, write, write_synced};
 
 fn unit(name: &str) -> ActOptions {
     ActOptions {
@@ -30,14 +30,14 @@ fn records_of(s: &Setup, plan: &str, kind: RecordKind) -> Vec<cardinal::contract
 fn assert_only_planned(host_toml: Option<&str>) {
     let s = Setup::with_host(host_toml.unwrap_or_default());
     let wt = s.worktree("unit");
-    write(&wt, "target/debug/app", "bin");
+    write_synced(&wt, "target/debug/app", b"bin");
     let plan = s.plan(PlanKind::ReclaimDir, &wt.join("target"));
     let before = plan_support::listing(&wt);
     for _ in 0..2 {
         let result = s.act(&plan.id, &unit("disk-reclaim")).unwrap();
         assert_eq!(result.status, ActStatus::DryRun, "{result:#?}");
         assert_eq!(result.caller, "unit:disk-reclaim");
-        assert!(result.freed_bytes.unwrap() > 0);
+        plan_support::assert_dry_run_frees(result.freed_bytes, &result);
     }
     assert_eq!(
         plan_support::listing(&wt),

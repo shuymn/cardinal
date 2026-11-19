@@ -9,6 +9,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::contract::RootId;
+use crate::observe::{Bound, Counted, Exclusive, Measure};
 use crate::testpoint;
 
 /// The type of an entry, as `lstat` reports it.
@@ -17,7 +18,30 @@ pub enum EntryKind {
     File,
     Dir,
     Symlink,
+    Fifo,
+    Socket,
+    /// A block or character device.
+    Device,
     Other,
+}
+
+impl EntryKind {
+    /// A FIFO, a socket, or a device: where processes meet, or what does not belong in build
+    /// output, which `plain_target` refuses in a `reclaim_dir` target (section 9.2).
+    #[must_use]
+    pub fn is_special(self) -> bool {
+        matches!(self, Self::Fifo | Self::Socket | Self::Device)
+    }
+
+    /// The type a test's fake names (`testpoint::fake_entry_type`).
+    fn faked(name: &str) -> Option<Self> {
+        match name {
+            "fifo" => Some(Self::Fifo),
+            "socket" => Some(Self::Socket),
+            "device" => Some(Self::Device),
+            _ => None,
+        }
+    }
 }
 
 /// One entry of a target as a walk or snapshot records it: its identity, size, modification
@@ -39,6 +63,9 @@ pub struct Entry {
     /// The number of names the entry has, here and elsewhere (on Windows read for regular
     /// files, 1 for other entries).
     pub nlink: u64,
+    /// What the measure of the target's file system reads of a regular file (section 8.5):
+    /// its private size (APFS) or its counted data extents (ext2–4); `None` when not read.
+    pub own: Option<u64>,
 }
 
 impl Entry {
@@ -59,7 +86,7 @@ impl Entry {
         } else if file_type.is_file() {
             EntryKind::File
         } else {
-            EntryKind::Other
+            special(file_type)
         };
         #[cfg(unix)]
         {
@@ -73,6 +100,7 @@ impl Entry {
                 mtime_ns: i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec()),
                 allocated: meta.blocks().saturating_mul(512),
                 nlink: meta.nlink(),
+                own: None,
             }
         }
         #[cfg(not(unix))]
@@ -91,6 +119,7 @@ impl Entry {
                 mtime_ns,
                 allocated: meta.len(),
                 nlink: 1,
+                own: None,
             }
         }
     }
@@ -105,6 +134,9 @@ impl Entry {
                 Kind::File => EntryKind::File,
                 Kind::Dir => EntryKind::Dir,
                 Kind::Symlink => EntryKind::Symlink,
+                Kind::Fifo => EntryKind::Fifo,
+                Kind::Socket => EntryKind::Socket,
+                Kind::Device => EntryKind::Device,
                 Kind::Other => EntryKind::Other,
             },
             dev: st.dev,
@@ -113,8 +145,41 @@ impl Entry {
             mtime_ns: st.mtime_ns,
             allocated: st.blocks.saturating_mul(512),
             nlink: st.nlink,
+            own: None,
         }
     }
+
+    /// This entry as a test's fake makes the walks read the entry at `path`
+    /// (`testpoint::fake_entry_type`): a FIFO, a socket, or a device, which only root could
+    /// make. Unchanged outside tests.
+    #[must_use]
+    pub fn faked(self, path: &Path) -> Self {
+        match testpoint::fake_entry_type(path).and_then(|ty| EntryKind::faked(&ty)) {
+            Some(kind) => Self { kind, ..self },
+            None => self,
+        }
+    }
+}
+
+/// The type of an entry that is not a regular file, a directory, or a symbolic link.
+#[cfg(unix)]
+fn special(file_type: std::fs::FileType) -> EntryKind {
+    use std::os::unix::fs::FileTypeExt;
+    if file_type.is_fifo() {
+        EntryKind::Fifo
+    } else if file_type.is_socket() {
+        EntryKind::Socket
+    } else if file_type.is_block_device() || file_type.is_char_device() {
+        EntryKind::Device
+    } else {
+        EntryKind::Other
+    }
+}
+
+/// The type of an entry that is not a regular file, a directory, or a symbolic link.
+#[cfg(not(unix))]
+fn special(_file_type: std::fs::FileType) -> EntryKind {
+    EntryKind::Other
 }
 
 /// Whether a target is on the mount of the directory that contains it.
@@ -169,6 +234,15 @@ pub struct Walk {
     /// The directories below the root on another device or mount than the root, recorded and
     /// not entered, which fail `plain_target` (section 9.2).
     pub boundaries: Vec<PathBuf>,
+    /// The type of the file system the target is on (`os::mount::fs_type`), which
+    /// `local_volume` and the freed-bytes bound read (sections 8.5 and 9.2), or why it could
+    /// not be read.
+    pub fs_type: Result<String, String>,
+    /// The reads of the bound's measure that failed, by worktree-relative path: a directory
+    /// whose entries' private sizes, or a file whose extents, could not be read, and a
+    /// directory the walk recorded and did not list, the target included, whose contents the
+    /// bound would leave out.
+    pub unmeasured: Vec<(PathBuf, String)>,
 }
 
 impl Walk {
@@ -197,6 +271,32 @@ impl Walk {
     #[must_use]
     pub fn own_file_bytes(&self) -> u64 {
         self.sizes().own_files
+    }
+
+    /// The lower bound of the bytes removing the target frees, by the measure of its file
+    /// system (section 8.5): null when a read it needs failed, a directory was not listed, or
+    /// the file system's sharing is not read.
+    #[must_use]
+    pub fn exclusive(&self) -> Exclusive {
+        let mut bound = Bound::new(Measure::of(&self.fs_type));
+        if let Some((path, err)) = self.unmeasured.first() {
+            bound.fail(format!("{}: {err}", path.display()));
+        }
+        for entry in self.all() {
+            let kind = match entry.kind {
+                EntryKind::Dir => Counted::Dir,
+                EntryKind::File => Counted::File,
+                _ => Counted::Other,
+            };
+            bound.add(
+                kind,
+                (entry.dev, entry.ino),
+                entry.nlink,
+                entry.allocated,
+                entry.own,
+            );
+        }
+        bound.finish()
     }
 
     /// The sizes of the walk, files with several names counted once.
@@ -342,10 +442,17 @@ impl Tree {
             .take_while(|e| e.rel.starts_with(rel))
             .cloned()
             .collect();
+        let below = |path: &PathBuf| path.starts_with(rel);
         let boundaries = root
             .boundaries
             .iter()
-            .filter(|b| b.starts_with(rel))
+            .filter(|b| below(b))
+            .cloned()
+            .collect();
+        let unmeasured = root
+            .unmeasured
+            .iter()
+            .filter(|(path, _)| below(path))
             .cloned()
             .collect();
         Some(Walk {
@@ -354,6 +461,10 @@ impl Tree {
             link_in_path: None,
             entries,
             boundaries,
+            // The target is on the root's mount, unless a test's fake names it.
+            fs_type: testpoint::fake_fs_type(&worktree.join(rel))
+                .map_or_else(|| root.fs_type.clone(), Ok),
+            unmeasured,
         })
     }
 }
@@ -361,21 +472,33 @@ impl Tree {
 /// [`walk`], with the directories it recorded and did not list (see [`Tree`]).
 fn walk_listed(worktree: &Path, target: &Path) -> io::Result<(Walk, Vec<PathBuf>)> {
     let Checked {
-        root,
+        mut root,
         mount,
         link_in_path,
         listing,
     } = check_root(worktree, target)?;
+    let fs_type = fs_type(target, listing.as_ref().map(|(listing, _)| listing));
+    let own = own(&Measure::of(&fs_type));
     let mut entries = Vec::new();
     let mut boundaries = Vec::new();
     let mut unlisted = Vec::new();
+    let mut unmeasured = Vec::new();
+    if root.kind == EntryKind::File {
+        match own_of_file(target, &root, own) {
+            Ok(read) => root.own = read,
+            Err(err) => unmeasured.push((root.rel.clone(), err.to_string())),
+        }
+    }
+    if root.kind == EntryKind::Dir && listing.is_none() {
+        unmeasured.push((root.rel.clone(), "the target was not listed".to_owned()));
+    }
     if let Some((listing, on_mount)) = listing {
         walk_dir(
             worktree,
-            listing,
+            (listing, own),
             (&root.rel, root.dev, &on_mount),
             &mut entries,
-            (&mut boundaries, &mut unlisted),
+            (&mut boundaries, &mut unlisted, &mut unmeasured),
         )?;
     }
     let walk = Walk {
@@ -384,6 +507,8 @@ fn walk_listed(worktree: &Path, target: &Path) -> io::Result<(Walk, Vec<PathBuf>
         link_in_path,
         entries,
         boundaries,
+        fs_type,
+        unmeasured,
     };
     Ok((walk, unlisted))
 }
@@ -420,7 +545,7 @@ fn check_root(worktree: &Path, target: &Path) -> io::Result<Checked> {
     }
     let parent = target.parent().unwrap_or(target);
     let parent_dev = Entry::from_metadata(PathBuf::new(), &std::fs::symlink_metadata(parent)?).dev;
-    let root = lstat(rel, target)?;
+    let root = lstat(rel, target)?.faked(target);
     let root_mount = mount_id(target);
     let mut mount = Mount::between(parent_dev, root.dev, &mount_id(parent), &root_mount);
     let mut listing = None;
@@ -439,6 +564,69 @@ fn check_root(worktree: &Path, target: &Path) -> io::Result<Checked> {
         link_in_path,
         listing,
     })
+}
+
+/// The type of the file system `target` is on: read from `listing`, the target opened to be
+/// listed, or else from the directory that contains it; a test's fake first
+/// (`testpoint::fake_fs_type`).
+fn fs_type(target: &Path, listing: Option<&Listing>) -> Result<String, String> {
+    if let Some(ty) = testpoint::fake_fs_type(target) {
+        return Ok(ty);
+    }
+    #[cfg(unix)]
+    {
+        if let Some(listing) = listing {
+            crate::os::mount::fs_type(&listing.dir)
+        } else {
+            let parent = target.parent().unwrap_or(target);
+            std::fs::File::open(parent)
+                .map_err(|err| format!("{}: {err}", parent.display()))
+                .and_then(crate::os::mount::fs_type)
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = listing;
+        Err("the file system type is not read on this platform".to_owned())
+    }
+}
+
+/// What a listing reads of each regular file for `measure`.
+#[cfg(unix)]
+type Own = crate::os::dir::Own;
+/// Windows reads nothing of a file for the bound.
+#[cfg(not(unix))]
+#[derive(Clone, Copy)]
+struct Own;
+
+#[cfg(unix)]
+fn own(measure: &Measure) -> Own {
+    measure.own()
+}
+
+#[cfg(not(unix))]
+fn own(_measure: &Measure) -> Own {
+    Own
+}
+
+/// What `own` reads of the regular file `target`, whose entry the walk recorded as `seen`,
+/// through its parent directory.
+#[cfg(unix)]
+fn own_of_file(target: &Path, seen: &Entry, own: Own) -> io::Result<Option<u64>> {
+    let (Some(parent), Some(name)) = (target.parent(), target.file_name()) else {
+        return Ok(None);
+    };
+    let parent = std::fs::File::open(parent)?;
+    crate::os::dir::own_at(&parent, name, (seen.dev, seen.ino), own)
+}
+
+#[cfg(not(unix))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the same signature as the Unix version"
+)]
+fn own_of_file(_target: &Path, _seen: &Entry, _own: Own) -> io::Result<Option<u64>> {
+    Ok(None)
 }
 
 /// What identifies a mount.
@@ -475,24 +663,44 @@ fn mount_id(_path: &Path) -> Result<MountKey, String> {
 /// entry was read, is recorded but never listed, and a mount that cannot be read fails the
 /// walk. Each directory is listed in full and closed before anything below it is opened, so
 /// one directory is open at a time. A directory found on another device or mount by its path
-/// goes into `boundaries` too, and every directory recorded and not listed into `unlisted`.
+/// goes into `boundaries` too, and every directory recorded and not listed into `unlisted` and
+/// `unmeasured`.
 fn walk_dir(
     worktree: &Path,
-    listing: Listing,
+    (listing, own): (Listing, Own),
     (rel, dev, on_mount): (&Path, u64, &MountKey),
     out: &mut Vec<Entry>,
-    (boundaries, unlisted): (&mut Vec<PathBuf>, &mut Vec<PathBuf>),
+    (boundaries, unlisted, unmeasured): (
+        &mut Vec<PathBuf>,
+        &mut Vec<PathBuf>,
+        &mut Vec<(PathBuf, String)>,
+    ),
 ) -> io::Result<()> {
+    let mut list = |listing: Listing, rel: &Path| -> io::Result<std::vec::IntoIter<Entry>> {
+        let (entries, unread) = listing.entries(rel, own)?;
+        unmeasured.extend(unread);
+        let faked: Vec<Entry> = entries
+            .into_iter()
+            .map(|e| {
+                let path = worktree.join(&e.rel);
+                e.faked(&path)
+            })
+            .collect();
+        Ok(faked.into_iter())
+    };
+    let mut not_listed = Vec::new();
     // The remaining entries of each directory being walked, innermost last.
-    let mut pending = vec![listing.entries(rel)?.into_iter()];
+    let mut pending = vec![list(listing, rel)?];
     while let Some(level) = pending.last_mut() {
         let Some(entry) = level.next() else {
             pending.pop();
             continue;
         };
         let mut listed = false;
+        let mut why = "replaced or removed while the walk ran";
         if entry.kind == EntryKind::Dir && entry.dev != dev {
             boundaries.push(entry.rel.clone());
+            why = "on another device";
         }
         if entry.kind == EntryKind::Dir && entry.dev == dev {
             let path = worktree.join(&entry.rel);
@@ -504,14 +712,15 @@ fn walk_dir(
             };
             if !enter && !gone(&path) {
                 boundaries.push(entry.rel.clone());
+                why = "on another mount";
             }
             if enter {
                 testpoint::hit(testpoint::WALK_DIR_CHECKED).map_err(io::Error::other)?;
                 let below = Listing::open(&path, &entry, on_mount)
-                    .and_then(|below| below.map(|below| below.entries(&entry.rel)).transpose());
+                    .and_then(|below| below.map(|below| list(below, &entry.rel)).transpose());
                 match below {
                     Ok(Some(below)) => {
-                        pending.push(below.into_iter());
+                        pending.push(below);
                         listed = true;
                     }
                     // Replaced or removed since its entry was read: the entry stays as it was
@@ -524,9 +733,11 @@ fn walk_dir(
         }
         if entry.kind == EntryKind::Dir && !listed {
             unlisted.push(entry.rel.clone());
+            not_listed.push((entry.rel.clone(), format!("{why}, not listed")));
         }
         out.push(entry);
     }
+    unmeasured.extend(not_listed);
     Ok(())
 }
 
@@ -575,20 +786,35 @@ impl Listing {
         }))
     }
 
-    /// The entries of the directory below the worktree-relative `rel`, in name order; the
-    /// directory is closed on return. An entry removed before it is read is left out.
+    /// The entries of the directory below the worktree-relative `rel`, in name order, each
+    /// regular file with what `own` reads of it, and the reads of `own` that failed, by
+    /// worktree-relative path; the directory is closed on return. An entry removed before it
+    /// is read is left out.
     #[cfg(unix)]
-    fn entries(self, rel: &Path) -> io::Result<Vec<Entry>> {
-        Ok(crate::os::dir::list(self.dir)?
+    #[expect(clippy::type_complexity, reason = "two lists the walk keeps apart")]
+    fn entries(self, rel: &Path, own: Own) -> io::Result<(Vec<Entry>, Vec<(PathBuf, String)>)> {
+        let listed = crate::os::dir::list(&self.dir, own)?;
+        let entries = listed
+            .entries
             .into_iter()
-            .map(|(name, st)| Entry::from_stat(rel.join(name), &st))
-            .collect())
+            .map(|(name, st, read)| Entry {
+                own: read,
+                ..Entry::from_stat(rel.join(name), &st)
+            })
+            .collect();
+        let unread = listed
+            .unread
+            .into_iter()
+            .map(|(name, err)| (name.map_or_else(|| rel.to_path_buf(), |n| rel.join(n)), err))
+            .collect();
+        Ok((entries, unread))
     }
 
     /// The entries of the directory below the worktree-relative `rel`, in name order. An
     /// entry removed before it is read is left out.
     #[cfg(not(unix))]
-    fn entries(self, rel: &Path) -> io::Result<Vec<Entry>> {
+    #[expect(clippy::type_complexity, reason = "two lists the walk keeps apart")]
+    fn entries(self, rel: &Path, _own: Own) -> io::Result<(Vec<Entry>, Vec<(PathBuf, String)>)> {
         let mut names = Vec::new();
         for entry in std::fs::read_dir(&self.path)? {
             match entry {
@@ -612,7 +838,7 @@ impl Listing {
                 Err(err) => return Err(err),
             }
         }
-        Ok(entries)
+        Ok((entries, Vec::new()))
     }
 }
 
@@ -711,8 +937,13 @@ mod tests {
             .collect();
         assert_eq!(rels, expected);
         for entry in &walk.entries {
+            // `own` is the bound's reading, which `lstat` does not give.
+            let recorded = super::Entry {
+                own: None,
+                ..entry.clone()
+            };
             assert_eq!(
-                *entry,
+                recorded,
                 super::lstat(entry.rel.clone(), &wt.join(&entry.rel)).unwrap(),
                 "recorded from lstat"
             );

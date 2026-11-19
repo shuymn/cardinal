@@ -981,6 +981,7 @@ fn report(at_ms: u64, free_bytes: u64) -> DiskReport {
             worktree: "/w".into(),
             target: "/w/target".into(),
             exclusive_bytes: 300 * MIB,
+            exclusive_measure: None,
             status: None,
             freed_bytes: None,
         }],

@@ -11,7 +11,7 @@ mod support;
 
 use std::time::Duration;
 
-use cardinal::contract::{DiskLevel, PlanKind, RecordKind};
+use cardinal::contract::{DiskLevel, ExclusiveMeasure, PlanKind, RecordKind};
 use cardinal::state::LockMode;
 use disk_support::{Disk, MIB, blocked, fill, own_errors, report, targets};
 
@@ -19,9 +19,10 @@ const LINES: (u64, u64, u64) = (1, 2, 3);
 const KIB: u64 = 1024;
 const RECOVERY: u64 = 3 * MIB;
 
-/// A pass's targets are listed in order, oldest worktree first, until their exclusive bytes
-/// would lift the final reading above the recovery line; each listed target gets a `planned`
-/// record, and nothing runs `act`.
+/// A pass's targets are listed in order, oldest worktree first, until their bounds of the
+/// freed bytes, each its plan's, would lift the final reading above the recovery line; each
+/// listed target gets a `planned` record, and nothing runs `act`. Windows reads no bound
+/// (section 8.5), so there nothing lifts the reading and every target is listed.
 #[test]
 fn order_and_stop() {
     let d = Disk::new(LINES);
@@ -50,15 +51,31 @@ fn order_and_stop() {
     );
     let report = report(&pass);
     assert_eq!(report.reading.free_bytes, last);
-    assert_eq!(
-        targets(report, &root),
-        ["old/target", "old/node_modules"],
-        "{report:#?}"
-    );
-    assert_eq!(report.shortfall_bytes, 0);
+    let expected: &[&str] = if cfg!(windows) {
+        &["old/target", "old/node_modules", "new/target"]
+    } else {
+        &["old/target", "old/node_modules"]
+    };
+    assert_eq!(targets(report, &root), expected, "{report:#?}");
+    for target in &report.targets {
+        let plan = cardinal::plan::load(&d.s.state, &target.plan_id).unwrap();
+        assert_eq!(
+            (target.exclusive_bytes, target.exclusive_measure),
+            (
+                plan.exclusive_bytes.unwrap_or(0),
+                Some(plan.exclusive_measure)
+            ),
+            "{plan:#?}"
+        );
+    }
     let listed: u64 = report.targets.iter().map(|t| t.exclusive_bytes).sum();
-    assert!(listed > 700 * KIB, "{report:#?}");
-    assert!(report.targets[0].exclusive_bytes < 700 * KIB, "{report:#?}");
+    assert_eq!(report.shortfall_bytes, (700 * KIB).saturating_sub(listed));
+    if cfg!(windows) {
+        assert_eq!(listed, 0, "{report:#?}");
+    } else {
+        assert!(listed > 700 * KIB, "{report:#?}");
+        assert!(report.targets[0].exclusive_bytes < 700 * KIB, "{report:#?}");
+    }
 
     let planned = d.records(RecordKind::Planned);
     let ids: Vec<&str> = planned
@@ -122,10 +139,15 @@ fn exclusive_bytes_first() {
         "{report:#?}"
     );
     let (target, modules) = (&report.targets[0], &report.targets[1]);
-    assert!(
-        target.exclusive_bytes > modules.exclusive_bytes,
-        "{report:#?}"
-    );
+    if cfg!(windows) {
+        // No bound is read (section 8.5).
+        assert_eq!((target.exclusive_bytes, modules.exclusive_bytes), (0, 0));
+    } else {
+        assert!(
+            target.exclusive_bytes > modules.exclusive_bytes,
+            "{report:#?}"
+        );
+    }
     assert!(modules.exclusive_bytes < 1024 * 1024, "{report:#?}");
     assert_eq!(
         blocked(report, &root),
@@ -136,6 +158,58 @@ fn exclusive_bytes_first() {
         report.shortfall_bytes,
         RECOVERY - last - target.exclusive_bytes - modules.exclusive_bytes
     );
+}
+
+/// A target is listed with its plan's bound, 0 where that is null, and a bound of 0 or null
+/// lifts the reading by nothing, however many bytes the target holds (section 10.4): a file
+/// cloned from one outside on APFS (bound 0), a file system whose sharing is not read on
+/// Linux (an injected `xfs`, null), and Windows, which reads no bound (null).
+#[test]
+fn a_bound_of_0_or_null_lifts_nothing() {
+    let d = Disk::new(LINES);
+    let root = d.s.fx.root().to_path_buf();
+    let a = d.s.worktree("a");
+    #[cfg(target_os = "macos")]
+    let measure = {
+        let store = d.s.fx.path("store");
+        fill(&store, "big.bin", MIB);
+        std::fs::create_dir_all(a.join("target")).unwrap();
+        let c_path = |path: std::path::PathBuf| {
+            std::ffi::CString::new(path.into_os_string().into_encoded_bytes()).unwrap()
+        };
+        let (from, to) = (
+            c_path(store.join("big.bin")),
+            c_path(a.join("target/big.bin")),
+        );
+        // SAFETY: both are NUL-terminated paths.
+        let cloned = unsafe { libc::clonefile(from.as_ptr(), to.as_ptr(), 0) };
+        assert_eq!(cloned, 0, "clonefile: {}", std::io::Error::last_os_error());
+        ExclusiveMeasure::PrivateSize
+    };
+    #[cfg(not(target_os = "macos"))]
+    fill(&a, "target/big.bin", MIB);
+    #[cfg(target_os = "linux")]
+    let measure = {
+        let fake = format!("xfs\t{}\n", a.join("target").display());
+        std::fs::write(d.points.dir().join("fs-types"), fake).unwrap();
+        ExclusiveMeasure::SharingUnread
+    };
+    #[cfg(windows)]
+    let measure = ExclusiveMeasure::NotMeasured;
+    let last = 3 * MIB / 2;
+    d.fixture_reads(&[Some(last)]);
+
+    let pass = d.reconcile();
+    assert_eq!(own_errors(&pass), Vec::<String>::new());
+    let report = report(&pass);
+    assert_eq!(targets(report, &root), ["a/target"], "{report:#?}");
+    let target = &report.targets[0];
+    assert_eq!(
+        (target.exclusive_bytes, target.exclusive_measure),
+        (0, Some(Some(measure))),
+        "{report:#?}"
+    );
+    assert_eq!(report.shortfall_bytes, RECOVERY - last, "{report:#?}");
 }
 
 /// A target in a worktree in use and one holding protected data are skipped, each counted in

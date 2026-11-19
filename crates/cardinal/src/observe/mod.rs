@@ -41,6 +41,7 @@ use crate::state::{Probe, StateDir, find_worktree_root, now_ms, probe, worktree_
 use crate::testpoint;
 
 use data::DataPatterns;
+pub use data::{Bound, Counted, Exclusive, Measure};
 use git::ListedWorktree;
 
 /// `cardinal inventory` arguments.
@@ -905,8 +906,8 @@ impl<'a> Observer<'a> {
 
         let (in_use, in_use_known) = in_use(&path, shared);
 
-        let ignored = status.as_ref().map_or_else(Vec::new, |s| {
-            ignored_entries(&path, &s.ignored, &ctx.patterns, shared.sizes)
+        let (ignored, unmeasured) = status.as_ref().map_or_else(Default::default, |s| {
+            ignored_entries(&path, &s.ignored, &ctx.patterns, (shared.sizes, &scope))
         });
         let step_failed = !errors.is_empty() || gh_error.is_some() || ctx.failure.is_some();
         let facts = Facts {
@@ -949,7 +950,7 @@ impl<'a> Observer<'a> {
                 reclaim,
                 ..worktree
             },
-            errors,
+            errors: [errors, unmeasured].concat(),
             gh_error,
         }
     }
@@ -1582,14 +1583,17 @@ struct Tracked {
 }
 
 /// The ignored entries of the worktree at `root`, classified, with the sizes of those matching
-/// a regenerable pattern when `sizes` is set.
+/// a regenerable pattern when `sizes` is set; and, in `scope`, the errors of the bounds that
+/// could not be read, which leave them null and fail no step of the worktree's observation
+/// (section 8.5).
 fn ignored_entries(
     root: &Path,
     ignored: &[PathBuf],
     patterns: &DataPatterns,
-    sizes: bool,
-) -> Vec<IgnoredEntry> {
-    ignored
+    (sizes, scope): (bool, &str),
+) -> (Vec<IgnoredEntry>, Vec<ScopedError>) {
+    let mut unmeasured = Vec::new();
+    let entries = ignored
         .iter()
         .map(|rel| {
             let class = data::classify(root, rel, patterns);
@@ -1598,15 +1602,22 @@ fn ignored_entries(
             let measured = (sizes && regenerable_match)
                 .then(|| data::sizes(&entry))
                 .flatten();
+            if let Some(error) = measured.as_ref().and_then(|m| m.exclusive.error.clone()) {
+                let message = format!("exclusive_bytes of {}: {error}", entry.display());
+                unmeasured.push(scoped(scope, message));
+            }
             IgnoredEntry {
                 path: display(&entry),
                 class,
                 regenerable_match,
-                allocated_bytes: measured.map(|m| m.allocated),
-                aliased_bytes: measured.and_then(|m| m.aliased),
+                allocated_bytes: measured.as_ref().map(|m| m.allocated),
+                aliased_bytes: measured.as_ref().and_then(|m| m.aliased),
+                exclusive_bytes: measured.as_ref().and_then(|m| m.exclusive.bytes),
+                exclusive_measure: measured.as_ref().map(|m| m.exclusive.measure),
             }
         })
-        .collect()
+        .collect();
+    (entries, unmeasured)
 }
 
 /// The status `out` printed, when it is complete. Status exits 0 when it cannot read a

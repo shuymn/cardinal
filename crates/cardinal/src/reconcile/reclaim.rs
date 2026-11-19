@@ -1,7 +1,7 @@
 //! `disk-reclaim` listing (`docs/architecture.md` section 10.4, C10): for each volume under
 //! pressure, from the plans of step 5 and the pass's last successful reading, the eligible
-//! `reclaim_dir` targets in reclamation order until they would lift the reading above the
-//! recovery line, the shortfall when they would not, the entries held by a failed check or
+//! `reclaim_dir` targets in reclamation order until their bounds of the freed bytes would lift
+//! the reading above the recovery line, the shortfall when they would not, the entries held by a failed check or
 //! by aliased files, and the worktrees observed only in part. It runs no `act` and observes
 //! nothing again; each listed target gets a `planned` record with the checks and bytes it was
 //! listed by.
@@ -67,21 +67,21 @@ pub fn reports(
 fn report(volume: &Watched, reading: ReportReading, observation: &Observation) -> DiskReport {
     let on_volume = plans_on(&volume.state.volume, &observation.plans);
     let mut blocked = Vec::new();
-    // Eligible targets with what removing them frees, by worktree.
+    // Eligible targets with the bytes they are ordered by, by worktree.
     let mut by_worktree: BTreeMap<&str, Vec<(&Plan, u64)>> = BTreeMap::new();
     for plan in on_volume {
         let own_file_bytes = observation.own_file_bytes.get(&plan.id).copied();
         match listed(plan, own_file_bytes) {
-            Ok(exclusive) => by_worktree
+            Ok(size) => by_worktree
                 .entry(plan.target.worktree.as_str())
                 .or_default()
-                .push((plan, exclusive)),
+                .push((plan, size)),
             Err(Some(entry)) => blocked.push(entry),
             Err(None) => {}
         }
     }
-    // Oldest worktree first (one whose activity is unknown last), then the most exclusive
-    // bytes first.
+    // Oldest worktree first (one whose activity is unknown last), then the most bytes not
+    // aliased first.
     let activity = |worktree: &str| {
         observation
             .inventory
@@ -101,16 +101,19 @@ fn report(volume: &Watched, reading: ReportReading, observation: &Observation) -
     let mut targets = Vec::new();
     'listing: for (_, mut plans) in worktrees {
         plans.sort_by(|(a, x), (b, y)| y.cmp(x).then_with(|| a.target.path.cmp(&b.target.path)));
-        for (plan, exclusive) in plans {
+        for (plan, _) in plans {
             if lifted > recovery {
                 break 'listing;
             }
-            lifted = lifted.saturating_add(exclusive);
+            // The plan's bound, which counts nothing where it is 0 or null (section 10.4).
+            let bound = plan.exclusive_bytes.unwrap_or(0);
+            lifted = lifted.saturating_add(bound);
             targets.push(ReportTarget {
                 plan_id: plan.id.clone(),
                 worktree: plan.target.worktree.clone(),
                 target: plan.target.path.clone(),
-                exclusive_bytes: exclusive,
+                exclusive_bytes: bound,
+                exclusive_measure: Some(plan.exclusive_measure),
                 status: None,
                 freed_bytes: None,
             });
@@ -129,11 +132,11 @@ fn report(volume: &Watched, reading: ReportReading, observation: &Observation) -
     }
 }
 
-/// How `plan` enters the report: listed by the bytes removing it frees (`Ok`), counted in
+/// How `plan` enters the report: listed, ordered by its bytes not aliased (`Ok`), counted in
 /// `blocked` with its first failed check, or as `aliased` when its regular files' bytes are
 /// all aliased, whatever its directories' blocks (`Err(Some)`), or left out when it holds
-/// nothing (`Err(None)`). `own_file_bytes` is [`plan::Built::own_file_bytes`]. The exclusive
-/// bytes include the directories' blocks, for the order and the shortfall.
+/// nothing (`Err(None)`). `own_file_bytes` is [`plan::Built::own_file_bytes`]. The bytes not
+/// aliased include the directories' blocks.
 fn listed(plan: &Plan, own_file_bytes: Option<u64>) -> Result<u64, Option<ReportBlocked>> {
     let allocated = plan.allocated_bytes.unwrap_or(0);
     if !(plan.invariants_ok && plan.approval == Approval::None) {
@@ -145,12 +148,12 @@ fn listed(plan: &Plan, own_file_bytes: Option<u64>) -> Result<u64, Option<Report
         return Err(Some(blocked_entry(plan, check, allocated)));
     }
     let aliased = plan.aliased_bytes.unwrap_or(0);
-    let exclusive = allocated.saturating_sub(aliased);
+    let unaliased = allocated.saturating_sub(aliased);
     let files_all_aliased = aliased > 0 && own_file_bytes == Some(0);
-    if exclusive == 0 || files_all_aliased {
+    if unaliased == 0 || files_all_aliased {
         return Err((allocated > 0).then(|| blocked_entry(plan, "aliased".to_owned(), allocated)));
     }
-    Ok(exclusive)
+    Ok(unaliased)
 }
 
 /// The worktrees on `volume` that `observation` read only in part: those with an error of

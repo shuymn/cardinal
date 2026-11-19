@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub use checks::{
-    DataLists, FACT_ENTRIES, InUseFacts, Inspection, approval, bound_facts, evaluate,
-    invariants_ok, processes_inside, provenance,
+    DataLists, Descriptors, FACT_ENTRIES, InUseFacts, Inspection, approval, bound_facts,
+    descriptor_scan, evaluate, invariants_ok, processes_inside, provenance,
 };
 pub use walk::{Entry, EntryKind, Mount, Tree, Walk, root_identity, walk};
 
@@ -24,8 +24,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crate::admission;
 use crate::config::Config;
 use crate::contract::{
-    Error, ErrorCode, InUse, Inventory, Plan, PlanKind, PlanList, PlanListSchema, PlanSchema,
-    PlanTarget, Record, RecordKind, Repo, ScopedError, Worktree,
+    Error, ErrorCode, InUse, Inventory, ObservedError, Plan, PlanKind, PlanList, PlanListSchema,
+    PlanSchema, PlanTarget, Record, RecordKind, Repo, ScopedError, Worktree,
 };
 use crate::observe::{self, InventoryOptions, WorktreeObservation};
 use crate::record::Recorder;
@@ -297,8 +297,20 @@ fn build_worktree(
         .first()
         .filter(|(kind, target)| whole(*kind, target))
         .map(|_| Tree::walk(worktree).map_err(|err| walk_error(worktree, &err)));
+    // One read of the processes working in the worktree for its plans, and one descriptor scan
+    // for its `reclaim_dir` targets, each read with the first plan that needs it, after the
+    // worktree's walk.
+    let mut working = None;
+    let mut scan = None;
     let mut plans = Vec::with_capacity(targets.len());
     for (kind, target) in targets {
+        let processes = working
+            .get_or_insert_with(|| processes_inside(worktree))
+            .clone();
+        let descriptors = match kind {
+            PlanKind::ReclaimDir => scan.get_or_insert_with(|| descriptor_scan(*kind)).clone(),
+            PlanKind::ReclaimWorktree => None,
+        };
         let own: Result<Walk, String>;
         let walked = match &tree {
             Some(tree) if whole(*kind, target) => {
@@ -322,7 +334,7 @@ fn build_worktree(
             sources,
             (*kind, target),
             observation,
-            walked,
+            (walked, processes, descriptors),
         ));
     }
     plans
@@ -355,17 +367,23 @@ pub fn patterns(config: &Config, repo: &Repo) -> DataLists {
 }
 
 /// The in-use facts of `target` when nothing is held: the lock probed, reservations read
-/// under the admission lock (an error when it is not free in time), and processes.
-fn probe_in_use(state: &StateDir, sources: &Real<'_>, worktree: &Path) -> InUseFacts {
+/// under the admission lock (an error when it is not free in time), and the processes read
+/// for its worktree: those working in it ([`processes_inside`]) and the descriptor scan read
+/// for the target, if any.
+fn probe_in_use(
+    state: &StateDir,
+    sources: &Real<'_>,
+    worktree: &Path,
+    (processes, descriptors): (Result<Vec<u32>, String>, Descriptors),
+) -> InUseFacts {
     let key = state::worktree_key(worktree);
     InUseFacts {
         lock_held: state::probe(&state.worktree_lock(&key))
             .map(|probe| probe == Probe::Held)
             .map_err(|err| err.to_string()),
         reservations: sources.in_use(&key).map_err(|err| err.message),
-        // The whole worktree for both kinds: a process working anywhere in it can use the
-        // target (section 9.2).
-        processes: processes_inside(worktree),
+        processes,
+        descriptors,
     }
 }
 
@@ -387,22 +405,30 @@ fn build(
         sources,
         (kind, target),
         observation,
-        walked.as_ref().map_err(String::as_str),
+        (
+            walked.as_ref().map_err(String::as_str),
+            // The whole worktree for both kinds: a process working anywhere in it can use the
+            // target (section 9.2).
+            processes_inside(worktree),
+            descriptor_scan(kind),
+        ),
     )
 }
 
-/// [`build`] from `walked`, the walk of `target` or why it failed.
+/// [`build`] from `walked`, the walk of `target` or why it failed, `processes`, those working
+/// in its worktree ([`processes_inside`]), and `descriptors`, the descriptor scan read for it,
+/// if any.
 fn build_with(
     config: &Config,
     state: &StateDir,
     sources: &Real<'_>,
     (kind, target): (PlanKind, &Path),
     observation: &WorktreeObservation,
-    walked: Result<&Walk, &str>,
+    (walked, processes, descriptors): (Result<&Walk, &str>, Result<Vec<u32>, String>, Descriptors),
 ) -> Built {
     let worktree = PathBuf::from(&observation.worktree.path);
     let (root_id, root_created_ms) = root_identity(&worktree).unwrap_or((None, None));
-    let in_use = probe_in_use(state, sources, &worktree);
+    let in_use = probe_in_use(state, sources, &worktree, (processes, descriptors));
     let patterns = patterns(config, &observation.repo);
     let inspection = Inspection {
         kind,
@@ -416,7 +442,14 @@ fn build_with(
         squash_merged: false,
     };
     let checks = evaluate(&inspection);
-    let provenance = provenance(config, &inspection);
+    let mut provenance = provenance(config, &inspection);
+    let exclusive = walked.ok().map(Walk::exclusive);
+    if let Some(error) = exclusive.as_ref().and_then(|e| e.error.clone()) {
+        provenance.errors.push(ObservedError {
+            source: "exclusive_bytes".to_owned(),
+            message: error,
+        });
+    }
     let plan = Plan {
         schema: PlanSchema,
         id: String::new(),
@@ -435,6 +468,8 @@ fn build_with(
         },
         allocated_bytes: walked.ok().map(Walk::allocated),
         aliased_bytes: walked.ok().map(Walk::aliased),
+        exclusive_bytes: exclusive.as_ref().and_then(|e| e.bytes),
+        exclusive_measure: exclusive.map(|e| e.measure),
         invariants_ok: invariants_ok(&checks),
         approval: approval(&checks),
         checks,

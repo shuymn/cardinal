@@ -320,3 +320,27 @@ pub fn write(root: &Path, rel: &str, contents: &str) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, contents).unwrap();
 }
+
+/// [`write`], then syncs the file, so its blocks are allocated where the freed-bytes bound
+/// reads them: ext4 reports the extents of data not yet written back as delayed, which the
+/// bound leaves out (`docs/architecture.md` section 8.5).
+pub fn write_synced(root: &Path, rel: &str, contents: &[u8]) {
+    let path = root.join(rel);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut file = std::fs::File::create(&path).unwrap();
+    std::io::Write::write_all(&mut file, contents).unwrap();
+    // Windows flushes only a handle opened for writing.
+    file.sync_all().unwrap();
+}
+
+/// Asserts that `freed`, a dry run's `freed_bytes` for a target holding a file written with
+/// [`write_synced`], is what the platform's bound gives (section 8.5): bytes to free on Unix,
+/// and null on Windows, which reads no bound.
+#[track_caller]
+pub fn assert_dry_run_frees(freed: Option<u64>, context: impl std::fmt::Debug) {
+    if cfg!(windows) {
+        assert_eq!(freed, None, "Windows reads no bound: {context:#?}");
+    } else {
+        assert!(freed.is_some_and(|bytes| bytes > 0), "{context:#?}");
+    }
+}

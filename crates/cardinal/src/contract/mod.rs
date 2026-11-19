@@ -47,8 +47,8 @@ pub use inbox::{
     ItemAnswer, ItemArbiter, Resolution, ResolutionOutcome,
 };
 pub use inventory::{
-    ArbiterView, BaseRef, DirtyUnknown, DirtyUnknownReason, Facts, GhStatus, HostInfo,
-    IgnoredClass, IgnoredEntry, InUse, Inventory, MergeEvidence, Os, Outlived, PrRef,
+    ArbiterView, BaseRef, DirtyUnknown, DirtyUnknownReason, ExclusiveMeasure, Facts, GhStatus,
+    HostInfo, IgnoredClass, IgnoredEntry, InUse, Inventory, MergeEvidence, Os, Outlived, PrRef,
     ReclaimSummary, Repo, Worktree, WorktreeView,
 };
 pub use plan::{
@@ -130,8 +130,9 @@ schema_marker!(
     PlanListSchema = "cardinal.plan-list.v1"
 );
 schema_marker!(
-    /// `cardinal.act-result.v1`
-    ActResultSchema = "cardinal.act-result.v1"
+    /// `cardinal.act-result.v2`: version 2 since a dry run's `freed_bytes` became the lower
+    /// bound of section 8.5 (unit X1a)
+    ActResultSchema = "cardinal.act-result.v2"
 );
 schema_marker!(
     /// `cardinal.act-claim.v1`

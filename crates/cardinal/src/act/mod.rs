@@ -144,6 +144,7 @@ impl Run<'_> {
             reservations,
             // The whole worktree for both kinds (section 9.2).
             processes: plan::processes_inside(&worktree),
+            descriptors: plan::descriptor_scan(self.plan.kind),
         };
         let patterns = observation.as_ref().map_or_else(
             |_| DataLists::default(),
@@ -183,7 +184,12 @@ impl Run<'_> {
             // (section 9.3).
             outcome.status = ActStatus::DryRun;
             outcome.reasons = vec![EXECUTION_NOT_DESIGNED.into()];
-            outcome.freed_bytes = snapshot.walk.as_ref().ok().map(Walk::allocated);
+            // The lower bound of section 8.5, null where it is unknown.
+            outcome.freed_bytes = snapshot
+                .walk
+                .as_ref()
+                .ok()
+                .and_then(|walk| walk.exclusive().bytes);
         }
         outcome
     }

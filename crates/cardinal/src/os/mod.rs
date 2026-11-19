@@ -3,8 +3,9 @@
 //!
 //! Process-group setup and signals (Unix) live in `os/unix.rs`, owned by the runner work unit.
 //! Short-lived children whose output the caller reads run through [`child`].
-//! Mount identity (Unix) lives in `os/mount.rs`, shared by `plan` and `act`, and listing a
-//! directory through the descriptor that identifies it (Unix, `plan`'s walk) in `os/dir.rs`.
+//! Mount identity (Unix) lives in `os/mount.rs`, shared by `plan` and `act`, listing a
+//! directory through the descriptor that identifies it (Unix, `plan`'s walk) in `os/dir.rs`,
+//! and the descriptor scan of `not_in_use` (Unix, section 9.7) in `os/fds.rs`.
 //! The free space and the volume of a path ([`disk`] and [`volume`], section 10.4) live in
 //! `os/disk.rs`, and starting a detached cardinal process ([`spawn_detached`], sections 5.2
 //! and 10.5) in `os/detached.rs`.
@@ -19,6 +20,7 @@ mod detached;
 #[cfg(unix)]
 pub mod dir;
 mod disk;
+pub mod fds;
 #[cfg(unix)]
 pub mod mount;
 #[cfg(unix)]

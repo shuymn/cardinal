@@ -24,7 +24,7 @@ impl ActStatus {
     }
 }
 
-/// `cardinal.act-result.v1`: the `act` output. `act` prints it and records it in an `act` or
+/// `cardinal.act-result.v2`: the `act` output. `act` prints it and records it in an `act` or
 /// `planned` record (`docs/architecture.md` section 9.5); an execution also writes it to
 /// `executions/<plan>/result.json` (section 9.7). The first release reports only `dry_run`,
 /// `rejected`, and `expired`.
@@ -43,7 +43,9 @@ pub struct ActResult {
     /// `"interrupted"`, `"in_progress"`, `"claim_unreadable"`, `"in_use_while_deleting"`.
     pub reasons: Vec<String>,
     pub checks: Vec<Check>,
-    /// `dry_run`: the snapshot's bytes; `executed` and `partial`: the blocks freed.
+    /// `dry_run`: the snapshot's `exclusive_bytes`, the lower bound of section 8.5, null where
+    /// it is unknown (version 1: the snapshot's allocated bytes); `executed` and `partial`:
+    /// what the unlinks are expected to have freed, null under a null measure.
     pub freed_bytes: Option<u64>,
     /// Entries an execution kept, relative to the target.
     pub skipped_changed: Vec<String>,

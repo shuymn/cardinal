@@ -27,7 +27,7 @@ const README: &str = include_str!(concat!(
     "/../../integrations/claude-code/README.md"
 ));
 
-/// Every status of `cardinal.act-result.v1`, in the order of [`status_index`].
+/// Every status of `cardinal.act-result.v2`, in the order of [`status_index`].
 const STATUSES: [ActStatus; 6] = [
     ActStatus::DryRun,
     ActStatus::Executed,

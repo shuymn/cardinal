@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use super::{ActStatus, DiskStateSchema, present};
+use super::{ActStatus, DiskStateSchema, ExclusiveMeasure, present};
 
 /// How free space was measured (`docs/architecture.md` section 10.4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,8 +68,16 @@ pub struct ReportTarget {
     pub plan_id: String,
     pub worktree: String,
     pub target: String,
-    /// `allocated_bytes` less `aliased_bytes`.
+    /// The plan's lower bound of the freed bytes (section 8.5), 0 where that is null.
     pub exclusive_bytes: u64,
+    /// The plan's `exclusive_measure` (section 8.5), null or not; absent in reports made
+    /// before it.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    pub exclusive_measure: Option<Option<ExclusiveMeasure>>,
     /// The status of the `act` that ran on the target when `disk-reclaim` executes (unit X,
     /// section 10.4); absent when it only lists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
