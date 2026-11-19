@@ -8,15 +8,16 @@ mod support;
 
 use cardinal::act::ActOptions;
 use cardinal::contract::{ActStatus, ErrorCode, PlanKind};
-use plan_support::{Setup, arbiter, write};
+use plan_support::{Setup, arbiter, write, write_synced};
 
-/// With or without `--dry-run`, `act` evaluates every check, reports what it would free, and
-/// neither claims, records a result for, nor deletes anything; a repeated call reports again.
+/// With or without `--dry-run`, `act` evaluates every check, reports the bound of what it would
+/// free, and neither claims, records a result for, nor deletes anything; a repeated call
+/// reports again.
 #[test]
 fn act_neither_claims_nor_deletes() {
     let s = Setup::new();
     let wt = s.worktree("dry");
-    write(&wt, "target/debug/app", "bin");
+    write_synced(&wt, "target/debug/app", b"bin");
     let plan = s.plan(PlanKind::ReclaimDir, &wt.join("target"));
     let dry = ActOptions {
         dry_run: true,
@@ -25,10 +26,7 @@ fn act_neither_claims_nor_deletes() {
     for options in [dry, arbiter(), arbiter()] {
         let result = s.act(&plan.id, &options).unwrap();
         assert_eq!(result.status, ActStatus::DryRun, "{result:#?}");
-        assert!(
-            result.freed_bytes.unwrap() > 0,
-            "reports what it would free"
-        );
+        plan_support::assert_dry_run_frees(result.freed_bytes, &result);
         assert!(!s.state.execution_claim(&plan.id).exists());
         assert!(!s.state.execution_result(&plan.id).exists());
         assert!(wt.join("target/debug/app").exists());

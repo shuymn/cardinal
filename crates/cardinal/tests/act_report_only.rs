@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use cardinal::contract::{ActResult, ActStatus, PlanKind};
-use plan_support::{Setup, act_result, write};
+use plan_support::{Setup, act_result, write, write_synced};
 
 /// Everything `act` must leave as it was.
 struct Untouched {
@@ -170,7 +170,7 @@ fn repeated_act_changes_nothing() {
 fn execution_not_designed_for_every_caller() {
     let s = Setup::with_host("[unit.disk-reclaim]\nact = true\n");
     let wt = s.worktree("passes");
-    write(&wt, "node_modules/pkg/index.js", "x");
+    write_synced(&wt, "node_modules/pkg/index.js", b"x");
     let plan = s.plan(PlanKind::ReclaimWorktree, &wt);
     assert!(
         plan.checks
@@ -192,7 +192,7 @@ fn execution_not_designed_for_every_caller() {
             assert_eq!(result.caller, named);
             assert_eq!(result.status, ActStatus::DryRun, "{args:?}: {result:#?}");
             assert_eq!(result.reasons, ["execution_not_designed"], "{args:?}");
-            assert!(result.freed_bytes.unwrap() > 0, "{args:?}: {result:#?}");
+            plan_support::assert_dry_run_frees(result.freed_bytes, (&args, &result));
             before.assert_unchanged(&s, &wt, &plan.id, named);
         }
     }

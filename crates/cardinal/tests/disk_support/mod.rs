@@ -249,11 +249,10 @@ fn relative(path: &str, root: &Path) -> String {
         .join("/")
 }
 
-/// Writes `bytes` bytes to `root/rel`, creating its directories.
+/// Writes `bytes` bytes to `root/rel`, creating its directories, and syncs them, so ext4's
+/// extents count them (section 8.5).
 pub fn fill(root: &Path, rel: &str, bytes: u64) {
-    let path = root.join(rel);
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    std::fs::write(path, vec![7u8; usize::try_from(bytes).unwrap()]).unwrap();
+    crate::plan_support::write_synced(root, rel, &vec![7u8; usize::try_from(bytes).unwrap()]);
 }
 
 /// Moves the last activity of the worktree at `wt` (its index's modification time)
