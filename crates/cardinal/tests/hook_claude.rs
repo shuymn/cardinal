@@ -609,6 +609,7 @@ fn shipped_settings_name_the_hook_commands() {
         [
             ("PreToolUse".to_owned(), "pre-tool-use".to_owned()),
             ("SessionEnd".to_owned(), "session-end".to_owned()),
+            ("SessionStart".to_owned(), "session-start".to_owned()),
             ("SubagentStop".to_owned(), "subagent-stop".to_owned()),
         ]
     );

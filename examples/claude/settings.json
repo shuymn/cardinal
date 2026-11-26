@@ -6,6 +6,9 @@
         "hooks": [{ "type": "command", "command": "cardinal hook claude pre-tool-use", "timeout": 5 }]
       }
     ],
+    "SessionStart": [
+      { "hooks": [{ "type": "command", "command": "cardinal hook claude session-start", "timeout": 5 }] }
+    ],
     "SubagentStop": [
       { "hooks": [{ "type": "command", "command": "cardinal hook claude subagent-stop", "timeout": 5 }] }
     ],

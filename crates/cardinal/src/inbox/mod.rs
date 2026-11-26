@@ -13,8 +13,8 @@
 //! raised or updated from a newer observation.
 //!
 //! The refresh that `cardinal inbox` and every `reconcile` pass run first runs the recovery
-//! pass, then raises and ends `recovery_needed` and `outlived_processes`, one refresh at a time
-//! under `inbox/.refresh.lock`. The items raised from a pass's observation and disk states come
+//! pass, then raises and ends `recovery_needed` and `outlived_processes` and expires session
+//! leases, one refresh at a time under `inbox/.refresh.lock`. The items raised from a pass's observation and disk states come
 //! from `reconcile`. [`raise`] and [`raise_item`] keep one item under a key as given, without
 //! occurrences.
 
@@ -631,8 +631,123 @@ pub fn refresh_with(
     }
 
     changes.extend(ended_gone(state, &before, &reserved, &sessions, found_ms));
+    expire_leases(config, state, found_ms);
     let applied = apply_recorded(config, state, &changes)?;
     listed.map(|_| applied)
+}
+
+/// Expires session leases (section 9.8, "Expiry"): lists `leases/`, takes each lease file's
+/// lock with one try, drops the entries that no longer hold, removes a file left empty, and
+/// removes a corrupt file whose mtime is more than `linger_s` old, appending
+/// `lease_corrupt_removed` once its lock is released. Only a regular file named by a worktree
+/// key with `.json` is a lease: nothing else there is read, locked, or removed. Each agent's
+/// process is read under its file's lock, never taken from an earlier table; an entry whose
+/// liveness that read cannot decide is kept. A file whose lock is held, that cannot be read, or
+/// that cannot be written is left for the next refresh. Lock files stay. Nothing on Windows,
+/// where no hook writes a lease (section 9.8).
+fn expire_leases(config: &Config, state: &StateDir, now_ms: u64) {
+    if cfg!(windows) {
+        return;
+    }
+    // `config` falls back to defaults when `host.toml` is there but cannot be read (a symbolic
+    // link whose target is being replaced), and may have been read before such an update; the
+    // shorter default would drop entries the owner's `linger_s` still holds. So expiry reads
+    // `host.toml` again, as the hooks do, takes `linger_s` from that read, and expires nothing
+    // when it fails.
+    let Ok(host) = HostConfig::load_present(&config.dir) else {
+        return;
+    };
+    let linger_ms = host.sessions.linger_s.saturating_mul(1000);
+    let boot_id = crate::os::boot_id();
+    let Ok(listing) = std::fs::read_dir(state.leases_dir()) else {
+        return;
+    };
+    let mut removed = Vec::new();
+    for entry in listing.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
+        let Some(key) = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .filter(|stem| state::lease::is_key(stem))
+        else {
+            continue;
+        };
+        if path != state.lease(key) || !is_regular(&path) {
+            continue;
+        }
+        let Ok(Some(_lock)) = state::try_lock(&state.lease_lock(key), LockMode::Exclusive) else {
+            continue;
+        };
+        let _ = testpoint::hit(testpoint::INBOX_LEASE_LOCKED);
+        // Checked again under the lock, before the read and before either removal: a file
+        // swapped for a symbolic link since the listing is left alone.
+        if !is_regular(&path) {
+            continue;
+        }
+        let mut live =
+            state::lease::liveness(boot_id.as_deref(), state::lease::StartIdentity::HOST, probe);
+        let stale_corrupt = match state::lease::read(&path) {
+            Ok(state::lease::Read::Parsed(mut lease)) => {
+                let before = lease.clone();
+                if state::lease::prune(&mut lease, None, now_ms, Some(linger_ms), &mut live, None)
+                    .is_err()
+                {
+                    continue;
+                }
+                if lease.sessions.is_empty() {
+                    if is_regular(&path) {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                } else if lease != before
+                    && let Ok(bytes) = serde_json::to_vec(&lease)
+                {
+                    let _ = state.write_atomic(&path, &bytes, Durability::Volatile);
+                }
+                None
+            }
+            // Read again under the lock: a regular file still.
+            Ok(state::lease::Read::Corrupt {
+                mtime_ms: Some(mtime_ms),
+            }) if now_ms.saturating_sub(mtime_ms) > linger_ms && is_regular(&path) => {
+                Some(mtime_ms)
+            }
+            _ => None,
+        };
+        if let Some(mtime_ms) = stale_corrupt
+            && std::fs::remove_file(&path).is_ok()
+        {
+            removed.push((path, mtime_ms));
+        }
+    }
+    let recorder = recorder(config, state);
+    for (path, mtime_ms) in removed {
+        let mut record = recorder.record(RecordKind::LeaseCorruptRemoved);
+        record.data = serde_json::json!({ "path": path, "mtime_ms": mtime_ms })
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        let _ = recorder.append(&record);
+    }
+}
+
+/// Whether `path` is a regular file by `lstat`: not a symbolic link, a directory, or anything
+/// else.
+fn is_regular(path: &std::path::Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file())
+}
+
+/// One read of `pid`, now (section 9.8): what an expiry may rest on.
+fn probe(pid: u32) -> state::lease::Process {
+    match crate::os::probe(pid) {
+        crate::os::Probe::Gone => state::lease::Process::Gone,
+        crate::os::Probe::Running { start_s, start_us } => {
+            state::lease::Process::Running { start_s, start_us }
+        }
+        crate::os::Probe::Unknown => state::lease::Process::Unknown,
+    }
 }
 
 /// `inbox/.refresh.lock`, taken before the admission lock and held from a refresh's first read

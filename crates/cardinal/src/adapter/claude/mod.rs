@@ -1,24 +1,27 @@
-//! The Claude Code adapter: hook input and output and the session-end snapshot
-//! (`docs/architecture.md` section 6). Classification and the rewrite itself are `classify`'s.
+//! The Claude Code adapter: hook input and output, the session hooks' lease writes, and the
+//! session-end snapshot (`docs/architecture.md` sections 6 and 9.8). Classification and the rewrite itself are `classify`'s.
 //!
 //! The CLI exits 0 for every hook, whatever these return, and writes the output of
 //! `pre_tool_use` to stdout only when it returns `Ok`.
 
 mod hook;
+mod lease;
 mod repo;
 mod session;
 
 use std::ffi::OsString;
 use std::io::{Read, Write};
-use std::time::Instant;
+use std::path::Path;
+use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value};
 
 use crate::config::{self, Base, Config, HostConfig};
-use crate::contract::{Error, ErrorCode, RecordKind};
+use crate::contract::{Error, ErrorCode, LeaseEvent, RecordKind};
 use crate::os::{self, Detail, ProcessTable};
-use crate::record::Recorder;
+use crate::record::{RecordError, Recorder};
 use crate::state::{Durability, StateDir, now_ms};
+use crate::testpoint;
 
 use hook::{Pass, Settings};
 
@@ -69,7 +72,42 @@ fn append(
     session_id: Option<String>,
     data: Map<String, Value>,
 ) -> Result<(), Error> {
-    let state = open_state(env)?;
+    append_until(env, host, kind, session_id, data, None)
+}
+
+/// [`append`], waiting for a rotation at most until `deadline` when one is given: a record
+/// that cannot be appended by then is dropped.
+fn append_until(
+    env: Env<'_>,
+    host: Option<&HostConfig>,
+    kind: RecordKind,
+    session_id: Option<String>,
+    data: Map<String, Value>,
+    deadline: Option<Instant>,
+) -> Result<(), Error> {
+    append_line(env, host, kind, session_id, data, deadline).map_err(|failed| failed.error)
+}
+
+/// An append that failed, and whether its line was written all the same: only the rotation
+/// after it failed.
+struct AppendFailed {
+    error: Error,
+    written: bool,
+}
+
+/// [`append_until`], telling a record dropped from one appended whose rotation failed.
+fn append_line(
+    env: Env<'_>,
+    host: Option<&HostConfig>,
+    kind: RecordKind,
+    session_id: Option<String>,
+    data: Map<String, Value>,
+    deadline: Option<Instant>,
+) -> Result<(), AppendFailed> {
+    let state = open_state(env).map_err(|error| AppendFailed {
+        error,
+        written: false,
+    })?;
     let defaults;
     let host = if let Some(host) = host {
         host
@@ -81,9 +119,14 @@ fn append(
     let mut record = recorder.record(kind);
     record.session_id = session_id;
     record.data = data;
-    recorder
-        .append(&record)
-        .map_err(|err| Error::new(ErrorCode::StateUnavailable, err.to_string()))
+    match deadline {
+        Some(deadline) => recorder.append_until(&record, deadline),
+        None => recorder.append(&record),
+    }
+    .map_err(|err| AppendFailed {
+        written: matches!(err, RecordError::Rotate(_)),
+        error: Error::new(ErrorCode::StateUnavailable, err.to_string()),
+    })
 }
 
 fn open_state(env: Env<'_>) -> Result<StateDir, Error> {
@@ -221,58 +264,206 @@ fn end_data(doc: &Map<String, Value>) -> Map<String, Value> {
         .collect()
 }
 
+/// `host.toml` alone: no repository profile can make a session hook fall back to defaults,
+/// and neither can a `host.toml` entry that is there but cannot be read, a symbolic link
+/// whose target is missing included.
 fn load_host() -> Option<HostConfig> {
     config::config_dir()
-        .and_then(|dir| Config::load(&dir))
+        .and_then(|dir| HostConfig::load_present(&dir))
         .ok()
-        .map(|config| config.host)
 }
 
-/// `cardinal hook claude subagent-stop`: records the end; never stops processes.
-pub fn subagent_stop(input: &mut dyn Read) -> Result<(), Error> {
-    let doc = read_input(input)?;
-    let host = load_host();
-    append(
-        &process_env,
-        host.as_ref(),
-        RecordKind::SubagentStopped,
-        string(&doc, "session_id"),
-        end_data(&doc),
+/// How long `session-start` and `subagent-stop` wait for a lease lock (section 9.8).
+const LEASE_WAIT: Duration = Duration::from_secs(1);
+
+/// The budget of `session-start` and `subagent-stop` from their start to their last write
+/// (section 9.8), well within the `timeout: 5` of section 6.2's settings.
+const HOOK_BUDGET: Duration = Duration::from_secs(2);
+
+/// How long `session-end` waits for a lease lock, within `SessionEnd`'s budget (section 9.8).
+const LEASE_WAIT_AT_END: Duration = Duration::from_millis(250);
+
+/// `SessionEnd`'s budget from the hook's start to its last write (section 9.8): Claude Code's
+/// default 1.5 s, less 100 ms for the process's start before `start` and its exit.
+const SESSION_END_BUDGET: Duration = Duration::from_millis(1400);
+
+/// The least of `SessionEnd`'s budget its snapshot starts with: the process listing cannot
+/// stop part-way. On the macOS development host (1,019 processes, a debug build) the listing
+/// with command lines, the snapshot, and its serialization took 9 ms at the median and 14 ms
+/// at most over 20 runs; 100 ms leaves about seven times that for the write and a busier host.
+const SNAPSHOT_MIN: Duration = Duration::from_millis(100);
+
+/// Updates the session's leases for `kind` (section 9.8) within `times`; returns the records
+/// to append once every lease lock is released. Input without a session ID or a `cwd` writes
+/// nothing.
+fn update_leases(
+    doc: &Map<String, Value>,
+    kind: LeaseEvent,
+    host: Option<&HostConfig>,
+    times: lease::Times,
+) -> Vec<lease::Pending> {
+    let (Some(session_id), Some(cwd)) = (string(doc, "session_id"), string(doc, "cwd")) else {
+        return Vec::new();
+    };
+    let input = lease::Input {
+        kind,
+        session_id: &session_id,
+        cwd: Path::new(&cwd),
+        transcript_path: string(doc, "transcript_path"),
+    };
+    lease::update(
+        &input,
+        cfg!(windows),
+        || open_state(&process_env).ok(),
+        host.map(|host| host.sessions.linger_s),
+        times,
     )
 }
 
-/// `cardinal hook claude session-end`: records the end and writes the session snapshot;
+/// Appends the records a lease update returned until `deadline`; returns how many were
+/// dropped. A record appended whose rotation then failed is not dropped.
+fn append_pending(
+    host: Option<&HostConfig>,
+    session_id: Option<&String>,
+    pending: Vec<lease::Pending>,
+    deadline: Instant,
+) -> usize {
+    pending
+        .into_iter()
+        .filter(|record| {
+            append_line(
+                &process_env,
+                host,
+                record.kind,
+                session_id.cloned(),
+                record.data.clone(),
+                Some(deadline),
+            )
+            .is_err_and(|failed| !failed.written)
+        })
+        .count()
+}
+
+/// The data of the hook's own record, with how many of its diagnostics were dropped.
+fn end_record(doc: &Map<String, Value>, dropped: usize) -> Map<String, Value> {
+    let mut data = end_data(doc);
+    if dropped > 0 {
+        data.insert("dropped_records".into(), dropped.into());
+    }
+    data
+}
+
+/// `cardinal hook claude session-start`: upserts the session's leases; appends no record of
+/// its own.
+pub fn session_start(input: &mut dyn Read) -> Result<(), Error> {
+    let start = Instant::now();
+    let deadline = start + HOOK_BUDGET;
+    let doc = read_input(input)?;
+    let host = load_host();
+    let pending = update_leases(
+        &doc,
+        LeaseEvent::SessionStart,
+        host.as_ref(),
+        lease::Times {
+            start,
+            lock_deadline: (start + LEASE_WAIT).min(deadline),
+            deadline,
+        },
+    );
+    append_pending(
+        host.as_ref(),
+        string(&doc, "session_id").as_ref(),
+        pending,
+        deadline,
+    );
+    Ok(())
+}
+
+/// `cardinal hook claude subagent-stop`: upserts the session's leases, then records the end;
 /// never stops processes.
+pub fn subagent_stop(input: &mut dyn Read) -> Result<(), Error> {
+    let start = Instant::now();
+    let deadline = start + HOOK_BUDGET;
+    let doc = read_input(input)?;
+    let host = load_host();
+    let pending = update_leases(
+        &doc,
+        LeaseEvent::SubagentStop,
+        host.as_ref(),
+        lease::Times {
+            start,
+            lock_deadline: (start + LEASE_WAIT).min(deadline),
+            deadline,
+        },
+    );
+    let session_id = string(&doc, "session_id");
+    let dropped = append_pending(host.as_ref(), session_id.as_ref(), pending, deadline);
+    append_until(
+        &process_env,
+        host.as_ref(),
+        RecordKind::SubagentStopped,
+        session_id,
+        end_record(&doc, dropped),
+        Some(deadline),
+    )
+}
+
+/// `cardinal hook claude session-end`: upserts the session's leases, writes the session
+/// snapshot, and records the end, in that order, all within one budget from its start: each
+/// step takes only what the steps before it left, and a step past the budget is dropped, the
+/// snapshot never started; never stops processes.
 pub fn session_end(input: &mut dyn Read) -> Result<(), Error> {
+    let start = Instant::now();
+    let deadline = start + SESSION_END_BUDGET;
     let doc = read_input(input)?;
     let session_id = string(&doc, "session_id");
     let host = load_host();
-    // The snapshot comes first: it must list the processes as close to the end as possible,
-    // and the record append may wait for a rotation.
-    let snapshot = session_id.as_deref().map(|id| {
-        let table = ProcessTable::snapshot(Detail {
-            cmd: true,
-            cwd: false,
-        })
-        .map_err(|err| Error::new(ErrorCode::Internal, err.to_string()))?;
-        let reason = string(&doc, "reason").unwrap_or_default();
-        let Some(snapshot) = session::snapshot(&table, os::current_pid(), id, &reason, now_ms())
-        else {
-            return Ok(());
-        };
-        let state = open_state(&process_env)?;
-        let bytes = serde_json::to_vec(&snapshot)
+    // The lease comes first (section 9.8): it takes no lock but the lease file's, and the
+    // snapshot and the records come after it within `SessionEnd`'s budget.
+    let pending = update_leases(
+        &doc,
+        LeaseEvent::SessionEnd,
+        host.as_ref(),
+        lease::Times {
+            start,
+            lock_deadline: (start + LEASE_WAIT_AT_END).min(deadline),
+            deadline,
+        },
+    );
+    let _ = testpoint::hit(testpoint::HOOK_SNAPSHOT_ADMISSION);
+    // The snapshot comes before the records: it must list the processes as close to the end as
+    // possible, and the record append may wait for a rotation. It starts only with
+    // `SNAPSHOT_MIN` left, since the listing cannot stop part-way.
+    let snapshot = session_id
+        .as_deref()
+        .filter(|_| deadline.saturating_duration_since(Instant::now()) >= SNAPSHOT_MIN)
+        .map(|id| {
+            let table = ProcessTable::snapshot(Detail {
+                cmd: true,
+                cwd: false,
+            })
             .map_err(|err| Error::new(ErrorCode::Internal, err.to_string()))?;
-        state
-            .write_atomic(&state.session(id), &bytes, Durability::Volatile)
-            .map_err(Error::from)
-    });
-    let recorded = append(
+            let reason = string(&doc, "reason").unwrap_or_default();
+            let Some(snapshot) =
+                session::snapshot(&table, os::current_pid(), id, &reason, now_ms(), deadline)
+            else {
+                return Ok(());
+            };
+            let state = open_state(&process_env)?;
+            let bytes = serde_json::to_vec(&snapshot)
+                .map_err(|err| Error::new(ErrorCode::Internal, err.to_string()))?;
+            state
+                .write_atomic(&state.session(id), &bytes, Durability::Volatile)
+                .map_err(Error::from)
+        });
+    let dropped = append_pending(host.as_ref(), session_id.as_ref(), pending, deadline);
+    let recorded = append_until(
         &process_env,
         host.as_ref(),
         RecordKind::SessionEnded,
         session_id,
-        end_data(&doc),
+        end_record(&doc, dropped),
+        Some(deadline),
     );
     snapshot.transpose().and(recorded)
 }

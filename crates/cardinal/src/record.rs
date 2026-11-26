@@ -67,36 +67,37 @@ impl Recorder {
 
     /// Appends `record`, then rotates if the current file has grown past the limit.
     pub fn append(&self, record: &Record) -> Result<(), RecordError> {
+        self.append_until(record, Instant::now() + APPEND_WAIT)
+    }
+
+    /// [`Self::append`] waiting for a rotation, and rotating, only until `deadline` (and at most
+    /// the usual waits): once it has passed, the lock is tried once and the record dropped if it
+    /// is held. For a hook within its budget (section 9.8).
+    pub fn append_until(&self, record: &Record, deadline: Instant) -> Result<(), RecordError> {
+        let deadline = deadline.min(Instant::now() + APPEND_WAIT);
         let line = serde_json::to_vec(record)?;
         let path = self.state.records_file();
         let append_error = |source| RecordError::Append {
             path: path.clone(),
             source,
         };
-        let shared = state::lock(
-            &self.state.records_lock(),
-            LockMode::Shared,
-            Instant::now() + APPEND_WAIT,
-        )
-        .map_err(|err| append_error(io::Error::other(err)))?;
+        let shared = state::lock(&self.state.records_lock(), LockMode::Shared, deadline)
+            .map_err(|err| append_error(io::Error::other(err)))?;
         let file = state::open_append(&path).map_err(append_error)?;
         testpoint::hit(testpoint::RECORD_OPENED)
             .map_err(|err| append_error(io::Error::other(err)))?;
         state::append_line(&file, &line).map_err(append_error)?;
         drop((file, shared));
-        self.rotate_if_needed().map_err(RecordError::Rotate)
+        self.rotate_if_needed(deadline.min(Instant::now() + ROTATE_WAIT))
+            .map_err(RecordError::Rotate)
     }
 
-    fn rotate_if_needed(&self) -> io::Result<()> {
+    fn rotate_if_needed(&self, deadline: Instant) -> io::Result<()> {
         let current = self.state.records_file();
         if !self.over_limit()? {
             return Ok(());
         }
-        let lock = match state::lock(
-            &self.state.records_lock(),
-            LockMode::Exclusive,
-            Instant::now() + ROTATE_WAIT,
-        ) {
+        let lock = match state::lock(&self.state.records_lock(), LockMode::Exclusive, deadline) {
             Ok(lock) => lock,
             // Appenders are still writing or another appender is rotating; the next append
             // rotates.

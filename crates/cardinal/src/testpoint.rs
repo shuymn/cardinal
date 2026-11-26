@@ -68,6 +68,13 @@ pub const WALK_DIR_CHECKED: &str = "walk.dir_checked";
 pub const OBSERVE_FILTERS_LISTED: &str = "observe.filters_listed";
 /// The hook classified the command.
 pub const HOOK_CLASSIFIED: &str = "hook.classified";
+/// A session hook found the worktrees of its `cwd` and has not looked for its agent or taken
+/// a lease lock (section 9.8).
+pub const HOOK_LEASE_AGENT: &str = "hook.lease_agent";
+/// `session-end` updated its leases and has not decided whether its snapshot fits its budget.
+pub const HOOK_SNAPSHOT_ADMISSION: &str = "hook.snapshot_admission";
+/// The inbox refresh holds a lease file's lock and has not checked the file again or read it.
+pub const INBOX_LEASE_LOCKED: &str = "inbox.lease_locked";
 /// A record appender holds the shared records lock and the open current file, and has not
 /// written its line.
 pub const RECORD_OPENED: &str = "record.opened";
@@ -136,6 +143,9 @@ pub const POINTS: &[&str] = &[
     WALK_DIR_CHECKED,
     OBSERVE_FILTERS_LISTED,
     HOOK_CLASSIFIED,
+    HOOK_LEASE_AGENT,
+    HOOK_SNAPSHOT_ADMISSION,
+    INBOX_LEASE_LOCKED,
     RECORD_OPENED,
     INBOX_LISTING,
     INBOX_OBSERVED,
