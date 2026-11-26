@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 pub use host::{
     Act, Admission, Arbiter, Disk, DiskLines, Hook, HostConfig, MAX_ITEMS, Managed, Observe,
-    Reconcile, Records, Unit, VolumeLines, logical_cpus, validate_runner,
+    Reconcile, Records, Sessions, Unit, VolumeLines, logical_cpus, validate_runner,
 };
 pub use locations::{Base, config_dir, resolve, state_dir};
 pub use profile::{
@@ -133,6 +133,32 @@ impl HostConfig {
     pub fn load(dir: &Path) -> Result<Self, ConfigError> {
         let path = dir.join("host.toml");
         let text = read_optional(&path)?.unwrap_or_default();
+        Self::parse(
+            &path,
+            &text,
+            logical_cpus(),
+            locations::home_dir().as_deref(),
+        )
+    }
+
+    /// [`Self::load`] for a reader whose fallback to defaults would change what it removes,
+    /// the session hooks' lease pruning (section 9.8): only a `host.toml` with no directory
+    /// entry is absent. An entry that is there but cannot be read is an error, `ENOENT` through
+    /// a symbolic link whose target is missing included, as during an update that replaces
+    /// the target.
+    pub fn load_present(dir: &Path) -> Result<Self, ConfigError> {
+        let path = dir.join("host.toml");
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(err)
+                if err.kind() == std::io::ErrorKind::NotFound
+                    && std::fs::symlink_metadata(&path)
+                        .is_err_and(|meta| meta.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                String::new()
+            }
+            Err(source) => return Err(ConfigError::Read { path, source }),
+        };
         Self::parse(
             &path,
             &text,

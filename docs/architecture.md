@@ -291,7 +291,7 @@ protected = ["fuzz/corpus", "fuzz/artifacts", "proptest-regressions"]
 | `VERSION`, `host-id` | text | first cardinal process that finds them missing: a fully written temp file is hard-linked into place, which fails if another process won, and the loser reads the winner's file | all |
 | `reservations/<job>.json` | `cardinal.reservation.v1` | owning runner; the recovery pass deletes others' reservations; both only under the admission lock (section 4.3) | admission, observe, inbox, plan, act, explain, all under the admission lock |
 | `sessions/<session>.json` | `cardinal.session-snapshot.v1` | `hook claude session-end` | inbox refresh |
-| `leases/<key>.json` | the session lease (section 11.3) | `hook claude session-start`, `subagent-stop`, and `session-end`, and the inbox refresh's pruning, each under `leases/<key>.lock` | `inventory`, `plan`, `act`, by name and without the lock (section 9.8) |
+| `leases/<key>.json` | `cardinal.session-lease.v1` (section 11.3) | `hook claude session-start`, `subagent-stop`, and `session-end`, and the inbox refresh's pruning, each under `leases/<key>.lock` | `inventory`, `plan`, `act`, by name and without the lock (section 9.8) |
 | `inbox/<key-hash>.json` | `cardinal.inbox-item.v1` | inbox raise, refresh, resolve, and the arbiter launcher's assignments and outcomes, all under `inbox/.lock` | `inbox`, `explain`, the arbiter trigger (under `inbox/.lock`) |
 | `plans/<plan>/plan.json` | `cardinal.plan.v1` | `plan` | `act`, `explain` |
 | `executions/<plan>/manifest`, `claim`, `result.json` | `cardinal.act-manifest.v1`, `cardinal.act-claim.v1`, `cardinal.act-result.v2` | the `act` or recovery holding the plan's `act.lock` (section 9.7) | `act`, recovery, `explain` |
@@ -1469,7 +1469,7 @@ type ExclusiveMeasure = "private_size" | "extents" | "links" | "read_failed" | "
   agent: { pid: number; start_s: number; name: string };
   processes: { pid: number; start_s: number; name: string; command: string }[] }
 
-// the session lease (leases/<key>.json, section 9.8); unit X3 declares its type and names its schema with a version
+// cardinal.session-lease.v1  (leases/<key>.json, section 9.8)
 { schema; worktree: string;
   overflow?: true;                                         // file-level: live or undecidable entries alone passed 1,024, so the file
                                                            // holds more than 1,024 entries; readers take the worktree as unknown

@@ -5,6 +5,7 @@
 mod fnv_vectors;
 mod fs;
 mod id;
+pub mod lease;
 mod lock;
 mod reserve;
 
@@ -180,6 +181,27 @@ impl StateDir {
     pub fn session(&self, session: &str) -> PathBuf {
         self.sessions_dir()
             .join(format!("{}.json", file_safe(session)))
+    }
+
+    /// `leases/`: session leases (section 9.8), created by the first writer. Only the inbox
+    /// refresh lists it.
+    #[must_use]
+    pub fn leases_dir(&self) -> PathBuf {
+        self.root.join("leases")
+    }
+
+    /// `leases/<key>.json` (`cardinal.session-lease.v1`), `key` a worktree key (section 4.6).
+    /// Readers read it by name, without the lock.
+    #[must_use]
+    pub fn lease(&self, key: &str) -> PathBuf {
+        self.leases_dir().join(format!("{}.json", file_safe(key)))
+    }
+
+    /// `leases/<key>.lock`: serializes the writers of `leases/<key>.json`, taken alone or last
+    /// (section 4.3). Never deleted.
+    #[must_use]
+    pub fn lease_lock(&self, key: &str) -> PathBuf {
+        self.leases_dir().join(format!("{}.lock", file_safe(key)))
     }
 
     #[must_use]

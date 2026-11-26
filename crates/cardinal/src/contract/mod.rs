@@ -1,5 +1,5 @@
 //! serde types for every JSON document cardinal reads or writes (`docs/architecture.md`
-//! section 11.3), plus the run spec, reservation, record, and session-snapshot files.
+//! section 11.3), plus the run spec, reservation, record, session-snapshot, and session-lease files.
 //!
 //! Every top-level document carries a `schema` field `"cardinal.<name>.v<N>"`. The field is
 //! a zero-sized marker type per document, so deserializing a document of another schema or
@@ -14,6 +14,7 @@ mod execution;
 mod explain;
 mod inbox;
 mod inventory;
+mod lease;
 mod plan;
 mod reconcile;
 mod record;
@@ -50,6 +51,9 @@ pub use inventory::{
     ArbiterView, BaseRef, DirtyUnknown, DirtyUnknownReason, ExclusiveMeasure, Facts, GhStatus,
     HostInfo, IgnoredClass, IgnoredEntry, InUse, Inventory, MergeEvidence, Os, Outlived, PrRef,
     ReclaimSummary, Repo, Worktree, WorktreeView,
+};
+pub use lease::{
+    LeaseAgent, LeaseEntry, LeaseEvent, MAX_ENTRIES as LEASE_MAX_ENTRIES, SessionLease,
 };
 pub use plan::{
     Approval, ConfigKey, ObservedError, Plan, PlanKind, PlanList, PlanTarget, Provenance, RootId,
@@ -169,6 +173,10 @@ schema_marker!(
 schema_marker!(
     /// `cardinal.session-snapshot.v1`
     SessionSnapshotSchema = "cardinal.session-snapshot.v1"
+);
+schema_marker!(
+    /// `cardinal.session-lease.v1`
+    SessionLeaseSchema = "cardinal.session-lease.v1"
 );
 schema_marker!(
     /// `cardinal.disk-state.v1`
