@@ -9,6 +9,7 @@ mod plan_support;
 mod support;
 
 use cardinal::contract::{DiskLevel, InboxStatus, RecordKind};
+use cardinal::reconcile::TIMER_INTERVAL_MS;
 use disk_support::{Disk, MIB, carried_report, own_errors, report};
 
 const LINES: (u64, u64, u64) = (1, 2, 3);
@@ -87,23 +88,79 @@ fn hysteresis() {
     assert_eq!(state.readings[11].free_bytes, Some(recovery + 1));
 }
 
-/// From `ok`, readings that fall fast enough to reach the critical line within two timer
-/// intervals enter `warning` above the warning line; the same reading without the fall stays
-/// `ok`.
+/// One pass after another, each earlier one a timer interval and a few seconds before.
+fn levels_an_interval_apart(d: &Disk, passes: usize) -> Vec<DiskLevel> {
+    (0..passes)
+        .map(|pass| {
+            if pass > 0 {
+                d.age(TIMER_INTERVAL_MS + 4_000);
+            }
+            levels(d, 1)[0]
+        })
+        .collect()
+}
+
+/// From `ok`, readings an interval apart that fall fast enough to reach the critical line
+/// within two timer intervals enter `warning` above the warning line; the same fall within a
+/// pass's time, or the same reading without the fall, stays `ok`.
 #[test]
 fn prediction() {
     let control = Disk::new(LINES);
-    control.fixture_reads(&[Some(mib(29)), Some(mib(28))]);
+    control.fixture_reads(&[Some(mib(29)), Some(mib(22))]);
+    let close = Disk::new(LINES);
+    close.fixture_reads(&[Some(mib(29)), Some(mib(22))]);
     let steady = Disk::new(LINES);
-    steady.fixture_reads(&[Some(mib(28))]);
-    assert_eq!(levels(&steady, 2), [DiskLevel::Ok, DiskLevel::Ok]);
-    // 0.1 MiB within a pass's time: 1.8 MiB above the critical line is seconds away.
-    assert_eq!(levels(&control, 2), [DiskLevel::Ok, DiskLevel::Warning]);
+    steady.fixture_reads(&[Some(mib(22))]);
+    assert_eq!(
+        levels_an_interval_apart(&steady, 2),
+        [DiskLevel::Ok, DiskLevel::Ok]
+    );
+    assert_eq!(levels(&close, 2), [DiskLevel::Ok, DiskLevel::Ok]);
+    // 0.7 MiB in an interval: 1.2 MiB above the critical line is less than two away.
+    assert_eq!(
+        levels_an_interval_apart(&control, 2),
+        [DiskLevel::Ok, DiskLevel::Warning]
+    );
     let records = control.records(RecordKind::DiskState);
     let entered = records.last().unwrap();
     assert_eq!(entered.data["to"], "warning");
     assert_eq!(entered.data["predicted"], true);
-    assert_eq!(entered.data["free_bytes"], mib(28));
+    assert_eq!(entered.data["predicted_only"], true);
+    assert_eq!(entered.data["free_bytes"], mib(22));
+    assert!(control.state().predicted_only);
+}
+
+/// A volume in `warning` only by prediction returns to `ok` at a reading above the warning
+/// line once the fall stops, kept across passes in its disk state; one whose episode has been
+/// below the warning line, even once after entering by prediction, stays in `warning` up to
+/// the recovery line.
+#[test]
+fn prediction_only_warning_clears() {
+    let predicted = Disk::new(LINES);
+    // Pass 2 reads twice: step 4 enters `warning`, step 6 reads the same.
+    predicted.fixture_reads(&[Some(mib(29)), Some(mib(22)), Some(mib(22)), Some(mib(25))]);
+    assert_eq!(
+        levels_an_interval_apart(&predicted, 3),
+        [DiskLevel::Ok, DiskLevel::Warning, DiskLevel::Ok]
+    );
+    assert!(!predicted.state().predicted_only);
+    assert_eq!(predicted.disk_statuses().0, Some(InboxStatus::Resolved));
+
+    let dipped = Disk::new(LINES);
+    dipped.fixture_reads(&[
+        Some(mib(29)),
+        Some(mib(22)),
+        Some(mib(19)), // below the warning line at step 6
+        Some(mib(25)),
+        Some(mib(25)),
+        Some(mib(25)),
+    ]);
+    assert_eq!(
+        levels_an_interval_apart(&dipped, 3),
+        [DiskLevel::Ok, DiskLevel::Warning, DiskLevel::Warning]
+    );
+    assert!(!dipped.state().predicted_only);
+    assert_eq!(dipped.disk_statuses().0, Some(InboxStatus::Open));
 }
 
 /// A first reading below the critical line is `critical` at once, and `disk-reclaim` reports

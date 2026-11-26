@@ -154,6 +154,7 @@ fn disk_state() -> Value {
     json!({
         "schema": "cardinal.disk-state.v1", "volume": "af63dc4c8601ec8c", "mount": "/",
         "measure": "important_usage", "state": "warning", "since_ms": 5,
+        "predicted_only": true,
         "lines": {"warning_bytes": 300, "recovery_bytes": 400, "critical_bytes": 100},
         "readings": [{"at_ms": 4, "free_bytes": 250, "total_bytes": 1000},
                      {"at_ms": 5, "free_bytes": null, "total_bytes": null}]
@@ -345,6 +346,11 @@ fn inventory_document() {
 fn disk_state_document() {
     round_trips::<DiskState>(&disk_state());
     rejects_wrong_schema_and_missing::<DiskState>(&disk_state(), "lines");
+    // A state written before `predicted_only` keeps the recovery line.
+    let mut before = disk_state();
+    before.as_object_mut().unwrap().remove("predicted_only");
+    let before: DiskState = serde_json::from_value(before).unwrap();
+    assert!(!before.predicted_only);
     rejects::<DiskState>(&disk_state(), "an unknown measure", |d| {
         d["measure"] = json!("statfs");
     });

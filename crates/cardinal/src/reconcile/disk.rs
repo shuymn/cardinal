@@ -29,8 +29,10 @@ pub const KEPT_READINGS: usize = 12;
 /// looks two of them ahead.
 pub const TIMER_INTERVAL_MS: u64 = 5 * 60 * 1000;
 
-/// How far back the readings that predict the critical line go.
-pub const PREDICTION_WINDOW_MS: u64 = 60 * 60 * 1000;
+/// How far back the readings that predict the critical line go: two timer intervals, so the
+/// rate is that of the last interval or two and an earlier rise does not dilute it
+/// (section 10.4).
+pub const PREDICTION_WINDOW_MS: u64 = 2 * TIMER_INTERVAL_MS;
 
 /// The measure a pass reads (section 10.4).
 const MEASURE: Measure = Measure::Usable;
@@ -94,6 +96,7 @@ pub fn read_watched(
             measure: MEASURE_KIND,
             state: DiskLevel::Unknown,
             since_ms: state::now_ms(),
+            predicted_only: false,
             lines,
             readings: Vec::new(),
         });
@@ -140,7 +143,14 @@ pub fn read(
         Ok(space) => {
             let free = space.free_bytes;
             let predicted = predicts_critical(&volume.state.readings, at_ms, &volume.state.lines);
-            let to = next(from, free, &volume.state.lines, predicted);
+            let (to, predicted_only) = next(
+                from,
+                volume.state.predicted_only,
+                free,
+                &volume.state.lines,
+                predicted,
+            );
+            volume.state.predicted_only = predicted_only;
             if to != from {
                 volume.state.state = to;
                 volume.state.since_ms = at_ms;
@@ -153,7 +163,13 @@ pub fn read(
                 record(
                     &recorder,
                     &volume.state,
-                    json!({ "from": from, "to": to, "free_bytes": free, "predicted": predicted }),
+                    json!({
+                        "from": from,
+                        "to": to,
+                        "free_bytes": free,
+                        "predicted": predicted,
+                        "predicted_only": predicted_only,
+                    }),
                 );
             }
             volume.reading = Some(ReportReading {
@@ -215,48 +231,74 @@ pub fn write_reserve(
     }
 }
 
-/// The state a successful reading of `free` bytes leads to from `current` (section 10.4):
-/// below the critical line `critical`, a first reading included; from `ok` below the warning
-/// line or when `predicted`, `warning`; out of `critical` above the critical line, `warning`;
-/// out of pressure only above the recovery line. A reading on a line crosses nothing.
+/// The state a successful reading of `free` bytes leads to from `current` (section 10.4), and
+/// whether the episode is still `predicted_only`: below the critical line `critical`, a first
+/// reading included; from `ok` below the warning line or when `predicted` is `Some(true)`,
+/// `warning`, only by prediction when the reading is not below the warning line; out of
+/// `critical` above the critical line, `warning`; out of pressure above the recovery line, or,
+/// for an episode that entered `warning` only by prediction and has never been below the
+/// warning line, at a reading above the warning line that no longer predicts (`Some(false)`).
+/// A prediction without enough readings (`None`) enters nothing and clears nothing. A reading
+/// below the warning line ends `predicted_only` for the rest of the episode. A reading on a
+/// line crosses nothing.
 #[must_use]
-pub fn next(current: DiskLevel, free: u64, lines: &DiskLines, predicted: bool) -> DiskLevel {
+pub fn next(
+    current: DiskLevel,
+    predicted_only: bool,
+    free: u64,
+    lines: &DiskLines,
+    predicted: Option<bool>,
+) -> (DiskLevel, bool) {
     let below_critical = free < lines.critical_bytes;
-    match current {
+    let below_warning = free < lines.warning_bytes;
+    let to = match current {
         DiskLevel::Ok | DiskLevel::Unknown if below_critical => DiskLevel::Critical,
-        DiskLevel::Ok | DiskLevel::Unknown if free < lines.warning_bytes || predicted => {
+        DiskLevel::Ok | DiskLevel::Unknown if below_warning || predicted == Some(true) => {
             DiskLevel::Warning
         }
         DiskLevel::Ok | DiskLevel::Unknown => DiskLevel::Ok,
         DiskLevel::Warning | DiskLevel::Critical if free > lines.recovery_bytes => DiskLevel::Ok,
         DiskLevel::Warning if below_critical => DiskLevel::Critical,
+        DiskLevel::Warning
+            if predicted_only && free > lines.warning_bytes && predicted == Some(false) =>
+        {
+            DiskLevel::Ok
+        }
         DiskLevel::Warning => DiskLevel::Warning,
         DiskLevel::Critical if free > lines.critical_bytes => DiskLevel::Warning,
         DiskLevel::Critical => DiskLevel::Critical,
-    }
+    };
+    let still = match current {
+        DiskLevel::Ok | DiskLevel::Unknown => true,
+        DiskLevel::Warning | DiskLevel::Critical => predicted_only,
+    };
+    (to, to == DiskLevel::Warning && still && !below_warning)
 }
 
-/// Whether the successful readings of the last hour, the newest at `now_ms` included, reach
-/// the critical line within two timer intervals at the rate free space fell between the first
-/// and the last of them.
+/// Whether the successful readings of the last two timer intervals, the newest at `now_ms`
+/// from this pass, reach the critical line within two timer intervals at the rate free space
+/// fell between the oldest and the newest of them; `None` when they cannot tell, the newest
+/// not this pass's or none at least one interval before it (the state's readings filled by
+/// one pass's, or a gap longer than the window).
 #[must_use]
-pub fn predicts_critical(readings: &[DiskReading], now_ms: u64, lines: &DiskLines) -> bool {
-    let hour: Vec<(u64, u64)> = readings
+pub fn predicts_critical(readings: &[DiskReading], now_ms: u64, lines: &DiskLines) -> Option<bool> {
+    let window: Vec<(u64, u64)> = readings
         .iter()
         .filter(|r| r.at_ms.saturating_add(PREDICTION_WINDOW_MS) >= now_ms)
         .filter_map(|r| r.free_bytes.map(|free| (r.at_ms, free)))
         .collect();
-    let (Some(&(first_ms, first)), Some(&(last_ms, last))) = (hour.first(), hour.last()) else {
-        return false;
-    };
-    if last_ms <= first_ms || last >= first {
-        return false;
+    let (&(first_ms, first), &(last_ms, last)) = (window.first()?, window.last()?);
+    if last_ms != now_ms || last_ms.saturating_sub(first_ms) < TIMER_INTERVAL_MS {
+        return None;
+    }
+    if last >= first {
+        return Some(false);
     }
     // room / (fallen / elapsed) <= 2 intervals, in integers.
     let room = u128::from(last.saturating_sub(lines.critical_bytes));
     let fallen = u128::from(first - last);
     let elapsed = u128::from(last_ms - first_ms);
-    room * elapsed <= fallen * 2 * u128::from(TIMER_INTERVAL_MS)
+    Some(room * elapsed <= fallen * 2 * u128::from(TIMER_INTERVAL_MS))
 }
 
 /// The state dir, then each worktree of `reconcile/observation.json`.
@@ -330,11 +372,65 @@ mod tests {
             (Critical, 49, Critical),
             (Critical, 301, Ok),
         ] {
-            assert_eq!(next(from, free, &LINES, false), to, "{from:?} at {free}");
+            assert_eq!(
+                next(from, false, free, &LINES, Some(false)),
+                (to, false),
+                "{from:?} at {free}"
+            );
         }
-        assert_eq!(next(Ok, 250, &LINES, true), Warning);
-        assert_eq!(next(Warning, 250, &LINES, true), Warning);
-        assert_eq!(next(Critical, 250, &LINES, true), Warning);
+        assert_eq!(next(Ok, false, 250, &LINES, Some(true)), (Warning, true));
+        assert_eq!(next(Ok, false, 200, &LINES, Some(true)), (Warning, true));
+        assert_eq!(next(Ok, false, 150, &LINES, Some(true)), (Warning, false));
+        assert_eq!(
+            next(Warning, false, 250, &LINES, Some(true)),
+            (Warning, false)
+        );
+        assert_eq!(
+            next(Critical, false, 250, &LINES, Some(true)),
+            (Warning, false)
+        );
+    }
+
+    /// An episode that entered `warning` only by prediction ends at a reading above the
+    /// warning line that no longer predicts; one that has been below the warning line keeps
+    /// the recovery line, however its trend turns.
+    #[test]
+    fn prediction_only_warning_clears_above_the_warning_line() {
+        use DiskLevel::{Critical, Ok, Warning};
+        // Prediction only: clears above the warning line once the trend reverses.
+        assert_eq!(next(Warning, true, 201, &LINES, Some(false)), (Ok, false));
+        // Readings that cannot tell the rate enter nothing and clear nothing.
+        assert_eq!(next(Warning, true, 201, &LINES, None), (Warning, true));
+        assert_eq!(next(Ok, false, 201, &LINES, None), (Ok, false));
+        assert_eq!(next(Ok, false, 199, &LINES, None), (Warning, false));
+        // Still predicting, or on the line: stays, still by prediction only.
+        assert_eq!(
+            next(Warning, true, 250, &LINES, Some(true)),
+            (Warning, true)
+        );
+        assert_eq!(
+            next(Warning, true, 200, &LINES, Some(false)),
+            (Warning, true)
+        );
+        // Below the warning line: the episode keeps the recovery line from then on.
+        assert_eq!(
+            next(Warning, true, 199, &LINES, Some(false)),
+            (Warning, false)
+        );
+        assert_eq!(
+            next(Warning, false, 250, &LINES, Some(false)),
+            (Warning, false)
+        );
+        assert_eq!(
+            next(Warning, true, 49, &LINES, Some(false)),
+            (Critical, false)
+        );
+        assert_eq!(
+            next(Critical, false, 250, &LINES, Some(false)),
+            (Warning, false)
+        );
+        // Above the recovery line every episode ends.
+        assert_eq!(next(Warning, true, 301, &LINES, Some(true)), (Ok, false));
     }
 
     fn reading(at_ms: u64, free: Option<u64>) -> DiskReading {
@@ -345,10 +441,54 @@ mod tests {
         }
     }
 
+    /// The levels and marks of byte readings `(at_ms, free)`, each read as `read` reads it:
+    /// kept, the state's last [`super::KEPT_READINGS`] only, then predicted from and applied.
+    fn walk(readings: &[(u64, u64)]) -> Vec<(DiskLevel, bool)> {
+        let mut kept: Vec<DiskReading> = Vec::new();
+        let (mut level, mut mark) = (DiskLevel::Unknown, false);
+        readings
+            .iter()
+            .map(|&(at, free)| {
+                kept.push(reading(at, Some(free)));
+                let excess = kept.len().saturating_sub(super::KEPT_READINGS);
+                kept.drain(..excess);
+                let predicted = predicts_critical(&kept, at, &LINES);
+                (level, mark) = next(level, mark, free, &LINES, predicted);
+                (level, mark)
+            })
+            .collect()
+    }
+
+    /// A falling `warning` entered by prediction alone stays while a granted pass's readings
+    /// after each `act`, seconds apart, push the previous pass's out of the state's 12, so the
+    /// readings can no longer tell the rate.
     #[test]
-    fn the_last_hour_predicts_the_critical_line() {
-        let hour = 60 * 60 * 1000;
-        let now = 10 * hour;
+    fn readings_within_a_pass_keep_a_predicted_warning() {
+        use DiskLevel::{Ok, Warning};
+        let s = 1000;
+        // 600 at -400 s, 290 at 0: the critical line 310 s away; then 1 lower every 8 s.
+        let mut readings = vec![(10_000 * s, 600), (10_400 * s, 290)];
+        readings.extend((1..=12).map(|n| (10_400 * s + n * 8 * s, 290 - n)));
+        let walked = walk(&readings);
+        assert_eq!(walked[0], (Ok, false));
+        assert!(
+            walked[1..].iter().all(|&w| w == (Warning, true)),
+            "{walked:?}"
+        );
+    }
+
+    /// A reading above the warning line after a gap longer than the window, with nothing
+    /// within it before, keeps a `warning` entered by prediction alone.
+    #[test]
+    fn a_gap_keeps_a_predicted_warning() {
+        let s = 1000;
+        let gap = walk(&[(10_000 * s, 600), (10_400 * s, 290), (14_000 * s, 250)]);
+        assert_eq!(gap[2], (DiskLevel::Warning, true), "{gap:?}");
+    }
+
+    #[test]
+    fn the_last_two_intervals_predict_the_critical_line() {
+        let now = 10 * 60 * 60 * 1000;
         let step = TIMER_INTERVAL_MS;
         // 50 bytes per interval: 100 bytes above critical is two intervals away.
         let falling = [
@@ -356,14 +496,85 @@ mod tests {
             reading(now - step, None),
             reading(now, Some(150)),
         ];
-        assert!(predicts_critical(&falling, now, &LINES));
+        assert_eq!(predicts_critical(&falling, now, &LINES), Some(true));
         let slower = [reading(now - 2 * step, Some(240)), reading(now, Some(150))];
-        assert!(!predicts_critical(&slower, now, &LINES));
-        // A fall older than an hour does not count.
-        let old = [reading(now - hour - 1, Some(900)), reading(now, Some(150))];
-        assert!(!predicts_critical(&old, now, &LINES));
+        assert_eq!(predicts_critical(&slower, now, &LINES), Some(false));
+        // A fall older than two intervals does not count: the readings cannot tell.
+        let old = [
+            reading(now - 2 * step - 1, Some(900)),
+            reading(now, Some(150)),
+        ];
+        assert_eq!(predicts_critical(&old, now, &LINES), None);
         let rising = [reading(now - step, Some(150)), reading(now, Some(250))];
-        assert!(!predicts_critical(&rising, now, &LINES));
-        assert!(!predicts_critical(&[reading(now, Some(60))], now, &LINES));
+        assert_eq!(predicts_critical(&rising, now, &LINES), Some(false));
+        assert_eq!(
+            predicts_critical(&[reading(now, Some(60))], now, &LINES),
+            None
+        );
+        // Readings less than one interval apart cannot tell, however fast they fall.
+        let close = [reading(now - step + 1, Some(250)), reading(now, Some(60))];
+        assert_eq!(predicts_critical(&close, now, &LINES), None);
+        // The newest successful reading must be this pass's.
+        let stale = [
+            reading(now - 2 * step, Some(250)),
+            reading(now - 1, Some(150)),
+        ];
+        assert_eq!(predicts_critical(&stale, now, &LINES), None);
+    }
+
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+
+    /// The readings of a transient writer, as seconds from the first and GiB free, at the
+    /// shipped lines (warning 20, recovery 30, critical 5 GiB): a rise of 40 GiB at 601 s,
+    /// then 13–14 GiB lost per interval. Taken from one host's free space.
+    const WRITER: [(u64, f64); 7] = [
+        (0, 35.02),
+        (300, 21.63),
+        (601, 61.07),
+        (901, 56.74),
+        (1202, 43.70),
+        (1506, 29.68),
+        (1870, 19.03),
+    ];
+
+    fn gib_lines() -> DiskLines {
+        let gib = |n: u64| n * 1024 * 1024 * 1024;
+        DiskLines {
+            warning_bytes: gib(20),
+            recovery_bytes: gib(30),
+            critical_bytes: gib(5),
+        }
+    }
+
+    /// The states the readings lead to, each pass predicting from the readings up to its own.
+    fn levels(readings: &[(u64, f64)]) -> Vec<DiskLevel> {
+        let lines = gib_lines();
+        let mut kept = Vec::new();
+        let (mut level, mut predicted_only) = (DiskLevel::Ok, false);
+        let mut levels = Vec::new();
+        for &(s, gib) in readings {
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "fixture values are small and positive"
+            )]
+            let free = (gib * GIB) as u64;
+            let at = 1_000_000 + s * 1000;
+            kept.push(reading(at, Some(free)));
+            let predicted = predicts_critical(&kept, at, &lines);
+            (level, predicted_only) = next(level, predicted_only, free, &lines, predicted);
+            levels.push(level);
+        }
+        levels
+    }
+
+    /// At 1506 s, 29.68 GiB free and 14.02 GiB lost in the last 304 s, the critical line is
+    /// 535 s away: the rule enters `warning` there, a pass before the reading below the
+    /// warning line. A rate over the hour, diluted by the rise at 601 s, did not. The
+    /// prediction at 300 s clears at the rise, since that episode was never below the line.
+    #[test]
+    fn a_transient_writer_is_predicted_a_pass_early() {
+        use DiskLevel::{Ok, Warning};
+        assert_eq!(levels(&WRITER), [Ok, Warning, Ok, Ok, Ok, Warning, Warning]);
     }
 }
