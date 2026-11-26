@@ -19,7 +19,7 @@ mod reclaim;
 mod recovery;
 
 pub use arbiter::run as run_arbiter;
-pub use disk::TIMER_INTERVAL_MS;
+pub use disk::{TIMER_INTERVAL_MS, read_history};
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -322,13 +322,15 @@ fn observe(
     // Reclamation does not wait for this write: a test's fake fails it as `observation`
     // (section 13.7), and the pass goes on from the observation in memory.
     match testpoint::fake_write("observation") {
-        Ok(()) => write_json(
-            state,
-            &state.reconcile_observation(),
-            &inventory,
-            "observe",
-            errors,
-        ),
+        Ok(()) => {
+            write_json(
+                state,
+                &state.reconcile_observation(),
+                &inventory,
+                "observe",
+                errors,
+            );
+        }
         Err(err) => errors.push(scoped("observe", err.to_string())),
     }
     Some(Observation {
@@ -430,7 +432,7 @@ fn write_json<T: Serialize>(
     value: &T,
     scope: &str,
     errors: &mut Vec<ScopedError>,
-) {
+) -> bool {
     let written = serde_json::to_vec(value)
         .map_err(|err| err.to_string())
         .and_then(|bytes| {
@@ -438,8 +440,12 @@ fn write_json<T: Serialize>(
                 .write_atomic(path, &bytes, Durability::Volatile)
                 .map_err(|err| err.to_string())
         });
-    if let Err(message) = written {
-        errors.push(scoped(scope, message));
+    match written {
+        Ok(()) => true,
+        Err(message) => {
+            errors.push(scoped(scope, message));
+            false
+        }
     }
 }
 

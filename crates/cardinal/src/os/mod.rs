@@ -251,6 +251,32 @@ pub fn file_links(path: &Path) -> std::io::Result<(u64, u64)> {
     windows::file_links(path)
 }
 
+/// Opens `path` with `options` as a regular file only: the open neither follows a final
+/// symbolic link (Unix `O_NOFOLLOW`, Windows `FILE_FLAG_OPEN_REPARSE_POINT`) nor blocks
+/// (`O_NONBLOCK`, which a FIFO would otherwise wait in), and anything but a regular file is
+/// an error.
+pub fn open_regular(
+    options: &mut std::fs::OpenOptions,
+    path: &Path,
+) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(options, libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    #[cfg(windows)]
+    std::os::windows::fs::OpenOptionsExt::custom_flags(
+        options,
+        windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
+    );
+    let file = options.open(path)?;
+    if file.metadata()?.is_file() {
+        Ok(file)
+    } else {
+        Err(std::io::Error::other(format!(
+            "{}: not a regular file",
+            path.display()
+        )))
+    }
+}
+
 /// Reads one process. `None` if it does not exist or cannot be read.
 #[must_use]
 pub fn process(pid: u32, detail: Detail) -> Option<ProcessInfo> {

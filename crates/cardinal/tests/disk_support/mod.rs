@@ -131,6 +131,12 @@ impl Disk {
         .unwrap();
     }
 
+    /// The one volume's readings history, oldest first.
+    pub fn history(&self) -> Vec<cardinal::contract::DiskReading> {
+        let files = self.s.state.disk_readings(&self.state().volume);
+        cardinal::reconcile::read_history(&files).unwrap()
+    }
+
     /// Every `disk_low` and `disk_critical` item, each occurrence its own, `disk_low` first.
     pub fn disk_items(&self) -> Vec<InboxItem> {
         let mut items: Vec<InboxItem> = cardinal::inbox::list(

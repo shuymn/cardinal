@@ -41,6 +41,9 @@ pub const RUN_FINISHED: &str = "run.finished";
 pub const RUN_RECONCILE_SPAWNING: &str = "run.reconcile_spawning";
 /// `act` recorded its snapshot and has not run its checks.
 pub const ACT_SNAPSHOTTED: &str = "act.snapshotted";
+/// A pass took a successful reading of a volume and has made the first of its two writes, the
+/// disk state and the readings history, and not the second (section 10.4).
+pub const RECONCILE_DISK_WRITTEN: &str = "reconcile.disk_written";
 /// A `reconcile` pass kept its full observation and has raised no item.
 pub const RECONCILE_OBSERVED: &str = "reconcile.observed";
 /// The arbiter launcher holds `arbiter/.lock` and has started no command.
@@ -122,6 +125,7 @@ pub const POINTS: &[&str] = &[
     RUN_FINISHED,
     RUN_RECONCILE_SPAWNING,
     ACT_SNAPSHOTTED,
+    RECONCILE_DISK_WRITTEN,
     RECONCILE_OBSERVED,
     ARBITER_LOCKED,
     ARBITER_RECORDED,
