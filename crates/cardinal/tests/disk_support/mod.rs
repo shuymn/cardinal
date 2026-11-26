@@ -116,6 +116,27 @@ impl Disk {
         states.into_iter().next().unwrap()
     }
 
+    /// Moves the one disk state's readings and `since_ms` `by_ms` into the past, as if the
+    /// passes so far had run that long ago: the timer's interval without waiting for it.
+    pub fn age(&self, by_ms: u64) {
+        let mut state = self.state();
+        state.since_ms -= by_ms;
+        for reading in &mut state.readings {
+            reading.at_ms -= by_ms;
+        }
+        std::fs::write(
+            self.s.state.disk_state(&state.volume),
+            serde_json::to_vec(&state).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// The one volume's readings history, oldest first.
+    pub fn history(&self) -> Vec<cardinal::contract::DiskReading> {
+        let files = self.s.state.disk_readings(&self.state().volume);
+        cardinal::reconcile::read_history(&files).unwrap()
+    }
+
     /// Every `disk_low` and `disk_critical` item, each occurrence its own, `disk_low` first.
     pub fn disk_items(&self) -> Vec<InboxItem> {
         let mut items: Vec<InboxItem> = cardinal::inbox::list(

@@ -50,6 +50,12 @@ pub struct DiskState {
     pub state: DiskLevel,
     /// When the volume entered `state`.
     pub since_ms: u64,
+    /// The volume entered `warning` only by prediction and no reading of the episode has been
+    /// below the warning line, so pressure ends at a reading above the warning line that no
+    /// longer predicts (section 10.4). Absent in states written before it, which read as
+    /// `false`: pressure then ends only above the recovery line.
+    #[serde(default)]
+    pub predicted_only: bool,
     pub lines: DiskLines,
     /// The last 12 readings, oldest first.
     pub readings: Vec<DiskReading>,

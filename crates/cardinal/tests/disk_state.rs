@@ -9,7 +9,10 @@ mod plan_support;
 mod support;
 
 use cardinal::contract::{DiskLevel, InboxStatus, RecordKind};
+use cardinal::reconcile::TIMER_INTERVAL_MS;
+use cardinal::testpoint::RECONCILE_DISK_WRITTEN;
 use disk_support::{Disk, MIB, carried_report, own_errors, report};
+use plan_support::RUN_LIMIT;
 
 const LINES: (u64, u64, u64) = (1, 2, 3);
 
@@ -31,7 +34,7 @@ fn levels(d: &Disk, passes: usize) -> Vec<DiskLevel> {
 
 /// Pressure starts below the warning line and ends only above the recovery line: a reading
 /// back above the warning line, or on the recovery line, stays in `warning`. `since_ms` moves
-/// only on a transition, and 12 readings are kept.
+/// only on a transition, and 12 readings are kept in the state, every one in the history.
 #[test]
 fn hysteresis() {
     let d = Disk::new(LINES);
@@ -85,25 +88,85 @@ fn hysteresis() {
     let state = d.state();
     assert_eq!(state.readings.len(), 12, "{state:#?}");
     assert_eq!(state.readings[11].free_bytes, Some(recovery + 1));
+    // The history keeps every reading, past the state's 12.
+    let history = d.history();
+    assert_eq!(history.len(), 13, "{history:#?}");
+    assert_eq!(history[1..], state.readings[..]);
 }
 
-/// From `ok`, readings that fall fast enough to reach the critical line within two timer
-/// intervals enter `warning` above the warning line; the same reading without the fall stays
-/// `ok`.
+/// One pass after another, each earlier one a timer interval and a few seconds before.
+fn levels_an_interval_apart(d: &Disk, passes: usize) -> Vec<DiskLevel> {
+    (0..passes)
+        .map(|pass| {
+            if pass > 0 {
+                d.age(TIMER_INTERVAL_MS + 4_000);
+            }
+            levels(d, 1)[0]
+        })
+        .collect()
+}
+
+/// From `ok`, readings an interval apart that fall fast enough to reach the critical line
+/// within two timer intervals enter `warning` above the warning line; the same fall within a
+/// pass's time, or the same reading without the fall, stays `ok`.
 #[test]
 fn prediction() {
     let control = Disk::new(LINES);
-    control.fixture_reads(&[Some(mib(29)), Some(mib(28))]);
+    control.fixture_reads(&[Some(mib(29)), Some(mib(22))]);
+    let close = Disk::new(LINES);
+    close.fixture_reads(&[Some(mib(29)), Some(mib(22))]);
     let steady = Disk::new(LINES);
-    steady.fixture_reads(&[Some(mib(28))]);
-    assert_eq!(levels(&steady, 2), [DiskLevel::Ok, DiskLevel::Ok]);
-    // 0.1 MiB within a pass's time: 1.8 MiB above the critical line is seconds away.
-    assert_eq!(levels(&control, 2), [DiskLevel::Ok, DiskLevel::Warning]);
+    steady.fixture_reads(&[Some(mib(22))]);
+    assert_eq!(
+        levels_an_interval_apart(&steady, 2),
+        [DiskLevel::Ok, DiskLevel::Ok]
+    );
+    assert_eq!(levels(&close, 2), [DiskLevel::Ok, DiskLevel::Ok]);
+    // 0.7 MiB in an interval: 1.2 MiB above the critical line is less than two away.
+    assert_eq!(
+        levels_an_interval_apart(&control, 2),
+        [DiskLevel::Ok, DiskLevel::Warning]
+    );
     let records = control.records(RecordKind::DiskState);
     let entered = records.last().unwrap();
     assert_eq!(entered.data["to"], "warning");
     assert_eq!(entered.data["predicted"], true);
-    assert_eq!(entered.data["free_bytes"], mib(28));
+    assert_eq!(entered.data["predicted_only"], true);
+    assert_eq!(entered.data["free_bytes"], mib(22));
+    assert!(control.state().predicted_only);
+}
+
+/// A volume in `warning` only by prediction returns to `ok` at a reading above the warning
+/// line once the fall stops, kept across passes in its disk state; one whose episode has been
+/// below the warning line, even once after entering by prediction, stays in `warning` up to
+/// the recovery line.
+#[test]
+fn prediction_only_warning_clears() {
+    let predicted = Disk::new(LINES);
+    // Pass 2 reads twice: step 4 enters `warning`, step 6 reads the same.
+    predicted.fixture_reads(&[Some(mib(29)), Some(mib(22)), Some(mib(22)), Some(mib(25))]);
+    assert_eq!(
+        levels_an_interval_apart(&predicted, 3),
+        [DiskLevel::Ok, DiskLevel::Warning, DiskLevel::Ok]
+    );
+    assert!(!predicted.state().predicted_only);
+    assert_eq!(predicted.disk_statuses().0, Some(InboxStatus::Resolved));
+
+    let dipped = Disk::new(LINES);
+    dipped.fixture_reads(&[
+        Some(mib(29)),
+        Some(mib(22)),
+        Some(mib(19)), // below the warning line at step 6
+        Some(mib(25)),
+        Some(mib(25)),
+        Some(mib(25)),
+    ]);
+    assert_eq!(
+        levels_an_interval_apart(&dipped, 3),
+        [DiskLevel::Ok, DiskLevel::Warning, DiskLevel::Warning]
+    );
+    assert!(!dipped.state().predicted_only);
+    assert_eq!(dipped.disk_statuses().0, Some(InboxStatus::Open));
 }
 
 /// A first reading below the critical line is `critical` at once, and `disk-reclaim` reports
@@ -194,6 +257,15 @@ fn failed_final_reading_keeps_the_state() {
     assert_eq!(after.readings.len(), 4);
     assert_eq!(d.disk_items(), items);
     assert!(after.readings[2..].iter().all(|r| r.free_bytes.is_none()));
+    // The history keeps the successful readings, and no failed one.
+    let successful: Vec<_> = after
+        .readings
+        .iter()
+        .filter(|r| r.free_bytes.is_some())
+        .copied()
+        .collect();
+    assert_eq!(successful.len(), 1);
+    assert_eq!(d.history(), successful);
     let failures: Vec<_> = d
         .records(RecordKind::DiskState)
         .into_iter()
@@ -201,4 +273,108 @@ fn failed_final_reading_keeps_the_state() {
         .collect();
     assert_eq!(failures.len(), 3, "{failures:#?}");
     assert!(failures.iter().all(|r| r.data["to"] == "warning"));
+}
+
+/// A pass stopped between a reading's two writes, the disk state and the readings history,
+/// never leaves a state that has not seen a reading below the warning line that the history
+/// holds: the next pass keeps the episode's recovery line, and the history holds only
+/// readings the state saw.
+#[test]
+fn a_stop_between_the_writes_keeps_the_recovery_line() {
+    let d = Disk::new(LINES);
+    d.fixture_reads(&[
+        Some(mib(29)),
+        Some(mib(22)), // `warning` by prediction alone
+        Some(mib(22)),
+        Some(mib(19)), // below the warning line; the pass stops after its first write
+        Some(mib(25)),
+    ]);
+    assert_eq!(
+        levels_an_interval_apart(&d, 2),
+        [DiskLevel::Ok, DiskLevel::Warning]
+    );
+    assert!(d.state().predicted_only);
+    d.age(TIMER_INTERVAL_MS + 4_000);
+    let mut stopped = d.reconcile_command();
+    d.points.apply(&mut stopped, &[], None);
+    stopped.env("CARDINAL_TEST_PANIC", RECONCILE_DISK_WRITTEN);
+    let out = stopped.output_within(RUN_LIMIT).unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    let saved: Vec<_> = d
+        .state()
+        .readings
+        .iter()
+        .filter_map(|r| r.free_bytes)
+        .collect();
+    let history: Vec<_> = d.history().iter().filter_map(|r| r.free_bytes).collect();
+
+    d.age(TIMER_INTERVAL_MS + 4_000);
+    assert_eq!(levels(&d, 1), [DiskLevel::Warning]);
+    assert_eq!(d.disk_statuses().0, Some(InboxStatus::Open));
+    // The history holds the readings the state saw, in order, and may lack the last.
+    assert!(saved.starts_with(&history), "{history:?} beyond {saved:?}");
+}
+
+/// Something other than a regular file at a readings history path, a FIFO or a symbolic
+/// link, at the current file or at the rotated one, is reported as the pass's history error;
+/// the pass neither blocks on it nor writes through it, and the state is saved.
+#[cfg(unix)]
+#[test]
+fn a_history_that_is_not_a_regular_file_is_reported() {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::FileTypeExt;
+
+    let mkfifo = |path: &std::path::Path| {
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c` is a valid NUL-terminated path.
+        let made = unsafe { libc::mkfifo(c.as_ptr(), 0o600) };
+        assert_eq!(made, 0, "mkfifo: {}", std::io::Error::last_os_error());
+    };
+    let pass_within = |d: &Disk| {
+        let out = d
+            .reconcile_command()
+            .output_within(std::time::Duration::from_secs(60))
+            .expect("the pass ends");
+        assert!(out.status.success(), "{out:?}");
+        serde_json::from_slice::<cardinal::contract::Reconcile>(&out.stdout).unwrap()
+    };
+    let history_errors = |pass: &cardinal::contract::Reconcile| {
+        pass.errors
+            .iter()
+            .filter(|e| e.scope.starts_with("disk:") && e.message.contains("disk-readings"))
+            .count()
+    };
+
+    // A FIFO, then a symbolic link to a file elsewhere, at the current file.
+    let d = Disk::new(LINES);
+    d.fixture_reads(&[Some(mib(25))]);
+    d.reconcile();
+    let (current, rotated) = d.s.state.disk_readings(&d.state().volume);
+    std::fs::remove_file(&current).unwrap();
+    mkfifo(&current);
+    let pass = pass_within(&d);
+    assert_eq!(history_errors(&pass), 1, "{pass:#?}");
+    assert_eq!(d.state().readings.len(), 2);
+    std::fs::remove_file(&current).unwrap();
+    let elsewhere = d.s.fx.root().join("elsewhere");
+    std::fs::write(&elsewhere, b"").unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &current).unwrap();
+    let pass = pass_within(&d);
+    assert_eq!(history_errors(&pass), 1, "{pass:#?}");
+    assert_eq!(std::fs::read(&elsewhere).unwrap(), b"");
+
+    // A FIFO at the rotated file, when the current one is full: the rename does not replace it.
+    std::fs::remove_file(&current).unwrap();
+    let line = b"{\"at_ms\":1,\"free_bytes\":1,\"total_bytes\":1}\n";
+    std::fs::write(&current, line.repeat(1024 * 1024 / line.len() + 1)).unwrap();
+    mkfifo(&rotated);
+    let pass = pass_within(&d);
+    assert_eq!(history_errors(&pass), 1, "{pass:#?}");
+    assert!(
+        std::fs::symlink_metadata(&rotated)
+            .unwrap()
+            .file_type()
+            .is_fifo(),
+        "the rotated FIFO was replaced"
+    );
 }

@@ -324,6 +324,23 @@ impl StateDir {
     }
 
     #[must_use]
+    pub fn disk_readings_dir(&self) -> PathBuf {
+        self.root.join("disk-readings")
+    }
+
+    /// `disk-readings/<volume>.jsonl` and, rotated, `<volume>.1.jsonl`: every successful
+    /// reading of a volume, one per line (section 10.4). Written under `reconcile.lock`.
+    #[must_use]
+    pub fn disk_readings(&self, volume: &str) -> (PathBuf, PathBuf) {
+        let volume = file_safe(volume);
+        let dir = self.disk_readings_dir();
+        (
+            dir.join(format!("{volume}.jsonl")),
+            dir.join(format!("{volume}.1.jsonl")),
+        )
+    }
+
+    #[must_use]
     pub fn arbiter_dir(&self) -> PathBuf {
         self.root.join("arbiter")
     }
