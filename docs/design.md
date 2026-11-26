@@ -387,6 +387,19 @@ These are the conditions agreed with the owner. Protection conditions are verifi
 | G13 | When a command would wait a long time, it runs exactly once as an accepted job, and the worker agent can collect the result. | With the budget full, submit a command, confirm a job ID is returned, the job runs once after resources free up, and `wait` returns the result. A wait expected to be short that drags on also returns a job ID when it reaches the maximum synchronous wait. Also check retries with the same tool call and cancellation |
 | G14 | When a runner crashes, the job's reservation and in-use state remain until its process group stops, and are released after it stops. | Kill a running runner and try admission and reclamation; confirm they are treated as reserved and in use. End the group's remaining members, then confirm no children remain and the next job is admitted |
 
+### Review depth by reversibility
+
+A change is reviewed as deeply as its mistakes are hard to undo. Each change is classed by the worst thing a mistake in it can do, and a change that touches several classes takes the deepest.
+
+| Class | What falls in it | Why | Review depth |
+| --- | --- | --- | --- |
+| Irreversible | The deletion path: executing `act` (eligibility, the move, the checks after it, the commit, the restore), the deleter, recovery's deletions, and, when they come, whole-worktree removal and reclamation in managed worktrees | Deleted bytes cannot come back, and a miss loses the owner's data | Deep: a design review by two independent reviewers of different model lineages, asked for contradictions with the purpose, missed risks, and the one to three changes to make before building, with the findings both raise first; at least two rounds of code review at the highest effort; probes on a real APFS volume and on Linux; and, before whole-worktree removal or managed worktrees, a survey of their failure modes |
+| Irreversible | Protection decisions that widen what may be deleted: profile patterns and their anchoring, managed roots, the roots execution is allowed in | A wrong widening deletes owned data on every host at once | Deep, as above, and a dry run on a real host that lists every newly reclaimable path before the change merges |
+| Irreversible (format) | Versioned contracts (JSON schemas, CLI exit codes), the state directory's layout, and an execution's claim and manifest | Readers in the field and records written by older builds depend on them | One review round at high effort, and a compatibility test against an older build's files |
+| Reversible | The arbiter's skill text, the web page, how the inbox presents items, unit ordering, budgets and lines (disk lines, the reclaim budget, the reserve's size), the timer's interval | A configuration edit or the next release changes them; a wrong value costs time or a missed notice, not data | Light: one review round at medium or high effort; measured on a host after the merge |
+| Self-healing | Fail-open in the runner, recovery of interrupted executions, stranded-data items, rewriting the reserve, ending inbox occurrences, collecting temporary files | The next pass repairs them, and a failure shows as an inbox item | One review round at high effort on whether a failed read can be taken for success; a real-host check that the repair ran |
+| Contract with the outside | Claude Code's hooks, T3 Code's worktree roots, git's index and ignore behaviour, APFS and ext4 readings | Another program owns the behaviour, and it changes without notice | Verified on the real thing: a contract test on a real host for each release, and the primary source cited in the design |
+
 ## 11. Plan layer (claims)
 
 Hypotheses derived from the purpose layer. Test names are filled in during implementation.
