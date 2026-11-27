@@ -12,7 +12,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::io;
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::{Component, Path, PathBuf};
 
 use rustix::fs::{AtFlags, FileType, Mode, OFlags, Stat};
@@ -204,6 +204,8 @@ impl Target {
                 boundaries: Vec::new(),
                 fs_type: Err(not_reached),
                 unmeasured: Vec::new(),
+                unlisted: Vec::new(),
+                vanished: Vec::new(),
             });
         }
         let path = self.worktree.join(&self.rel);
@@ -224,7 +226,8 @@ impl Target {
             let (mount, own_mount) = self.target_mount(root.dev, Some(&fd));
             if let (Mount::Same, Ok(key)) = (&mount, &own_mount) {
                 let read = (own, self.worktree.as_path());
-                snapshot_dir(&fd, &self.rel, (root.dev, key), read, &mut recorded)?;
+                let at = dir::At::entry(self.parent.as_fd(), &self.name);
+                snapshot_dir((&fd, at), &self.rel, (root.dev, key), read, &mut recorded)?;
             }
             mount
         } else {
@@ -248,6 +251,10 @@ impl Target {
             boundaries: recorded.boundaries,
             fs_type,
             unmeasured: recorded.unmeasured,
+            // Step 5's comparison (section 9.7) refuses either, as it refuses them in the
+            // moved tree.
+            unlisted: recorded.unlisted,
+            vanished: recorded.vanished,
         })
     }
 
@@ -277,56 +284,69 @@ impl Target {
     }
 }
 
-/// The entries below the open directory `fd`, a moved target, walked as the snapshot walks
-/// (section 9.7, step 5): by paths relative to it, without following links or entering a
-/// directory on another device or mount than `dev` and `on_mount`, each entry read as the
-/// tests' fakes below `at` make it read; and the directories not entered.
+/// The entries below the open directory `fd`, a moved target named `name` in `parent`, walked
+/// as the snapshot walks (section 9.7, step 5): by paths relative to it, without following
+/// links or entering a directory on another device or mount than `dev` and `on_mount`, each
+/// entry read as the tests' fakes below `at` make it read; and the paths it did not read
+/// whole: the directories not entered or not listed, and what was removed while it read them.
 pub fn walk_moved(
-    fd: &OwnedFd,
+    (fd, parent, name): (&OwnedFd, BorrowedFd<'_>, &OsStr),
     (dev, on_mount): (u64, &[u8]),
     at: &Path,
 ) -> io::Result<(Vec<Entry>, Vec<PathBuf>)> {
     let mut recorded = Recorded::default();
     snapshot_dir(
-        fd,
+        (fd, dir::At::entry(parent, name)),
         Path::new(""),
         (dev, on_mount),
         (Own::Nothing, at),
         &mut recorded,
     )?;
-    Ok((recorded.entries, recorded.boundaries))
+    let mut not_read = recorded.boundaries;
+    not_read.extend(recorded.unlisted);
+    not_read.extend(recorded.vanished);
+    Ok((recorded.entries, not_read))
 }
 
-/// What [`snapshot_dir`] records: the entries, the directories not entered, and the reads of
-/// the bound's measure that failed.
+/// What [`snapshot_dir`] records: the entries, the directories not entered, the reads of the
+/// bound's measure that failed, the directories recorded and not listed (those not entered
+/// included), and what was removed while it read them.
 #[derive(Default)]
 struct Recorded {
     entries: Vec<Entry>,
     boundaries: Vec<PathBuf>,
     unmeasured: Vec<(PathBuf, String)>,
+    unlisted: Vec<PathBuf>,
+    vanished: Vec<PathBuf>,
 }
 
-/// Records the entries below `fd`, each regular file with what `own` reads of it, and each
-/// entry as the tests' fakes below `worktree` make it read. A directory on another device or
-/// mount than `dev` and `on_mount` is recorded but not entered, and goes into `boundaries`; a
-/// mount that cannot be read fails the snapshot.
+/// Records the entries below `fd`, named by `at`, each regular file with what `own` reads of
+/// it, and each entry as the tests' fakes below `worktree` make it read. A directory on another
+/// device or mount than `dev` and `on_mount` is recorded but not entered, and goes into
+/// `boundaries` and `unlisted`; one replaced before it was opened is recorded as it was seen and
+/// goes into `unlisted`; one removed before it was opened, an entry removed before its `lstat`,
+/// and a directory removed or replaced while it was listed go into `vanished`. A mount that
+/// cannot be read fails the snapshot.
 fn snapshot_dir(
-    fd: &OwnedFd,
+    (fd, at): (&OwnedFd, dir::At<'_>),
     rel: &Path,
     (dev, on_mount): (u64, &[u8]),
     (own, worktree): (Own, &Path),
     recorded: &mut Recorded,
 ) -> io::Result<()> {
-    let listed = dir::list(&std::fs::File::from(fd.try_clone()?), own)?;
+    let listed = dir::list_with(&std::fs::File::from(fd.try_clone()?), own, at, &mut || {
+        testpoint::hit(testpoint::ACT_DIR_LISTED).map_err(io::Error::other)
+    })?;
+    let path_of = |name: Option<OsString>| name.map_or_else(|| rel.to_path_buf(), |n| rel.join(n));
+    recorded.unmeasured.extend(
+        listed
+            .unread
+            .into_iter()
+            .map(|(name, err)| (path_of(name), err)),
+    );
     recorded
-        .unmeasured
-        .extend(listed.unread.into_iter().map(|(name, err)| {
-            (
-                name.map_or_else(|| rel.to_path_buf(), |name| rel.join(name)),
-                err,
-            )
-        }));
-    // An entry removed before its `lstat` is left out of the listing.
+        .vanished
+        .extend(listed.vanished.into_iter().map(path_of));
     for (name, st, read) in listed.entries {
         let child_rel = rel.join(&name);
         let child = Entry {
@@ -336,32 +356,34 @@ fn snapshot_dir(
         .faked(&worktree.join(&child_rel));
         if child.kind == EntryKind::Dir && child.dev != dev {
             recorded.boundaries.push(child.rel.clone());
+            recorded.unlisted.push(child.rel.clone());
         }
         let enter = child.kind == EntryKind::Dir && child.dev == dev;
         let index = recorded.entries.len();
         recorded.entries.push(child);
         if enter {
+            let child_rel = recorded.entries[index].rel.clone();
             match open_dir_at(fd, &name) {
                 Ok(child_fd) => {
                     let opened = entry(PathBuf::new(), &rustix::fs::fstat(&child_fd)?);
                     // Replaced between the stat and the open: the entry stays as the stat
                     // saw it, and nothing below the replacement is recorded.
-                    if recorded.entries[index].same_identity(&opened) {
-                        let child_rel = recorded.entries[index].rel.clone();
-                        if mount::of_dir(&child_fd).map_err(io::Error::other)? == on_mount {
-                            let read = (own, worktree);
-                            snapshot_dir(&child_fd, &child_rel, (dev, on_mount), read, recorded)?;
-                        } else {
-                            recorded.boundaries.push(child_rel);
-                        }
+                    if !recorded.entries[index].same_identity(&opened) {
+                        recorded.unlisted.push(child_rel);
+                    } else if mount::of_dir(&child_fd).map_err(io::Error::other)? == on_mount {
+                        let read = (own, worktree);
+                        let at = dir::At::entry(fd.as_fd(), &name);
+                        snapshot_dir((&child_fd, at), &child_rel, (dev, on_mount), read, recorded)?;
+                    } else {
+                        recorded.boundaries.push(child_rel.clone());
+                        recorded.unlisted.push(child_rel);
                     }
                 }
-                Err(err)
-                    if matches!(
-                        err.raw_os_error().map(Errno::from_raw_os_error),
-                        Some(Errno::NOENT | Errno::LOOP | Errno::NOTDIR)
-                    ) => {}
-                Err(err) => return Err(err),
+                Err(err) => match err.raw_os_error().map(Errno::from_raw_os_error) {
+                    Some(Errno::NOENT) => recorded.vanished.push(child_rel),
+                    Some(Errno::LOOP | Errno::NOTDIR) => recorded.unlisted.push(child_rel),
+                    _ => return Err(err),
+                },
             }
         }
     }

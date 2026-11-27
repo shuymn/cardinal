@@ -161,6 +161,32 @@ impl Setup {
         document(&output, &[0]).expect("a plan list")
     }
 
+    /// [`Setup::plan`] paused at `point`: calls `change` once it has reached it, releases it,
+    /// and returns the plan.
+    pub fn plan_at(
+        &self,
+        kind: PlanKind,
+        target: &Path,
+        point: &str,
+        change: impl FnOnce(),
+    ) -> Plan {
+        let sub = match kind {
+            PlanKind::ReclaimWorktree => "reclaim-worktree",
+            PlanKind::ReclaimDir => "reclaim-dir",
+        };
+        let mut command = self.cardinal();
+        command.args(["plan", sub]).arg(target);
+        document(&run_at(command, point, change), &[0]).expect("a plan")
+    }
+
+    /// [`Setup::plan_all`] paused at `point`: calls `change` once it has reached it, releases
+    /// it, and returns the plans.
+    pub fn plan_all_at(&self, point: &str, change: impl FnOnce()) -> PlanList {
+        let mut command = self.cardinal();
+        command.arg("plan").arg("--repo").arg(&self.main);
+        document(&run_at(command, point, change), &[0]).expect("a plan list")
+    }
+
     /// `cardinal act PLAN` with `options`; panics first if the plan targets anything outside
     /// the fixture.
     pub fn act_command(&self, plan: &str, options: &ActOptions) -> Command {
@@ -214,6 +240,24 @@ impl Setup {
         act_result(&child.wait_with_output().expect("wait for cardinal act"))
             .expect("an act result")
     }
+}
+
+/// Runs `command` paused at `point`, calls `change` once it has reached it, releases it, and
+/// returns its output.
+fn run_at(mut command: Command, point: &str, change: impl FnOnce()) -> Output {
+    // A test-point directory of its own, so no release file of an earlier race is left.
+    let scope = Scope::new();
+    let points = TestPoints::new(&scope);
+    points.apply(&mut command, &[point], None);
+    let child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start cardinal");
+    points.wait_reached(point, child.id(), Duration::from_secs(20));
+    change();
+    points.release(point);
+    child.wait_with_output().expect("wait for cardinal")
 }
 
 /// The `act` result an `act` process printed.
@@ -312,6 +356,24 @@ pub fn listing(root: &Path) -> BTreeMap<PathBuf, String> {
     let mut out = BTreeMap::new();
     walk(root, root, &mut out);
     out
+}
+
+/// Moves the modification time of `path` an hour into the past, so a write a test makes as
+/// part of a race other than the quiet period's (section 9.8) is no activity signal.
+pub fn backdate(path: &Path) {
+    std::fs::File::open(path)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - Duration::from_hours(1))
+        .unwrap();
+}
+
+/// Moves the modification time of `path` an hour into the future, which counts as now
+/// (section 9.8): a signal a test makes stays recent however late a plan reads it.
+pub fn ahead(path: &Path) {
+    std::fs::File::open(path)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() + Duration::from_hours(1))
+        .unwrap();
 }
 
 /// Writes `contents` to `root/rel`, creating its directories.

@@ -26,8 +26,8 @@ use crate::contract::{
     ActResult, ActResultSchema, ActStatus, Approval, Caller, Check, CheckResult, CheckRole,
     ConfigKey, Error, InUse, Plan, PlanKind, Provenance, RecordKind, RootId,
 };
-use crate::observe::WorktreeObservation;
-use crate::plan::{self, DataLists, InUseFacts, Inspection, Real, Walk};
+use crate::observe::{Quiet, WorktreeObservation};
+use crate::plan::{self, Activity, DataLists, InUseFacts, Inspection, Real, Walk};
 use crate::state::{self, Probe, StateDir};
 use crate::testpoint;
 
@@ -47,6 +47,10 @@ pub const EXECUTION_NOT_DESIGNED: &str = "execution_not_designed";
 /// Why such a plan reports `dry_run` when `[act] execute` does not grant its caller the plan's
 /// kind, or, for a unit, while its `[unit.<name>] act` is false (section 9.7).
 pub const EXECUTION_NOT_GRANTED: &str = "execution_not_granted";
+
+/// Why such a plan reports `dry_run` when its worktree is under no `[sessions] covered` root
+/// (section 9.8), an eligibility rule of section 9.7.
+pub const SESSIONS_UNCOVERED: &str = "sessions_uncovered";
 
 /// Why such a plan reports `dry_run` when a granted caller passed `--dry-run`.
 pub const DRY_RUN_REQUESTED: &str = "dry_run_requested";
@@ -161,6 +165,10 @@ struct Evaluated {
     snapshot: Snapshot,
     #[cfg_attr(not(unix), expect(dead_code, reason = "only an execution reads it"))]
     observation: Option<WorktreeObservation>,
+    /// The newest entry below the worktree's other regenerable targets as step 5 read it
+    /// (section 9.8), which steps 7 and 8 judge again.
+    #[cfg_attr(not(unix), expect(dead_code, reason = "only an execution reads it"))]
+    targets: crate::observe::Newest,
 }
 
 struct Run<'a> {
@@ -233,6 +241,7 @@ impl Run<'_> {
             passed: false,
             snapshot,
             observation,
+            targets: crate::observe::Newest::default(),
         };
         if let Err(err) = testpoint::hit(testpoint::ACT_SNAPSHOTTED) {
             let outcome = Outcome {
@@ -254,6 +263,7 @@ impl Run<'_> {
             // The whole worktree for both kinds (section 9.2).
             processes: plan::processes_inside(&worktree),
             descriptors: plan::descriptor_scan(self.plan.kind),
+            activity: self.activity(observation.as_ref(), &key),
         };
         let patterns = observation.as_ref().map_or_else(
             |_| DataLists::default(),
@@ -270,7 +280,16 @@ impl Run<'_> {
             managed: &self.config.host.observe.managed,
             squash_merged: self.options.squash_merged,
         };
-        let checks = plan::evaluate(&inspection);
+        let mut checks = plan::evaluate(&inspection);
+        let full = self.with_other_targets(&checks, &in_use, observation.as_ref(), &target);
+        let in_use = full.as_ref().unwrap_or(&in_use);
+        let inspection = Inspection {
+            in_use,
+            ..inspection
+        };
+        if full.is_some() {
+            checks = plan::evaluate(&inspection);
+        }
         let failed: Vec<String> = checks
             .iter()
             .filter(|c| c.role == CheckRole::Invariant && c.result != CheckResult::Pass)
@@ -304,6 +323,53 @@ impl Run<'_> {
             passed,
             snapshot,
             observation: observation.ok(),
+            targets: in_use.activity.targets.clone().unwrap_or_default(),
+        }
+    }
+
+    /// `in_use` with every entry below the worktree's other regenerable targets, for a
+    /// `reclaim_dir` target, read last and only when `checks`, evaluated without them, find
+    /// every invariant passing, `not_in_use` among them: every other fact of it finds the
+    /// worktree unused (section 9.8), and nothing else refuses. `None` when they are not read;
+    /// the checks are then evaluated again with them.
+    fn with_other_targets(
+        &self,
+        checks: &[Check],
+        in_use: &InUseFacts,
+        observation: Result<&WorktreeObservation, &Error>,
+        target: &Path,
+    ) -> Option<InUseFacts> {
+        let passed = plan::invariants_ok(checks);
+        let (PlanKind::ReclaimDir, true, Ok(o)) = (self.plan.kind, passed, observation) else {
+            return None;
+        };
+        Some(InUseFacts {
+            activity: Activity {
+                targets: Some(plan::other_targets(&o.worktree, target)),
+                ..in_use.activity.clone()
+            },
+            ..in_use.clone()
+        })
+    }
+
+    /// The lease and the signals of section 9.8 on step 4's `observation`, the target present
+    /// and its snapshot's entries among them; the other regenerable targets' entries are read
+    /// after the checks ([`Run::evaluate`]). Without an observation the lease alone is read and
+    /// the signals are unknown.
+    fn activity(&self, observation: Result<&WorktreeObservation, &Error>, key: &str) -> Activity {
+        let sessions = &self.config.host.sessions;
+        match observation {
+            Ok(o) => plan::activity(self.state, sessions, &o.worktree, (None, None), true),
+            Err(err) => Activity {
+                lease: crate::admission::lease_hold(
+                    self.state,
+                    key,
+                    state::now_ms(),
+                    sessions.linger_s.saturating_mul(1000),
+                ),
+                quiet: Quiet::Unknown(format!("the observation failed: {}", err.message)),
+                ..Activity::unread()
+            },
         }
     }
 

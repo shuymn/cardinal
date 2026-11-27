@@ -173,7 +173,7 @@ fn disk_report() -> Value {
                     {"plan_id": "0123456789abcdee", "worktree": "/w", "target": "/w/out",
                      "exclusive_bytes": 0, "exclusive_measure": null, "status": "rejected",
                      "freed_bytes": null}],
-        "shortfall_bytes": 30,
+        "shortfall_bytes": 30, "reachable_bytes": 180,
         "blocked": [{"worktree": "/w2", "target": "/w2/node_modules", "check": "not_in_use",
                      "bytes": 80},
                     {"worktree": "/w", "target": "/w/.pnpm", "check": "aliased", "bytes": 9}],
@@ -406,6 +406,17 @@ fn reconcile_documents() {
         .remove("incomplete");
     let parsed: Reconcile = serde_json::from_value(before).unwrap();
     assert_eq!(parsed.disk_reports[0].incomplete, Vec::new());
+    // `reachable_bytes` is additive too: a report made before it reads as null.
+    let mut before = doc.clone();
+    before["disk_reports"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("reachable_bytes");
+    let parsed: Reconcile = serde_json::from_value(before).unwrap();
+    assert_eq!(parsed.disk_reports[0].reachable_bytes, None);
+    rejects::<Reconcile>(&doc, "negative reachable bytes", |d| {
+        d["disk_reports"][0]["reachable_bytes"] = json!(-1);
+    });
     rejects::<Reconcile>(&doc, "an incomplete worktree without its reason", |d| {
         d["disk_reports"][0]["incomplete"][0]
             .as_object_mut()
@@ -417,6 +428,20 @@ fn reconcile_documents() {
                        "last_observation_ms": null});
     round_trips::<ReconcileState>(&state);
     rejects_wrong_schema_and_missing::<ReconcileState>(&state, "last_pass_ms");
+    // The runs of `not_in_use` read as `unknown` (section 9.8), absent when there are none.
+    let streaks = json!({"schema": "cardinal.reconcile-state.v1", "last_pass_ms": 7,
+                         "last_observation_ms": 6,
+                         "in_use_unknown": [{"worktree": "/w", "streak": 3,
+                                             "input": "session lease: /s/leases/k.json: corrupt"}]});
+    round_trips::<ReconcileState>(&streaks);
+    let parsed: ReconcileState = serde_json::from_value(state.clone()).unwrap();
+    assert_eq!(parsed.in_use_unknown, Vec::new());
+    rejects::<ReconcileState>(&streaks, "a run without its input", |d| {
+        d["in_use_unknown"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("input");
+    });
 }
 
 #[test]
@@ -644,6 +669,7 @@ fn inbox_documents() {
         "disk_critical",
         "arbiter_failing",
         "reclaim_stranded",
+        "in_use_unknown",
     ] {
         let mut doc = inbox_item();
         doc["kind"] = json!(kind);

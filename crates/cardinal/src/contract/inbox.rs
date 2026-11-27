@@ -18,6 +18,9 @@ pub enum InboxKind {
     ArbiterFailing,
     /// An execution left data in the trash (section 9.7).
     ReclaimStranded,
+    /// A worktree's `not_in_use` was `unknown` at three consecutive full observations
+    /// (section 9.8).
+    InUseUnknown,
 }
 
 impl InboxKind {
@@ -27,7 +30,11 @@ impl InboxKind {
     pub fn is_owners(self) -> bool {
         matches!(
             self,
-            Self::DiskLow | Self::DiskCritical | Self::ArbiterFailing | Self::ReclaimStranded
+            Self::DiskLow
+                | Self::DiskCritical
+                | Self::ArbiterFailing
+                | Self::ReclaimStranded
+                | Self::InUseUnknown
         )
     }
 }
@@ -205,6 +212,7 @@ mod tests {
         assert!(InboxKind::DiskCritical.is_owners());
         assert!(InboxKind::ArbiterFailing.is_owners());
         assert!(InboxKind::ReclaimStranded.is_owners());
+        assert!(InboxKind::InUseUnknown.is_owners());
         assert!(!InboxKind::Reclaimable.is_owners());
         assert!(!InboxKind::RecoveryNeeded.is_owners());
     }

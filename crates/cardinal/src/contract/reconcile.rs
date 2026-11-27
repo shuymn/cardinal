@@ -65,9 +65,23 @@ pub struct Reconcile {
 }
 
 /// `cardinal.reconcile-state.v1` (`reconcile/state.json`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReconcileState {
     pub schema: ReconcileStateSchema,
     pub last_pass_ms: u64,
     pub last_observation_ms: Option<u64>,
+    /// The worktrees whose `not_in_use` was `unknown` at the last `streak` full observations
+    /// (section 9.8), which raise `in_use_unknown` at 3. Absent in states written before it
+    /// and when there is none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub in_use_unknown: Vec<InUseUnknownStreak>,
+}
+
+/// A worktree's run of full observations whose `not_in_use` was `unknown`, with the input the
+/// last one could not read.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InUseUnknownStreak {
+    pub worktree: String,
+    pub streak: u32,
+    pub input: String,
 }

@@ -119,6 +119,11 @@ pub struct DiskReport {
     pub targets: Vec<ReportTarget>,
     /// The bytes still missing to the recovery line; 0 when the targets reach it.
     pub shortfall_bytes: u64,
+    /// The exclusive bytes of the targets `disk-reclaim` would run `act` on, covered and
+    /// eligible, on the state dir's volume, whatever the grant and the unit's `act` (section
+    /// 9.8); 0 on any other volume. Absent in reports made before it was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reachable_bytes: Option<u64>,
     pub blocked: Vec<ReportBlocked>,
     /// The worktrees on the volume that the pass's observation read only in part, so that
     /// what is listed there is not all there is. Absent in reports made before it was

@@ -534,6 +534,205 @@ fn act_false_records_planned() {
     }
 }
 
+/// A44: a worktree under no `[sessions] covered` root leaves `disk-reclaim`'s queue before
+/// any budget is spent: its target is listed after the executed ones, not attempted, and
+/// recorded `planned` with `sessions_uncovered`; the covered worktrees around it execute in
+/// their order (control).
+#[test]
+fn uncovered_listed_not_attempted() {
+    let mut d = granted("");
+    let [a, b, c] = three(&d);
+    let covered: Vec<String> = [&a, &c]
+        .map(|wt| format!("'{}'", dunce::canonicalize(wt).unwrap().display()))
+        .into();
+    d.s.scene.observe_config(&format!(
+        "[sessions]\ncovered = [{}]\nlinger_s = 1\nquiet_s = 1\n",
+        covered.join(", ")
+    ));
+    std::thread::sleep(Duration::from_millis(1200));
+    let before = plan_support::listing(&b);
+    d.fixture_reads(&[UNDER]);
+
+    let pass = d.reconcile();
+    assert_eq!(own_errors(&pass), Vec::<String>::new());
+    let report = report(&pass);
+    assert_eq!(
+        statuses(&d, report),
+        [
+            executed("a/target"),
+            executed("c/target"),
+            ("b/target".to_owned(), None)
+        ],
+        "{report:#?}"
+    );
+    assert!(!a.join("target").exists());
+    assert!(!c.join("target").exists());
+    assert_eq!(plan_support::listing(&b), before);
+    let acts = d.records(RecordKind::Act);
+    assert_eq!(acts.len(), 2, "{acts:#?}");
+    let planned = d.records(RecordKind::Planned);
+    assert_eq!(planned.len(), 1, "{planned:#?}");
+    assert_eq!(
+        planned[0].data["reasons"],
+        serde_json::json!(["sessions_uncovered"])
+    );
+    let keys = planned[0].data["provenance"]["config"].as_array().unwrap();
+    assert!(
+        keys.iter().any(|k| k["key"] == "sessions.covered"),
+        "{planned:#?}"
+    );
+}
+
+/// A44: a worktree withdrawn from `[sessions] covered` while the pass is paused at
+/// `reconcile.observed`, after its startup configuration put the target in the queue: the
+/// reload before that target skips it before any budget is spent, and each target left out is
+/// listed after the executed ones and recorded `planned` with `sessions_uncovered` under the
+/// configuration that left it out: `c`, never covered, under the startup one, and `b` under
+/// the reload that withdrew it, while `a` executes and `reachable_bytes` counts it alone; the
+/// same pause with a rewrite that keeps `b` covered executes `a` and `b`, records `c` under the
+/// startup configuration, and counts both (control).
+#[test]
+fn coverage_withdrawn_during_the_pass() {
+    let run = |withdraw: bool| {
+        let d = granted("");
+        let [a, b, _] = three(&d);
+        let root = |wt: &PathBuf| format!("'{}'", dunce::canonicalize(wt).unwrap().display());
+        let startup = [&a, &b].map(root).join(", ");
+        let mut d = d;
+        d.s.scene.observe_config(&format!(
+            "[sessions]\ncovered = [{startup}]\nlinger_s = 1\nquiet_s = 1\n"
+        ));
+        std::thread::sleep(Duration::from_millis(1200));
+        let before = plan_support::listing(&b);
+        d.fixture_reads(&[UNDER]);
+        let mut command = d.reconcile_command();
+        d.points
+            .apply(&mut command, &[testpoint::RECONCILE_OBSERVED], None);
+        let child = command
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        d.points.wait_reached(
+            testpoint::RECONCILE_OBSERVED,
+            child.id(),
+            Duration::from_secs(30),
+        );
+        let host = d.s.config_dir.join("host.toml");
+        let text = std::fs::read_to_string(&host).unwrap();
+        let kept = if withdraw { root(&a) } else { startup.clone() };
+        let rewritten = text.replace(
+            &format!("covered = [{startup}]"),
+            &format!("covered = [{kept}]"),
+        );
+        assert!(text.contains(&format!("covered = [{startup}]")), "{text}");
+        std::fs::write(&host, rewritten).unwrap();
+        d.points.release(testpoint::RECONCILE_OBSERVED);
+        let pass = disk_support::pass(&child.wait_with_output().unwrap());
+        assert_eq!(own_errors(&pass), Vec::<String>::new());
+        let report = report(&pass).clone();
+        (d, b, before, report)
+    };
+    let (d, b, before, report) = run(true);
+    assert_eq!(
+        statuses(&d, &report),
+        [
+            executed("a/target"),
+            ("c/target".to_owned(), None),
+            ("b/target".to_owned(), None)
+        ],
+        "{report:#?}"
+    );
+    assert_eq!(plan_support::listing(&b), before);
+    assert_eq!(d.records(RecordKind::Act).len(), 1);
+    assert_eq!(
+        covered_by_target(&d),
+        [
+            ("b".to_owned(), roots(&d, &["a"])),
+            ("c".to_owned(), roots(&d, &["a", "b"])),
+        ]
+    );
+    assert_eq!(
+        report.reachable_bytes,
+        Some(bound(&report, "a/target")),
+        "{report:#?}"
+    );
+
+    let (d, b, _, report) = run(false);
+    assert_eq!(
+        statuses(&d, &report),
+        [
+            executed("a/target"),
+            executed("b/target"),
+            ("c/target".to_owned(), None)
+        ],
+        "{report:#?}"
+    );
+    assert!(!b.join("target").exists());
+    assert_eq!(
+        covered_by_target(&d),
+        [("c".to_owned(), roots(&d, &["a", "b"]))]
+    );
+    assert_eq!(
+        report.reachable_bytes,
+        Some(bound(&report, "a/target") + bound(&report, "b/target")),
+        "{report:#?}"
+    );
+}
+
+/// The worktree (`a`, `b`, or `c`) of each `planned` record, all `sessions_uncovered`, with the
+/// roots `sessions.covered` held in the configuration it was recorded under, by worktree.
+fn covered_by_target(d: &Disk) -> Vec<(String, serde_json::Value)> {
+    let mut found: Vec<(String, serde_json::Value)> = d
+        .records(RecordKind::Planned)
+        .iter()
+        .map(|record| {
+            assert_eq!(
+                record.data["reasons"],
+                serde_json::json!(["sessions_uncovered"]),
+                "{record:#?}"
+            );
+            let path = record.data["target"].as_str().unwrap();
+            let target = ["a", "b", "c"]
+                .into_iter()
+                .find(|name| Path::new(path).ends_with(format!("{name}/target")))
+                .unwrap()
+                .to_owned();
+            let covered = record.data["provenance"]["config"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|key| key["key"] == "sessions.covered")
+                .map(|key| key["value"].clone())
+                .unwrap();
+            (target, covered)
+        })
+        .collect();
+    found.sort_by(|x, y| x.0.cmp(&y.0));
+    found
+}
+
+/// The roots of the worktrees `names`, as `sessions.covered` records them.
+fn roots(d: &Disk, names: &[&str]) -> serde_json::Value {
+    let roots: Vec<String> = names
+        .iter()
+        .map(|name| {
+            let wt = d.s.fx.path(name);
+            dunce::canonicalize(wt).unwrap().display().to_string()
+        })
+        .collect();
+    serde_json::json!(roots)
+}
+
+/// The bound a report lists for its target ending in `name`.
+fn bound(report: &cardinal::contract::DiskReport, name: &str) -> u64 {
+    report
+        .targets
+        .iter()
+        .find(|t| t.target.ends_with(name))
+        .expect("the target")
+        .exclusive_bytes
+}
+
 /// A pass whose volume reads above the recovery line still finishes, at step 2, a committed
 /// execution of the unit that died, and executes nothing more.
 #[test]

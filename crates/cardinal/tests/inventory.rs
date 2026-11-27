@@ -176,6 +176,7 @@ fn unreadable_reservations_leave_in_use_unknown() {
     let reservations = state.reservations_dir();
     std::fs::remove_dir(&reservations).unwrap();
     std::fs::write(&reservations, "not a directory").unwrap();
+    scene.settle();
     let inv = cardinal::observe::Observer::new(&config)
         .with_env(scene.env())
         .inventory(

@@ -244,6 +244,23 @@ impl Paused {
         }
     }
 
+    /// [`Paused::finish`], with whether the process reached `point` before it ended.
+    pub fn finish_reached(self, points: &[&str], point: &str) -> (ActResult, bool) {
+        for point in points {
+            self.points.release(point);
+        }
+        let pid = self.child.id();
+        let output = self
+            .child
+            .wait_with_output()
+            .expect("wait for cardinal act");
+        let reached = self.points.reached(point, pid);
+        (
+            plan_support::act_result(&output).expect("an act result"),
+            reached,
+        )
+    }
+
     /// Releases every point in `points` and returns the result the process printed.
     pub fn finish(self, points: &[&str]) -> ActResult {
         self.finish_logged(points).0

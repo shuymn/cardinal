@@ -1,5 +1,8 @@
-//! Session leases (`docs/architecture.md` section 9.8): the writers (A40) and the expiry in the
-//! inbox refresh (A43's pruning).
+//! Session leases (`docs/architecture.md` section 9.8): the writers (A40), the expiry in the
+//! inbox refresh (A43's pruning), and the readers: the lease and the quiet period in
+//! `not_in_use` (A41), the report week's case refused (A42), and the quiescent control executed
+//! (A43). The readers' tests set `linger_s` and `quiet_s` to seconds, since fixtures are fresh,
+//! and wait them out where a test needs an idle worktree.
 //!
 //! Hooks run as children of a stand-in agent, this test binary hard-linked under the name its
 //! test needs (`claude`, or another name for the control) and run in [`AGENT_MODE`]: it runs
@@ -9,7 +12,11 @@
 
 #![cfg(unix)]
 
+mod disk_support;
 mod hook_support;
+mod live_support;
+mod observe_common;
+mod plan_support;
 mod support;
 
 use std::os::unix::fs::PermissionsExt as _;
@@ -1738,4 +1745,952 @@ fn a_failed_rotation_drops_nothing() {
     let stopped = of_kind(&dirs, RecordKind::SubagentStopped);
     assert_eq!(stopped.len(), 1, "{stopped:#?}");
     assert_eq!(stopped[0].data.get("dropped_records"), None, "{stopped:#?}");
+}
+
+// --- Readers (A41–A43) ----------------------------------------------------------------------
+
+use cardinal::contract::{ActStatus, CheckResult, Plan, PlanKind};
+use plan_support::Setup;
+
+/// `[sessions]` covering the fixture with `linger_s` and `quiet_s`.
+fn sessions(s: &Setup, linger_s: u64, quiet_s: u64) -> String {
+    format!(
+        "[sessions]\ncovered = ['{}']\nlinger_s = {linger_s}\nquiet_s = {quiet_s}\n",
+        dunce::canonicalize(s.fx.root()).unwrap().display()
+    )
+}
+
+/// A plan setup whose `[sessions]` covers the fixture with these bounds.
+fn bounded(linger_s: u64, quiet_s: u64) -> Setup {
+    let mut s = Setup::new();
+    let host = sessions(&s, linger_s, quiet_s);
+    s.scene.observe_config(&host);
+    s
+}
+
+/// Waits out `secs`, a bound of the test's own `[sessions]`.
+fn wait_out(secs: u64) {
+    std::thread::sleep(Duration::from_millis(secs * 1000 + 200));
+}
+
+/// Writes the lease of the worktree at `root` in `s`'s state dir.
+fn put_lease(s: &Setup, root: &Path, sessions: Vec<LeaseEntry>, overflow: bool) {
+    let path = s
+        .state
+        .lease(&state::worktree_key(&dunce::canonicalize(root).unwrap()));
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let lease = SessionLease {
+        schema: cardinal::contract::SessionLeaseSchema,
+        worktree: dunce::canonicalize(root).unwrap().display().to_string(),
+        overflow,
+        sessions,
+    };
+    std::fs::write(path, serde_json::to_vec(&lease).unwrap()).unwrap();
+}
+
+/// `not_in_use` of `plan`: its result and detail.
+fn in_use(plan: &Plan) -> (CheckResult, String) {
+    let check = plan
+        .checks
+        .iter()
+        .find(|c| c.name == "not_in_use")
+        .expect("not_in_use");
+    (check.result, check.detail.clone())
+}
+
+/// The `reclaim_dir` plan of `wt`'s `node_modules`.
+fn plan_modules(s: &Setup, wt: &Path) -> Plan {
+    s.plan(PlanKind::ReclaimDir, &wt.join("node_modules"))
+}
+
+fn now_ms() -> u64 {
+    state::now_ms()
+}
+
+/// Moves `path`'s modification time an hour into the past.
+fn backdate(path: &Path) {
+    plan_support::backdate(path);
+}
+
+/// A worktree `name` with a `node_modules` of one file, which a plan finds idle once `wait`
+/// seconds have passed.
+fn idle_worktree(s: &Setup, name: &str, wait: u64) -> PathBuf {
+    let wt = s.worktree(name);
+    plan_support::write(&wt, "node_modules/pkg/index.js", "x");
+    wait_out(wait);
+    wt
+}
+
+/// A41: a live entry (the test process is its agent, with its start time and boot ID) holds
+/// its worktree, named; a worktree with no lease, idle, passes (control).
+#[test]
+fn live_session_refuses() {
+    let s = bounded(60, 1);
+    let free = idle_worktree(&s, "free", 0);
+    let wt = idle_worktree(&s, "live", 1);
+    put_lease(&s, &wt, vec![plain("s-live", Some(me()), 1, None)], false);
+    let (result, detail) = in_use(&plan_modules(&s, &wt));
+    assert_eq!(result, CheckResult::Fail, "{detail}");
+    assert!(detail.contains("session s-live is live"), "{detail}");
+    assert_eq!(in_use(&plan_modules(&s, &free)).0, CheckResult::Pass);
+}
+
+/// A41: an entry that ended within `linger_s` holds its worktree; one that ended earlier does
+/// not (control).
+#[test]
+fn ended_session_lingers() {
+    let s = bounded(60, 1);
+    let wt = idle_worktree(&s, "ended", 1);
+    put_lease(
+        &s,
+        &wt,
+        vec![plain("s-ended", None, now_ms(), Some(now_ms()))],
+        false,
+    );
+    let (result, detail) = in_use(&plan_modules(&s, &wt));
+    assert_eq!(result, CheckResult::Fail, "{detail}");
+    assert!(detail.contains("session s-ended lingers"), "{detail}");
+    let old = now_ms() - 120_000;
+    put_lease(&s, &wt, vec![plain("s-ended", None, old, Some(old))], false);
+    assert_eq!(in_use(&plan_modules(&s, &wt)).0, CheckResult::Pass);
+}
+
+/// An entry whose events are older than `linger_s`, its transcript at `transcript`.
+fn stale_with(transcript: &Path) -> LeaseEntry {
+    let old = now_ms() - 120_000;
+    LeaseEntry {
+        transcript_path: Some(transcript.display().to_string()),
+        ..plain("s-crashed", None, old, Some(old))
+    }
+}
+
+/// A41: a session that died without `SessionEnd` lingers from its transcript's mtime; a
+/// transcript older than `linger_s` holds nothing (control).
+#[test]
+fn crash_lingers_from_the_transcript() {
+    let s = bounded(60, 1);
+    let wt = idle_worktree(&s, "crashed", 1);
+    let transcript = s.fx.path("transcripts/s-crashed.jsonl");
+    plan_support::write(s.fx.root(), "transcripts/s-crashed.jsonl", "{}\n");
+    put_lease(&s, &wt, vec![stale_with(&transcript)], false);
+    assert_eq!(in_use(&plan_modules(&s, &wt)).0, CheckResult::Fail);
+    backdate(&transcript);
+    assert_eq!(in_use(&plan_modules(&s, &wt)).0, CheckResult::Pass);
+}
+
+/// A41: a subagent's transcript, beside the session's (`<transcript>/subagents/`), holds the
+/// worktree while the main transcript stays silent; backdated, it holds nothing (control).
+#[test]
+fn subagent_transcript_holds() {
+    let s = bounded(60, 1);
+    let wt = idle_worktree(&s, "subagent", 1);
+    let transcript = s.fx.path("transcripts/s-crashed.jsonl");
+    plan_support::write(s.fx.root(), "transcripts/s-crashed.jsonl", "{}\n");
+    plan_support::write(
+        s.fx.root(),
+        "transcripts/s-crashed/subagents/a.jsonl",
+        "{}\n",
+    );
+    backdate(&transcript);
+    put_lease(&s, &wt, vec![stale_with(&transcript)], false);
+    assert_eq!(in_use(&plan_modules(&s, &wt)).0, CheckResult::Fail);
+    backdate(&s.fx.path("transcripts/s-crashed/subagents/a.jsonl"));
+    assert_eq!(in_use(&plan_modules(&s, &wt)).0, CheckResult::Pass);
+}
+
+/// A41: a PID another process took, told by its start time, is not live, and an entry with it
+/// and old events holds nothing; the same PID with its own start time holds (control).
+#[test]
+fn reused_pid_is_not_live() {
+    let s = bounded(60, 1);
+    let wt = idle_worktree(&s, "reused", 1);
+    let old = now_ms() - 120_000;
+    put_lease(
+        &s,
+        &wt,
+        vec![plain("s-old", Some(later(&me())), old, None)],
+        false,
+    );
+    assert_eq!(in_use(&plan_modules(&s, &wt)).0, CheckResult::Pass);
+    put_lease(&s, &wt, vec![plain("s-old", Some(me()), old, None)], false);
+    assert_eq!(in_use(&plan_modules(&s, &wt)).0, CheckResult::Fail);
+}
+
+/// A41: a lease file that does not parse, one marked `overflow`, and an `uncertain` entry
+/// within `linger_s` leave `not_in_use` unknown; an `uncertain` entry past `linger_s` holds
+/// nothing (control).
+#[test]
+fn torn_lease_is_unknown() {
+    let s = bounded(60, 1);
+    let wt = idle_worktree(&s, "torn", 1);
+    let path = s
+        .state
+        .lease(&state::worktree_key(&dunce::canonicalize(&wt).unwrap()));
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, b"{\"schema\": \"cardinal.session-lease.v1\", \"sess").unwrap();
+    let (result, detail) = in_use(&plan_modules(&s, &wt));
+    assert_eq!(result, CheckResult::Unknown, "{detail}");
+    assert!(detail.contains("corrupt"), "{detail}");
+
+    let old = now_ms() - 120_000;
+    put_lease(&s, &wt, vec![plain("s-old", None, old, Some(old))], true);
+    let (result, detail) = in_use(&plan_modules(&s, &wt));
+    assert_eq!(result, CheckResult::Unknown, "{detail}");
+    assert!(detail.contains("overflow"), "{detail}");
+
+    let uncertain = |at: u64| LeaseEntry {
+        uncertain: true,
+        ..plain("cardinal:uncertain", None, at, Some(at))
+    };
+    put_lease(&s, &wt, vec![uncertain(now_ms())], false);
+    let (result, detail) = in_use(&plan_modules(&s, &wt));
+    assert_eq!(result, CheckResult::Unknown, "{detail}");
+    assert!(detail.contains("uncertain"), "{detail}");
+    put_lease(&s, &wt, vec![uncertain(old)], false);
+    assert_eq!(in_use(&plan_modules(&s, &wt)).0, CheckResult::Pass);
+}
+
+/// Writes `n` files `<rel>/f<i>` under `root`, each backdated.
+fn old_files(root: &Path, rel: &str, n: usize) {
+    for i in 0..n {
+        let file = format!("{rel}/f{i}");
+        plan_support::write(root, &file, "x");
+        backdate(&root.join(file));
+    }
+    backdate(&root.join(rel));
+}
+
+/// A41: each cap passed without a recent signal leaves `not_in_use` unknown, never a partial
+/// newest mtime: more than 1,000 paths `git status` lists, more than 4,096 files of a session's
+/// `subagents/`, and more than 4,096 entries in an ignored entry; at each cap it passes
+/// (control).
+#[test]
+fn caps_are_unknown() {
+    let s = bounded(60, 1);
+    let subagents = idle_worktree(&s, "subagents", 0);
+    // Status paths.
+    let wt = s.worktree("paths");
+    plan_support::write(&wt, "node_modules/pkg/index.js", "x");
+    old_files(&wt, "untracked", 1000);
+    wait_out(1);
+    assert_eq!(in_use(&plan_modules(&s, &wt)).0, CheckResult::Pass);
+    old_files(&wt, "more", 1);
+    let (result, detail) = in_use(&plan_modules(&s, &wt));
+    assert_eq!(result, CheckResult::Unknown, "{detail}");
+    assert!(detail.contains("more than 1000"), "{detail}");
+
+    // Subagent transcripts.
+    let wt = subagents;
+    let transcript = s.fx.path("transcripts/s-many.jsonl");
+    plan_support::write(s.fx.root(), "transcripts/s-many.jsonl", "{}\n");
+    backdate(&transcript);
+    old_files(s.fx.root(), "transcripts/s-many/subagents", 4096);
+    put_lease(&s, &wt, vec![stale_with(&transcript)], false);
+    assert_eq!(in_use(&plan_modules(&s, &wt)).0, CheckResult::Pass);
+    plan_support::write(s.fx.root(), "transcripts/s-many/subagents/f4096", "x");
+    backdate(&s.fx.path("transcripts/s-many/subagents/f4096"));
+    let (result, detail) = in_use(&plan_modules(&s, &wt));
+    assert_eq!(result, CheckResult::Unknown, "{detail}");
+    assert!(detail.contains("more than 4096 files"), "{detail}");
+
+    // An ignored entry's top-level entries.
+    let wt = s.worktree("ignored");
+    plan_support::write(&wt, "node_modules/pkg/index.js", "x");
+    old_files(&wt, "fuzz/corpus", 4096);
+    backdate(&wt.join("fuzz"));
+    wait_out(1);
+    assert_eq!(in_use(&plan_modules(&s, &wt)).0, CheckResult::Pass);
+    plan_support::write(&wt, "fuzz/corpus/f4096", "x");
+    backdate(&wt.join("fuzz/corpus/f4096"));
+    backdate(&wt.join("fuzz/corpus"));
+    let (result, detail) = in_use(&plan_modules(&s, &wt));
+    assert_eq!(result, CheckResult::Unknown, "{detail}");
+    assert!(detail.contains("more than 4096 entries"), "{detail}");
+}
+
+/// A41's signals, each alone: a worktree idle for `quiet_s` passes (the control, first), and
+/// after `change` its plan fails `not_in_use` naming `named`.
+mod quiet_signals {
+    use std::path::Path;
+
+    use super::{CheckResult, bounded, in_use, plan_modules, wait_out};
+    use crate::plan_support::{self, Setup};
+
+    const QUIET_S: u64 = 4;
+
+    fn case(change: impl FnOnce(&Setup, &Path) -> std::path::PathBuf, named: &str) {
+        case_with(|_| {}, change, named);
+    }
+
+    /// [`case`] with `prepare` run on the worktree before the quiet period is waited out.
+    fn case_with(
+        prepare: impl FnOnce(&Path),
+        change: impl FnOnce(&Setup, &Path) -> std::path::PathBuf,
+        named: &str,
+    ) {
+        let s = bounded(60, QUIET_S);
+        std::fs::write(s.main.join(".git/info/exclude"), "dist/\nlocal.env\n").unwrap();
+        let wt = s.worktree("signal");
+        plan_support::write(&wt, "node_modules/pkg/index.js", "x");
+        prepare(&wt);
+        wait_out(QUIET_S);
+        assert_eq!(in_use(&plan_modules(&s, &wt)).0, CheckResult::Pass);
+        let wt = change(&s, &wt);
+        let (result, detail) = in_use(&plan_modules(&s, &wt));
+        assert_eq!(result, CheckResult::Fail, "{detail}");
+        assert!(detail.contains("not quiet"), "{detail}");
+        assert!(detail.contains(named), "{named}: {detail}");
+    }
+
+    #[test]
+    fn index_write() {
+        case(
+            |s, wt| {
+                plan_support::write(wt, "staged.rs", "x");
+                s.fx.add(wt, "staged.rs");
+                plan_support::backdate(&wt.join("staged.rs"));
+                wt.to_path_buf()
+            },
+            "/index",
+        );
+    }
+
+    /// A commit modifying a tracked file, the file and the index backdated: the reflog
+    /// alone is the signal, its mtime set ahead so that it stays recent however late the plan
+    /// reads it.
+    #[test]
+    fn commit() {
+        case(
+            |s, wt| {
+                s.fx.commit_file(wt, "src/lib.rs", "// more\n", "more");
+                plan_support::backdate(&wt.join("src/lib.rs"));
+                plan_support::backdate(&s.main.join(".git/worktrees/signal/index"));
+                plan_support::ahead(&s.main.join(".git/worktrees/signal/logs/HEAD"));
+                wt.to_path_buf()
+            },
+            "logs/HEAD",
+        );
+    }
+
+    /// The reflog's last entry alone: an entry written an hour ahead, `logs/HEAD`'s own mtime
+    /// set back after it, is the signal, named as the last entry.
+    #[test]
+    fn reflog_entry() {
+        case(
+            |s, wt| {
+                use std::io::Write as _;
+                let reflog = s.main.join(".git/worktrees/signal/logs/HEAD");
+                let zeros = "0".repeat(40);
+                let at_s = super::now_ms() / 1000 + 3600;
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&reflog)
+                    .unwrap()
+                    .write_all(
+                        format!("{zeros} {zeros} A U Thor <a@example.com> {at_s} +0000\tx\n")
+                            .as_bytes(),
+                    )
+                    .unwrap();
+                plan_support::backdate(&reflog);
+                wt.to_path_buf()
+            },
+            "the last entry of",
+        );
+    }
+
+    #[test]
+    fn tracked_edit() {
+        case(
+            |_, wt| {
+                plan_support::write(wt, "src/lib.rs", "// edited\n");
+                wt.to_path_buf()
+            },
+            "src/lib.rs",
+        );
+    }
+
+    #[test]
+    fn tracked_deletion() {
+        case(
+            |_, wt| {
+                std::fs::remove_file(wt.join("src/lib.rs")).unwrap();
+                wt.to_path_buf()
+            },
+            "a tracked deletion",
+        );
+    }
+
+    #[test]
+    fn untracked_file() {
+        case(
+            |_, wt| {
+                plan_support::write(wt, "notes.txt", "x");
+                wt.to_path_buf()
+            },
+            "notes.txt",
+        );
+    }
+
+    #[test]
+    fn target_entry() {
+        case(
+            |_, wt| {
+                plan_support::write(wt, "node_modules/pkg/new.js", "x");
+                plan_support::backdate(&wt.join("node_modules/pkg"));
+                wt.to_path_buf()
+            },
+            "node_modules/pkg/new.js",
+        );
+    }
+
+    /// A write in place deep inside another regenerable target (`target/`), below its
+    /// top-level entries: the plan of `node_modules` reads every target's entries.
+    #[test]
+    fn another_target_entry() {
+        case_with(
+            |wt| plan_support::write(wt, "target/debug/deps/libx.rlib", "x"),
+            |_, wt| {
+                use std::io::Write as _;
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(wt.join("target/debug/deps/libx.rlib"))
+                    .unwrap()
+                    .write_all(b"y")
+                    .unwrap();
+                plan_support::ahead(&wt.join("target/debug/deps/libx.rlib"));
+                wt.to_path_buf()
+            },
+            "target/debug/deps/libx.rlib",
+        );
+    }
+
+    #[test]
+    fn ignored_output() {
+        case(
+            |_, wt| {
+                plan_support::write(wt, "dist/out.js", "x");
+                wt.to_path_buf()
+            },
+            "dist",
+        );
+    }
+
+    /// An ignored file no regenerable pattern matches: its own mtime is a signal.
+    #[test]
+    fn ignored_file() {
+        case(
+            |_, wt| {
+                plan_support::write(wt, "local.env", "x");
+                wt.to_path_buf()
+            },
+            "local.env",
+        );
+    }
+
+    #[test]
+    fn worktree_move() {
+        case(
+            |s, wt| {
+                let to = s.fx.path("moved");
+                s.fx.worktree_move(&s.main, wt, &to);
+                to
+            },
+            "gitdir",
+        );
+    }
+}
+
+/// Section 9.8: in `cardinal plan`'s plans of every target, a write in place deep inside one
+/// regenerable target (`target/debug/deps/libx.rlib`) fails the other's (`node_modules`)
+/// `not_in_use`, read from the walk the plans already took; before the write both pass
+/// (control).
+#[test]
+fn another_target_holds_every_plan() {
+    use std::io::Write as _;
+    let s = bounded(60, 2);
+    let wt = s.worktree("siblings");
+    plan_support::write(&wt, "node_modules/pkg/index.js", "x");
+    plan_support::write(&wt, "target/debug/deps/libx.rlib", "x");
+    wait_out(2);
+    let modules = |s: &Setup| {
+        let plans = s.plan_all().plans;
+        let plan = plans
+            .iter()
+            .find(|p| p.target.path.ends_with("siblings/node_modules"))
+            .expect("the node_modules plan")
+            .clone();
+        in_use(&plan)
+    };
+    assert_eq!(modules(&s).0, CheckResult::Pass);
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(wt.join("target/debug/deps/libx.rlib"))
+        .unwrap()
+        .write_all(b"y")
+        .unwrap();
+    plan_support::ahead(&wt.join("target/debug/deps/libx.rlib"));
+    let (result, detail) = modules(&s);
+    assert_eq!(result, CheckResult::Fail, "{detail}");
+    assert!(detail.contains("target/debug/deps/libx.rlib"), "{detail}");
+}
+
+/// Section 9.8: the entries below another regenerable target are read whole, or the plans of
+/// the worktree read them `unknown`. In the main worktree, `target/debug` replaced by a new
+/// directory after the walk listed `target/` and before it lists `debug` (`walk.dir_checked`)
+/// leaves `node_modules`'s `not_in_use` unknown in `plan reclaim-dir` and in `cardinal plan`,
+/// never quiet from the entries recorded; removed there, with the read held past `quiet_s`,
+/// it is activity now. Nothing changed at the pause, both plans pass (control).
+#[test]
+fn another_target_is_read_whole() {
+    let s = bounded(60, 1);
+    let main = s.main.clone();
+    let debug = main.join("target/debug");
+    // Every entry an hour old; `node_modules` holds no directory, so the first directory the
+    // plans' walks open is `target/debug`.
+    let reset = || {
+        let _ = std::fs::remove_dir_all(main.join("target"));
+        plan_support::write(&main, "node_modules/index.js", "x");
+        plan_support::write(&main, "target/debug/deps/libx.rlib", "x");
+        for path in [
+            "node_modules/index.js",
+            "target/debug/deps/libx.rlib",
+            "target/debug/deps",
+            "target/debug",
+        ] {
+            backdate(&main.join(path));
+        }
+    };
+    let replace = || {
+        let aside = main.join("target/debug.old");
+        std::fs::rename(&debug, &aside).unwrap();
+        std::fs::create_dir(&debug).unwrap();
+        backdate(&debug);
+        backdate(&aside);
+    };
+    let remove = || {
+        std::fs::remove_dir_all(&debug).unwrap();
+        wait_out(1);
+    };
+    let point = cardinal::testpoint::WALK_DIR_CHECKED;
+    let modules = main.join("node_modules");
+    let one = |change: &dyn Fn()| {
+        reset();
+        in_use(&s.plan_at(PlanKind::ReclaimDir, &modules, point, change))
+    };
+    let all = |change: &dyn Fn()| {
+        reset();
+        let plans = s.plan_all_at(point, change).plans;
+        let plan = plans
+            .iter()
+            .find(|p| Path::new(&p.target.path) == modules)
+            .expect("the node_modules plan");
+        in_use(plan)
+    };
+    reset();
+    wait_out(1);
+    for read in [&all as &dyn Fn(&dyn Fn()) -> (CheckResult, String), &one] {
+        assert_eq!(read(&|| {}).0, CheckResult::Pass);
+        let (result, detail) = read(&replace);
+        assert_eq!(result, CheckResult::Unknown, "{detail}");
+        assert!(detail.contains("target/debug"), "{detail}");
+        let (result, detail) = read(&remove);
+        assert_eq!(result, CheckResult::Fail, "{detail}");
+        assert!(detail.contains("target/debug"), "{detail}");
+    }
+}
+
+/// Section 9.8: a regenerable target's top-level entries, below a target whose whole walk the
+/// plans read, are read outside both caps: a `node_modules` of 4,097 files, every entry past
+/// `quiet_s`, leaves `node_modules`'s `not_in_use` `pass` (an ignored entry no regenerable
+/// pattern matches past the cap is `caps_are_unknown`'s).
+#[test]
+fn a_large_regenerable_target_is_read_past_the_caps() {
+    let s = bounded(60, 1);
+    let large = s.worktree("large");
+    let dir = large.join("node_modules");
+    std::fs::create_dir_all(&dir).unwrap();
+    for n in 0..=cardinal::observe::quiet::MAX_ENTRIES_PER_IGNORED {
+        std::fs::write(dir.join(format!("f{n}")), "x").unwrap();
+    }
+    wait_out(1);
+    let (result, detail) = in_use(&plan_modules(&s, &large));
+    assert_eq!(result, CheckResult::Pass, "{detail}");
+}
+
+/// Section 9.8: a plan's reading of its own target counts what the walk found removed while
+/// it read. `target` renamed out of the worktree after the walk opened it and read its names
+/// (`walk.dir_listed`), an empty directory put at its name, every time an hour old and no
+/// directory below it left unlisted: the identity recheck finds the name no longer the
+/// directory listed, and `plan reclaim-dir`'s `not_in_use` fails, never `pass` from the old
+/// directory's entries. Nothing changed at the pause,
+/// it passes (control).
+#[test]
+fn a_target_replaced_while_it_was_read_is_not_quiet() {
+    let s = bounded(60, 1);
+    let main = s.main.clone();
+    let target = main.join("target");
+    let aside = s.fx.root().join("target-aside");
+    let reset = || {
+        let _ = std::fs::remove_dir_all(&target);
+        let _ = std::fs::remove_dir_all(&aside);
+        plan_support::write(&main, "target/app", "x");
+        for path in ["target/app", "target"] {
+            backdate(&main.join(path));
+        }
+    };
+    let replace = || {
+        std::fs::rename(&target, &aside).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        backdate(&target);
+    };
+    let point = cardinal::testpoint::WALK_DIR_LISTED;
+    let read = |change: &dyn Fn()| {
+        reset();
+        in_use(&s.plan_at(PlanKind::ReclaimDir, &target, point, change))
+    };
+    reset();
+    wait_out(1);
+    let (result, detail) = read(&|| {});
+    assert_eq!(result, CheckResult::Pass, "{detail}");
+    let (result, detail) = read(&replace);
+    assert_eq!(result, CheckResult::Fail, "{detail}");
+    assert!(detail.contains("removed while it was read"), "{detail}");
+}
+
+/// Section 9.8, Linux: an ignored file whose name is not UTF-8, written now, is read by the
+/// name git listed, not a lossy spelling that names nothing: `not_in_use` fails; backdated,
+/// it passes (control).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_name_that_is_not_utf8_is_read() {
+    use std::os::unix::ffi::OsStrExt as _;
+    let s = bounded(60, 2);
+    std::fs::write(s.main.join(".git/info/exclude"), "*.log\n").unwrap();
+    let wt = s.worktree("bytes");
+    plan_support::write(&wt, "node_modules/pkg/index.js", "x");
+    let name = wt.join(std::ffi::OsStr::from_bytes(b"build-\xff.log"));
+    std::fs::write(&name, "x").unwrap();
+    backdate(&name);
+    wait_out(2);
+    assert_eq!(in_use(&plan_modules(&s, &wt)).0, CheckResult::Pass);
+    std::fs::write(&name, "y").unwrap();
+    plan_support::ahead(&name);
+    let (result, detail) = in_use(&plan_modules(&s, &wt));
+    assert_eq!(result, CheckResult::Fail, "{detail}");
+    assert!(detail.contains(".log"), "{detail}");
+}
+
+/// Section 9.8: a FIFO at the worktree's `logs/HEAD`, its mtime an hour old, is no reflog: the
+/// plan reads it without waiting in it, and `not_in_use` is unknown, naming it; a regular
+/// reflog there passes (control).
+#[test]
+fn a_reflog_that_is_not_a_regular_file_never_blocks() {
+    use std::os::unix::ffi::OsStrExt as _;
+    let s = bounded(60, 1);
+    let wt = idle_worktree(&s, "fifo", 1);
+    assert_eq!(in_use(&plan_modules(&s, &wt)).0, CheckResult::Pass);
+    let reflog = s.main.join(".git/worktrees/fifo/logs/HEAD");
+    let kept = std::fs::read(&reflog).unwrap();
+    std::fs::remove_file(&reflog).unwrap();
+    let c = std::ffi::CString::new(reflog.as_os_str().as_bytes()).unwrap();
+    // SAFETY: `c` is a valid NUL-terminated path.
+    let made = unsafe { libc::mkfifo(c.as_ptr(), 0o600) };
+    assert_eq!(made, 0, "mkfifo: {}", std::io::Error::last_os_error());
+    let hour_ago = libc::timespec {
+        tv_sec: libc::time_t::try_from(now_ms() / 1000 - 3600).unwrap(),
+        tv_nsec: 0,
+    };
+    // SAFETY: `c` is a valid NUL-terminated path and `times` two `timespec`s; a FIFO's times
+    // are set without opening it, which would wait for a writer.
+    let set =
+        unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), [hour_ago, hour_ago].as_ptr(), 0) };
+    assert_eq!(set, 0, "utimensat: {}", std::io::Error::last_os_error());
+    let (result, detail) = in_use(&plan_modules(&s, &wt));
+    assert_eq!(result, CheckResult::Unknown, "{detail}");
+    assert!(detail.contains("logs/HEAD: not a regular file"), "{detail}");
+    std::fs::remove_file(&reflog).unwrap();
+    std::fs::write(&reflog, kept).unwrap();
+    backdate(&reflog);
+    assert_eq!(in_use(&plan_modules(&s, &wt)).0, CheckResult::Pass);
+}
+
+/// A41: a signal that cannot be read, here an ignored directory whose top-level entries
+/// cannot be listed, leaves `not_in_use` unknown, never idle, naming it; readable again, the
+/// worktree passes (control).
+#[test]
+fn unreadable_signal_is_unknown() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let s = bounded(60, 1);
+    let wt = s.worktree("unreadable");
+    plan_support::write(&wt, "node_modules/pkg/index.js", "x");
+    plan_support::write(&wt, "fuzz/corpus/a", "x");
+    wait_out(1);
+    let corpus = wt.join("fuzz/corpus");
+    std::fs::set_permissions(&corpus, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let (result, detail) = in_use(&plan_modules(&s, &wt));
+    std::fs::set_permissions(&corpus, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(result, CheckResult::Unknown, "{detail}");
+    assert!(detail.contains("fuzz/corpus"), "{detail}");
+    assert_eq!(in_use(&plan_modules(&s, &wt)).0, CheckResult::Pass);
+}
+
+/// A41: `act`'s move and restore change the target's own times and its parent's mtime, never
+/// read: a target renamed away and back, its own mtime now, is idle, while a write into its entries is not
+/// (control).
+#[test]
+fn a_restored_target_is_not_held_by_its_own_times() {
+    let s = bounded(60, 2);
+    let wt = idle_worktree(&s, "restored", 2);
+    std::fs::rename(wt.join("node_modules"), wt.join("node_modules.moved")).unwrap();
+    std::fs::rename(wt.join("node_modules.moved"), wt.join("node_modules")).unwrap();
+    // A rename keeps a directory's own mtime on some file systems and not others: set it now.
+    std::fs::File::open(wt.join("node_modules"))
+        .unwrap()
+        .set_modified(std::time::SystemTime::now())
+        .unwrap();
+    assert_eq!(in_use(&plan_modules(&s, &wt)).0, CheckResult::Pass);
+    plan_support::write(&wt, "node_modules/pkg/index.js", "y");
+    plan_support::ahead(&wt.join("node_modules/pkg/index.js"));
+    assert_eq!(in_use(&plan_modules(&s, &wt)).0, CheckResult::Fail);
+}
+
+/// A41: an entry the refresh dropped under the old `linger_s` stays dropped when `linger_s`
+/// is raised: the worktree is idle under the new bound too; the entry held before it expired
+/// (control).
+#[test]
+fn raised_linger_revives_nothing() {
+    let mut s = bounded(2, 1);
+    let wt = idle_worktree(&s, "raised", 1);
+    put_lease(
+        &s,
+        &wt,
+        vec![plain("s-gone", None, now_ms(), Some(now_ms()))],
+        false,
+    );
+    assert_eq!(in_use(&plan_modules(&s, &wt)).0, CheckResult::Fail);
+    wait_out(2);
+    let refreshed = s
+        .cardinal()
+        .arg("inbox")
+        .output_within(plan_support::RUN_LIMIT);
+    assert!(refreshed.unwrap().status.success());
+    assert!(
+        !s.state
+            .lease(&state::worktree_key(&dunce::canonicalize(&wt).unwrap()))
+            .exists()
+    );
+    s.scene.clear_observe_config();
+    let host = sessions(&s, 7200, 1);
+    s.scene.observe_config(&host);
+    assert_eq!(in_use(&plan_modules(&s, &wt)).0, CheckResult::Pass);
+}
+
+/// A41: a worktree whose `not_in_use` is unknown at three consecutive full observations raises
+/// `in_use_unknown` naming the input, not before, and the item ends once a full observation
+/// reads `pass` or `fail`.
+#[test]
+fn unknown_raises_an_item() {
+    use cardinal::contract::{InboxItem, InboxKind, InboxStatus};
+    let mut d = disk_support::Disk::with_host((1, 2, 3), "");
+    let host = sessions(&d.s, 3600, 1);
+    d.s.scene.observe_config(&host);
+    let wt = d.s.worktree("unknown");
+    let path =
+        d.s.state
+            .lease(&state::worktree_key(&dunce::canonicalize(&wt).unwrap()));
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, b"torn").unwrap();
+    d.fixture_reads(&[Some(3 * disk_support::MIB / 2)]);
+    wait_out(observe_common::QUIET_SESSIONS_S);
+    let items = |d: &disk_support::Disk| -> Vec<InboxItem> {
+        cardinal::inbox::list(
+            &d.s.config(),
+            &d.s.state,
+            Some(cardinal::inbox::StatusFilter::All),
+            false,
+        )
+        .unwrap()
+        .items
+        .into_iter()
+        .filter(|i| i.kind == InboxKind::InUseUnknown)
+        .collect()
+    };
+    for _ in 0..2 {
+        d.reconcile();
+        assert_eq!(items(&d), Vec::new());
+    }
+    d.reconcile();
+    let raised = items(&d);
+    assert_eq!(raised.len(), 1, "{raised:#?}");
+    assert_eq!(raised[0].status, InboxStatus::Open);
+    assert_eq!(raised[0].evidence["streak"], 3);
+    assert!(
+        raised[0].evidence["input"]
+            .as_str()
+            .unwrap()
+            .contains("session lease"),
+        "{raised:#?}"
+    );
+    std::fs::remove_file(&path).unwrap();
+    d.reconcile();
+    let ended = items(&d);
+    assert_eq!(ended.len(), 1);
+    assert!(ended[0].ended_ms.is_some(), "{ended:#?}");
+    assert_eq!(ended[0].status, InboxStatus::Resolved);
+}
+
+/// The disk setup of A42 and A43: lines at 1, 2, and 3 MiB with the whole fixture one volume
+/// read under the warning line, `disk-reclaim` and the owner granted, and `[sessions]` with
+/// these bounds covering the fixture. The main worktree holds a regenerable root
+/// `node_modules` and a package's.
+fn pressured(linger_s: u64, quiet_s: u64) -> disk_support::Disk {
+    let grant = "[unit.disk-reclaim]\nact = true\n[act]\nexecute = { owner = [\"reclaim_dir\"], \
+                 \"unit:disk-reclaim\" = [\"reclaim_dir\"] }\n";
+    let mut d = disk_support::Disk::with_host((1, 2, 3), grant);
+    let host = sessions(&d.s, linger_s, quiet_s);
+    d.s.scene.observe_config(&host);
+    plan_support::write(&d.s.main, "node_modules/react/index.js", "root");
+    plan_support::write(&d.s.main, "packages/a/node_modules/lib/index.js", "package");
+    d.fixture_reads(&[Some(3 * disk_support::MIB / 2)]);
+    d
+}
+
+/// `session-start`, then `session-end`, for one session with its `cwd` in `dir`, run by the
+/// test: their agent, the test process, is not `claude`, so the entry has none, as when the
+/// agent was released.
+fn between_turns(d: &disk_support::Disk, dir: &Path) {
+    for event in ["session-start", "session-end"] {
+        let input = input(
+            if event == "session-start" {
+                "SessionStart"
+            } else {
+                "SessionEnd"
+            },
+            "s-turns",
+            dir,
+            None,
+        );
+        let output = output_with_stdin(
+            d.s.cardinal().args(["hook", "claude", event]),
+            input.to_string().as_bytes(),
+        );
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+    }
+}
+
+/// Asserts `pass` listed and ran none of the main worktree's targets and blocked both under
+/// `not_in_use`, and that the owner's granted `act` on the root one reports `rejected`
+/// (`not_in_use`) and leaves it; returns the detail of that `not_in_use`.
+fn assert_refused(d: &disk_support::Disk, pass: &cardinal::contract::Reconcile) -> String {
+    let report = disk_support::report(pass);
+    assert_eq!(report.targets, Vec::new(), "{report:#?}");
+    let blocked = disk_support::blocked(report, d.s.fx.root());
+    for target in ["repo/node_modules", "repo/packages/a/node_modules"] {
+        assert!(
+            blocked.contains(&(target.to_owned(), "not_in_use".to_owned())),
+            "{target}: {blocked:?}"
+        );
+    }
+    let plan =
+        d.s.plan(PlanKind::ReclaimDir, &d.s.main.join("node_modules"));
+    let result = d.s.act(&plan.id, &live_support::owner()).unwrap();
+    assert_eq!(result.status, ActStatus::Rejected, "{result:#?}");
+    assert_eq!(result.reasons, ["not_in_use"]);
+    assert!(d.s.main.join("node_modules/react/index.js").exists());
+    in_use_check(&result.checks)
+}
+
+/// The detail of `not_in_use` among `checks`.
+fn in_use_check(checks: &[cardinal::contract::Check]) -> String {
+    checks
+        .iter()
+        .find(|c| c.name == "not_in_use")
+        .map_or_else(String::new, |c| c.detail.clone())
+}
+
+/// Moves the modification time of every entry under `dir` and `dir` itself an hour into the
+/// past, never through a link.
+fn backdate_tree(dir: &Path) {
+    for item in std::fs::read_dir(dir).unwrap() {
+        let path = item.unwrap().path();
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+        if meta.is_dir() {
+            backdate_tree(&path);
+        } else if meta.is_file() {
+            backdate(&path);
+        }
+    }
+    backdate(dir);
+}
+
+/// A42, the report week's case: a session in the main worktree sent `SessionEnd` less than
+/// `linger_s` before a pass under pressure, with no process of it left and the worktree
+/// quiet; the pass lists none of its targets, and the owner's `act` is refused.
+#[test]
+fn session_between_turns_refused() {
+    let d = pressured(3600, 1);
+    between_turns(&d, &d.s.main.join("packages/a"));
+    wait_out(1);
+    let pass = d.reconcile();
+    let detail = assert_refused(&d, &pass);
+    assert!(detail.contains("session s-turns"), "{detail}");
+}
+
+/// A42, without hooks: no lease file and a commit in the main worktree within `quiet_s`, as
+/// the reflog showed, every other signal (the targets, the committed file, the index) an hour
+/// old: the pass lists none of its targets, and the owner's `act` is refused naming the
+/// reflog. The reflog's mtime is set an hour ahead, which counts as now, so a slow run reads
+/// it as recent too.
+#[test]
+fn unhooked_commit_refused() {
+    let d = pressured(1, 3600);
+    d.s.fx
+        .commit_file(&d.s.main, "src/main.rs", "fn main() { }\n", "edit");
+    backdate_tree(&d.s.main);
+    std::fs::File::open(d.s.main.join(".git/logs/HEAD"))
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() + Duration::from_hours(1))
+        .unwrap();
+    let pass = d.reconcile();
+    let detail = assert_refused(&d, &pass);
+    assert!(detail.contains("logs/HEAD"), "{detail}");
+}
+
+/// A43: with both bounds at 2 s and waited out, the case of A42 and a second worktree no
+/// session touched are executed in one pass, and the pass's refresh prunes the expired lease
+/// file.
+#[test]
+fn quiescent_control_executes() {
+    let d = pressured(2, 2);
+    let other = d.s.worktree("untouched");
+    plan_support::write(&other, "node_modules/x/index.js", "x");
+    between_turns(&d, &d.s.main.join("packages/a"));
+    let lease = d.s.state.lease(&state::worktree_key(
+        &dunce::canonicalize(&d.s.main).unwrap(),
+    ));
+    assert!(lease.exists());
+    wait_out(2);
+    let pass = d.reconcile();
+    let report = disk_support::report(&pass);
+    let executed: Vec<String> = disk_support::targets(report, d.s.fx.root());
+    for target in [
+        "repo/node_modules",
+        "repo/packages/a/node_modules",
+        "untouched/node_modules",
+    ] {
+        assert!(
+            executed.contains(&target.to_owned()),
+            "{target}: {report:#?}"
+        );
+    }
+    assert!(
+        report
+            .targets
+            .iter()
+            .all(|t| t.status == Some(ActStatus::Executed)),
+        "{report:#?}"
+    );
+    assert!(!d.s.main.join("node_modules").exists());
+    assert!(!other.join("node_modules").exists());
+    assert!(!lease.exists(), "the expired lease file is pruned");
 }

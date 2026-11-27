@@ -50,7 +50,7 @@ pub use inbox::{
 pub use inventory::{
     ArbiterView, BaseRef, DirtyUnknown, DirtyUnknownReason, ExclusiveMeasure, Facts, GhStatus,
     HostInfo, IgnoredClass, IgnoredEntry, InUse, Inventory, MergeEvidence, Os, Outlived, PrRef,
-    ReclaimSummary, Repo, Worktree, WorktreeView,
+    ReclaimSummary, Repo, StatusPath, Worktree, WorktreeView,
 };
 pub use lease::{
     LeaseAgent, LeaseEntry, LeaseEvent, MAX_ENTRIES as LEASE_MAX_ENTRIES, SessionLease,
@@ -59,7 +59,8 @@ pub use plan::{
     Approval, ConfigKey, ObservedError, Plan, PlanKind, PlanList, PlanTarget, Provenance, RootId,
 };
 pub use reconcile::{
-    ArbiterStart, InboxChanges, Reconcile, ReconcileState, RecoveredExecution, Skipped, Trigger,
+    ArbiterStart, InUseUnknownStreak, InboxChanges, Reconcile, ReconcileState, RecoveredExecution,
+    Skipped, Trigger,
 };
 pub use record::{Record, RecordKind};
 pub use reservation::{

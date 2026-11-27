@@ -35,17 +35,33 @@ pub(super) fn has_exited(pid: u32) -> bool {
 /// `std::fs::symlink_metadata` opens one.
 pub(super) fn file_links(path: &Path) -> io::Result<(u64, u64)> {
     use std::os::windows::fs::OpenOptionsExt;
-    use std::os::windows::io::AsRawHandle;
     let file = std::fs::OpenOptions::new()
         .access_mode(0)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)?;
+    let info = information(&file)?;
+    Ok((index(&info), u64::from(info.nNumberOfLinks)))
+}
+
+/// The volume serial number and the file index of the open file `file`.
+pub(super) fn file_id(file: &std::fs::File) -> io::Result<(u64, u64)> {
+    let info = information(file)?;
+    Ok((u64::from(info.dwVolumeSerialNumber), index(&info)))
+}
+
+/// The file index `info` holds.
+fn index(info: &BY_HANDLE_FILE_INFORMATION) -> u64 {
+    (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow)
+}
+
+/// `GetFileInformationByHandle` of the open file `file`.
+fn information(file: &std::fs::File) -> io::Result<BY_HANDLE_FILE_INFORMATION> {
+    use std::os::windows::io::AsRawHandle;
     let mut info = BY_HANDLE_FILE_INFORMATION::default();
     // SAFETY: `file` stays open for the call, and `info` is a writable
     // `BY_HANDLE_FILE_INFORMATION`.
     if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &raw mut info) } == 0 {
         return Err(io::Error::last_os_error());
     }
-    let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
-    Ok((index, u64::from(info.nNumberOfLinks)))
+    Ok(info)
 }

@@ -92,7 +92,8 @@ fn walk_taken_if_requested() {
 const WAIT: Duration = Duration::from_secs(20);
 
 /// A tracked file edited after the snapshot, before the checks: the checks, which observe
-/// the worktree through git again, see it dirty, and nothing is touched.
+/// the worktree through git again, see it dirty and the edit as activity within the quiet
+/// period (section 9.8), and nothing is touched.
 #[test]
 fn edit_before_checks_is_rejected() {
     let s = Setup::new();
@@ -106,7 +107,7 @@ fn edit_before_checks_is_rejected() {
         || write(&wt, "src/lib.rs", "// edited after the snapshot\n"),
     );
     assert_eq!(result.status, ActStatus::Rejected, "{result:#?}");
-    assert_eq!(result.reasons, ["clean"]);
+    assert_eq!(result.reasons, ["not_in_use", "clean"]);
     assert!(
         wt.join("node_modules/pkg/index.js").exists(),
         "nothing touched"

@@ -556,3 +556,72 @@ fn a_planned_record_that_fails_is_reported() {
     );
     assert_eq!(d.records(RecordKind::Planned), Vec::new());
 }
+
+/// A44: without a grant, the disk report gives `reachable_bytes`, the bounds of the covered,
+/// eligible targets on the state dir's volume, which `disk-reclaim` would execute were it
+/// granted: every listed target of the covered worktrees, not the uncovered one's (whose
+/// bytes the control counts once it is covered). On a volume other than the state dir's, it
+/// is 0. Windows executes nothing, so it is 0 there.
+#[test]
+fn reachable_bytes_without_a_grant() {
+    let reachable = |cover_all: bool| {
+        let mut d = Disk::new(LINES);
+        let covered = d.s.worktree("covered");
+        let uncovered = d.s.worktree("uncovered");
+        fill(&covered, "target/a.bin", 64 * KIB);
+        fill(&uncovered, "target/b.bin", 32 * KIB);
+        let roots: Vec<String> = if cover_all {
+            vec![&covered, &uncovered]
+        } else {
+            vec![&covered]
+        }
+        .into_iter()
+        .map(|wt| format!("'{}'", dunce::canonicalize(wt).unwrap().display()))
+        .collect();
+        d.s.scene.observe_config(&format!(
+            "[sessions]\ncovered = [{}]\nlinger_s = 1\nquiet_s = 1\n",
+            roots.join(", ")
+        ));
+        std::thread::sleep(Duration::from_millis(1200));
+        d.fixture_reads(&[Some(3 * MIB / 2)]);
+        let pass = d.reconcile();
+        assert_eq!(own_errors(&pass), Vec::<String>::new());
+        let report = report(&pass).clone();
+        assert!(report.targets.iter().all(|t| t.status.is_none()));
+        let bound = |name: &str| {
+            report
+                .targets
+                .iter()
+                .find(|t| t.worktree.ends_with(name))
+                .map_or(0, |t| t.exclusive_bytes)
+        };
+        (
+            report.reachable_bytes,
+            bound("/covered"),
+            bound("/uncovered"),
+        )
+    };
+    let (bytes, covered, uncovered) = reachable(false);
+    let (all, _, _) = reachable(true);
+    if cfg!(unix) {
+        assert!(covered > 0 && uncovered > 0, "{covered} {uncovered}");
+        assert_eq!(bytes, Some(covered));
+        assert_eq!(all, Some(covered + uncovered));
+    } else {
+        assert_eq!((bytes, all), (Some(0), Some(0)));
+    }
+
+    let d = Disk::new(LINES);
+    let wt = d.s.worktree("elsewhere");
+    fill(&wt, "target/a.bin", 64 * KIB);
+    d.readings(&[
+        (d.s.fx.root(), &[Some(3 * MIB / 2)]),
+        (&d.s.scene.state_dir, &[Some(60 * MIB)]),
+    ]);
+    // A first pass observes the worktree; from the next, its volume is watched.
+    d.reconcile();
+    let pass = d.reconcile();
+    let report = report(&pass);
+    assert!(!report.targets.is_empty(), "{report:#?}");
+    assert_eq!(report.reachable_bytes, Some(0), "{report:#?}");
+}

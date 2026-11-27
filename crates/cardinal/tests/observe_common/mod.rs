@@ -27,6 +27,11 @@ pub const GITHUB: &str = "acme/app";
 pub const QUIET_DISK: &str =
     "[disk]\nwarning_mib = 1\nrecovery_mib = 2\ncritical_mib = 0\nreserve_mib = 1\n";
 
+/// `[sessions]` of a scene that sets none (section 9.8): the fixture covered, and the lease
+/// and the quiet period at their shortest, 1 s, which [`Scene::settle`] waits out before each
+/// command, so a fixture just written is idle by then unless a test writes during the command.
+pub const QUIET_SESSIONS_S: u64 = 1;
+
 pub struct Scene {
     pub fx: Fixture,
     pub repo: PathBuf,
@@ -41,6 +46,8 @@ pub struct Scene {
     pub git_timeout_ms: u64,
     /// Variables every `cardinal` command of the scene gets on top of its environment.
     pub cardinal_env: Vec<(OsString, OsString)>,
+    /// Roots `[sessions] covered` lists besides the fixture's, for worktrees on other volumes.
+    pub covered: Vec<PathBuf>,
 }
 
 impl Scene {
@@ -64,6 +71,7 @@ impl Scene {
             gh_timeout_ms: 15_000,
             git_timeout_ms: 15_000,
             cardinal_env: Vec::new(),
+            covered: Vec::new(),
         };
         scene.observe_new_repo("repo");
         scene.write_gh();
@@ -260,8 +268,20 @@ exit "$code"
         } else {
             QUIET_DISK
         };
+        let sessions = if self.observe_extra.contains("[sessions]") {
+            String::new()
+        } else {
+            let covered: Vec<String> = std::iter::once(self.fx.root())
+                .chain(self.covered.iter().map(PathBuf::as_path))
+                .map(|root| format!("'{}'", dunce::canonicalize(root).unwrap().display()))
+                .collect();
+            format!(
+                "[sessions]\ncovered = [{}]\nlinger_s = {QUIET_SESSIONS_S}\nquiet_s = {QUIET_SESSIONS_S}\n",
+                covered.join(", ")
+            )
+        };
         let host = format!(
-            "{disk}[observe]\ngh = '{}'\ngh_timeout_ms = {}\ngit_timeout_ms = {}\n{}",
+            "{disk}{sessions}[observe]\ngh = '{}'\ngh_timeout_ms = {}\ngit_timeout_ms = {}\n{}",
             self.gh_program().display(),
             self.gh_timeout_ms,
             self.git_timeout_ms,
@@ -307,8 +327,20 @@ exit "$code"
         env
     }
 
+    /// Waits out the quiet period of [`QUIET_SESSIONS_S`], so what the fixture wrote before
+    /// it is idle (section 9.8); a scene with `[sessions]` of its own sets its own times and
+    /// waits for nothing here.
+    pub fn settle(&self) {
+        if !self.observe_extra.contains("[sessions]") {
+            std::thread::sleep(std::time::Duration::from_millis(
+                QUIET_SESSIONS_S * 1000 + 100,
+            ));
+        }
+    }
+
     /// `inventory --repo <repo>` through the library, with `--sizes` if `sizes`.
     pub fn inventory_with(&self, sizes: bool) -> Inventory {
+        self.settle();
         let config = self.config();
         Observer::new(&config)
             .with_env(self.env())
@@ -329,6 +361,7 @@ exit "$code"
 
     /// `observe_worktree` of `path`.
     pub fn observe(&self, path: &Path) -> Result<WorktreeObservation, Error> {
+        self.settle();
         let config = self.config();
         Observer::new(&config)
             .with_env(self.env())
@@ -344,6 +377,7 @@ exit "$code"
 
     /// [`Scene::cardinal`] started in `dir`, which must be inside the fixture.
     pub fn cardinal_in(&self, dir: &Path) -> Command {
+        self.settle();
         self.config();
         let mut command = self.fx.command(bin_exe("cardinal"), dir);
         for (name, value) in self

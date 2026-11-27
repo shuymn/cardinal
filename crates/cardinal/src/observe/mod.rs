@@ -14,6 +14,7 @@
 mod data;
 mod gh;
 mod git;
+pub mod quiet;
 #[cfg(test)]
 mod ref_name_vectors;
 
@@ -33,7 +34,8 @@ use crate::contract::{
     ArbiterView, BaseRef, CheckResult, DerivedState, DirtyUnknown, DirtyUnknownReason, DiskState,
     Error, ErrorCode, Facts, GhStatus, HostInfo, IgnoredClass, IgnoredEntry, InUse, Inventory,
     InventorySchema, MergeEvidence, Os, Outlived, PrRef, ReclaimSummary, Repo, ReservationView,
-    Resources, ScopedError, SessionSnapshot, Tri, Worktree, WorktreeSchema, WorktreeView,
+    Resources, ScopedError, SessionSnapshot, StatusPath, Tri, Worktree, WorktreeSchema,
+    WorktreeView,
 };
 use crate::os::child;
 use crate::os::{Detail, ProcessTable};
@@ -44,6 +46,7 @@ use data::DataPatterns;
 pub use data::{Bound, Counted, Exclusive, Measure};
 use git::ListedWorktree;
 pub use git::{IGNORE_KEYS, IgnoreRule, IgnoreValues, IndexEntry};
+pub use quiet::{Newest, Quiet, Signals, Window};
 
 /// `cardinal inventory` arguments.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -254,9 +257,11 @@ pub fn split_index_file(index: &Path, dirs: &[PathBuf]) -> Result<Option<PathBuf
 /// select are unknown (section 3.3), and observation records it as the repository's `gh_error`.
 pub const REMOTE_UNREAD: &str = "git remote get-url origin failed";
 
-/// Runs one git command bound to a worktree: the directory it runs in and its argv after the
-/// program. [`BoundGit::new`] runs git as observation does; a test passes its own.
-pub type GitRunner<'a> = dyn Fn(&Path, &[OsString]) -> Result<Output, ChildError> + 'a;
+/// Runs one git command bound to a worktree: the directory it runs in, its argv after the
+/// program, and when it must have ended, if sooner than git's own bound. [`BoundGit::new`]
+/// runs git as observation does; a test passes its own.
+pub type GitRunner<'a> =
+    dyn Fn(&Path, &[OsString], Option<Instant>) -> Result<Output, ChildError> + 'a;
 
 /// git bound to one worktree (section 9.7, "Pin and bound reads"): every command runs in the
 /// worktree root with `--git-dir` and `--work-tree` naming the git dir and the root the checks
@@ -268,6 +273,8 @@ pub struct BoundGit<'a> {
     root: PathBuf,
     git_dir: PathBuf,
     run: Box<GitRunner<'a>>,
+    /// When every command must have ended, if set ([`BoundGit::bound_by`]).
+    by: std::cell::Cell<Option<Instant>>,
 }
 
 impl<'a> BoundGit<'a> {
@@ -280,14 +287,12 @@ impl<'a> BoundGit<'a> {
         Self::with_runner(
             root,
             git_dir,
-            Box::new(move |dir, argv| {
-                child::run(
-                    &observe.git,
-                    argv,
-                    &observer.env,
-                    dir,
-                    limits(observe.git_timeout_ms),
-                )
+            Box::new(move |dir, argv, by| {
+                let mut limits = limits(observe.git_timeout_ms);
+                if let Some(by) = by {
+                    limits.deadline = limits.deadline.min(by);
+                }
+                child::run(&observe.git, argv, &observer.env, dir, limits)
             }),
         )
     }
@@ -299,7 +304,15 @@ impl<'a> BoundGit<'a> {
             root: root.to_path_buf(),
             git_dir: git_dir.to_path_buf(),
             run,
+            by: std::cell::Cell::new(None),
         }
+    }
+
+    /// Bounds every later command by `by`, sooner than git's own bound: a command started past
+    /// it fails without running ([`quiet::LATE`]), and one running at it is ended; `None`
+    /// lifts the bound (section 9.8, an executing `act`'s reads after the move).
+    pub fn bound_by(&self, by: Option<Instant>) {
+        self.by.set(by);
     }
 
     /// The argv of `args` bound to the worktree.
@@ -324,8 +337,12 @@ impl<'a> BoundGit<'a> {
                 .collect::<Vec<_>>()
                 .join(" ")
         );
+        let by = self.by.get();
+        if quiet::past(by) {
+            return Err(format!("{what}: {}", quiet::LATE));
+        }
         let out =
-            (self.run)(&self.root, &self.argv(args)).map_err(|err| format!("{what}: {err}"))?;
+            (self.run)(&self.root, &self.argv(args), by).map_err(|err| format!("{what}: {err}"))?;
         match out.code {
             Some(code) if codes.contains(&code) => {}
             Some(code) => return Err(format!("{what} exited with {code}: {}", out.stderr_line())),
@@ -404,13 +421,66 @@ impl<'a> BoundGit<'a> {
         Ok(values)
     }
 
+    /// The paths `git status` lists as changed, unmerged, or untracked, and the ignored entries
+    /// it lists, each relative to the worktree root, for an executing `act`'s last read of the quiet period (section
+    /// 9.8, step 8): read-only and bound as every command here, entering no submodule, listing
+    /// ignored entries as observation does, with every filter driver the worktree's
+    /// configuration defines disabled, as observation runs it (section 8.1), by `-c` options; a
+    /// driver whose name holds `=`, which `-c` cannot name, fails the read.
+    pub fn status_paths(&self) -> Result<(Vec<StatusPath>, Vec<PathBuf>), String> {
+        let args: [&OsStr; 5] = [
+            "config".as_ref(),
+            "-z".as_ref(),
+            "--name-only".as_ref(),
+            "--get-regexp".as_ref(),
+            r"^filter\.".as_ref(),
+        ];
+        let out = self.complete(&args, &[0, 1])?;
+        let drivers = git::parse_filter_drivers(&out.stdout)?;
+        let mut args: Vec<OsString> = Vec::new();
+        for driver in &drivers {
+            if driver.contains('=') {
+                return Err(format!("the filter driver {driver:?} cannot be disabled"));
+            }
+            for (key, value) in [
+                ("clean", ""),
+                ("smudge", ""),
+                ("process", ""),
+                ("required", "false"),
+            ] {
+                args.push("-c".into());
+                args.push(format!("filter.{driver}.{key}={value}").into());
+            }
+        }
+        args.extend(
+            [
+                "status",
+                "--porcelain=v2",
+                "-z",
+                "--branch",
+                "--ignore-submodules=all",
+                "--untracked-files=all",
+                "--ignored=matching",
+            ]
+            .map(OsString::from),
+        );
+        let args: Vec<&OsStr> = args.iter().map(OsString::as_os_str).collect();
+        let out = self.complete(&args, &[0])?;
+        let status = git::parse_status(&out.stdout)?;
+        Ok((status.changed, status.ignored))
+    }
+
     /// The URL of `origin`, which selects profiles with the common dir (section 3.3):
     /// `git remote get-url origin`, `None` when git answers that there is no such remote (exit
     /// 2, with nothing printed), and an error for any other answer, so a failed read is never
     /// taken for an absent remote.
     pub fn remote_url(&self) -> Result<Option<String>, String> {
         let args: [&OsStr; 3] = ["remote".as_ref(), "get-url".as_ref(), "origin".as_ref()];
-        let out = (self.run)(&self.root, &self.argv(&args)).map_err(|err| err.to_string())?;
+        let by = self.by.get();
+        if quiet::past(by) {
+            return Err(quiet::LATE.into());
+        }
+        let out = (self.run)(&self.root, &self.argv(&args), by).map_err(|err| err.to_string())?;
         git::remote_answer(out.code, &out.stdout, &out.stderr)
     }
 }
@@ -1111,6 +1181,7 @@ impl<'a> Observer<'a> {
         let (ignored, unmeasured) = status.as_ref().map_or_else(Default::default, |s| {
             ignored_entries(&path, &s.ignored, &ctx.patterns, (shared.sizes, &scope))
         });
+
         let step_failed = !errors.is_empty() || gh_error.is_some() || ctx.failure.is_some();
         let facts = Facts {
             dirty,
@@ -1138,23 +1209,41 @@ impl<'a> Observer<'a> {
             allocated_bytes: shared.sizes.then(|| data::allocated_bytes(&path)).flatten(),
             facts,
             ignored,
+            status_paths: status.as_ref().map(|s| s.changed.clone()),
+            in_use_unknown: None,
         };
         let checks = ReclaimInputs {
             status_known: status.is_some(),
             step_failed,
             in_use_known,
+            activity: self.activity(shared.state, &Signals::of(&worktree, None)),
             tracked,
             plain_target: plain_target(&path),
         };
-        let reclaim = reclaim_summary(&worktree, &checks);
         WorktreeResult {
-            worktree: Worktree {
-                reclaim,
-                ..worktree
-            },
+            worktree: summarized(worktree, &checks),
             errors: [errors, unmeasured].concat(),
             gh_error,
         }
+    }
+
+    /// The worktree's session lease and quiet period (section 9.8) now, read with
+    /// `[sessions]`, for the whole-worktree summary: the target walks of the plans are not
+    /// read here.
+    fn activity(&self, state: &StateDir, signals: &Signals<'_>) -> (admission::LeaseHold, Quiet) {
+        let sessions = &self.config.host.sessions;
+        let now_ms = now_ms();
+        let lease = admission::lease_hold(
+            state,
+            &worktree_key(signals.root),
+            now_ms,
+            sessions.linger_s.saturating_mul(1000),
+        );
+        let window = Window {
+            now_ms,
+            quiet_ms: sessions.quiet_s.saturating_mul(1000),
+        };
+        (lease, quiet::read(signals, window))
     }
 
     /// `content_in_base` (section 8.2): the paths the branch changed since its merge base with
@@ -1805,6 +1894,7 @@ fn ignored_entries(
                 aliased_bytes: measured.as_ref().and_then(|m| m.aliased),
                 exclusive_bytes: measured.as_ref().and_then(|m| m.exclusive.bytes),
                 exclusive_measure: measured.as_ref().map(|m| m.exclusive.measure),
+                native: Some(entry),
             }
         })
         .collect();
@@ -1864,12 +1954,44 @@ fn in_use(path: &Path, shared: &Shared<'_>) -> (InUse, bool) {
     (InUse { value, jobs }, known)
 }
 
+/// `worktree` with its reclaim summary, and what left its `not_in_use` unknown, if anything.
+fn summarized(worktree: Worktree, inputs: &ReclaimInputs) -> Worktree {
+    let reclaim = reclaim_summary(&worktree, inputs);
+    let in_use_unknown = reclaim
+        .unknown
+        .iter()
+        .any(|name| name == "not_in_use")
+        .then(|| in_use_unknown(inputs.in_use_known, &inputs.activity));
+    Worktree {
+        reclaim,
+        in_use_unknown,
+        ..worktree
+    }
+}
+
+/// What left a worktree's `not_in_use` unknown, naming each input that could not be read.
+fn in_use_unknown(in_use_known: bool, activity: &(admission::LeaseHold, Quiet)) -> String {
+    let mut inputs = Vec::new();
+    if !in_use_known {
+        inputs.push("the in-use lock, the reservations, or the process table".to_owned());
+    }
+    if let admission::LeaseHold::Unknown(why) = &activity.0 {
+        inputs.push(format!("session lease: {why}"));
+    }
+    if let Quiet::Unknown(why) = &activity.1 {
+        inputs.push(format!("quiet period: {why}"));
+    }
+    inputs.join("; ")
+}
+
 /// What the reclaim summary needs beyond the worktree's facts.
 struct ReclaimInputs {
     status_known: bool,
     /// A git or gh step of this worktree or its repository failed.
     step_failed: bool,
     in_use_known: bool,
+    /// The session lease and the quiet period (section 9.8).
+    activity: (admission::LeaseHold, Quiet),
     /// `None` when the index could not be read.
     tracked: Option<Tracked>,
     plain_target: CheckResult,
@@ -1926,12 +2048,14 @@ fn reclaim_summary(worktree: &Worktree, inputs: &ReclaimInputs) -> ReclaimSummar
         ),
         (
             "not_in_use",
-            if f.in_use.value {
-                CheckResult::Fail
-            } else if inputs.in_use_known {
-                CheckResult::Pass
-            } else {
-                CheckResult::Unknown
+            match &inputs.activity {
+                _ if f.in_use.value => CheckResult::Fail,
+                (admission::LeaseHold::Holds(_), _) | (_, Quiet::Active(_)) => CheckResult::Fail,
+                _ if !inputs.in_use_known => CheckResult::Unknown,
+                (admission::LeaseHold::Unknown(_), _) | (_, Quiet::Unknown(_)) => {
+                    CheckResult::Unknown
+                }
+                (admission::LeaseHold::Free, Quiet::Quiet) => CheckResult::Pass,
             },
         ),
         (

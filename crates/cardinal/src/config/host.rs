@@ -71,13 +71,7 @@ impl Managed {
     /// does not exist covers nothing; any other failure to resolve the root or `path` is an
     /// error, since the path as written could miss what it leads to.
     pub fn covers(&self, path: &Path) -> Result<bool, String> {
-        let root = match dunce::canonicalize(&self.root) {
-            Ok(root) => root,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(err) => return Err(format!("the root {}: {err}", self.root.display())),
-        };
-        let path = dunce::canonicalize(path).map_err(|err| format!("{}: {err}", path.display()))?;
-        Ok(path.starts_with(root))
+        resolves_under(&self.root, path)
     }
 
     /// The first of `roots` that [`Managed::covers`] `path`; when none does, the first
@@ -208,6 +202,18 @@ pub struct Act {
     pub execute: BTreeMap<String, Vec<PlanKind>>,
 }
 
+/// Whether `path` is at or below `root`, both as the volume resolves them: a root that does
+/// not exist holds nothing; any other failure to resolve either is an error.
+fn resolves_under(root: &Path, path: &Path) -> Result<bool, String> {
+    let root = match dunce::canonicalize(root) {
+        Ok(root) => root,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(format!("the root {}: {err}", root.display())),
+    };
+    let path = dunce::canonicalize(path).map_err(|err| format!("{}: {err}", path.display()))?;
+    Ok(path.starts_with(root))
+}
+
 /// `[sessions]` (section 9.8): agent session leases and the quiet period.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Sessions {
@@ -218,6 +224,23 @@ pub struct Sessions {
     pub linger_s: u64,
     /// A worktree is quiet once none of its activity signals changed for this long.
     pub quiet_s: u64,
+}
+
+impl Sessions {
+    /// Whether the worktree at `path` lies under a `covered` root, as the volume resolves both
+    /// (section 9.8, "Coverage"), as [`Managed::covers`] compares; `Err` names a root or the
+    /// path that could not be resolved, which covers nothing.
+    pub fn covers(&self, path: &Path) -> Result<bool, String> {
+        let mut unresolved = None;
+        for root in &self.covered {
+            match resolves_under(root, path) {
+                Ok(true) => return Ok(true),
+                Ok(false) => {}
+                Err(why) => unresolved = unresolved.or(Some(why)),
+            }
+        }
+        unresolved.map_or(Ok(false), Err)
+    }
 }
 
 /// The callers `[act] execute` accepts (section 3.2). The arbiter holds no grant until a skill
@@ -1106,6 +1129,36 @@ mod tests {
                 Err(err) => err.to_string(),
             };
             assert!(message.contains(expected), "{text}: {message}");
+        }
+    }
+
+    /// `Sessions::covers` (section 9.8, "Coverage"): a worktree at or below a root, as the
+    /// volume resolves both, is covered, a sibling is not (control); a root that does not
+    /// exist covers nothing, and a path that cannot be resolved is an error, never covered.
+    #[test]
+    fn sessions_cover() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let worktree = root.join("w");
+        let sibling = tmp.path().join("other");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        let sessions = |covered: Vec<PathBuf>| super::Sessions {
+            covered,
+            linger_s: 1,
+            quiet_s: 1,
+        };
+        let covering = sessions(vec![tmp.path().join("missing"), root.clone()]);
+        assert_eq!(covering.covers(&worktree), Ok(true));
+        assert_eq!(covering.covers(&root), Ok(true));
+        assert_eq!(covering.covers(&sibling), Ok(false));
+        assert_eq!(sessions(Vec::new()).covers(&worktree), Ok(false));
+        assert!(covering.covers(&tmp.path().join("gone")).is_err());
+        #[cfg(unix)]
+        {
+            let alias = tmp.path().join("alias");
+            std::os::unix::fs::symlink(&root, &alias).unwrap();
+            assert_eq!(sessions(vec![alias]).covers(&worktree), Ok(true));
         }
     }
 

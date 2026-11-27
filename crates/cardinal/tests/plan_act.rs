@@ -431,7 +431,10 @@ fn nested_repository_refused() {
             &plan.id,
             &owner_approved(),
             cardinal::testpoint::ACT_SNAPSHOTTED,
-            || std::fs::remove_dir_all(wt.join("node_modules/pkg/.git")).unwrap(),
+            || {
+                std::fs::remove_dir_all(wt.join("node_modules/pkg/.git")).unwrap();
+                plan_support::backdate(&wt.join("node_modules/pkg"));
+            },
         );
         assert_eq!(result.status, ActStatus::Rejected, "{result:#?}");
         assert_eq!(result.reasons, ["no_nested_repository"], "{result:#?}");
@@ -543,6 +546,7 @@ fn plain_target_checks(
             reservations: Ok(InUse::default()),
             processes: Ok(Vec::new()),
             descriptors: None,
+            activity: cardinal::plan::Activity::unread(),
         },
         patterns: &cardinal::plan::DataLists::default(),
         managed: &[],

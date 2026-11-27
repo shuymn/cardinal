@@ -896,6 +896,33 @@ mod eligibility {
         assert!(!x.entry().exists());
     }
 
+    /// `host.toml`'s `[sessions]` covering only `covered`, with bounds of a second.
+    fn covering(covered: &Path) -> String {
+        format!(
+            "[sessions]\ncovered = ['{}']\nlinger_s = 1\nquiet_s = 1\n",
+            covered.display()
+        )
+    }
+
+    /// A worktree under no `[sessions] covered` root: `sessions_uncovered`, naming it, since
+    /// cardinal cannot tell its sessions; covered by its own path instead, the same `act`
+    /// executes (control).
+    #[test]
+    fn sessions_uncovered() {
+        let mut x = Live::new("uncovered", "target", &["debug/app"]);
+        let elsewhere = x.s.fx.path("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        x.s.scene.observe_config(&covering(&elsewhere));
+        assert_report_only(&x, "sessions_uncovered", "under no [sessions] covered root");
+
+        x.s.scene.clear_observe_config();
+        x.s.scene.observe_config(GRANT);
+        let wt = dunce::canonicalize(&x.wt).unwrap();
+        x.s.scene.observe_config(&covering(&wt));
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        assert_eq!(x.act().status, ActStatus::Executed);
+    }
+
     /// A worktree whose only skip-worktree entry is a `.gitignore` removed from the worktree,
     /// with `core.sparseCheckout` false: `sparse_checkout`.
     #[test]

@@ -9,12 +9,13 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::admission::LeaseHold;
 use crate::config::{Config, DataList, Managed, Selection, data_patterns_cover};
 use crate::contract::{
     Approval, Check, CheckFact, CheckResult, CheckRole, ConfigKey, IgnoredClass, InUse,
     MergeEvidence, ObservedError, PlanKind, Provenance, Tri,
 };
-use crate::observe::WorktreeObservation;
+use crate::observe::{Newest, Quiet, Window, WorktreeObservation};
 use crate::os::fds::{Scan, Use, Way};
 use crate::os::{Detail, ProcessTable};
 
@@ -33,6 +34,45 @@ pub struct InUseFacts {
     /// The descriptor scan of section 9.7, read for a `reclaim_dir` target on Unix
     /// ([`descriptor_scan`]).
     pub descriptors: Descriptors,
+    /// The session lease and the quiet period (section 9.8).
+    pub activity: Activity,
+}
+
+/// What section 9.8 adds to the in-use facts: the worktree's session lease and its activity
+/// signals, read at one time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Activity {
+    pub lease: LeaseHold,
+    /// Every signal but the target walk's entries.
+    pub quiet: Quiet,
+    pub window: Window,
+    /// Whether the walk's entries are signals too ([`entries_newest`]), never the walk's root: at
+    /// `act`'s step 5, not at its steps 7 and 8, where step 5's comparison decided them, nor in
+    /// `plan`, whose `targets` holds them.
+    pub walk_entries: bool,
+    /// The newest mtime below the worktree's other regenerable targets, never their own, as
+    /// [`walk_newest`] of their walks found it; in `plan`, the target walk's own entries too; at
+    /// `act`'s steps 7 and 8, step 5's, the target's own entries included, judged again at
+    /// this window. `None` where nothing else is read.
+    pub targets: Option<Newest>,
+}
+
+impl Activity {
+    /// Nothing read: unknown, for an evaluation of checks other than `not_in_use`.
+    #[must_use]
+    pub fn unread() -> Self {
+        let why = "not read".to_owned();
+        Self {
+            lease: LeaseHold::Unknown(why.clone()),
+            quiet: Quiet::Unknown(why),
+            window: Window {
+                now_ms: 0,
+                quiet_ms: 0,
+            },
+            walk_entries: false,
+            targets: None,
+        }
+    }
 }
 
 /// The descriptor scan read for a target, or why it is not complete; `None` where it is not
@@ -171,6 +211,16 @@ pub fn evaluate_only(i: &Inspection<'_>, wanted: impl Fn(&str) -> bool) -> Vec<C
     checks
 }
 
+/// `not_in_use` with its facts, from `users`, what [`descriptor_users`] found of the target's
+/// walk before the walk was dropped: with `in_use.activity.walk_entries` unset it reads no
+/// walk of `i` (`plan`, section 9.2).
+#[must_use]
+pub(crate) fn evaluate_not_in_use(i: &Inspection<'_>, users: Option<&[DescriptorUser]>) -> Check {
+    let mut check = not_in_use(i, users);
+    check.facts = facts("not_in_use", i, users);
+    check
+}
+
 /// One fact a check read, with what produced it; null when it was not read. Kept whole: plans,
 /// `act` records, and `explain` hold every entry, and only a command a timer pass runs prints
 /// it cut ([`bound_facts`]).
@@ -283,6 +333,24 @@ fn in_use_facts(i: &Inspection<'_>, users: Option<&[DescriptorUser]>) -> Vec<Che
             scan(i).map(|scan| scan.others),
             "descriptor scan",
         ),
+        fact(
+            "in_use.session_lease",
+            Some(match &in_use.activity.lease {
+                LeaseHold::Free => "free".to_owned(),
+                LeaseHold::Holds(who) => format!("held: {who}"),
+                LeaseHold::Unknown(why) => format!("unknown: {why}"),
+            }),
+            "session lease",
+        ),
+        fact(
+            "in_use.quiet",
+            Some(match quiet(i) {
+                Quiet::Quiet => "quiet".to_owned(),
+                Quiet::Active(signal) => format!("active: {signal}"),
+                Quiet::Unknown(why) => format!("unknown: {why}"),
+            }),
+            "lstat",
+        ),
     ]
 }
 
@@ -373,6 +441,14 @@ fn facts(name: &str, i: &Inspection<'_>, users: Option<&[DescriptorUser]>) -> Ve
 /// managed roots of `host.toml`).
 #[must_use]
 pub fn provenance(config: &Config, i: &Inspection<'_>) -> Provenance {
+    let mut provenance = walk_provenance(config, i);
+    provenance.errors.extend(in_use_errors(i.in_use));
+    provenance
+}
+
+/// [`provenance`] without the in-use facts' errors ([`in_use_errors`]), which follow them.
+#[must_use]
+pub(crate) fn walk_provenance(config: &Config, i: &Inspection<'_>) -> Provenance {
     let error = |source: &str, message: &str| ObservedError {
         source: source.to_owned(),
         message: message.to_owned(),
@@ -389,18 +465,6 @@ pub fn provenance(config: &Config, i: &Inspection<'_>) -> Provenance {
     }
     if let Err(err) = i.walk {
         errors.push(error("walk", err));
-    }
-    if let Err(err) = &i.in_use.lock_held {
-        errors.push(error("worktree in-use lock", err));
-    }
-    if let Err(err) = &i.in_use.reservations {
-        errors.push(error("reservations", err));
-    }
-    if let Err(err) = &i.in_use.processes {
-        errors.push(error("process table", err));
-    }
-    if let Some(Err(err)) = &i.in_use.descriptors {
-        errors.push(error("descriptor scan", err));
     }
     let mut keys = Vec::new();
     if let Ok(o) = i.observation {
@@ -438,6 +502,29 @@ pub fn provenance(config: &Config, i: &Inspection<'_>) -> Provenance {
     }
 }
 
+/// The in-use facts of `in_use` that could not be read, as [`provenance`] lists them.
+#[must_use]
+pub(crate) fn in_use_errors(in_use: &InUseFacts) -> Vec<ObservedError> {
+    let error = |source: &str, message: &str| ObservedError {
+        source: source.to_owned(),
+        message: message.to_owned(),
+    };
+    let mut errors = Vec::new();
+    if let Err(err) = &in_use.lock_held {
+        errors.push(error("worktree in-use lock", err));
+    }
+    if let Err(err) = &in_use.reservations {
+        errors.push(error("reservations", err));
+    }
+    if let Err(err) = &in_use.processes {
+        errors.push(error("process table", err));
+    }
+    if let Some(Err(err)) = &in_use.descriptors {
+        errors.push(error("descriptor scan", err));
+    }
+    errors
+}
+
 /// Whether every invariant passed.
 #[must_use]
 pub fn invariants_ok(checks: &[Check]) -> bool {
@@ -464,18 +551,48 @@ pub fn approval(checks: &[Check]) -> Approval {
 /// left out: a `plan` or `act` run from inside the worktree reads the target, never uses it.
 /// `plan` and `act` ask it of the whole worktree for both plan kinds (section 9.2).
 pub fn processes_inside(target: &Path) -> Result<Vec<u32>, String> {
+    processes_inside_any(&[target], None)
+}
+
+/// [`processes_inside`] of any of `targets`, from one read of the process table, in PID order.
+/// Each target is matched as given and as the OS names it, as the deletion guard matches the
+/// trash entry, so a path given through a symbolic link still finds a working directory the OS
+/// reports by its physical path; a target that cannot be resolved is an error, and so is
+/// `deadline` passed before a resolution or the read of the table (section 9.8).
+pub fn processes_inside_any(
+    targets: &[&Path],
+    deadline: Option<std::time::Instant>,
+) -> Result<Vec<u32>, String> {
+    let mut spellings: Vec<PathBuf> = Vec::with_capacity(targets.len() * 2);
+    for target in targets {
+        if crate::observe::quiet::past(deadline) {
+            return Err(crate::observe::quiet::LATE.into());
+        }
+        let resolved =
+            dunce::canonicalize(target).map_err(|err| format!("{}: {err}", target.display()))?;
+        spellings.push(target.to_path_buf());
+        spellings.push(resolved);
+    }
+    if crate::observe::quiet::past(deadline) {
+        return Err(crate::observe::quiet::LATE.into());
+    }
+    let targets = &spellings;
     let table = ProcessTable::snapshot(Detail {
         cmd: false,
         cwd: true,
     })
     .map_err(|err| err.to_string())?;
     let own = std::process::id();
-    Ok(table
+    let inside = |cwd: &Path| targets.iter().any(|target| cwd.starts_with(target));
+    let mut pids: Vec<u32> = table
         .iter()
         .filter(|p| p.pid != own && !p.zombie)
-        .filter(|p| p.cwd.as_deref().is_some_and(|cwd| cwd.starts_with(target)))
+        .filter(|p| p.cwd.as_deref().is_some_and(inside))
         .map(|p| p.pid)
-        .collect())
+        .collect();
+    pids.sort_unstable();
+    pids.dedup();
+    Ok(pids)
 }
 
 /// The descriptor scan `not_in_use` reads for a target of `kind`: a `reclaim_dir` target's on
@@ -500,7 +617,7 @@ fn scan<'a>(i: &Inspection<'a>) -> Option<&'a Scan> {
 
 /// One use of the target the descriptor scan found.
 #[derive(Debug, serde::Serialize)]
-struct DescriptorUser {
+pub(crate) struct DescriptorUser {
     pid: u32,
     way: Way,
     /// Worktree-relative when inside the worktree.
@@ -563,7 +680,7 @@ pub(crate) fn descriptor_uses<'s>(
 /// The uses of the target that the descriptor scan found ([`descriptor_uses`]), each named by
 /// its path relative to the worktree, or by the entry it uses. `None` without a complete scan
 /// and a walk, or when the target's path as the OS names it cannot be read.
-fn descriptor_users(i: &Inspection<'_>) -> Option<Vec<DescriptorUser>> {
+pub(crate) fn descriptor_users(i: &Inspection<'_>) -> Option<Vec<DescriptorUser>> {
     let scan = scan(i)?;
     let walk = i.walk.ok()?;
     let mut ids: HashMap<(u64, u64), Linked> = HashMap::new();
@@ -803,6 +920,16 @@ fn not_in_use(i: &Inspection<'_>, users: Option<&[DescriptorUser]>) -> Check {
         }
         (None, _) | (Some(Ok(_)), Some(_)) => {}
     }
+    match &i.in_use.activity.lease {
+        LeaseHold::Free => {}
+        LeaseHold::Holds(who) => failed.push(format!("the session lease holds it: {who}")),
+        LeaseHold::Unknown(why) => unknown.push(format!("session lease: {why}")),
+    }
+    match quiet(i) {
+        Quiet::Quiet => {}
+        Quiet::Active(signal) => failed.push(format!("not quiet: {signal}")),
+        Quiet::Unknown(why) => unknown.push(format!("quiet period: {why}")),
+    }
     if !failed.is_empty() {
         invariant("not_in_use", CheckResult::Fail, failed.join("; "))
     } else if !unknown.is_empty() {
@@ -810,6 +937,89 @@ fn not_in_use(i: &Inspection<'_>, users: Option<&[DescriptorUser]>) -> Check {
     } else {
         pass("not_in_use")
     }
+}
+
+/// The quiet period of section 9.8: the signals read for the worktree, the other regenerable
+/// targets' entries, then the walk's entries when they count, never the walk's root, whose
+/// times `act`'s move and restore change. A walk that failed is unknown.
+fn quiet(i: &Inspection<'_>) -> Quiet {
+    let activity = &i.in_use.activity;
+    let quiet = match &activity.targets {
+        Some(targets) => activity.quiet.clone().and(targets.judge(activity.window)),
+        None => activity.quiet.clone(),
+    };
+    if !activity.walk_entries {
+        return quiet;
+    }
+    let walked = match i.walk {
+        Ok(walk) => entries_newest(i.worktree, walk),
+        Err(err) => unwalked(err),
+    };
+    quiet.and(walked.judge(activity.window))
+}
+
+/// The reading of a walk that failed, `err`: unknown.
+#[must_use]
+pub fn unwalked(err: &str) -> Newest {
+    Newest {
+        unknown: Some(format!("the walk: {err}")),
+        ..Newest::default()
+    }
+}
+
+/// The newest mtime among the entries `walk`, a walk of a directory in `worktree`, recorded,
+/// never its root (section 9.8): the reading of a target's own entries, whose changes during an
+/// execution step 5's comparison decides. A directory below the root the walk recorded and did
+/// not list on its mount (replaced or removed while it was read) leaves them unknown; one on
+/// another device or mount `plain_target` refuses.
+#[must_use]
+pub fn entries_newest(worktree: &Path, walk: &Walk) -> Newest {
+    let mut newest = Newest::default();
+    for entry in &walk.entries {
+        let at_ms = u64::try_from(entry.mtime_ns / 1_000_000).unwrap_or(0);
+        if newest.at.as_ref().is_none_or(|(at, _)| at_ms > *at) {
+            newest.add(at_ms, &worktree.join(&entry.rel));
+        }
+    }
+    let on_mount = walk
+        .unlisted
+        .iter()
+        .find(|dir| !walk.boundaries.contains(dir));
+    if let Some(rel) = on_mount {
+        newest.fail(not_listed(worktree, rel));
+    }
+    newest
+}
+
+/// Why the entries below `rel`, a directory in `worktree` a walk did not list, are unknown.
+fn not_listed(worktree: &Path, rel: &Path) -> String {
+    format!(
+        "{}: not listed, so the entries below it were not read",
+        worktree.join(rel).display()
+    )
+}
+
+/// [`entries_newest`] of `walk`, read whole or unknown: the one reading of the entries below
+/// a worktree's other regenerable targets, in `plan` and at `act`'s step 5 (section 9.8). A
+/// directory the walk recorded and did not list (the root included: a symbolic link on the
+/// way, on another mount, or replaced while it was read) leaves them unknown, and an entry
+/// removed while the walk read it is activity now.
+#[must_use]
+pub fn walk_newest(worktree: &Path, walk: &Walk) -> Newest {
+    let mut newest = entries_newest(worktree, walk);
+    if let Some(rel) = walk.vanished.first() {
+        newest.vanish(&worktree.join(rel));
+    }
+    let root_unlisted = walk.root.kind == EntryKind::Dir
+        && (walk.link_in_path.is_some() || walk.mount != Mount::Same);
+    let unlisted = root_unlisted
+        .then_some(&walk.root.rel)
+        .or(walk.boundaries.first())
+        .or(walk.unlisted.first());
+    if let Some(rel) = unlisted {
+        newest.fail(not_listed(worktree, rel));
+    }
+    newest
 }
 
 /// How a process uses a file, for a check detail.
@@ -1121,6 +1331,20 @@ mod tests {
     use crate::contract::{CheckResult, InUse, PlanKind};
     use crate::os::fds::{Process, Scan, Use, Way};
 
+    /// No lease holds and every signal but the walk's is quiet.
+    fn idle() -> super::Activity {
+        super::Activity {
+            lease: crate::admission::LeaseHold::Free,
+            quiet: crate::observe::Quiet::Quiet,
+            window: crate::observe::Window {
+                now_ms: 0,
+                quiet_ms: 0,
+            },
+            walk_entries: false,
+            targets: None,
+        }
+    }
+
     /// `not_in_use` and its facts for the target `t` of `wt` under `scan`.
     fn not_in_use(wt: &Path, scan: Option<Result<Scan, String>>) -> crate::contract::Check {
         not_in_use_with(wt, Vec::new(), scan)
@@ -1139,6 +1363,7 @@ mod tests {
             reservations: Ok(InUse::default()),
             processes: Ok(working),
             descriptors: scan.map(|scan| scan.map(Arc::new)),
+            activity: idle(),
         };
         let checks = evaluate(&Inspection {
             kind: PlanKind::ReclaimDir,
