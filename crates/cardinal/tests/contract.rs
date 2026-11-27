@@ -5,7 +5,7 @@ use cardinal::contract::{
     ActClaim, ActManifest, ActResult, ArbiterPass, ClassifyRequest, ClassifyResponse, DiskState,
     EntryPath, ErrorDoc, Explain, Inbox, InboxBrief, InboxItem, Inventory, ManifestEntry, Plan,
     PlanList, Reconcile, ReconcileState, Record, Reservation, ReservationView, RunSpec,
-    SessionSnapshot, Snapshot, WorktreeView,
+    SessionLease, SessionSnapshot, Snapshot, WorktreeView,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -766,6 +766,8 @@ fn record_document() {
     for kind in [
         "disk_state",
         "reconcile",
+        "lease_corrupt",
+        "lease_corrupt_removed",
         "arbiter_pass",
         "planned",
         "inbox_raised",
@@ -795,6 +797,7 @@ const TESTED: &[&str] = &[
     "cardinal.explain.v1",
     "cardinal.record.v1",
     "cardinal.session-snapshot.v1",
+    "cardinal.session-lease.v1",
     "cardinal.disk-state.v1",
     "cardinal.reconcile.v1",
     "cardinal.reconcile-state.v1",
@@ -840,6 +843,85 @@ fn session_snapshot_document() {
     });
     round_trips::<SessionSnapshot>(&doc);
     rejects_wrong_schema_and_missing::<SessionSnapshot>(&doc, "agent");
+}
+
+fn lease() -> Value {
+    json!({
+        "schema": "cardinal.session-lease.v1", "worktree": "/w",
+        "sessions": [
+            {"session_id": "s1",
+             "agent": {"pid": 10, "start_s": 2, "start_us": 2_000_100, "boot_id": "b"},
+             "transcript_path": "/t/s1.jsonl", "last_event": "session_start",
+             "last_event_ms": 5, "ended_ms": null},
+            {"session_id": "s2", "agent": null, "transcript_path": null,
+             "last_event": "subagent_stop", "last_event_ms": 6, "ended_ms": 6}
+        ]
+    })
+}
+
+/// The session lease's states (section 9.8): plain entries, an `uncertain` entry standing for a
+/// corrupt file's, and a file marked `overflow`; both markers exist only as `true`.
+#[test]
+fn session_lease_documents() {
+    round_trips::<SessionLease>(&lease());
+    rejects_wrong_schema_and_missing::<SessionLease>(&lease(), "sessions");
+
+    let mut uncertain = lease();
+    uncertain["sessions"][1]["uncertain"] = json!(true);
+    uncertain["sessions"][1]["last_event"] = json!("session_end");
+    round_trips::<SessionLease>(&uncertain);
+    let parsed: SessionLease = serde_json::from_value(uncertain.clone()).unwrap();
+    assert!(parsed.sessions[1].uncertain && !parsed.sessions[0].uncertain);
+
+    let mut overflow = lease();
+    overflow["overflow"] = json!(true);
+    round_trips::<SessionLease>(&overflow);
+    let parsed: SessionLease = serde_json::from_value(overflow.clone()).unwrap();
+    assert!(parsed.overflow);
+    assert!(
+        !serde_json::from_value::<SessionLease>(lease())
+            .unwrap()
+            .overflow
+    );
+
+    rejects::<SessionLease>(&overflow, "overflow false", |d| {
+        d["overflow"] = json!(false);
+    });
+    rejects::<SessionLease>(&uncertain, "uncertain false", |d| {
+        d["sessions"][1]["uncertain"] = json!(false);
+    });
+    rejects::<SessionLease>(&lease(), "an unknown event", |d| {
+        d["sessions"][0]["last_event"] = json!("pre_tool_use");
+    });
+    rejects::<SessionLease>(&lease(), "an agent without its boot ID", |d| {
+        d["sessions"][0]["agent"]
+            .as_object_mut()
+            .unwrap()
+            .remove("boot_id");
+    });
+    for (at, key) in [
+        ("/sessions/1", "agent"),
+        ("/sessions/1", "transcript_path"),
+        ("/sessions/0", "ended_ms"),
+        ("/sessions/0/agent", "start_us"),
+    ] {
+        rejects::<SessionLease>(&lease(), &format!("{at} without {key}"), |d| {
+            d.pointer_mut(at)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .remove(key);
+        });
+    }
+    let mut unread = lease();
+    unread["sessions"][0]["agent"]["start_us"] = Value::Null;
+    round_trips::<SessionLease>(&unread);
+    rejects::<SessionLease>(&lease(), "an entry without its last event time", |d| {
+        d["sessions"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("last_event_ms");
+    });
 }
 
 #[test]

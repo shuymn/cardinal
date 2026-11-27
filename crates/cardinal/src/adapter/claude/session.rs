@@ -3,6 +3,7 @@
 //! process and its descendants for the outlived-process sweep.
 
 use std::collections::BTreeSet;
+use std::time::Instant;
 
 use crate::contract::{SessionProcess, SessionSnapshot, SessionSnapshotSchema, SnapshotAgent};
 use crate::os::ProcessTable;
@@ -12,7 +13,7 @@ const COMMAND_BYTES: usize = 256;
 
 /// Process names that are shells: the agent is the nearest ancestor that is not one. A
 /// leading `-` (login shell) and a `.exe` suffix are ignored.
-fn is_shell(name: &str) -> bool {
+pub(super) fn is_shell(name: &str) -> bool {
     let name = name.strip_prefix('-').unwrap_or(name).to_ascii_lowercase();
     let name = name.strip_suffix(".exe").unwrap_or(&name);
     matches!(
@@ -24,13 +25,14 @@ fn is_shell(name: &str) -> bool {
 /// The snapshot for a session that ends now: the agent process (the nearest ancestor of
 /// `hook_pid` that is not a shell) and every live descendant of it except the hook's own
 /// chain (the hook, its descendants, and the shells between it and the agent). `None` when
-/// no such ancestor exists.
+/// no such ancestor exists, or when `deadline` passes during the walk.
 pub(super) fn snapshot(
     table: &ProcessTable,
     hook_pid: u32,
     session_id: &str,
     reason: &str,
     ended_ms: u64,
+    deadline: Instant,
 ) -> Option<SessionSnapshot> {
     let ancestors = table.ancestors(hook_pid);
     let position = ancestors
@@ -39,9 +41,9 @@ pub(super) fn snapshot(
     let agent = table.get(ancestors[position])?;
     let mut chain: BTreeSet<u32> = ancestors[..position].iter().copied().collect();
     chain.insert(hook_pid);
-    chain.extend(table.descendants(hook_pid));
+    chain.extend(table.descendants_until(hook_pid, Some(deadline))?);
     let mut processes: Vec<SessionProcess> = table
-        .descendants(agent.pid)
+        .descendants_until(agent.pid, Some(deadline))?
         .into_iter()
         .filter(|pid| !chain.contains(pid))
         .filter_map(|pid| table.get(pid))
@@ -70,6 +72,8 @@ pub(super) fn snapshot(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::{is_shell, snapshot};
     use crate::os::{ProcessInfo, ProcessTable};
 
@@ -116,7 +120,7 @@ mod tests {
             },
             proc(30, Some(10), "node"),
         ]);
-        let snap = snapshot(&table, 13, "s1", "clear", 5).unwrap();
+        let snap = snapshot(&table, 13, "s1", "clear", 5, later()).unwrap();
         assert_eq!((snap.agent.pid, snap.agent.name.as_str()), (10, "claude"));
         assert_eq!(snap.agent.start_s, 1010);
         let pids: Vec<u32> = snap.processes.iter().map(|p| p.pid).collect();
@@ -136,7 +140,21 @@ mod tests {
     fn no_agent_without_a_non_shell_ancestor() {
         let table =
             ProcessTable::from_processes([proc(1, None, "sh"), proc(2, Some(1), "cardinal")]);
-        assert_eq!(snapshot(&table, 2, "s", "other", 0), None);
-        assert_eq!(snapshot(&ProcessTable::default(), 2, "s", "other", 0), None);
+        assert_eq!(snapshot(&table, 2, "s", "other", 0, later()), None);
+        assert_eq!(
+            snapshot(&ProcessTable::default(), 2, "s", "other", 0, later()),
+            None
+        );
+        // Past its deadline the walk stops and makes none, where it made one above.
+        let table = ProcessTable::from_processes([
+            proc(10, Some(1), "claude"),
+            proc(13, Some(10), "cardinal"),
+        ]);
+        assert!(snapshot(&table, 13, "s", "other", 0, later()).is_some());
+        assert_eq!(snapshot(&table, 13, "s", "other", 0, Instant::now()), None);
+    }
+
+    fn later() -> Instant {
+        Instant::now() + std::time::Duration::from_secs(60)
     }
 }

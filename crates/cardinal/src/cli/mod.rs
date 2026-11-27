@@ -97,6 +97,8 @@ pub enum HookAgent {
 pub enum ClaudeEvent {
     /// Classify a Bash call and rewrite its heavy stages
     PreToolUse,
+    /// Hold the session's worktrees with a lease
+    SessionStart,
     /// Record that a subagent stopped
     SubagentStop,
     /// Record that a session ended and snapshot its processes
@@ -526,6 +528,7 @@ fn hook(args: &HookArgs) -> ExitCode {
         let mut stdin = std::io::stdin().lock();
         match event {
             ClaudeEvent::PreToolUse => claude::pre_tool_use(&mut stdin, &mut output),
+            ClaudeEvent::SessionStart => claude::session_start(&mut stdin),
             ClaudeEvent::SubagentStop => claude::subagent_stop(&mut stdin),
             ClaudeEvent::SessionEnd => claude::session_end(&mut stdin),
         }
@@ -612,6 +615,7 @@ mod tests {
         let expected: &[(&[&str], &[&str])] = &[
             (&["run"], &["spec-b64"]),
             (&["hook", "claude", "pre-tool-use"], &[]),
+            (&["hook", "claude", "session-start"], &[]),
             (&["hook", "claude", "subagent-stop"], &[]),
             (&["hook", "claude", "session-end"], &[]),
             (&["inventory"], &["repo", "sizes", "worktree"]),

@@ -25,6 +25,10 @@ pub enum RecordKind {
     ArbiterPass,
     HookError,
     ConfigError,
+    /// A lease writer found its file unparsable and replaced it (section 9.8).
+    LeaseCorrupt,
+    /// The inbox refresh removed a corrupt lease file older than `linger_s` (section 9.8).
+    LeaseCorruptRemoved,
 }
 
 /// `cardinal.record.v1`: one line in `records/*.jsonl`.

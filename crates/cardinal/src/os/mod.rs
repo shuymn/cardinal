@@ -1,5 +1,5 @@
 //! Platform process facts behind one API: the process table, start times, parent PIDs,
-//! working directories, and boot time (`docs/architecture.md` section 2.2).
+//! working directories, boot time, and the boot ID (`docs/architecture.md` section 2.2).
 //!
 //! Process-group setup and signals (Unix) live in `os/unix.rs`, owned by the runner work unit.
 //! Short-lived children whose output the caller reads run through [`child`].
@@ -28,9 +28,10 @@ pub mod unix;
 #[cfg(windows)]
 mod windows;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use sysinfo::{Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System, UpdateKind};
 
@@ -195,6 +196,14 @@ impl ProcessTable {
     /// Every descendant of `pid`, breadth first, without `pid` itself.
     #[must_use]
     pub fn descendants(&self, pid: u32) -> Vec<u32> {
+        self.descendants_until(pid, None).unwrap_or_default()
+    }
+
+    /// [`Self::descendants`], or `None` once `deadline` has passed: the walk checks it as it
+    /// goes, for a hook within its budget (section 9.8).
+    #[must_use]
+    pub fn descendants_until(&self, pid: u32, deadline: Option<Instant>) -> Option<Vec<u32>> {
+        let passed = || deadline.is_some_and(|deadline| Instant::now() >= deadline);
         let mut children: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
         for process in self.iter() {
             if let Some(parent) = process.parent
@@ -204,16 +213,20 @@ impl ProcessTable {
             }
         }
         let mut found = Vec::new();
+        let mut seen = BTreeSet::from([pid]);
         let mut queue = std::collections::VecDeque::from([pid]);
         while let Some(next) = queue.pop_front() {
+            if passed() {
+                return None;
+            }
             for &child in children.get(&next).into_iter().flatten() {
-                if child != pid && !found.contains(&child) {
+                if seen.insert(child) {
                     found.push(child);
                     queue.push_back(child);
                 }
             }
         }
-        found
+        Some(found)
     }
 
     /// The ancestors of `pid`, nearest first, stopping at a cycle or a missing parent.
@@ -331,6 +344,179 @@ pub fn boot_time_s() -> Result<u64, OsError> {
     System::boot_time().map_err(|err| OsError(err.to_string()))
 }
 
+/// This boot's ID (section 9.8): `kern.bootsessionuuid` on macOS,
+/// `/proc/sys/kernel/random/boot_id` on Linux; `None` elsewhere and when it cannot be read. A
+/// reboot is told by it, never by a time.
+#[must_use]
+pub fn boot_id() -> Option<String> {
+    let id = read_boot_id()?;
+    let id = id.trim();
+    is_uuid(id).then(|| id.to_owned())
+}
+
+/// Whether `id` is a whole UUID string: a partial read is no boot ID, which would pass for
+/// another boot.
+fn is_uuid(id: &str) -> bool {
+    id.len() == 36
+        && id.char_indices().all(|(i, c)| match i {
+            8 | 13 | 18 | 23 => c == '-',
+            _ => c.is_ascii_hexdigit(),
+        })
+}
+
+/// What one fresh read of a PID establishes (section 9.8): only an absent or exited process,
+/// or one with a readable start time, is decided.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Probe {
+    /// No process has the PID (`kill(pid, 0)` fails with `ESRCH`), or it has exited (a zombie).
+    Gone,
+    /// A running process with this start time (Unix seconds, never 0) and its start time at
+    /// the OS's finest resolution ([`start_us`]) when that could be read.
+    Running { start_s: u64, start_us: Option<u64> },
+    /// It could not be read whole: listed without a start time, not listed while it exists, or
+    /// a platform without the check.
+    Unknown,
+}
+
+/// Reads `pid` once, now: never from an earlier table.
+#[cfg(unix)]
+#[must_use]
+pub fn probe(pid: u32) -> Probe {
+    // PID 0 and PIDs past `i32::MAX` name no process, and `kill` would take them for groups.
+    let Ok(raw) = libc::pid_t::try_from(pid) else {
+        return Probe::Gone;
+    };
+    if raw <= 0 {
+        return Probe::Gone;
+    }
+    let absent = || {
+        // SAFETY: signal 0 sends nothing; it only checks that `raw`, a positive PID, exists.
+        let status = unsafe { libc::kill(raw, 0) };
+        status != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    };
+    if absent() {
+        return Probe::Gone;
+    }
+    match process(pid, Detail::default()) {
+        Some(p) if p.zombie => Probe::Gone,
+        Some(p) if p.start_s == 0 => Probe::Unknown,
+        Some(p) => Probe::Running {
+            start_s: p.start_s,
+            start_us: start_us(pid),
+        },
+        // Listed by `kill` but not read: gone only if it is gone now.
+        None if absent() => Probe::Gone,
+        None => Probe::Unknown,
+    }
+}
+
+#[cfg(not(unix))]
+#[must_use]
+pub fn probe(_pid: u32) -> Probe {
+    Probe::Unknown
+}
+
+/// The start time of `pid` in microseconds at the OS's finest resolution, comparable only
+/// within one boot: since the epoch on macOS (`proc_pidinfo` `PROC_PIDTBSDINFO`, 1 µs), since
+/// boot on Linux (`/proc/<pid>/stat` field 22, in clock ticks); `None` when it cannot be read
+/// and elsewhere.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn start_us(pid: u32) -> Option<u64> {
+    let raw = libc::c_int::try_from(pid).ok()?;
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
+    // SAFETY: `info` is writable for `size` bytes, the size of the struct the flavor fills.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            raw,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if written != size {
+        return None;
+    }
+    // SAFETY: the call filled the whole struct.
+    let info = unsafe { info.assume_init() };
+    let us = info
+        .pbi_start_tvsec
+        .checked_mul(1_000_000)?
+        .checked_add(info.pbi_start_tvusec)?;
+    (us > 0).then_some(us)
+}
+
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn start_us(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The command name, in parentheses, can hold spaces and parentheses: fields after it are
+    // counted from its last `)`, field 3 first.
+    let rest = &stat[stat.rfind(')')? + 1..];
+    let ticks: u64 = rest.split_whitespace().nth(22 - 3)?.parse().ok()?;
+    // SAFETY: `sysconf` reads a constant.
+    let hz = u64::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) }).ok()?;
+    (hz > 0).then(|| ticks.saturating_mul(1_000_000) / hz)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[must_use]
+pub fn start_us(_pid: u32) -> Option<u64> {
+    None
+}
+
+/// The file name of the executable `pid` runs, from `/proc/<pid>/exe` on Linux, which a
+/// process cannot rename as it can its `comm`; `None` when it cannot be read and elsewhere.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn exe_name(pid: u32) -> Option<String> {
+    let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+    exe.file_name()?.to_str().map(str::to_owned)
+}
+
+#[cfg(not(target_os = "linux"))]
+#[must_use]
+pub fn exe_name(_pid: u32) -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn read_boot_id() -> Option<String> {
+    std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()
+}
+
+#[cfg(target_os = "macos")]
+fn read_boot_id() -> Option<String> {
+    const NAME: &std::ffi::CStr = c"kern.bootsessionuuid";
+    // A UUID string with its NUL is 37 bytes.
+    let mut buffer = [0_u8; 64];
+    let mut len = buffer.len();
+    // SAFETY: `NAME` is NUL-terminated, `buffer` is writable for `len` bytes and `len` is a
+    // valid `size_t` the call updates; no new value is passed.
+    let status = unsafe {
+        libc::sysctlbyname(
+            NAME.as_ptr(),
+            buffer.as_mut_ptr().cast(),
+            &raw mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if status != 0 {
+        return None;
+    }
+    let bytes = buffer.get(..len)?;
+    let bytes = bytes.split(|b| *b == 0).next()?;
+    String::from_utf8(bytes.to_vec()).ok()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn read_boot_id() -> Option<String> {
+    None
+}
+
 /// This process's PID.
 #[must_use]
 pub fn current_pid() -> u32 {
@@ -409,6 +595,10 @@ mod tests {
         ]);
         assert_eq!(table.children(10), [11, 13]);
         assert_eq!(table.descendants(10), [11, 13, 12]);
+        // A walk past its deadline stops, where without one it finishes (control).
+        let passed = std::time::Instant::now();
+        assert_eq!(table.descendants_until(10, Some(passed)), None);
+        assert_eq!(table.descendants_until(10, None), Some(vec![11, 13, 12]));
         assert_eq!(table.ancestors(12), [11, 10, 1]);
         assert!(table.is_alive(11, 111));
         assert!(
@@ -432,6 +622,58 @@ mod tests {
         assert!(with_me.get(me).is_some());
         let snapshot = ProcessTable::snapshot(super::Detail::default()).unwrap();
         assert!(snapshot.get(me).is_some());
+    }
+
+    /// A boot ID is a whole UUID: a partial or padded read is none.
+    #[test]
+    fn boot_id_is_a_whole_uuid() {
+        assert!(super::is_uuid("0f3b2a8e-1c4d-4e5f-8a9b-0c1d2e3f4a5b"));
+        for partial in [
+            "",
+            "0f3b2a8e-1c4d-4e5f",
+            "0f3b2a8e-1c4d-4e5f-8a9b-0c1d2e3f4a5",
+            "0f3b2a8e-1c4d-4e5f-8a9b-0c1d2e3f4a5bb",
+            "0f3b2a8e_1c4d-4e5f-8a9b-0c1d2e3f4a5b",
+            "0f3b2a8e-1c4d-4e5f-8a9b-0c1d2e3f4a5g",
+        ] {
+            assert!(!super::is_uuid(partial), "{partial}");
+        }
+    }
+
+    /// A probe reads the process now: this process runs with the start time the table lists,
+    /// PID 0 and an unused PID are gone, and the start time at the finest resolution is within
+    /// the second the table lists (macOS) or readable (Linux).
+    #[cfg(unix)]
+    #[test]
+    fn probe_reads_now() {
+        let me = super::current_pid();
+        assert_eq!(
+            super::probe(me),
+            super::Probe::Running {
+                start_s: super::start_time_s(me).unwrap(),
+                start_us: super::start_us(me),
+            }
+        );
+        assert_eq!(super::probe(0), super::Probe::Gone);
+        assert_eq!(super::probe(u32::MAX), super::Probe::Gone);
+        let fine = super::start_us(me).expect("a start time");
+        if cfg!(target_os = "macos") {
+            assert_eq!(fine / 1_000_000, super::start_time_s(me).unwrap());
+        }
+        assert!(fine > 0);
+    }
+
+    /// The boot ID is read where the OS has one, the same on every read.
+    #[test]
+    fn boot_id_is_stable() {
+        let id = super::boot_id();
+        if cfg!(any(target_os = "linux", target_os = "macos")) {
+            let id = id.expect("a boot ID");
+            assert_eq!(id.len(), 36, "{id}");
+            assert_eq!(super::boot_id().as_deref(), Some(id.as_str()));
+        } else {
+            assert_eq!(id, None);
+        }
     }
 
     #[test]

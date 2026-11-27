@@ -25,6 +25,7 @@ pub struct HostConfig {
     /// `[unit.<name>]` tables, which honor only `act`.
     pub units: BTreeMap<String, Unit>,
     pub act: Act,
+    pub sessions: Sessions,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -207,6 +208,18 @@ pub struct Act {
     pub execute: BTreeMap<String, Vec<PlanKind>>,
 }
 
+/// `[sessions]` (section 9.8): agent session leases and the quiet period.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Sessions {
+    /// Roots under which cardinal may execute once a worktree is idle, with `~` expanded;
+    /// empty by default.
+    pub covered: Vec<PathBuf>,
+    /// A lease entry holds its worktree this long after its session's last activity.
+    pub linger_s: u64,
+    /// A worktree is quiet once none of its activity signals changed for this long.
+    pub quiet_s: u64,
+}
+
 /// The callers `[act] execute` accepts (section 3.2). The arbiter holds no grant until a skill
 /// that executes ships (section 14.3).
 const GRANTABLE: [&str; 2] = ["owner", "unit:disk-reclaim"];
@@ -328,6 +341,7 @@ struct RawHost {
     reconcile: RawReconcile,
     unit: BTreeMap<String, RawUnit>,
     act: RawAct,
+    sessions: RawSessions,
 }
 
 #[derive(Debug, Deserialize)]
@@ -492,6 +506,43 @@ impl Default for RawReconcile {
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct RawSessions {
+    covered: Vec<String>,
+    linger_s: u64,
+    quiet_s: u64,
+}
+
+impl Default for RawSessions {
+    fn default() -> Self {
+        Self {
+            covered: Vec::new(),
+            linger_s: 7200,
+            quiet_s: 7200,
+        }
+    }
+}
+
+impl RawSessions {
+    /// The settings, with absolute roots and positive bounds.
+    fn resolve(self, home: Option<&Path>) -> Result<Sessions, String> {
+        if self.linger_s == 0 || self.quiet_s == 0 {
+            return Err("sessions.linger_s and sessions.quiet_s must be positive".into());
+        }
+        let covered = self
+            .covered
+            .iter()
+            .map(|root| absolute_path(root, home).map_err(|m| format!("sessions.covered: {m}")))
+            .collect::<Result<_, _>>()?;
+        Ok(Sessions {
+            covered,
+            linger_s: self.linger_s,
+            quiet_s: self.quiet_s,
+        })
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 struct RawUnit {
@@ -622,6 +673,7 @@ impl RawHost {
         let reconcile = self.reconcile.resolve().map_err(invalid)?;
         let arbiter = self.arbiter.resolve().map_err(invalid)?;
         let act = self.act.resolve().map_err(invalid)?;
+        let sessions = self.sessions.resolve(home).map_err(invalid)?;
 
         Ok(HostConfig {
             budget,
@@ -657,6 +709,7 @@ impl RawHost {
                 .map(|(name, unit)| (name, Unit { act: unit.act }))
                 .collect(),
             act,
+            sessions,
         })
     }
 }
@@ -1004,6 +1057,49 @@ mod tests {
                 "invalid type",
             ),
             ("[act]\ngrant = {}", "unknown field `grant`"),
+        ] {
+            let message = match parse(text) {
+                Ok(_) => panic!("accepted: {text}"),
+                Err(err) => err.to_string(),
+            };
+            assert!(message.contains(expected), "{text}: {message}");
+        }
+    }
+
+    /// `[sessions]` (section 9.8): empty coverage and two-hour bounds by default, roots made
+    /// absolute, and bounds that must be positive.
+    #[test]
+    fn sessions() {
+        let host = parse("").unwrap();
+        assert!(
+            host.sessions.covered.is_empty(),
+            "nothing is covered by default"
+        );
+        assert_eq!(
+            (host.sessions.linger_s, host.sessions.quiet_s),
+            (7200, 7200)
+        );
+
+        let root = if cfg!(windows) { r"C:\\src" } else { "/src" };
+        let host = parse(&format!(
+            "[sessions]\ncovered = [\"~/w\", \"{root}\"]\nlinger_s = 3\nquiet_s = 4\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            host.sessions.covered,
+            [home().join("w"), PathBuf::from(root.replace(r"\\", r"\"))]
+        );
+        assert_eq!((host.sessions.linger_s, host.sessions.quiet_s), (3, 4));
+
+        for (text, expected) in [
+            ("[sessions]\nlinger_s = 0", "must be positive"),
+            ("[sessions]\nquiet_s = 0", "must be positive"),
+            (
+                "[sessions]\ncovered = [\"src\"]",
+                "sessions.covered: `src` is not an absolute path",
+            ),
+            ("[sessions]\ncovered = \"/src\"", "invalid type"),
+            ("[sessions]\nlinger = 1", "unknown field `linger`"),
         ] {
             let message = match parse(text) {
                 Ok(_) => panic!("accepted: {text}"),

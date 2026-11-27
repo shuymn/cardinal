@@ -6,7 +6,8 @@
 //! starts a background process (the "dev server" an agent leaves running), runs the hook as
 //! its child, directly or through `sh -c` as Claude Code does, and then stays alive until the
 //! test kills it. On Unix one case puts the session's processes in groups shared with
-//! processes outside the session.
+//! processes outside the session. Its lease write comes first (`docs/architecture.md` section
+//! 9.8); `tests/session_lease.rs` holds the lease tests.
 
 mod hook_support;
 mod support;
@@ -310,4 +311,180 @@ fn session_end_without_session_id_or_config_still_records() {
     assert_eq!(found[0].session_id, None);
     let sessions = StateDir::open(dirs.state()).unwrap().sessions_dir();
     assert_eq!(std::fs::read_dir(sessions).unwrap().count(), 0);
+}
+
+/// Section 9.8: `session-end` writes its lease before its snapshot and before it takes
+/// `records/.lock`. Paused before its lease, the hook has written neither. Paused at the
+/// records lock in a second run, its lease and snapshot are written: that pause comes after
+/// both, so it uses none of the budget they are written within.
+#[cfg(unix)]
+#[test]
+fn session_end_writes_its_lease_first() {
+    use cardinal::testpoint::{HOOK_LEASE_AGENT, RECORD_OPENED};
+    use cardinal_test_support::fixture::Fixture;
+    use std::io::Write as _;
+    use std::process::Stdio;
+    use support::testpoints::TestPoints;
+
+    let dirs = Dirs::new();
+    let fixture = Fixture::new();
+    let repo = fixture.init("repo");
+    let lease = StateDir::open(dirs.state())
+        .unwrap()
+        .lease(&cardinal::state::worktree_key(
+            &dunce::canonicalize(&repo).unwrap(),
+        ));
+    let snapshot = StateDir::open(dirs.state()).unwrap().session("sess-1");
+    let points = TestPoints::new(dirs.scope());
+    let spawn = |point: &str| {
+        let mut command = dirs.cmd();
+        points.apply(&mut command, &[point], None);
+        let mut hook = command
+            .args(["hook", "claude", "session-end"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut stdin = hook.stdin.take().unwrap();
+        stdin
+            .write_all(session_input(&repo).to_string().as_bytes())
+            .unwrap();
+        drop(stdin);
+        points.wait_reached(point, hook.id(), Duration::from_secs(30));
+        hook
+    };
+
+    let mut hook = spawn(HOOK_LEASE_AGENT);
+    assert!(!snapshot.exists(), "no snapshot before the lease");
+    assert!(!lease.exists());
+    assert!(records(&dirs).is_empty(), "no record before the lease");
+    points.release(HOOK_LEASE_AGENT);
+    assert_eq!(hook.wait().unwrap().code(), Some(0));
+    for written in [&lease, &snapshot] {
+        if written.exists() {
+            std::fs::remove_file(written).unwrap();
+        }
+    }
+
+    let mut hook = spawn(RECORD_OPENED);
+    assert!(
+        lease.exists(),
+        "the lease is written before the records lock is taken"
+    );
+    assert!(snapshot.exists(), "and the snapshot");
+    points.release(RECORD_OPENED);
+    assert_eq!(hook.wait().unwrap().code(), Some(0));
+    assert_eq!(
+        records(&dirs).last().unwrap().kind,
+        RecordKind::SessionEnded
+    );
+}
+
+/// Section 9.8: `session-end` starts no snapshot without the least budget it needs. Paused
+/// before the decision until less than that is left, the hook writes no snapshot, records its
+/// end, and exits 0 within `SessionEnd`'s 1.5 s; released at once, it writes the snapshot
+/// (control, run first so the binary's first start is not timed).
+#[cfg(unix)]
+#[test]
+fn session_end_skips_a_snapshot_that_does_not_fit() {
+    use cardinal::testpoint::HOOK_SNAPSHOT_ADMISSION;
+    use std::io::Write as _;
+    use std::process::Stdio;
+    use std::time::Instant;
+    use support::testpoints::TestPoints;
+
+    /// `SessionEnd`'s budget from the hook's start (1.4 s) less half the least a snapshot
+    /// starts with (100 ms).
+    const HOLD: Duration = Duration::from_millis(1350);
+
+    let dirs = Dirs::new();
+    let snapshot = StateDir::open(dirs.state()).unwrap().session("sess-1");
+    let points = TestPoints::new(dirs.scope());
+    let run = |hold: Duration| {
+        let mut command = dirs.cmd();
+        points.apply(&mut command, &[HOOK_SNAPSHOT_ADMISSION], None);
+        let mut hook = command
+            .args(["hook", "claude", "session-end"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut stdin = hook.stdin.take().unwrap();
+        stdin
+            .write_all(session_input(Path::new("/w")).to_string().as_bytes())
+            .unwrap();
+        drop(stdin);
+        points.wait_reached(HOOK_SNAPSHOT_ADMISSION, hook.id(), Duration::from_secs(30));
+        // The hook started before it reached the point: its deadline is at most this far off.
+        let reached = Instant::now();
+        std::thread::sleep((reached + hold).saturating_duration_since(Instant::now()));
+        points.release(HOOK_SNAPSHOT_ADMISSION);
+        assert_eq!(hook.wait().unwrap().code(), Some(0));
+        // Timed from the point, not from the spawn: the hook's own clock starts after the
+        // process does, so a slow start counts against the test, not against the budget.
+        let took = reached.elapsed();
+        std::fs::remove_file(
+            points
+                .dir()
+                .join(format!("{HOOK_SNAPSHOT_ADMISSION}.release")),
+        )
+        .unwrap();
+        took
+    };
+
+    run(Duration::ZERO);
+    assert!(snapshot.exists(), "a snapshot with the budget left");
+    std::fs::remove_file(&snapshot).unwrap();
+
+    let took = run(HOLD);
+    assert!(!snapshot.exists(), "no snapshot started");
+    // Released at `HOLD`; with no snapshot the hook exits right after.
+    assert!(took < HOLD + Duration::from_millis(500), "took {took:?}");
+    let ended: Vec<_> = records(&dirs)
+        .into_iter()
+        .filter(|r| r.kind == RecordKind::SessionEnded)
+        .collect();
+    assert_eq!(ended.len(), 2, "{ended:#?}");
+}
+
+/// Section 9.8: `session-end` keeps one budget from its start. With the lease lock and
+/// `records/.lock` both held it exits 0 within `SessionEnd`'s 1.5 s, its records dropped;
+/// with both free it records its end (control, run first so the binary's first start is not
+/// timed).
+#[cfg(unix)]
+#[test]
+fn session_end_keeps_its_budget() {
+    use cardinal::state::{self, LockMode};
+    use cardinal_test_support::fixture::Fixture;
+    use std::time::Instant;
+
+    let dirs = Dirs::new();
+    let fixture = Fixture::new();
+    let repo = fixture.init("repo");
+    let run = || {
+        let started = Instant::now();
+        let output = output_with_stdin(
+            dirs.cmd().args(["hook", "claude", "session-end"]),
+            session_input(&repo).to_string().as_bytes(),
+        );
+        assert_eq!(output.status.code(), Some(0));
+        started.elapsed()
+    };
+    // The control: the process's own start, work, and exit with nothing held. A loaded host
+    // starts processes slower than the 100 ms section 9.8 sets aside for that, so the bound
+    // below is the hook's own deadline on top of what this host takes, not a wall-clock 1.5 s.
+    let control = run();
+    assert_eq!(records(&dirs).len(), 1);
+
+    let state = StateDir::open(dirs.state()).unwrap();
+    let key = state::worktree_key(&dunce::canonicalize(&repo).unwrap());
+    let held = Instant::now() + Duration::from_secs(5);
+    let lease_lock = state::lock(&state.lease_lock(&key), LockMode::Exclusive, held).unwrap();
+    let records_lock = state::lock(&state.records_lock(), LockMode::Exclusive, held).unwrap();
+    let took = run();
+    drop((lease_lock, records_lock));
+    // 1.4 s: `session-end`'s deadline from its start (section 9.8).
+    let bound = Duration::from_millis(1400) + control + Duration::from_millis(100);
+    assert!(took < bound, "took {took:?}, bound {bound:?}");
+    assert_eq!(records(&dirs).len(), 1, "dropped, never waited for");
 }
