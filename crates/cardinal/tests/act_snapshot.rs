@@ -194,19 +194,18 @@ fn act_with_binds(s: &Setup, plan: &str, binds: &[(&Path, &Path)]) -> ActResult 
     act_result(&output).expect("an act result")
 }
 
-/// Runs `act` of `plan` under `binds` paused at `point`, calls `at` once it has reached it,
-/// releases it, and returns its result.
+/// Runs `command`, an `act` ([`Setup::act_command`]), under `binds` paused at `point`, calls
+/// `at` once it has reached it, releases it, and returns its result.
 #[cfg(target_os = "linux")]
 fn act_with_binds_at(
     s: &Setup,
-    plan: &str,
+    mut command: Command,
     binds: &[(&Path, &Path)],
     point: &str,
     at: impl FnOnce(),
 ) -> ActResult {
     let scope = Scope::new();
     let points = TestPoints::new(&scope);
-    let mut command = s.act_command(plan, &arbiter());
     points.apply(&mut command, &[point], None);
     s.fx.scope().mount_namespace(&mut command, binds);
     let child = command
@@ -430,6 +429,9 @@ fn bind_mounts_are_not_listed() {
     std::fs::create_dir_all(&cache).unwrap();
     let target = wt.join("node_modules");
     let plan = s.plan(PlanKind::ReclaimDir, &target);
+    // Made before the watch: making it waits out the quiet period by reading the fixture's
+    // times, `data` included.
+    let act = s.act_command(&plan.id, &arbiter());
 
     let watch = Watch::new(&data);
     let (mount, entries) = walk_with_binds(&s, &wt, &target, &[(&data, &cache)]);
@@ -447,7 +449,7 @@ fn bind_mounts_are_not_listed() {
     let listed = std::cell::Cell::new(None);
     let result = act_with_binds_at(
         &s,
-        &plan.id,
+        act,
         &[(&data, &cache)],
         cardinal::testpoint::ACT_SNAPSHOTTED,
         || listed.set(Some(watch.seen().1)),
