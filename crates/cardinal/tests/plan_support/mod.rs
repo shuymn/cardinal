@@ -358,6 +358,46 @@ pub fn listing(root: &Path) -> BTreeMap<PathBuf, String> {
     out
 }
 
+/// Moves the modification time of `path` `ago` into the past.
+pub fn aged(path: &Path, ago: Duration) {
+    std::fs::File::open(path)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - ago)
+        .unwrap();
+}
+
+/// [`aged`] for every entry under `dir` and `dir` itself, never through a link.
+pub fn age_tree(dir: &Path, ago: Duration) {
+    for item in std::fs::read_dir(dir).unwrap() {
+        let path = item.unwrap().path();
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+        if meta.is_dir() {
+            age_tree(&path, ago);
+        } else if meta.is_file() {
+            aged(&path, ago);
+        }
+    }
+    aged(dir, ago);
+}
+
+impl Setup {
+    /// Makes what the setup wrote in the linked worktree `wt` older than any `quiet_s` of the
+    /// tests (section 9.8), as waiting it out would: every entry of the worktree and of its
+    /// administrative directory an hour old. The fixture's commits, and so the reflog's
+    /// entries, carry a fixed date in the past (`GIT_COMMITTER_DATE`).
+    pub fn age_worktree(&self, wt: &Path) {
+        let ago = Duration::from_hours(1);
+        age_tree(wt, ago);
+        age_tree(
+            &self
+                .main
+                .join(".git/worktrees")
+                .join(wt.file_name().unwrap()),
+            ago,
+        );
+    }
+}
+
 /// Moves the modification time of `path` an hour into the past, so a write a test makes as
 /// part of a race other than the quiet period's (section 9.8) is no activity signal.
 pub fn backdate(path: &Path) {

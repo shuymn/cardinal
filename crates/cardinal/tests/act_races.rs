@@ -24,6 +24,7 @@ use cardinal::contract::ActStatus;
 use cardinal::testpoint;
 use execution_support::{Execution, outcome};
 use live_support::{GRANT, Live, assert_restored};
+use plan_support::{age_tree, aged};
 
 #[test]
 fn helper() {
@@ -67,7 +68,7 @@ const QUIET_S: u64 = 4;
 /// A45's execution: the owner's granted `act` on `target/` of a linked worktree `name`, with
 /// `[sessions]` covering the fixture, `linger_s` 60 and `quiet_s` [`QUIET_S`]; `prepare` runs
 /// on the setup and the worktree before the target is written, and the plan is made once the
-/// worktree has been quiet for `quiet_s`.
+/// worktree is quiet ([`plan_support::Setup::age_worktree`]).
 fn quiet_live(name: &str, prepare: impl FnOnce(&plan_support::Setup, &Path)) -> Live {
     let mut s = plan_support::Setup::with_host(GRANT);
     let root = dunce::canonicalize(s.fx.root()).unwrap();
@@ -78,7 +79,7 @@ fn quiet_live(name: &str, prepare: impl FnOnce(&plan_support::Setup, &Path)) -> 
     Live::in_setup(s, name, "target", &[], |s, wt| {
         prepare(s, wt);
         plan_support::write(wt, "target/debug/app", "debug/app");
-        std::thread::sleep(Duration::from_millis(QUIET_S * 1000 + 200));
+        s.age_worktree(wt);
     })
 }
 
@@ -114,28 +115,6 @@ fn ahead(path: &Path) {
         .unwrap()
         .set_modified(std::time::SystemTime::now() + Duration::from_hours(1))
         .unwrap();
-}
-
-/// Moves the modification time of `path` `ago` into the past.
-fn aged(path: &Path, ago: Duration) {
-    std::fs::File::open(path)
-        .unwrap()
-        .set_modified(std::time::SystemTime::now() - ago)
-        .unwrap();
-}
-
-/// [`aged`] for every entry under `dir` and `dir` itself, never through a link.
-fn age_tree(dir: &Path, ago: Duration) {
-    for item in std::fs::read_dir(dir).unwrap() {
-        let path = item.unwrap().path();
-        let meta = std::fs::symlink_metadata(&path).unwrap();
-        if meta.is_dir() {
-            age_tree(&path, ago);
-        } else if meta.is_file() {
-            aged(&path, ago);
-        }
-    }
-    aged(dir, ago);
 }
 
 /// Writes `n` files `<rel>/f<i>` under `root`, each and their directory an hour old.
@@ -291,15 +270,37 @@ fn a_held_worktree_reads_no_other_target() {
     assert!(!reached, "the other target was read");
     drop(sleeper);
 
-    // A FIFO made in the target after the plan, older than `quiet_s` by `act`: `not_in_use`
-    // passes and `plain_target` refuses.
+    // A FIFO made in the target after the plan, older than `quiet_s`: `not_in_use` passes and
+    // `plain_target` refuses.
     let x = quiet_live("fifo-no-read", prepare);
     let fifo = x.target().join("pipe").into_os_string();
     let fifo = std::ffi::CString::new(std::os::unix::ffi::OsStringExt::into_vec(fifo)).unwrap();
     // SAFETY: `fifo` is a valid NUL-terminated path.
     let mkfifo = unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) };
     assert_eq!(mkfifo, 0, "mkfifo: {}", std::io::Error::last_os_error());
-    std::thread::sleep(Duration::from_millis(QUIET_S * 1000 + 200));
+    // An hour old, set by name: opening a FIFO to set its times would wait for a writer.
+    let old = rustix::fs::Timespec {
+        tv_sec: i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                - 3600,
+        )
+        .unwrap(),
+        tv_nsec: 0,
+    };
+    let times = rustix::fs::Timestamps {
+        last_access: old,
+        last_modification: old,
+    };
+    rustix::fs::utimensat(
+        rustix::fs::CWD,
+        fifo.as_c_str(),
+        &times,
+        rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+    )
+    .unwrap();
     let (result, reached) = run(&x);
     assert_eq!(result.status, ActStatus::Rejected, "{result:#?}");
     assert_eq!(result.reasons, ["plain_target"], "{result:#?}");
@@ -1836,10 +1837,10 @@ mod checked {
             "[sessions]\ncovered = ['{}']\nlinger_s = 60\nquiet_s = {QUIET_S}\n",
             root.display()
         ));
-        Live::in_setup(s, name, "target", &[], |_, wt| {
+        Live::in_setup(s, name, "target", &[], |s, wt| {
             plan_support::write(wt, "node_modules/a.js", "x");
             plan_support::write(wt, "target/debug/app", "debug/app");
-            std::thread::sleep(Duration::from_millis(QUIET_S * 1000 + 200));
+            s.age_worktree(wt);
         })
     }
 

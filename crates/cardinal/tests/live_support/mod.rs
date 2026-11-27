@@ -74,9 +74,15 @@ impl Live {
         prepare: impl FnOnce(&Setup, &Path),
     ) -> Self {
         let wt = s.worktree(name);
+        // The worktree's setup and the files, an hour old, are idle without waiting out the
+        // quiet period (section 9.8); what `prepare` writes keeps its own times.
+        s.age_worktree(&wt);
         prepare(&s, &wt);
         for file in files {
             write_synced(&wt, &format!("{rel}/{file}"), file.as_bytes());
+        }
+        if !files.is_empty() {
+            plan_support::age_tree(&wt.join(rel), Duration::from_hours(1));
         }
         let plan = s.plan(PlanKind::ReclaimDir, &wt.join(rel));
         assert!(plan.invariants_ok, "{:#?}", plan.checks);

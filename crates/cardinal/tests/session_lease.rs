@@ -1812,12 +1812,12 @@ fn backdate(path: &Path) {
     plan_support::backdate(path);
 }
 
-/// A worktree `name` with a `node_modules` of one file, which a plan finds idle once `wait`
-/// seconds have passed.
-fn idle_worktree(s: &Setup, name: &str, wait: u64) -> PathBuf {
+/// A worktree `name` with a `node_modules` of one file, which a plan finds idle: its setup
+/// aged past `quiet_s` ([`Setup::age_worktree`]).
+fn idle_worktree(s: &Setup, name: &str) -> PathBuf {
     let wt = s.worktree(name);
     plan_support::write(&wt, "node_modules/pkg/index.js", "x");
-    wait_out(wait);
+    s.age_worktree(&wt);
     wt
 }
 
@@ -1826,8 +1826,8 @@ fn idle_worktree(s: &Setup, name: &str, wait: u64) -> PathBuf {
 #[test]
 fn live_session_refuses() {
     let s = bounded(60, 1);
-    let free = idle_worktree(&s, "free", 0);
-    let wt = idle_worktree(&s, "live", 1);
+    let free = idle_worktree(&s, "free");
+    let wt = idle_worktree(&s, "live");
     put_lease(&s, &wt, vec![plain("s-live", Some(me()), 1, None)], false);
     let (result, detail) = in_use(&plan_modules(&s, &wt));
     assert_eq!(result, CheckResult::Fail, "{detail}");
@@ -1840,7 +1840,7 @@ fn live_session_refuses() {
 #[test]
 fn ended_session_lingers() {
     let s = bounded(60, 1);
-    let wt = idle_worktree(&s, "ended", 1);
+    let wt = idle_worktree(&s, "ended");
     put_lease(
         &s,
         &wt,
@@ -1869,7 +1869,7 @@ fn stale_with(transcript: &Path) -> LeaseEntry {
 #[test]
 fn crash_lingers_from_the_transcript() {
     let s = bounded(60, 1);
-    let wt = idle_worktree(&s, "crashed", 1);
+    let wt = idle_worktree(&s, "crashed");
     let transcript = s.fx.path("transcripts/s-crashed.jsonl");
     plan_support::write(s.fx.root(), "transcripts/s-crashed.jsonl", "{}\n");
     put_lease(&s, &wt, vec![stale_with(&transcript)], false);
@@ -1883,7 +1883,7 @@ fn crash_lingers_from_the_transcript() {
 #[test]
 fn subagent_transcript_holds() {
     let s = bounded(60, 1);
-    let wt = idle_worktree(&s, "subagent", 1);
+    let wt = idle_worktree(&s, "subagent");
     let transcript = s.fx.path("transcripts/s-crashed.jsonl");
     plan_support::write(s.fx.root(), "transcripts/s-crashed.jsonl", "{}\n");
     plan_support::write(
@@ -1903,7 +1903,7 @@ fn subagent_transcript_holds() {
 #[test]
 fn reused_pid_is_not_live() {
     let s = bounded(60, 1);
-    let wt = idle_worktree(&s, "reused", 1);
+    let wt = idle_worktree(&s, "reused");
     let old = now_ms() - 120_000;
     put_lease(
         &s,
@@ -1922,7 +1922,7 @@ fn reused_pid_is_not_live() {
 #[test]
 fn torn_lease_is_unknown() {
     let s = bounded(60, 1);
-    let wt = idle_worktree(&s, "torn", 1);
+    let wt = idle_worktree(&s, "torn");
     let path = s
         .state
         .lease(&state::worktree_key(&dunce::canonicalize(&wt).unwrap()));
@@ -1967,12 +1967,12 @@ fn old_files(root: &Path, rel: &str, n: usize) {
 #[test]
 fn caps_are_unknown() {
     let s = bounded(60, 1);
-    let subagents = idle_worktree(&s, "subagents", 0);
+    let subagents = idle_worktree(&s, "subagents");
     // Status paths.
     let wt = s.worktree("paths");
     plan_support::write(&wt, "node_modules/pkg/index.js", "x");
     old_files(&wt, "untracked", 1000);
-    wait_out(1);
+    s.age_worktree(&wt);
     assert_eq!(in_use(&plan_modules(&s, &wt)).0, CheckResult::Pass);
     old_files(&wt, "more", 1);
     let (result, detail) = in_use(&plan_modules(&s, &wt));
@@ -1998,7 +1998,7 @@ fn caps_are_unknown() {
     plan_support::write(&wt, "node_modules/pkg/index.js", "x");
     old_files(&wt, "fuzz/corpus", 4096);
     backdate(&wt.join("fuzz"));
-    wait_out(1);
+    s.age_worktree(&wt);
     assert_eq!(in_use(&plan_modules(&s, &wt)).0, CheckResult::Pass);
     plan_support::write(&wt, "fuzz/corpus/f4096", "x");
     backdate(&wt.join("fuzz/corpus/f4096"));
@@ -2013,7 +2013,7 @@ fn caps_are_unknown() {
 mod quiet_signals {
     use std::path::Path;
 
-    use super::{CheckResult, bounded, in_use, plan_modules, wait_out};
+    use super::{CheckResult, bounded, in_use, plan_modules};
     use crate::plan_support::{self, Setup};
 
     const QUIET_S: u64 = 4;
@@ -2022,7 +2022,7 @@ mod quiet_signals {
         case_with(|_| {}, change, named);
     }
 
-    /// [`case`] with `prepare` run on the worktree before the quiet period is waited out.
+    /// [`case`] with `prepare` run on the worktree before its setup is aged past the quiet period.
     fn case_with(
         prepare: impl FnOnce(&Path),
         change: impl FnOnce(&Setup, &Path) -> std::path::PathBuf,
@@ -2033,7 +2033,7 @@ mod quiet_signals {
         let wt = s.worktree("signal");
         plan_support::write(&wt, "node_modules/pkg/index.js", "x");
         prepare(&wt);
-        wait_out(QUIET_S);
+        s.age_worktree(&wt);
         assert_eq!(in_use(&plan_modules(&s, &wt)).0, CheckResult::Pass);
         let wt = change(&s, &wt);
         let (result, detail) = in_use(&plan_modules(&s, &wt));
@@ -2211,7 +2211,7 @@ fn another_target_holds_every_plan() {
     let wt = s.worktree("siblings");
     plan_support::write(&wt, "node_modules/pkg/index.js", "x");
     plan_support::write(&wt, "target/debug/deps/libx.rlib", "x");
-    wait_out(2);
+    s.age_worktree(&wt);
     let modules = |s: &Setup| {
         let plans = s.plan_all().plans;
         let plan = plans
@@ -2312,7 +2312,7 @@ fn a_large_regenerable_target_is_read_past_the_caps() {
     for n in 0..=cardinal::observe::quiet::MAX_ENTRIES_PER_IGNORED {
         std::fs::write(dir.join(format!("f{n}")), "x").unwrap();
     }
-    wait_out(1);
+    s.age_worktree(&large);
     let (result, detail) = in_use(&plan_modules(&s, &large));
     assert_eq!(result, CheckResult::Pass, "{detail}");
 }
@@ -2371,7 +2371,7 @@ fn a_name_that_is_not_utf8_is_read() {
     let name = wt.join(std::ffi::OsStr::from_bytes(b"build-\xff.log"));
     std::fs::write(&name, "x").unwrap();
     backdate(&name);
-    wait_out(2);
+    s.age_worktree(&wt);
     assert_eq!(in_use(&plan_modules(&s, &wt)).0, CheckResult::Pass);
     std::fs::write(&name, "y").unwrap();
     plan_support::ahead(&name);
@@ -2387,7 +2387,7 @@ fn a_name_that_is_not_utf8_is_read() {
 fn a_reflog_that_is_not_a_regular_file_never_blocks() {
     use std::os::unix::ffi::OsStrExt as _;
     let s = bounded(60, 1);
-    let wt = idle_worktree(&s, "fifo", 1);
+    let wt = idle_worktree(&s, "fifo");
     assert_eq!(in_use(&plan_modules(&s, &wt)).0, CheckResult::Pass);
     let reflog = s.main.join(".git/worktrees/fifo/logs/HEAD");
     let kept = std::fs::read(&reflog).unwrap();
@@ -2424,7 +2424,7 @@ fn unreadable_signal_is_unknown() {
     let wt = s.worktree("unreadable");
     plan_support::write(&wt, "node_modules/pkg/index.js", "x");
     plan_support::write(&wt, "fuzz/corpus/a", "x");
-    wait_out(1);
+    s.age_worktree(&wt);
     let corpus = wt.join("fuzz/corpus");
     std::fs::set_permissions(&corpus, std::fs::Permissions::from_mode(0o000)).unwrap();
     let (result, detail) = in_use(&plan_modules(&s, &wt));
@@ -2440,7 +2440,7 @@ fn unreadable_signal_is_unknown() {
 #[test]
 fn a_restored_target_is_not_held_by_its_own_times() {
     let s = bounded(60, 2);
-    let wt = idle_worktree(&s, "restored", 2);
+    let wt = idle_worktree(&s, "restored");
     std::fs::rename(wt.join("node_modules"), wt.join("node_modules.moved")).unwrap();
     std::fs::rename(wt.join("node_modules.moved"), wt.join("node_modules")).unwrap();
     // A rename keeps a directory's own mtime on some file systems and not others: set it now.
@@ -2460,7 +2460,7 @@ fn a_restored_target_is_not_held_by_its_own_times() {
 #[test]
 fn raised_linger_revives_nothing() {
     let mut s = bounded(2, 1);
-    let wt = idle_worktree(&s, "raised", 1);
+    let wt = idle_worktree(&s, "raised");
     put_lease(
         &s,
         &wt,
