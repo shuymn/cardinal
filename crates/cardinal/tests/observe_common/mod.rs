@@ -9,9 +9,9 @@
     reason = "each test crate uses a different subset of the scene"
 )]
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use cardinal::config::Config;
 use cardinal::contract::{Error, Inventory, Worktree};
@@ -27,6 +27,11 @@ pub const GITHUB: &str = "acme/app";
 pub const QUIET_DISK: &str =
     "[disk]\nwarning_mib = 1\nrecovery_mib = 2\ncritical_mib = 0\nreserve_mib = 1\n";
 
+/// `[sessions]` of a scene that sets none (section 9.8): the fixture covered, and the lease
+/// and the quiet period at their shortest, 1 s, which [`Scene::settle`] waits out before each
+/// command, so a fixture just written is idle by then unless a test writes during the command.
+pub const QUIET_SESSIONS_S: u64 = 1;
+
 pub struct Scene {
     pub fx: Fixture,
     pub repo: PathBuf,
@@ -41,6 +46,8 @@ pub struct Scene {
     pub git_timeout_ms: u64,
     /// Variables every `cardinal` command of the scene gets on top of its environment.
     pub cardinal_env: Vec<(OsString, OsString)>,
+    /// Roots `[sessions] covered` lists besides the fixture's, for worktrees on other volumes.
+    pub covered: Vec<PathBuf>,
 }
 
 impl Scene {
@@ -64,6 +71,7 @@ impl Scene {
             gh_timeout_ms: 15_000,
             git_timeout_ms: 15_000,
             cardinal_env: Vec::new(),
+            covered: Vec::new(),
         };
         scene.observe_new_repo("repo");
         scene.write_gh();
@@ -260,8 +268,20 @@ exit "$code"
         } else {
             QUIET_DISK
         };
+        let sessions = if self.observe_extra.contains("[sessions]") {
+            String::new()
+        } else {
+            let covered: Vec<String> = std::iter::once(self.fx.root())
+                .chain(self.covered.iter().map(PathBuf::as_path))
+                .map(|root| format!("'{}'", dunce::canonicalize(root).unwrap().display()))
+                .collect();
+            format!(
+                "[sessions]\ncovered = [{}]\nlinger_s = {QUIET_SESSIONS_S}\nquiet_s = {QUIET_SESSIONS_S}\n",
+                covered.join(", ")
+            )
+        };
         let host = format!(
-            "{disk}[observe]\ngh = '{}'\ngh_timeout_ms = {}\ngit_timeout_ms = {}\n{}",
+            "{disk}{sessions}[observe]\ngh = '{}'\ngh_timeout_ms = {}\ngit_timeout_ms = {}\n{}",
             self.gh_program().display(),
             self.gh_timeout_ms,
             self.git_timeout_ms,
@@ -307,8 +327,115 @@ exit "$code"
         env
     }
 
+    /// Waits out the quiet period of [`QUIET_SESSIONS_S`], so what the fixture wrote before
+    /// it is idle (section 9.8); a scene with `[sessions]` of its own sets its own times and
+    /// waits for nothing here. It waits only for what is left of the period after the newest
+    /// write [`Scene::newest_write`] finds, and for all of it when that cannot be read or lies
+    /// in the future, so a command right after another that wrote nothing starts at once.
+    pub fn settle(&self) {
+        if self.observe_extra.contains("[sessions]") {
+            return;
+        }
+        let period = Duration::from_millis(QUIET_SESSIONS_S * 1000 + 100);
+        let wait = self.newest_write().map_or(period, |newest| {
+            (newest + period)
+                .duration_since(SystemTime::now())
+                .unwrap_or(Duration::ZERO)
+                .min(period)
+        });
+        if !wait.is_zero() {
+            std::thread::sleep(wait);
+        }
+    }
+
+    /// The newest modification time of what a command can read as activity (section 9.8), and
+    /// more: every entry below the fixture's root and the other roots `[sessions] covered`
+    /// lists, never through a link, the state dir's `leases/` included. Left out are times no
+    /// signal reads: the roots' own, the fixture root's files (its tools and their
+    /// configuration), those of the worktrees directly in a root (a directory with a `.git`
+    /// entry), and in such a worktree's `.git` all but its `index`, `HEAD`, `logs/HEAD`, and
+    /// `gitdir` files, its own and its linked worktrees'; and what the commands and the test's
+    /// tools write and nothing reads as activity: the state dir but its `leases/`, the config
+    /// dir, the fake `gh`'s dir, and the scope's test points, fake tools, disk images, home,
+    /// temp dir, and hooks. `None` when an entry cannot be read.
+    fn newest_write(&self) -> Option<SystemTime> {
+        /// Where an entry is.
+        #[derive(Clone, Copy, PartialEq)]
+        enum At {
+            /// A root, the fixture's if `true`.
+            Root(bool),
+            /// Directly in a root, the fixture's if `true`.
+            Top(bool),
+            /// In a worktree's `.git`.
+            GitDir,
+            Below,
+        }
+        let root = self.fx.root();
+        let leases = self.state_dir.join("leases");
+        let mut skipped = vec![
+            self.state_dir.clone(),
+            self.config_dir.clone(),
+            self.gh_dir.clone(),
+        ];
+        skipped.extend(["points", "fakes", "home", "tmp", "hooks"].map(|name| root.join(name)));
+        let mut newest = SystemTime::UNIX_EPOCH;
+        let mut entries: Vec<(PathBuf, At)> = vec![(root.to_path_buf(), At::Root(true))];
+        entries.extend(
+            self.covered
+                .iter()
+                .map(|dir| (dir.clone(), At::Root(false))),
+        );
+        entries.push((leases.clone(), At::Below));
+        while let Some((path, at)) = entries.pop() {
+            let meta = match std::fs::symlink_metadata(&path) {
+                // No lease written yet.
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound && path == leases => {
+                    continue;
+                }
+                read => read.ok()?,
+            };
+            let worktree = matches!(at, At::Top(_))
+                && meta.is_dir()
+                && std::fs::symlink_metadata(path.join(".git")).is_ok();
+            let signal = || {
+                path.file_name()
+                    .is_some_and(|name| ["index", "HEAD", "gitdir"].map(OsStr::new).contains(&name))
+            };
+            let counted = match at {
+                At::Root(_) => false,
+                At::Top(fixture) => !worktree && (meta.is_dir() || !fixture),
+                At::GitDir => !meta.is_dir() && signal(),
+                At::Below => true,
+            };
+            if counted {
+                newest = newest.max(meta.modified().ok()?);
+            }
+            if !meta.is_dir() {
+                continue;
+            }
+            for item in std::fs::read_dir(&path).ok()? {
+                let item = item.ok()?;
+                let child = item.path();
+                let image = at == At::Root(true)
+                    && item.file_name().to_string_lossy().starts_with("image-");
+                if image || skipped.contains(&child) {
+                    continue;
+                }
+                let child_at = match at {
+                    At::Root(fixture) => At::Top(fixture),
+                    At::Top(_) if worktree && item.file_name() == ".git" => At::GitDir,
+                    At::GitDir => At::GitDir,
+                    _ => At::Below,
+                };
+                entries.push((child, child_at));
+            }
+        }
+        Some(newest)
+    }
+
     /// `inventory --repo <repo>` through the library, with `--sizes` if `sizes`.
     pub fn inventory_with(&self, sizes: bool) -> Inventory {
+        self.settle();
         let config = self.config();
         Observer::new(&config)
             .with_env(self.env())
@@ -329,6 +456,7 @@ exit "$code"
 
     /// `observe_worktree` of `path`.
     pub fn observe(&self, path: &Path) -> Result<WorktreeObservation, Error> {
+        self.settle();
         let config = self.config();
         Observer::new(&config)
             .with_env(self.env())
@@ -344,6 +472,7 @@ exit "$code"
 
     /// [`Scene::cardinal`] started in `dir`, which must be inside the fixture.
     pub fn cardinal_in(&self, dir: &Path) -> Command {
+        self.settle();
         self.config();
         let mut command = self.fx.command(bin_exe("cardinal"), dir);
         for (name, value) in self

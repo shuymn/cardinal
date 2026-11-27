@@ -85,6 +85,7 @@ A note is one line: the decision, the IDs (job, session, plan, PIDs), and for an
 | `disk_critical` | As `disk_low` |
 | `arbiter_failing` | The owner's, never assigned to a pass. On the owner's request, report the failed passes and their logs from its evidence; leave the item as it is |
 | `reclaim_stranded` | The owner's, never assigned to a pass. On the owner's request, report the trash entry, the target's original path (`target`, null for a trash entry no execution names), what is left (`entries_left`, `bytes_left`), and `reason`; leave the item as it is |
+| `in_use_unknown` | The owner's, never assigned to a pass. On the owner's request, report the worktree (`subject.worktree`), the input cardinal could not read (`input`), and over how many full observations in a row (`streak`): only the owner can repair or remove that input; leave the item as it is |
 
 Resolve an item whose evidence shows nothing left to decide (the reservation or the processes are gone), noting what you saw. Escalate an item you cannot decide from its evidence, with what is unknown.
 

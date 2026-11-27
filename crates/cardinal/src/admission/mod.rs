@@ -308,6 +308,87 @@ pub fn in_use(state: &StateDir, host: &HostConfig, worktree_key: &str) -> Result
     })
 }
 
+/// What a worktree's session lease shows at one time (section 9.8).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LeaseHold {
+    /// No entry holds the worktree, or there is no lease file, which proves nothing by itself.
+    Free,
+    /// An entry holds it, live or lingering, named.
+    Holds(String),
+    /// The file, or an entry's input, could not be read whole, named: never idle.
+    Unknown(String),
+}
+
+/// The session lease of the worktree with key `worktree_key` at `now_ms`, entries lingering
+/// `linger_ms` after their last activity (section 9.8, "Holding"): read by name, without the
+/// lock, through `state::lease`'s reads and assessment; each agent's liveness read now, once
+/// per PID. A file that cannot be read whole or parsed, one marked `overflow`, an `uncertain`
+/// entry that has not expired, and an entry whose liveness or activity cannot be read leave
+/// it unknown; an entry that holds wins over an unknown one.
+#[must_use]
+pub fn lease_hold(state: &StateDir, worktree_key: &str, now_ms: u64, linger_ms: u64) -> LeaseHold {
+    use state::lease::{self, Hold, Read};
+    let path = state.lease(worktree_key);
+    let lease = match lease::read(&path) {
+        Ok(Read::Missing) => return LeaseHold::Free,
+        Ok(Read::Parsed(lease)) => lease,
+        Ok(Read::Corrupt { .. }) => {
+            return LeaseHold::Unknown(format!("{}: corrupt", path.display()));
+        }
+        Err(err) => return LeaseHold::Unknown(format!("{}: {err}", path.display())),
+    };
+    if lease.overflow {
+        return LeaseHold::Unknown(format!("{}: overflow", path.display()));
+    }
+    let boot_id = crate::os::boot_id();
+    let mut live =
+        lease::liveness(
+            boot_id.as_deref(),
+            lease::StartIdentity::HOST,
+            |pid| match crate::os::probe(pid) {
+                crate::os::Probe::Gone => lease::Process::Gone,
+                crate::os::Probe::Running { start_s, start_us } => {
+                    lease::Process::Running { start_s, start_us }
+                }
+                crate::os::Probe::Unknown => lease::Process::Unknown,
+            },
+        );
+    let mut unknown = None;
+    for entry in &lease.sessions {
+        let assessed = lease::assess(entry, now_ms, linger_ms, &mut live);
+        let session = &entry.session_id;
+        match assessed.hold {
+            Hold::Expired => {}
+            _ if entry.uncertain => {
+                unknown.get_or_insert_with(|| {
+                    format!(
+                        "{}: an uncertain entry stands for a corrupt file's sessions",
+                        path.display()
+                    )
+                });
+            }
+            Hold::Live => return LeaseHold::Holds(format!("session {session} is live")),
+            Hold::Lingering => {
+                let ago_s = assessed
+                    .activity_ms
+                    .map_or(0, |ms| now_ms.saturating_sub(ms) / 1000);
+                return LeaseHold::Holds(format!(
+                    "session {session} lingers, last active {ago_s} s ago"
+                ));
+            }
+            Hold::Unknown => {
+                unknown.get_or_insert_with(|| {
+                    let why = lease::last_activity(entry)
+                        .err()
+                        .unwrap_or_else(|| "its agent's liveness cannot be read".into());
+                    format!("session {session}: {why}")
+                });
+            }
+        }
+    }
+    unknown.map_or(LeaseHold::Free, LeaseHold::Unknown)
+}
+
 /// A reservation a recovery pass released, appended as a `job_recovered` record once the
 /// admission lock is released.
 #[derive(Clone, Debug)]

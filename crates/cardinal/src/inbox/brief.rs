@@ -174,7 +174,7 @@ fn fields(kind: InboxKind) -> Option<&'static [&'static str]> {
             "/report/incomplete",
         ],
         InboxKind::ArbiterFailing => &["/logs"],
-        InboxKind::ReclaimStranded => return None,
+        InboxKind::ReclaimStranded | InboxKind::InUseUnknown => return None,
     })
 }
 

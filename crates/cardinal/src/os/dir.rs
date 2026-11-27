@@ -17,7 +17,7 @@
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io;
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
@@ -72,6 +72,9 @@ pub struct Listed {
     /// The reads of [`Own`] that failed: the directory's (`None`), which leaves every entry
     /// without its reading, or one entry's, by name.
     pub unread: Vec<(Option<OsString>, String)>,
+    /// What was removed while the listing read it: an entry gone before its `lstat` (or its
+    /// [`Own`] read), by name, or the directory itself (`None`), whose listing ended there.
+    pub vanished: Vec<Option<OsString>>,
 }
 
 /// Opens the directory at `path` without following a final symbolic link (`O_DIRECTORY |
@@ -159,13 +162,54 @@ pub fn current_path(fd: impl AsFd) -> io::Result<PathBuf> {
     }
 }
 
-/// The entries of the open directory `dir` in name order, without `.` and `..`: each name
-/// with what `lstat` reports of it, read relative to `dir`, and what `own` asks of a regular
-/// file. A directory removed while it is read ends its listing with what was read, an entry
-/// removed before its `lstat` is left out, and any other error of the listing or an `lstat`
-/// fails it; a read of `own` that fails is in [`Listed::unread`]. The listing reads `dir` from
-/// its current offset and leaves it at the end.
-pub fn list(dir: &File, own: Own) -> io::Result<Listed> {
+/// Where a directory being listed is named: the entry `name` in the open directory `parent`,
+/// or a path.
+#[derive(Clone, Copy, Debug)]
+pub struct At<'a> {
+    parent: BorrowedFd<'a>,
+    name: &'a Path,
+}
+
+impl<'a> At<'a> {
+    /// The entry `name` in the open directory `parent`.
+    #[must_use]
+    pub fn entry(parent: BorrowedFd<'a>, name: &'a OsStr) -> Self {
+        Self {
+            parent,
+            name: Path::new(name),
+        }
+    }
+
+    /// The directory at `path`, absolute or relative to the working directory.
+    #[must_use]
+    pub fn path(path: &'a Path) -> Self {
+        Self {
+            parent: rustix::fs::CWD,
+            name: path,
+        }
+    }
+}
+
+/// The entries of the open directory `dir`, named by `at`, in name order, without `.` and
+/// `..`: each name with what `lstat` reports of it, read relative to `dir`, and what `own` asks
+/// of a regular file. A directory removed while it is read ends its listing with what was
+/// read, an entry removed before its `lstat` is left out, each in [`Listed::vanished`], and any
+/// other error of the listing or an `lstat` fails it; a read of `own` that fails is in
+/// [`Listed::unread`]. Once listed, `at` is read again by `lstat` and must still name `dir`:
+/// a directory removed or replaced after it was opened, which macOS lists as empty or as the
+/// old one without an error, is in [`Listed::vanished`] (`None`) too. The listing reads `dir`
+/// from its current offset and leaves it at the end.
+pub fn list(dir: &File, own: Own, at: At<'_>) -> io::Result<Listed> {
+    list_with(dir, own, at, &mut || Ok(()))
+}
+
+/// [`list`], `names_read` run once the names are read and before the first `lstat`.
+pub fn list_with(
+    dir: &File,
+    own: Own,
+    at: At<'_>,
+    names_read: &mut dyn FnMut() -> io::Result<()>,
+) -> io::Result<Listed> {
     let mut listed = Listed::default();
     #[cfg(target_os = "macos")]
     let bulk = match own {
@@ -189,14 +233,18 @@ pub fn list(dir: &File, own: Own) -> io::Result<Listed> {
             names.sort();
             names
         }
-        None => names(dir)?,
+        None => names(dir, &mut listed.vanished)?,
     };
     #[cfg(not(target_os = "macos"))]
-    let names = names(dir)?;
+    let names = names(dir, &mut listed.vanished)?;
+    names_read()?;
     for name in names {
         let st = match rustix::fs::statat(dir, &name, AtFlags::SYMLINK_NOFOLLOW) {
             Ok(st) => stat(&st),
-            Err(Errno::NOENT) => continue,
+            Err(Errno::NOENT) => {
+                listed.vanished.push(Some(name));
+                continue;
+            }
             Err(err) => return Err(err.into()),
         };
         let mut read = None;
@@ -214,7 +262,10 @@ pub fn list(dir: &File, own: Own) -> io::Result<Listed> {
                 match extents_at(dir, &name, (st.dev, st.ino)) {
                     Ok(bytes) => read = Some(bytes),
                     // Removed since its `lstat`: left out, as an entry removed before it.
-                    Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                        listed.vanished.push(Some(name));
+                        continue;
+                    }
                     Err(err) => listed
                         .unread
                         .push((Some(name.clone()), format!("FIEMAP: {err}"))),
@@ -225,29 +276,74 @@ pub fn list(dir: &File, own: Own) -> io::Result<Listed> {
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     let _ = own;
+    if !listed.vanished.contains(&None) && !still_named(dir, at)? {
+        listed.vanished.push(None);
+    }
     Ok(listed)
+}
+
+/// Whether `at` names the open directory `dir` still: the same `dev` and `ino` by `lstat`.
+/// Nothing there is `false`; any other error of the `lstat` fails.
+pub fn still_named(dir: &File, at: At<'_>) -> io::Result<bool> {
+    let opened = stat_fd(dir)?;
+    match rustix::fs::statat(at.parent, at.name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(st) => {
+            let named = stat(&st);
+            Ok((named.dev, named.ino) == (opened.dev, opened.ino))
+        }
+        Err(Errno::NOENT | Errno::NOTDIR) => Ok(false),
+        Err(err) => Err(err.into()),
+    }
 }
 
 /// The names in the open directory `dir`, sorted, without `.` and `..`; read through a
 /// duplicate of the descriptor, from its current offset. A directory removed while it is read
-/// ends the listing with what was read.
-fn names(dir: &File) -> io::Result<Vec<OsString>> {
+/// ends the listing with what was read, and `None` goes into `vanished`.
+fn names(dir: &File, vanished: &mut Vec<Option<OsString>>) -> io::Result<Vec<OsString>> {
+    let read = names_while(dir, &mut |_| true)?;
+    if read.gone {
+        vanished.push(None);
+    }
+    let mut names = read.names;
+    names.sort();
+    Ok(names)
+}
+
+/// What [`names_while`] read.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Names {
+    /// The names read, in the order the file system returned them, without `.` and `..`.
+    pub names: Vec<OsString>,
+    /// Whether the directory was removed while it was read, which ended the reading.
+    pub gone: bool,
+}
+
+/// The names in the open directory `dir`, read as [`list`] reads them, through a duplicate of
+/// the descriptor from its current offset, as long as `more`, given how many were read, allows
+/// one more: a directory removed while it is read ends the reading with what was read.
+pub fn names_while(dir: &File, more: &mut dyn FnMut(usize) -> bool) -> io::Result<Names> {
     let stream = rustix::fs::Dir::new(OwnedFd::from(dir.try_clone()?))?;
-    let mut names = Vec::new();
+    let mut read = Names::default();
     for entry in stream {
         match entry {
             Ok(entry) => {
                 let name = entry.file_name().to_bytes();
-                if name != b"." && name != b".." {
-                    names.push(OsStr::from_bytes(name).to_os_string());
+                if name == b"." || name == b".." {
+                    continue;
                 }
+                if !more(read.names.len()) {
+                    break;
+                }
+                read.names.push(OsStr::from_bytes(name).to_os_string());
             }
-            Err(Errno::NOENT) => break,
+            Err(Errno::NOENT) => {
+                read.gone = true;
+                break;
+            }
             Err(err) => return Err(err.into()),
         }
     }
-    names.sort();
-    Ok(names)
+    Ok(read)
 }
 
 /// What the measure `own` reads of the regular file `name` in the open directory `dir`, which
@@ -676,7 +772,7 @@ mod tests {
         assert!(super::open(&dir.join("missing")).is_err());
 
         let opened = super::open(&dir).unwrap().unwrap();
-        let listed = super::list(&opened, Own::Nothing).unwrap();
+        let listed = super::list(&opened, Own::Nothing, super::At::path(&dir)).unwrap();
         assert_eq!(listed.unread, []);
         let entries = listed.entries;
         let names: Vec<_> = entries.iter().map(|(n, ..)| n.to_str().unwrap()).collect();
@@ -746,18 +842,41 @@ mod tests {
         });
     }
 
-    /// A directory removed after it was opened lists as empty instead of failing the listing,
-    /// although Linux reports `ENOENT` when it is read.
+    /// A directory removed after it was opened lists as empty and as removed, instead of
+    /// failing the listing, although only Linux reports `ENOENT` when it is read (macOS lists
+    /// nothing without an error); one replaced at its name after it was opened lists as
+    /// removed too, though its old entries are read. A directory left in place lists as it is,
+    /// nothing removed (control).
     #[test]
-    fn a_directory_removed_while_open_lists_as_empty() {
+    fn a_directory_removed_or_replaced_while_open_lists_as_removed() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("dir");
         std::fs::create_dir(&dir).unwrap();
+        let at = super::At::path(&dir);
+        for own in [Own::Nothing, Own::PrivateSize, Own::Extents] {
+            let opened = super::open(&dir).unwrap().unwrap();
+            let listed = super::list(&opened, own, at).unwrap();
+            assert_eq!(listed.vanished, [], "{own:?}");
+        }
         let opened = super::open(&dir).unwrap().unwrap();
         std::fs::remove_dir(&dir).unwrap();
         for own in [Own::Nothing, Own::PrivateSize, Own::Extents] {
-            let listed = super::list(&opened, own).unwrap();
+            let listed = super::list(&opened, own, at).unwrap();
             assert_eq!(listed.entries, [], "{own:?}");
+            assert_eq!(listed.vanished, [None], "{own:?}");
+        }
+
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("old"), b"").unwrap();
+        for own in [Own::Nothing, Own::PrivateSize, Own::Extents] {
+            let opened = super::open(&dir).unwrap().unwrap();
+            std::fs::rename(&dir, tmp.path().join("aside")).unwrap();
+            std::fs::create_dir(&dir).unwrap();
+            let listed = super::list(&opened, own, at).unwrap();
+            assert_eq!(listed.entries.len(), 1, "{own:?}");
+            assert_eq!(listed.vanished, [None], "{own:?}");
+            std::fs::remove_dir(&dir).unwrap();
+            std::fs::rename(tmp.path().join("aside"), &dir).unwrap();
         }
     }
 
@@ -771,7 +890,7 @@ mod tests {
         assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
         let _socket = std::os::unix::net::UnixListener::bind(tmp.path().join("socket")).unwrap();
         let opened = super::open(tmp.path()).unwrap().unwrap();
-        let listed = super::list(&opened, Own::Nothing).unwrap();
+        let listed = super::list(&opened, Own::Nothing, super::At::path(tmp.path())).unwrap();
         let kinds: Vec<_> = listed.entries.iter().map(|(_, st, _)| st.kind).collect();
         assert_eq!(kinds, [Kind::Fifo, Kind::Socket]);
         let null = std::fs::File::open("/dev").unwrap();
@@ -811,7 +930,7 @@ mod tests {
         let cloned = clone(&dir.join("own"), &dir.join("clone-a"))
             && clone(&dir.join("own"), &dir.join("clone-b"));
         let opened = super::open(&dir).unwrap().unwrap();
-        let listed = super::list(&opened, Own::PrivateSize).unwrap();
+        let listed = super::list(&opened, Own::PrivateSize, super::At::path(&dir)).unwrap();
         let read = |name: &str| {
             listed
                 .entries
@@ -832,7 +951,7 @@ mod tests {
             assert_eq!(read("empty").1, Some(0));
             std::fs::write(dir.join("fresh"), vec![1_u8; 32 * 1024]).unwrap();
             let opened = super::open(&dir).unwrap().unwrap();
-            let again = super::list(&opened, Own::PrivateSize).unwrap();
+            let again = super::list(&opened, Own::PrivateSize, super::At::path(&dir)).unwrap();
             let (allocated, private) = again
                 .entries
                 .iter()
@@ -875,7 +994,7 @@ mod tests {
             .sync_all()
             .unwrap();
         let opened = super::open(&dir).unwrap().unwrap();
-        let listed = super::list(&opened, Own::Extents).unwrap();
+        let listed = super::list(&opened, Own::Extents, super::At::path(&dir)).unwrap();
         let read = |name: &str| {
             listed
                 .entries

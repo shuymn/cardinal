@@ -243,6 +243,12 @@ pub struct Walk {
     /// directory the walk recorded and did not list, the target included, whose contents the
     /// bound would leave out.
     pub unmeasured: Vec<(PathBuf, String)>,
+    /// The directories below the root the walk recorded and did not list, worktree-relative:
+    /// on another device or mount, or replaced or removed before it listed them.
+    pub unlisted: Vec<PathBuf>,
+    /// What was removed while the walk read it, worktree-relative: a directory gone before it
+    /// was listed or while it was, and an entry gone before its `lstat`.
+    pub vanished: Vec<PathBuf>,
 }
 
 impl Walk {
@@ -348,7 +354,10 @@ struct Sizes {
 /// file's file index and link count are read too (`os::file_links`), which `std` metadata
 /// leaves out, so a file with several names is told apart as on Unix.
 fn lstat(rel: PathBuf, path: &Path) -> io::Result<Entry> {
-    let entry = Entry::from_metadata(rel, &std::fs::symlink_metadata(path)?);
+    let meta = std::fs::symlink_metadata(path)?;
+    // An mtime that cannot be read fails the walk, never reads as the epoch (section 9.8).
+    meta.modified()?;
+    let entry = Entry::from_metadata(rel, &meta);
     #[cfg(windows)]
     if entry.kind == EntryKind::File {
         let (ino, nlink) = crate::os::file_links(path)?;
@@ -372,7 +381,69 @@ fn lstat(rel: PathBuf, path: &Path) -> io::Result<Entry> {
 /// target's mount; its entries are read relative to it. A target that fails this is reported
 /// as [`Mount::Boundary`]; a directory below it is recorded as the walk saw it and not entered.
 pub fn walk(worktree: &Path, target: &Path) -> io::Result<Walk> {
-    walk_listed(worktree, target).map(|(walk, _)| walk)
+    walk_reading(worktree, target, true)
+}
+
+/// [`walk`] reading no sizes: no regular file's private size or extents, only what `lstat`
+/// reports, which is all [`crate::plan::walk_newest`] reads (section 9.8). Its bound is
+/// unknown wherever a file's own reading would count.
+pub fn walk_times(worktree: &Path, target: &Path) -> io::Result<Walk> {
+    walk_reading(worktree, target, false)
+}
+
+/// [`walk`], reading each regular file's own size with `sizes` set.
+fn walk_reading(worktree: &Path, target: &Path, sizes: bool) -> io::Result<Walk> {
+    let Checked {
+        mut root,
+        mount,
+        link_in_path,
+        listing,
+    } = check_root(worktree, target)?;
+    let fs_type = fs_type(target, listing.as_ref().map(|(listing, _)| listing));
+    let own = if sizes {
+        own(&Measure::of(&fs_type))
+    } else {
+        own(&Measure::NotMeasured)
+    };
+    let mut entries = Vec::new();
+    let mut boundaries = Vec::new();
+    let mut unlisted = Vec::new();
+    let mut unmeasured = Vec::new();
+    let mut vanished = Vec::new();
+    if root.kind == EntryKind::File {
+        match own_of_file(target, &root, own) {
+            Ok(read) => root.own = read,
+            Err(err) => unmeasured.push((root.rel.clone(), err.to_string())),
+        }
+    }
+    if root.kind == EntryKind::Dir && listing.is_none() {
+        unmeasured.push((root.rel.clone(), "the target was not listed".to_owned()));
+    }
+    if let Some((listing, on_mount)) = listing {
+        walk_dir(
+            worktree,
+            (listing, own),
+            (&root.rel, root.dev, &on_mount),
+            &mut entries,
+            Unread {
+                boundaries: &mut boundaries,
+                unlisted: &mut unlisted,
+                unmeasured: &mut unmeasured,
+                vanished: &mut vanished,
+            },
+        )?;
+    }
+    Ok(Walk {
+        root,
+        mount,
+        link_in_path,
+        entries,
+        boundaries,
+        fs_type,
+        unmeasured,
+        unlisted,
+        vanished,
+    })
 }
 
 /// A walk of a worktree root that the walks of directories inside it can be taken from
@@ -381,20 +452,12 @@ pub fn walk(worktree: &Path, target: &Path) -> io::Result<Walk> {
 pub struct Tree {
     /// The walk of the worktree root.
     pub walk: Walk,
-    /// The directories the walk recorded and did not list: on another device or mount, or
-    /// replaced or removed before it listed them.
-    unlisted: std::collections::HashSet<PathBuf>,
 }
 
 impl Tree {
-    /// Walks the worktree root `worktree` as [`walk`] does, keeping what [`Tree::walk_of`]
-    /// needs.
+    /// Walks the worktree root `worktree` as [`walk`] does.
     pub fn walk(worktree: &Path) -> io::Result<Self> {
-        let (walk, unlisted) = walk_listed(worktree, worktree)?;
-        Ok(Self {
-            walk,
-            unlisted: unlisted.into_iter().collect(),
-        })
+        walk(worktree, worktree).map(|walk| Self { walk })
     }
 
     /// The walk of the directory `rel` (worktree-relative) below the root `worktree`, as
@@ -422,7 +485,7 @@ impl Tree {
         if cfg!(windows)
             || !listed_root
             || rel.as_os_str().is_empty()
-            || self.unlisted.contains(rel)
+            || root.unlisted.iter().any(|dir| dir == rel)
         {
             return None;
         }
@@ -455,6 +518,7 @@ impl Tree {
             .filter(|(path, _)| below(path))
             .cloned()
             .collect();
+        let of = |paths: &[PathBuf]| paths.iter().filter(|p| below(p)).cloned().collect();
         Some(Walk {
             root: target.clone(),
             mount: Mount::Same,
@@ -465,52 +529,18 @@ impl Tree {
             fs_type: testpoint::fake_fs_type(&worktree.join(rel))
                 .map_or_else(|| root.fs_type.clone(), Ok),
             unmeasured,
+            unlisted: of(&root.unlisted),
+            vanished: of(&root.vanished),
         })
     }
 }
 
-/// [`walk`], with the directories it recorded and did not list (see [`Tree`]).
-fn walk_listed(worktree: &Path, target: &Path) -> io::Result<(Walk, Vec<PathBuf>)> {
-    let Checked {
-        mut root,
-        mount,
-        link_in_path,
-        listing,
-    } = check_root(worktree, target)?;
-    let fs_type = fs_type(target, listing.as_ref().map(|(listing, _)| listing));
-    let own = own(&Measure::of(&fs_type));
-    let mut entries = Vec::new();
-    let mut boundaries = Vec::new();
-    let mut unlisted = Vec::new();
-    let mut unmeasured = Vec::new();
-    if root.kind == EntryKind::File {
-        match own_of_file(target, &root, own) {
-            Ok(read) => root.own = read,
-            Err(err) => unmeasured.push((root.rel.clone(), err.to_string())),
-        }
-    }
-    if root.kind == EntryKind::Dir && listing.is_none() {
-        unmeasured.push((root.rel.clone(), "the target was not listed".to_owned()));
-    }
-    if let Some((listing, on_mount)) = listing {
-        walk_dir(
-            worktree,
-            (listing, own),
-            (&root.rel, root.dev, &on_mount),
-            &mut entries,
-            (&mut boundaries, &mut unlisted, &mut unmeasured),
-        )?;
-    }
-    let walk = Walk {
-        root,
-        mount,
-        link_in_path,
-        entries,
-        boundaries,
-        fs_type,
-        unmeasured,
-    };
-    Ok((walk, unlisted))
+/// What [`walk_dir`] records beside the entries.
+struct Unread<'a> {
+    boundaries: &'a mut Vec<PathBuf>,
+    unlisted: &'a mut Vec<PathBuf>,
+    unmeasured: &'a mut Vec<(PathBuf, String)>,
+    vanished: &'a mut Vec<PathBuf>,
 }
 
 /// What a walk reads of its target before it lists anything below it.
@@ -663,22 +693,25 @@ fn mount_id(_path: &Path) -> Result<MountKey, String> {
 /// entry was read, is recorded but never listed, and a mount that cannot be read fails the
 /// walk. Each directory is listed in full and closed before anything below it is opened, so
 /// one directory is open at a time. A directory found on another device or mount by its path
-/// goes into `boundaries` too, and every directory recorded and not listed into `unlisted` and
-/// `unmeasured`.
+/// goes into `boundaries` too, every directory recorded and not listed into `unlisted` and
+/// `unmeasured`, and what was removed while it was read into `vanished`.
 fn walk_dir(
     worktree: &Path,
     (listing, own): (Listing, Own),
     (rel, dev, on_mount): (&Path, u64, &MountKey),
     out: &mut Vec<Entry>,
-    (boundaries, unlisted, unmeasured): (
-        &mut Vec<PathBuf>,
-        &mut Vec<PathBuf>,
-        &mut Vec<(PathBuf, String)>,
-    ),
+    unread: Unread<'_>,
 ) -> io::Result<()> {
+    let Unread {
+        boundaries,
+        unlisted,
+        unmeasured,
+        vanished,
+    } = unread;
     let mut list = |listing: Listing, rel: &Path| -> io::Result<std::vec::IntoIter<Entry>> {
-        let (entries, unread) = listing.entries(rel, own)?;
+        let (entries, unread, gone) = listing.entries(rel, own)?;
         unmeasured.extend(unread);
+        vanished.extend(gone);
         let faked: Vec<Entry> = entries
             .into_iter()
             .map(|e| {
@@ -689,6 +722,7 @@ fn walk_dir(
         Ok(faked.into_iter())
     };
     let mut not_listed = Vec::new();
+    let mut removed = Vec::new();
     // The remaining entries of each directory being walked, innermost last.
     let mut pending = vec![list(listing, rel)?];
     while let Some(level) = pending.last_mut() {
@@ -707,7 +741,10 @@ fn walk_dir(
             let enter = match mount_id(&path) {
                 Ok(mount) => mount == *on_mount,
                 // Removed since it was listed: the entry stays as it was seen.
-                Err(_) if gone(&path) => false,
+                Err(_) if gone(&path) => {
+                    removed.push(entry.rel.clone());
+                    false
+                }
                 Err(err) => return Err(io::Error::other(err)),
             };
             if !enter && !gone(&path) {
@@ -726,7 +763,9 @@ fn walk_dir(
                     // Replaced or removed since its entry was read: the entry stays as it was
                     // seen.
                     Ok(None) => {}
-                    Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                        removed.push(entry.rel.clone());
+                    }
                     Err(err) => return Err(err),
                 }
             }
@@ -738,6 +777,7 @@ fn walk_dir(
         out.push(entry);
     }
     unmeasured.extend(not_listed);
+    vanished.extend(removed);
     Ok(())
 }
 
@@ -746,12 +786,15 @@ fn gone(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_err_and(|err| err.kind() == io::ErrorKind::NotFound)
 }
 
+/// What [`Listing::entries`] read: the entries, the reads of the bound's measure that failed,
+/// and what was removed while it was read.
+type Listed = (Vec<Entry>, Vec<(PathBuf, String)>, Vec<PathBuf>);
+
 /// A directory the walk lists: on Unix, opened and found to be the directory the walk
 /// recorded, on the target's mount.
 struct Listing {
     #[cfg(unix)]
     dir: std::fs::File,
-    #[cfg(not(unix))]
     path: PathBuf,
 }
 
@@ -770,7 +813,10 @@ impl Listing {
         {
             return Ok(None);
         }
-        Ok(Some(Self { dir }))
+        Ok(Some(Self {
+            dir,
+            path: path.to_owned(),
+        }))
     }
 
     /// Windows lists by path: a reparse point is recorded as a link and never listed, and
@@ -787,13 +833,15 @@ impl Listing {
     }
 
     /// The entries of the directory below the worktree-relative `rel`, in name order, each
-    /// regular file with what `own` reads of it, and the reads of `own` that failed, by
-    /// worktree-relative path; the directory is closed on return. An entry removed before it
-    /// is read is left out.
+    /// regular file with what `own` reads of it, the reads of `own` that failed, and what was
+    /// removed while it was read, by worktree-relative path; the directory is closed on
+    /// return. An entry removed before it is read is left out.
     #[cfg(unix)]
-    #[expect(clippy::type_complexity, reason = "two lists the walk keeps apart")]
-    fn entries(self, rel: &Path, own: Own) -> io::Result<(Vec<Entry>, Vec<(PathBuf, String)>)> {
-        let listed = crate::os::dir::list(&self.dir, own)?;
+    fn entries(self, rel: &Path, own: Own) -> io::Result<Listed> {
+        let at = crate::os::dir::At::path(&self.path);
+        let listed = crate::os::dir::list_with(&self.dir, own, at, &mut || {
+            testpoint::hit(testpoint::WALK_DIR_LISTED).map_err(io::Error::other)
+        })?;
         let entries = listed
             .entries
             .into_iter()
@@ -807,20 +855,28 @@ impl Listing {
             .into_iter()
             .map(|(name, err)| (name.map_or_else(|| rel.to_path_buf(), |n| rel.join(n)), err))
             .collect();
-        Ok((entries, unread))
+        let vanished = listed
+            .vanished
+            .into_iter()
+            .map(|name| name.map_or_else(|| rel.to_path_buf(), |n| rel.join(n)))
+            .collect();
+        Ok((entries, unread, vanished))
     }
 
-    /// The entries of the directory below the worktree-relative `rel`, in name order. An
-    /// entry removed before it is read is left out.
+    /// The entries of the directory below the worktree-relative `rel`, in name order, and
+    /// what was removed while it was read. An entry removed before it is read is left out.
     #[cfg(not(unix))]
-    #[expect(clippy::type_complexity, reason = "two lists the walk keeps apart")]
-    fn entries(self, rel: &Path, _own: Own) -> io::Result<(Vec<Entry>, Vec<(PathBuf, String)>)> {
+    fn entries(self, rel: &Path, _own: Own) -> io::Result<Listed> {
         let mut names = Vec::new();
+        let mut vanished = Vec::new();
         for entry in std::fs::read_dir(&self.path)? {
             match entry {
                 Ok(entry) => names.push(entry.file_name()),
                 // The directory was removed while it was read: what was read stays.
-                Err(err) if err.kind() == io::ErrorKind::NotFound => break,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                    vanished.push(rel.to_path_buf());
+                    break;
+                }
                 Err(err) => return Err(err),
             }
         }
@@ -834,11 +890,13 @@ impl Listing {
             // it.
             match lstat(rel.join(&name), &path) {
                 Ok(entry) => entries.push(entry),
-                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                    vanished.push(rel.join(&name));
+                }
                 Err(err) => return Err(err),
             }
         }
-        Ok((entries, Vec::new()))
+        Ok((entries, Vec::new(), vanished))
     }
 }
 
@@ -1009,8 +1067,98 @@ mod tests {
         std::fs::create_dir_all(wt.join("node_modules/a")).unwrap();
         let mut tree = super::Tree::walk(&wt).unwrap();
         assert!(tree.walk_of(&wt, "node_modules".as_ref()).is_some());
-        tree.unlisted.insert("node_modules".into());
+        tree.walk.unlisted.push("node_modules".into());
         assert_eq!(tree.walk_of(&wt, "node_modules".as_ref()), None);
+    }
+
+    /// A walk taken from the worktree's keeps what the worktree's walk did not list, and what
+    /// was removed while it read, below the directory, and nothing outside it: its reading of
+    /// the entries is unknown and activity as a walk of its own would be (section 9.8).
+    #[cfg(unix)]
+    #[test]
+    fn a_walk_taken_keeps_what_was_not_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = dunce::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir_all(wt.join("node_modules/a")).unwrap();
+        std::fs::create_dir_all(wt.join("target")).unwrap();
+        let mut tree = super::Tree::walk(&wt).unwrap();
+        tree.walk
+            .unlisted
+            .extend(["node_modules/a".into(), "target/b".into()]);
+        tree.walk
+            .vanished
+            .extend(["node_modules/c".into(), "target/d".into()]);
+        let taken = tree.walk_of(&wt, "node_modules".as_ref()).unwrap();
+        assert_eq!(taken.unlisted, [std::path::PathBuf::from("node_modules/a")]);
+        assert_eq!(taken.vanished, [std::path::PathBuf::from("node_modules/c")]);
+        let newest = crate::plan::walk_newest(&wt, &taken);
+        assert!(
+            newest
+                .unknown
+                .is_some_and(|why| why.contains("node_modules/a"))
+        );
+        assert_eq!(newest.vanished, Some(wt.join("node_modules/c")));
+        let target = tree.walk_of(&wt, "target".as_ref()).unwrap();
+        assert_eq!(target.unlisted, [std::path::PathBuf::from("target/b")]);
+    }
+
+    /// The read of the other targets (section 9.8) reads what `lstat` reports and no file's own
+    /// size: on APFS a walk reads each regular file's private size (control), the times-only
+    /// walk none, and both record the same entries.
+    #[cfg(unix)]
+    #[test]
+    fn a_times_walk_reads_no_sizes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = dunce::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir_all(wt.join("node_modules/pkg")).unwrap();
+        std::fs::write(wt.join("node_modules/pkg/index.js"), vec![7_u8; 8192]).unwrap();
+        let target = wt.join("node_modules");
+        let (sized, times) = (
+            super::walk(&wt, &target).unwrap(),
+            super::walk_times(&wt, &target).unwrap(),
+        );
+        let file = |walk: &super::Walk| {
+            walk.entries
+                .iter()
+                .find(|e| e.kind == super::EntryKind::File)
+                .cloned()
+                .unwrap()
+        };
+        if sized.fs_type.as_deref() == Ok("apfs") {
+            assert!(file(&sized).own.is_some(), "{sized:?}");
+        }
+        assert_eq!(file(&times).own, None, "{times:?}");
+        let rels = |walk: &super::Walk| {
+            walk.entries
+                .iter()
+                .map(|e| e.rel.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(rels(&times), rels(&sized));
+    }
+
+    /// A target's own reading (section 9.8): a directory below it its walk recorded and did not
+    /// list on its mount leaves its entries unknown; one on another mount, which `plain_target`
+    /// refuses, does not (control), and neither does a walk that listed everything (control).
+    #[cfg(unix)]
+    #[test]
+    fn an_unlisted_directory_of_the_target_is_unknown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = dunce::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir_all(wt.join("target/b")).unwrap();
+        let mut walk = super::walk(&wt, &wt.join("target")).unwrap();
+        let own = |walk: &super::Walk| crate::plan::checks::entries_newest(&wt, walk);
+        assert_eq!(own(&walk).unknown, None);
+        walk.unlisted.push("target/b".into());
+        assert!(
+            own(&walk)
+                .unknown
+                .is_some_and(|why| why.contains("target/b")),
+            "{:?}",
+            own(&walk)
+        );
+        walk.boundaries.push("target/b".into());
+        assert_eq!(own(&walk).unknown, None);
     }
 
     /// A directory replaced by another or by a symbolic link, or removed, since the worktree's

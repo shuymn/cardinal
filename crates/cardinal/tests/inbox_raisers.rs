@@ -205,6 +205,7 @@ fn observation(inventory: Inventory, plans: Vec<Plan>) -> Observation {
         plans,
         checks_ms,
         own_file_bytes: std::collections::BTreeMap::default(),
+        in_use_unknown: Vec::new(),
     }
 }
 
@@ -987,6 +988,7 @@ fn report(at_ms: u64, free_bytes: u64) -> DiskReport {
             freed_bytes: None,
         }],
         shortfall_bytes: 0,
+        reachable_bytes: None,
         blocked: vec![cardinal::contract::ReportBlocked {
             worktree: "/u".into(),
             target: "/u/target".into(),

@@ -483,8 +483,11 @@ fn session_end_keeps_its_budget() {
     let records_lock = state::lock(&state.records_lock(), LockMode::Exclusive, held).unwrap();
     let took = run();
     drop((lease_lock, records_lock));
-    // 1.4 s: `session-end`'s deadline from its start (section 9.8).
-    let bound = Duration::from_millis(1400) + control + Duration::from_millis(100);
+    // 1.4 s: `session-end`'s deadline from its start (section 9.8), plus the control and a
+    // margin for one slow process start on a loaded CI runner (the held run took 147 ms more
+    // than the control there). Waits that stack, 250 ms for the lease and 1 s for each record,
+    // took 2.27 s, still well past this bound.
+    let bound = Duration::from_millis(1400) + control + Duration::from_millis(500);
     assert!(took < bound, "took {took:?}, bound {bound:?}");
     assert_eq!(records(&dirs).len(), 1, "dropped, never waited for");
 }

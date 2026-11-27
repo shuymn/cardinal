@@ -264,6 +264,21 @@ pub fn file_links(path: &Path) -> std::io::Result<(u64, u64)> {
     windows::file_links(path)
 }
 
+/// The identity of the open file `file`: its device and inode on Unix, its volume's serial
+/// number and its file index on Windows.
+pub fn file_id(file: &std::fs::File) -> std::io::Result<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = file.metadata()?;
+        Ok((meta.dev(), meta.ino()))
+    }
+    #[cfg(windows)]
+    {
+        windows::file_id(file)
+    }
+}
+
 /// Opens `path` with `options` as a regular file only: the open neither follows a final
 /// symbolic link (Unix `O_NOFOLLOW`, Windows `FILE_FLAG_OPEN_REPARSE_POINT`) nor blocks
 /// (`O_NONBLOCK`, which a FIFO would otherwise wait in), and anything but a regular file is

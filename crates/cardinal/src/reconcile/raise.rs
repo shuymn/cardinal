@@ -1,6 +1,7 @@
 //! Inbox items raised from a pass's observation and disk states (`docs/architecture.md`
 //! section 10.1): `reclaimable`, `merge_undecided`, `closed_pr_dirty`, `managed_merged`, and
-//! `unclassifiable_data` from the full observation, `disk_low` and `disk_critical` from the
+//! `unclassifiable_data` from the full observation, `in_use_unknown` from its runs of
+//! `not_in_use` read as `unknown`, `disk_low` and `disk_critical` from the
 //! disk states with their disk reports, and `reclaim_stranded` from the trash listing: raised
 //! for an entry no execution names, ended for every item whose trash entry is gone. Each
 //! raises and ends occurrences through the inbox.
@@ -30,6 +31,10 @@ use crate::observe;
 use crate::state::{self, StateDir};
 
 use super::Observation;
+
+/// How many full observations in a row must read a worktree's `not_in_use` as `unknown`
+/// before `in_use_unknown` is raised (section 9.8).
+pub const IN_USE_UNKNOWN_AFTER: u32 = 3;
 
 /// How many unclassifiable paths an item's evidence lists.
 const EVIDENCE_PATHS: usize = 50;
@@ -212,6 +217,26 @@ fn worktree_changes(
     for (repo, worktree) in listed.values() {
         changes.extend(fact_items(inventory, repo, worktree).into_iter().map(raise));
     }
+    for streak in &observation.in_use_unknown {
+        if streak.streak < IN_USE_UNKNOWN_AFTER {
+            continue;
+        }
+        let Some((repo, worktree)) = listed.get(streak.worktree.as_str()) else {
+            continue;
+        };
+        let path = worktree.path.as_str();
+        changes.push(raise(NewItem {
+            key: format!("in_use_unknown:{path}"),
+            kind: InboxKind::InUseUnknown,
+            subject: subject(path, worktree.head.as_ref(), worktree.branch.as_ref()),
+            evidence: object(serde_json::json!({
+                "observed_ms": found_ms,
+                "repo": repo.common_dir,
+                "input": streak.input,
+                "streak": streak.streak,
+            })),
+        }));
+    }
     for (condition, item) in before {
         if item.ended_ms.is_some() {
             continue;
@@ -363,6 +388,7 @@ fn worktree_cleared(condition: &str, item: &InboxItem, listed: &Listed<'_>) -> O
             | InboxKind::ClosedPrDirty
             | InboxKind::ManagedMerged
             | InboxKind::UnclassifiableData
+            | InboxKind::InUseUnknown
     ) {
         return None;
     }
@@ -386,6 +412,9 @@ fn worktree_cleared(condition: &str, item: &InboxItem, listed: &Listed<'_>) -> O
         }),
         InboxKind::ClosedPrDirty => {
             (facts.dirty == Tri::No).then(|| "the worktree is clean".to_owned())
+        }
+        InboxKind::InUseUnknown => {
+            (!unknown(worktree, "not_in_use")).then(|| "not_in_use reads pass or fail".to_owned())
         }
         _ => {
             if unknown(worktree, "no_unclassifiable") {

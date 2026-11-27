@@ -131,6 +131,7 @@ fn set_host(d: &mut Disk, mount: &Path, lines: (u64, u64, u64), reserve_mib: u64
     let (critical, warning, recovery) = lines;
     let main = d.s.main.display().to_string();
     d.s.scene.clear_observe_config();
+    d.s.scene.covered = vec![mount.to_path_buf()];
     d.s.scene.observe_config(&format!(
         "repos = ['{main}']\n[disk]\ncritical_mib = 0\nwarning_mib = 1\nrecovery_mib = 2\n\
          reserve_mib = {reserve_mib}\nvolumes = [{{ mount = '{}', critical_mib = {critical}, \

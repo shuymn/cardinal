@@ -22,24 +22,29 @@ use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read as _};
+use std::os::fd::AsFd as _;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
 use std::path::{Component, Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use super::delete::{self, Deletion, Stop, Watch};
 use super::recover::{self, ClaimRead, ExecutionLock, Locked, Published, Recovered, RestoreError};
 use super::unix::Target;
-use super::{EXECUTION_NOT_GRANTED, Evaluated, Outcome, Run};
+use super::{EXECUTION_NOT_GRANTED, Evaluated, Outcome, Run, SESSIONS_UNCOVERED};
+use crate::admission::LeaseHold;
 use crate::config::{Config, without_userinfo};
 use crate::contract::{
     ActClaim, ActClaimSchema, ActResult, ActStatus, Caller, ChainDir, Check, CheckResult,
     ClaimRepo, ClaimStage, ClaimTarget, ClaimWorktree, EntryPath, EntryType, Error, ErrorCode,
     ManifestEntry, PlanKind, Provenance,
 };
-use crate::observe::{BoundGit, IgnoreValues, IndexEntry, Measure, WorktreeObservation};
+use crate::observe::{
+    BoundGit, IgnoreValues, IndexEntry, Measure, Newest, Quiet, WorktreeObservation, quiet,
+};
 use crate::os::dir::{self, Kind};
 use crate::os::mount;
-use crate::plan::{self, DataLists, EntryKind, InUseFacts, Inspection, Walk};
+use crate::plan::{self, Activity, DataLists, EntryKind, InUseFacts, Inspection, Walk};
 use crate::state::{self, FileLock, LockMode, Op, StateDir};
 use crate::testpoint;
 
@@ -338,6 +343,14 @@ struct Execution<'r, 'a> {
     walk: Walk,
     target: Target,
     observation: WorktreeObservation,
+    /// The newest entry step 5 read below the worktree's regenerable targets, the target's
+    /// own entries (its snapshot) included, which steps 7 and 8 judge again at their window
+    /// (section 9.8).
+    kept: Newest,
+    /// When the reads of steps 7 and 8 after the move must have finished, set as step 7
+    /// begins: `[observe] git_timeout_ms` later, which bounds step 8's git commands too
+    /// (section 9.8).
+    reads_by: Option<Instant>,
     lock: ExecutionLock,
     in_use: Option<FileLock>,
 }
@@ -367,6 +380,7 @@ impl<'r, 'a> Execution<'r, 'a> {
             outcome,
             snapshot,
             observation,
+            targets,
             ..
         } = evaluated;
         // Every invariant passed, so the snapshot and the observation were read.
@@ -378,12 +392,15 @@ impl<'r, 'a> Execution<'r, 'a> {
                 ..outcome
             })));
         };
+        let kept = targets.merge(&plan::entries_newest(&r.worktree(), &walk));
         Ok(Self {
             r,
             outcome,
             walk,
             target,
             observation,
+            kept,
+            reads_by: None,
             lock,
             in_use: Some(in_use),
         })
@@ -595,6 +612,28 @@ impl Execution<'_, '_> {
                 };
                 return self.restore(parent, outcome);
             }
+            Err(Commit::Uncovered(why)) => {
+                let outcome = Outcome {
+                    status: ActStatus::DryRun,
+                    reasons: vec![SESSIONS_UNCOVERED.into()],
+                    error: Some(why),
+                    ..self.outcome.clone()
+                };
+                return self.restore(parent, outcome);
+            }
+            Err(Commit::InUse(result, why)) => {
+                if let Some(check) = self
+                    .outcome
+                    .checks
+                    .iter_mut()
+                    .find(|c| c.name == "not_in_use")
+                {
+                    check.result = result;
+                    check.detail.clone_from(&why);
+                }
+                let outcome = self.failed(vec!["not_in_use".into()], format!("in use: {why}"));
+                return self.restore(parent, outcome);
+            }
         }
         let published = recover::publish_staged(
             self.state(),
@@ -790,6 +829,9 @@ impl Execution<'_, '_> {
                 fail(SPARSE_CHECKOUT, why.clone());
                 fail(TRACKED_OVERLAP, why);
             }
+        }
+        if let Some(why) = uncovered(self.r.config, &self.worktree()) {
+            fail(SESSIONS_UNCOVERED, why);
         }
         let classification = self.classification(git);
         if let Err(why) = &classification {
@@ -1165,7 +1207,9 @@ impl Execution<'_, '_> {
         // 6. Check again.
         self.check_again(git)?;
         // 7. In use, last.
-        self.in_use_last()
+        self.in_use_last()?;
+        git.bound_by(self.reads_by);
+        Ok(())
     }
 
     /// Whether the planned path, walked by name from a fresh open of the worktree root, leads
@@ -1209,9 +1253,10 @@ impl Execution<'_, '_> {
             let fd = dir::open_at(entry, OsStr::new("t"))?
                 .ok_or_else(|| io::Error::other("t is not a directory"))?;
             let mount = mount::of_dir(&fd).map_err(io::Error::other)?;
-            super::unix::walk_moved(&fd.into(), (root.dev, &mount), &at)
+            let moved = (&fd.into(), entry.as_fd(), OsStr::new("t"));
+            super::unix::walk_moved(moved, (root.dev, &mount), &at)
         })();
-        let Ok((entries, boundaries)) = walked else {
+        let Ok((entries, not_read)) = walked else {
             return vec![PathBuf::new()];
         };
         let target_rel = self.target.rel();
@@ -1230,7 +1275,10 @@ impl Execution<'_, '_> {
                 changed.push(found.rel.clone());
             }
         }
-        changed.extend(boundaries);
+        // What either walk did not read whole: the snapshot's then the moved tree's.
+        let unread = self.walk.unlisted.iter().chain(&self.walk.vanished);
+        changed.extend(unread.filter_map(|p| Some(p.strip_prefix(target_rel).ok()?.to_path_buf())));
+        changed.extend(not_read);
         changed.extend(expected.into_keys());
         changed.sort();
         changed.dedup();
@@ -1270,6 +1318,7 @@ impl Execution<'_, '_> {
             reservations: Err(String::new()),
             processes: Err(String::new()),
             descriptors: None,
+            activity: Activity::unread(),
         };
         let worktree = self.worktree();
         let target = worktree.join(self.target.rel());
@@ -1322,23 +1371,34 @@ impl Execution<'_, '_> {
     }
 
     /// Step 7: the reservations naming the worktree, the working directories inside it or the
-    /// trash entry, and the descriptor scan of the trash entry; anything found fails
-    /// `not_in_use`.
+    /// trash entry, the descriptor scan of the trash entry, and the session lease and the
+    /// activity signals of section 9.8 on step 4's observation, the target left out (its
+    /// entries were step 5's comparison's); anything found fails `not_in_use`. The signals and
+    /// the scan of the working directories, here and at step 8, are read by [`Self::reads_by`].
     fn in_use_last(&mut self) -> Result<(), Box<Outcome>> {
+        let bound = Duration::from_millis(self.r.config.host.observe.git_timeout_ms);
+        self.reads_by = Some(Instant::now() + bound);
         let worktree = self.worktree();
         let key = state::worktree_key(&worktree);
         let entry = self.entry();
-        let processes = plan::processes_inside(&worktree).and_then(|mut pids| {
-            pids.extend(plan::processes_inside(&entry)?);
-            pids.sort_unstable();
-            pids.dedup();
-            Ok(pids)
-        });
+        let target = worktree.join(self.target.rel());
+        let activity = Activity {
+            targets: Some(self.kept.clone()),
+            ..plan::activity(
+                self.state(),
+                &self.r.config.host.sessions,
+                &self.observation.worktree,
+                (Some(&target), self.reads_by),
+                false,
+            )
+        };
+        let processes = self.processes_inside();
         let in_use = InUseFacts {
             lock_held: Ok(false),
             reservations: self.r.reservations(&key),
             processes,
             descriptors: plan::descriptor_scan(PlanKind::ReclaimDir),
+            activity,
         };
         let patterns = DataLists::default();
         let inspection = Inspection {
@@ -1450,7 +1510,85 @@ impl Execution<'_, '_> {
         {
             return Err(Commit::NotGranted(format!("unit.{name}.act is false")));
         }
-        self.identities(facts, pin)
+        if let Some(why) = uncovered(&config, &self.worktree()) {
+            return Err(Commit::Uncovered(why));
+        }
+        self.identities(facts, pin)?;
+        self.in_use_at_commit(git, &config)?;
+        // Right before the publication.
+        self.in_time()
+    }
+
+    /// Step 8's last read of section 9.8, after the identities and the pin: the session lease,
+    /// step 7's scan of the working directories, step 7's signals, and a fresh bounded
+    /// `git status`, each path it lists `lstat`ed with
+    /// step 4's, each once, and each ignored entry it lists read with step 4's, under the
+    /// reloaded `linger_s` and `quiet_s`; and step 5's newest entry below the regenerable
+    /// targets, the target's own included, judged again under the reloaded `quiet_s`.
+    fn in_use_at_commit(&self, git: &BoundGit<'_>, config: &Config) -> Result<(), Commit> {
+        let mut worktree = self.observation.worktree.clone();
+        let fresh = git.status_paths();
+        worktree.status_paths = match (&worktree.status_paths, &fresh) {
+            (Some(listed), Ok((paths, _))) => Some(quiet::union_status(listed, paths)),
+            _ => None,
+        };
+        if let Ok((_, ignored)) = &fresh {
+            let root = Path::new(&self.observation.worktree.path);
+            let fresh = ignored.iter().map(|rel| root.join(rel)).collect();
+            worktree.ignored = quiet::union_ignored(&worktree.ignored, fresh);
+        }
+        let target = self.worktree().join(self.target.rel());
+        let mut activity = plan::activity(
+            self.state(),
+            &config.host.sessions,
+            &worktree,
+            (Some(&target), self.reads_by),
+            false,
+        );
+        activity.quiet = activity.quiet.and(self.kept.judge(activity.window));
+        let processes = self.processes_inside();
+        if let Err(err) = testpoint::hit(testpoint::ACT_CWD_READ) {
+            return Err(Commit::InUse(CheckResult::Unknown, err.to_string()));
+        }
+        let fail = |why: String| Err(Commit::InUse(CheckResult::Fail, why));
+        let unknown = |why: String| Err(Commit::InUse(CheckResult::Unknown, why));
+        match (activity.lease, processes, activity.quiet) {
+            (LeaseHold::Holds(who), ..) => fail(format!("the session lease holds it: {who}")),
+            (_, Ok(pids), _) if !pids.is_empty() => {
+                let pids: Vec<String> = pids.iter().map(u32::to_string).collect();
+                fail(format!(
+                    "processes with their working directory inside: {}",
+                    pids.join(", ")
+                ))
+            }
+            (.., Quiet::Active(signal)) => fail(format!("not quiet: {signal}")),
+            (LeaseHold::Unknown(why), ..) => unknown(format!("session lease: {why}")),
+            (_, Err(why), _) => unknown(format!("processes: {why}")),
+            (.., Quiet::Unknown(why)) => unknown(format!("quiet period: {why}")),
+            // Every read quiet, and all of them, the scan just returned included, in time.
+            (LeaseHold::Free, Ok(_), Quiet::Quiet) => self.in_time(),
+        }
+    }
+
+    /// Whether the reads after the move are still within [`Self::reads_by`]: past it, `unknown`
+    /// (section 9.8).
+    fn in_time(&self) -> Result<(), Commit> {
+        if quiet::past(self.reads_by) {
+            return Err(Commit::InUse(
+                CheckResult::Unknown,
+                format!("quiet period: {}", quiet::LATE),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The processes whose working directory is inside the worktree or the trash entry, one
+    /// read of the process table for both, each matched as given and as the OS names it
+    /// ([`plan::processes_inside_any`]), by [`Self::reads_by`]: step 7's scan, and step 8's
+    /// again (section 9.8).
+    fn processes_inside(&self) -> Result<Vec<u32>, String> {
+        let (worktree, entry) = (self.worktree(), self.entry());
+        plan::processes_inside_any(&[&worktree, &entry], self.reads_by)
     }
 
     /// The worktree root's and the git dir's identities as step 2 read them, and the index
@@ -1497,6 +1635,8 @@ impl Execution<'_, '_> {
     /// also reads `origin` before each batch, and finishes, or leaves the claim to recovery
     /// when the deletion stopped.
     fn delete(self, git: &BoundGit<'_>, claim: &ActClaim) -> ActResult {
+        // Past the commit, the reads after the move are done.
+        git.bound_by(None);
         let state = self.state();
         let entry = self.entry();
         let manifest = match manifest_of(&self.walk, self.target.rel()) {
@@ -1581,6 +1721,25 @@ enum Commit {
     Changed(String),
     /// The caller's grant was withdrawn, or its unit's gate closed: why.
     NotGranted(String),
+    /// The worktree is no longer under a `[sessions] covered` root: why.
+    Uncovered(String),
+    /// A lease entry holds the worktree, a signal is newer than the quiet period, or one of
+    /// them could not be read whole: `not_in_use` as it now reads.
+    InUse(CheckResult, String),
+}
+
+/// Why the worktree at `worktree` is not covered (section 9.8, "Coverage"): under no
+/// `[sessions] covered` root of `config`, or a root or the worktree could not be resolved;
+/// `None` when it is covered.
+fn uncovered(config: &Config, worktree: &Path) -> Option<String> {
+    match config.host.sessions.covers(worktree) {
+        Ok(true) => None,
+        Ok(false) => Some(format!(
+            "{} is under no [sessions] covered root",
+            worktree.display()
+        )),
+        Err(why) => Some(format!("[sessions] covered: {why}")),
+    }
 }
 
 /// The outcome of a write that failed after the evaluation passed: `rejected`, with `no_space`
@@ -1877,7 +2036,7 @@ mod tests {
         runs: &'a RefCell<Vec<(PathBuf, Vec<OsString>)>>,
         answer: impl Fn(&[OsString]) -> Output + 'a,
     ) -> Box<crate::observe::GitRunner<'a>> {
-        Box::new(move |dir: &Path, argv: &[OsString]| {
+        Box::new(move |dir: &Path, argv: &[OsString], _| {
             runs.borrow_mut().push((dir.to_path_buf(), argv.to_vec()));
             Ok(answer(argv))
         })
@@ -1950,6 +2109,41 @@ mod tests {
                 "{argv:?}"
             );
         }
+    }
+
+    /// Section 9.8: a bound set on the bound git reaches every later command, so step 8's git
+    /// gets only the time left until the deadline of the reads after the move: each command
+    /// run under it is given it, a command started past it fails without running, naming
+    /// "the last read did not finish in time", and with the bound lifted none is given one.
+    #[test]
+    fn a_bound_reaches_every_git_read() {
+        use std::time::{Duration, Instant};
+        let bys = RefCell::new(Vec::new());
+        let git = BoundGit::with_runner(
+            Path::new("/w/a"),
+            Path::new("/r/.git/worktrees/a"),
+            Box::new(|_: &Path, argv: &[OsString], by| {
+                bys.borrow_mut().push(by);
+                Ok(if argv.iter().any(|a| a == "ls-files") {
+                    output(0, b"H src/a.rs\0", b"")
+                } else {
+                    output(0, b"https://example.com/r.git\n", b"")
+                })
+            }),
+        );
+        let by = Instant::now() + Duration::from_secs(600);
+        git.bound_by(Some(by));
+        git.index_entries().unwrap();
+        git.remote_url().unwrap();
+        git.bound_by(Some(Instant::now()));
+        let late = git.index_entries().unwrap_err();
+        assert!(late.contains(crate::observe::quiet::LATE), "{late}");
+        let late = git.remote_url().unwrap_err();
+        assert!(late.contains(crate::observe::quiet::LATE), "{late}");
+        git.bound_by(None);
+        git.index_entries().unwrap();
+        drop(git);
+        assert_eq!(bys.into_inner(), [Some(by), Some(by), None]);
     }
 
     /// A39: a read that is not complete decides nothing. git exiting 0 with a warning on

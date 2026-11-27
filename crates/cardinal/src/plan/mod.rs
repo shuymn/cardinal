@@ -13,23 +13,25 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub use checks::{
-    DataLists, Descriptors, FACT_ENTRIES, InUseFacts, Inspection, approval, bound_facts,
-    descriptor_scan, evaluate, evaluate_only, invariants_ok, processes_inside, provenance,
+    Activity, DataLists, Descriptors, FACT_ENTRIES, InUseFacts, Inspection, approval, bound_facts,
+    descriptor_scan, entries_newest, evaluate, evaluate_only, invariants_ok, processes_inside,
+    processes_inside_any, provenance, walk_newest,
 };
 #[cfg(unix)]
 pub(crate) use checks::{Linked, descriptor_uses, processes_fact};
-pub use walk::{Entry, EntryKind, Mount, Tree, Walk, root_identity, walk};
+pub use walk::{Entry, EntryKind, Mount, Tree, Walk, root_identity, walk, walk_times};
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::admission;
-use crate::config::Config;
+use crate::admission::LeaseHold;
+use crate::config::{Config, Sessions};
 use crate::contract::{
     Error, ErrorCode, InUse, Inventory, ObservedError, Plan, PlanKind, PlanList, PlanListSchema,
     PlanSchema, PlanTarget, Record, RecordKind, Repo, ScopedError, Worktree,
 };
-use crate::observe::{self, InventoryOptions, WorktreeObservation};
+use crate::observe::{self, InventoryOptions, Newest, Quiet, Signals, Window, WorktreeObservation};
 use crate::record::Recorder;
 use crate::state::{self, Durability, Probe, StateDir};
 
@@ -119,7 +121,10 @@ pub fn create(
         }
         _ => {}
     }
-    let built = build(config, state, &sources, kind, &target, &observation);
+    // Built even when invariants fail, so the reason is visible.
+    let built = build_worktree(config, state, &sources, &observation, &[(kind, target)])
+        .pop()
+        .expect("one plan of one target");
     store(config, state, built.plan, None)
 }
 
@@ -294,6 +299,15 @@ impl Drop for SetOnPanic<'_> {
 /// stored. The worktree's own walk, taken first when its plan is among them, gives each
 /// directory below it its walk when it listed that directory and the path holds it still
 /// ([`Tree::walk_of`]); any other target is walked on its own.
+///
+/// Each `reclaim_dir` target's entries are a signal of every plan of the worktree (section
+/// 9.8), so the plans are built in two passes. The first walks each target and reduces its
+/// walk to what its plan keeps ([`Walked`]: every check but `not_in_use`, what that check reads
+/// of the walk, its newest entry, and its sizes) before the next is walked, so the first pass
+/// holds the worktree's walk and one target's walk at most, as a plan built right after its
+/// walk does; the worktree's walk is dropped once every target has its own. The second reads
+/// the lease and the signals once, then the regenerable targets no walk of the first pass read
+/// unless those refuse, and the in-use facts, and finishes each plan with `not_in_use`.
 fn build_worktree(
     config: &Config,
     state: &StateDir,
@@ -309,47 +323,171 @@ fn build_worktree(
         .first()
         .filter(|(kind, target)| whole(*kind, target))
         .map(|_| Tree::walk(worktree).map_err(|err| walk_error(worktree, &err)));
-    // One read of the processes working in the worktree for its plans, and one descriptor scan
-    // for its `reclaim_dir` targets, each read with the first plan that needs it, after the
-    // worktree's walk.
-    let mut working = None;
+    // One descriptor scan for the worktree's `reclaim_dir` targets, read with the first that
+    // needs it, after its walk.
     let mut scan = None;
-    let mut plans = Vec::with_capacity(targets.len());
-    for (kind, target) in targets {
-        let processes = working
-            .get_or_insert_with(|| processes_inside(worktree))
-            .clone();
-        let descriptors = match kind {
-            PlanKind::ReclaimDir => scan.get_or_insert_with(|| descriptor_scan(*kind)).clone(),
-            PlanKind::ReclaimWorktree => None,
-        };
-        let own: Result<Walk, String>;
-        let walked = match &tree {
-            Some(tree) if whole(*kind, target) => {
-                tree.as_ref().map(|tree| &tree.walk).map_err(String::as_str)
+    let walked: Vec<Walked> = targets
+        .iter()
+        .map(|(kind, target)| {
+            let mut descriptors = || match kind {
+                PlanKind::ReclaimDir => scan.get_or_insert_with(|| descriptor_scan(*kind)).clone(),
+                PlanKind::ReclaimWorktree => None,
+            };
+            if let (Some(tree), true) = (&tree, whole(*kind, target)) {
+                let walk = tree.as_ref().map(|tree| &tree.walk).map_err(String::as_str);
+                return reduce(config, (*kind, target), observation, walk, descriptors());
             }
-            _ => {
-                let taken = tree.as_ref().and_then(|tree| {
-                    let rel = target.strip_prefix(worktree).ok()?;
-                    tree.as_ref().ok()?.walk_of(worktree, rel)
-                });
-                own = taken.map_or_else(
-                    || walk(worktree, target).map_err(|err| walk_error(target, &err)),
-                    Ok,
-                );
-                own.as_ref().map_err(String::as_str)
+            let taken = tree.as_ref().and_then(|tree| {
+                let rel = target.strip_prefix(worktree).ok()?;
+                tree.as_ref().ok()?.walk_of(worktree, rel)
+            });
+            let own = taken.map_or_else(
+                || walk(worktree, target).map_err(|err| walk_error(target, &err)),
+                Ok,
+            );
+            let walk = own.as_ref().map_err(String::as_str);
+            reduce(config, (*kind, target), observation, walk, descriptors())
+        })
+        .collect();
+    drop(tree);
+    // The regenerable targets no walk above read, for the `reclaim_dir` plans; the worktree's
+    // own walk read every entry.
+    let dirs = |path: &Path| {
+        targets
+            .iter()
+            .any(|(kind, target)| *kind == PlanKind::ReclaimDir && target == path)
+    };
+    let mut unwalked = None;
+    let whole_reads: Vec<Option<Newest>> = targets
+        .iter()
+        .zip(&walked)
+        .map(|((kind, _), walked)| (*kind == PlanKind::ReclaimDir).then(|| walked.whole.clone()))
+        .collect();
+    // One read of the lease and the signals, and one of the processes working in the
+    // worktree, for its plans, each with the first plan that needs it, after the walks.
+    let mut read = None;
+    let mut working = None;
+    targets
+        .iter()
+        .zip(walked)
+        .enumerate()
+        .map(|(n, ((kind, target), walked))| {
+            let base = read
+                .get_or_insert_with(|| {
+                    activity(
+                        state,
+                        &config.host.sessions,
+                        &observation.worktree,
+                        (None, None),
+                        false,
+                    )
+                })
+                .clone();
+            // The target walk's entries, the other targets' walks, and the targets no walk read.
+            let mut targets = walked.own.clone();
+            for (m, other) in whole_reads.iter().enumerate() {
+                if let (true, Some(other)) = (m != n, other) {
+                    targets = targets.merge(other);
+                }
             }
-        };
-        plans.push(build_with(
-            config,
-            state,
-            sources,
-            (*kind, target),
-            observation,
-            (walked, processes, descriptors),
-        ));
+            // Read with the first `reclaim_dir` plan, and only when the lease and the signals
+            // leave the worktree free and quiet: a plan they refuse is refused without them.
+            let idle = base.lease == LeaseHold::Free && base.quiet == Quiet::Quiet;
+            if let (PlanKind::ReclaimDir, true) = (kind, idle) {
+                let unwalked =
+                    unwalked.get_or_insert_with(|| read_targets(&observation.worktree, &dirs));
+                targets = targets.merge(unwalked);
+            }
+            let activity = Activity {
+                targets: Some(targets),
+                ..base
+            };
+            let processes = working
+                .get_or_insert_with(|| processes_inside(worktree))
+                .clone();
+            finish(
+                config,
+                (state, sources),
+                (*kind, target),
+                observation,
+                walked,
+                (processes, activity),
+            )
+        })
+        .collect()
+}
+
+/// What a target's plan keeps of its walk once the walk is dropped ([`build_worktree`]).
+struct Walked {
+    /// Every check but `not_in_use`, in their order.
+    checks: Vec<crate::contract::Check>,
+    /// The provenance of the observation and the walk; the in-use facts' errors follow.
+    provenance: crate::contract::Provenance,
+    /// What [`checks::descriptor_users`] found of the walk, which `not_in_use` reads.
+    users: Option<Vec<checks::DescriptorUser>>,
+    /// The descriptor scan read for the target, if any.
+    descriptors: Descriptors,
+    /// [`checks::entries_newest`] of the walk with what it found removed while it read (the
+    /// target's root included), its plan's own reading, or why the walk failed. An execution
+    /// reads its snapshot's removals in step 5's comparison instead.
+    own: Newest,
+    /// [`walk_newest`] of the walk, the other plans' reading, or why the walk failed.
+    whole: Newest,
+    allocated_bytes: Option<u64>,
+    aliased_bytes: Option<u64>,
+    exclusive: Option<crate::observe::Exclusive>,
+    own_file_bytes: Option<u64>,
+}
+
+/// [`Walked`] of `walked`, the walk of `target` or why it failed, with `descriptors`, the
+/// descriptor scan read for it, if any.
+fn reduce(
+    config: &Config,
+    (kind, target): (PlanKind, &Path),
+    observation: &WorktreeObservation,
+    walked: Result<&Walk, &str>,
+    descriptors: Descriptors,
+) -> Walked {
+    let worktree = Path::new(&observation.worktree.path);
+    let unread = "read with not_in_use".to_owned();
+    // The in-use facts but the scan are read later, with `not_in_use`, which alone reads them.
+    let in_use = InUseFacts {
+        lock_held: Err(unread.clone()),
+        reservations: Err(unread.clone()),
+        processes: Err(unread),
+        descriptors,
+        activity: Activity::unread(),
+    };
+    let patterns = patterns(config, &observation.repo);
+    let inspection = Inspection {
+        kind,
+        worktree,
+        target,
+        observation: Ok(observation),
+        walk: walked,
+        in_use: &in_use,
+        patterns: &patterns,
+        managed: &config.host.observe.managed,
+        squash_merged: false,
+    };
+    Walked {
+        checks: evaluate_only(&inspection, |name| name != "not_in_use"),
+        provenance: checks::walk_provenance(config, &inspection),
+        users: checks::descriptor_users(&inspection),
+        own: walked.map_or_else(checks::unwalked, |walk| {
+            let mut own = checks::entries_newest(worktree, walk);
+            if let Some(rel) = walk.vanished.first() {
+                own.vanish(&worktree.join(rel));
+            }
+            own
+        }),
+        whole: walked.map_or_else(checks::unwalked, |walk| walk_newest(worktree, walk)),
+        allocated_bytes: walked.ok().map(Walk::allocated),
+        aliased_bytes: walked.ok().map(Walk::aliased),
+        exclusive: walked.ok().map(Walk::exclusive),
+        own_file_bytes: walked.ok().map(Walk::own_file_bytes),
+        descriptors: in_use.descriptors,
     }
-    plans
 }
 
 fn walk_error(target: &Path, err: &std::io::Error) -> String {
@@ -378,6 +516,76 @@ pub fn patterns(config: &Config, repo: &Repo) -> DataLists {
     DataLists::from_selection(&config.select(|p| repo.profiles.contains(&p.name)))
 }
 
+/// The session lease and the quiet period of the observed `worktree` (section 9.8), read now
+/// under `sessions`: the lease file by name, and the signals of the observation's git dir,
+/// status paths, and ignored entries, `skip` left out, by `deadline` when there is one. With
+/// `walk_entries`, the checks read the target walk's entries as signals too.
+#[must_use]
+pub fn activity(
+    state: &StateDir,
+    sessions: &Sessions,
+    worktree: &Worktree,
+    (skip, deadline): (Option<&Path>, Option<std::time::Instant>),
+    walk_entries: bool,
+) -> Activity {
+    let now_ms = state::now_ms();
+    let window = Window {
+        now_ms,
+        quiet_ms: sessions.quiet_s.saturating_mul(1000),
+    };
+    Activity {
+        lease: admission::lease_hold(
+            state,
+            &state::worktree_key(Path::new(&worktree.path)),
+            now_ms,
+            sessions.linger_s.saturating_mul(1000),
+        ),
+        quiet: observe::quiet::read(
+            &Signals {
+                deadline,
+                ..Signals::of(worktree, skip)
+            },
+            window,
+        ),
+        window,
+        walk_entries,
+        targets: None,
+    }
+}
+
+/// The newest entry below the regenerable targets of the observed `worktree` other than
+/// `target`, never their own times (section 9.8), as [`read_targets`] reads them.
+#[must_use]
+pub fn other_targets(worktree: &Worktree, target: &Path) -> Newest {
+    read_targets(worktree, &|path| path == target)
+}
+
+/// The newest entry below the regenerable targets of the observed `worktree` that `walked`
+/// does not name, each walked by [`walk_times`], as `plan` walks a target but reading no sizes,
+/// and reduced by [`walk_newest`] before the next is walked (section 9.8): a target the
+/// observation listed and gone when its walk begins, or removed during it, is activity now, as
+/// a status path gone is; a walk that fails otherwise, and a path git listed that was not kept,
+/// is unknown. Its cost is the targets' walks, as `plan`'s without the sizes.
+fn read_targets(worktree: &Worktree, walked: &dyn Fn(&Path) -> bool) -> Newest {
+    let root = Path::new(&worktree.path);
+    let mut newest = Newest::default();
+    for entry in worktree.ignored.iter().filter(|e| e.regenerable_match) {
+        let Some(path) = entry.native.as_deref() else {
+            newest.fail(format!("{}: the path git listed was not kept", entry.path));
+            continue;
+        };
+        if walked(path) {
+            continue;
+        }
+        match walk_times(root, path) {
+            Ok(walked) => newest = newest.merge(&walk_newest(root, &walked)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => newest.vanish(path),
+            Err(err) => newest.fail(format!("the walk: {}", walk_error(path, &err))),
+        }
+    }
+    newest
+}
+
 /// The in-use facts of `target` when nothing is held: the lock probed, reservations read
 /// under the admission lock (an error when it is not free in time), and the processes read
 /// for its worktree: those working in it ([`processes_inside`]) and the descriptor scan read
@@ -386,7 +594,7 @@ fn probe_in_use(
     state: &StateDir,
     sources: &Real<'_>,
     worktree: &Path,
-    (processes, descriptors): (Result<Vec<u32>, String>, Descriptors),
+    (processes, descriptors, activity): (Result<Vec<u32>, String>, Descriptors, Activity),
 ) -> InUseFacts {
     let key = state::worktree_key(worktree);
     InUseFacts {
@@ -396,67 +604,55 @@ fn probe_in_use(
         reservations: sources.in_use(&key).map_err(|err| err.message),
         processes,
         descriptors,
+        activity,
     }
 }
 
-/// Builds a plan for `target` from an observation of its worktree. Plans are built even
-/// when invariants fail, so the reason is visible.
-fn build(
+/// The plan of `target` from `walked`, what it kept of its walk, `processes`, those working in
+/// its worktree ([`processes_inside`]), and `activity`, the lease and the signals with the
+/// regenerable targets' entries: the in-use facts are read now, and `not_in_use` is evaluated
+/// from them.
+fn finish(
     config: &Config,
-    state: &StateDir,
-    sources: &Real<'_>,
-    kind: PlanKind,
-    target: &Path,
-    observation: &WorktreeObservation,
-) -> Built {
-    let worktree = Path::new(&observation.worktree.path);
-    let walked = walk(worktree, target).map_err(|err| walk_error(target, &err));
-    build_with(
-        config,
-        state,
-        sources,
-        (kind, target),
-        observation,
-        (
-            walked.as_ref().map_err(String::as_str),
-            // The whole worktree for both kinds: a process working anywhere in it can use the
-            // target (section 9.2).
-            processes_inside(worktree),
-            descriptor_scan(kind),
-        ),
-    )
-}
-
-/// [`build`] from `walked`, the walk of `target` or why it failed, `processes`, those working
-/// in its worktree ([`processes_inside`]), and `descriptors`, the descriptor scan read for it,
-/// if any.
-fn build_with(
-    config: &Config,
-    state: &StateDir,
-    sources: &Real<'_>,
+    (state, sources): (&StateDir, &Real<'_>),
     (kind, target): (PlanKind, &Path),
     observation: &WorktreeObservation,
-    (walked, processes, descriptors): (Result<&Walk, &str>, Result<Vec<u32>, String>, Descriptors),
+    walked: Walked,
+    (processes, activity): (Result<Vec<u32>, String>, Activity),
 ) -> Built {
     let worktree = PathBuf::from(&observation.worktree.path);
     let (root_id, root_created_ms) = root_identity(&worktree).unwrap_or((None, None));
-    let in_use = probe_in_use(state, sources, &worktree, (processes, descriptors));
+    let in_use = probe_in_use(
+        state,
+        sources,
+        &worktree,
+        (processes, walked.descriptors, activity),
+    );
     let patterns = patterns(config, &observation.repo);
     let inspection = Inspection {
         kind,
         worktree: &worktree,
         target,
         observation: Ok(observation),
-        walk: walked,
+        walk: Err("reduced"),
         in_use: &in_use,
         patterns: &patterns,
         managed: &config.host.observe.managed,
         squash_merged: false,
     };
-    let checks = evaluate(&inspection);
-    let mut provenance = provenance(config, &inspection);
-    let exclusive = walked.ok().map(Walk::exclusive);
-    if let Some(error) = exclusive.as_ref().and_then(|e| e.error.clone()) {
+    let mut checks = walked.checks;
+    // `not_in_use` follows `observed`, as `evaluate` orders them.
+    let at = checks
+        .iter()
+        .position(|c| c.name == "observed")
+        .map_or(0, |n| n + 1);
+    checks.insert(
+        at,
+        checks::evaluate_not_in_use(&inspection, walked.users.as_deref()),
+    );
+    let mut provenance = walked.provenance;
+    provenance.errors.extend(checks::in_use_errors(&in_use));
+    if let Some(error) = walked.exclusive.as_ref().and_then(|e| e.error.clone()) {
         provenance.errors.push(ObservedError {
             source: "exclusive_bytes".to_owned(),
             message: error,
@@ -478,10 +674,10 @@ fn build_with(
             root_id,
             root_created_ms,
         },
-        allocated_bytes: walked.ok().map(Walk::allocated),
-        aliased_bytes: walked.ok().map(Walk::aliased),
-        exclusive_bytes: exclusive.as_ref().and_then(|e| e.bytes),
-        exclusive_measure: exclusive.map(|e| e.measure),
+        allocated_bytes: walked.allocated_bytes,
+        aliased_bytes: walked.aliased_bytes,
+        exclusive_bytes: walked.exclusive.as_ref().and_then(|e| e.bytes),
+        exclusive_measure: walked.exclusive.map(|e| e.measure),
         invariants_ok: invariants_ok(&checks),
         approval: approval(&checks),
         checks,
@@ -489,7 +685,7 @@ fn build_with(
     };
     Built {
         plan,
-        own_file_bytes: walked.ok().map(Walk::own_file_bytes),
+        own_file_bytes: walked.own_file_bytes,
     }
 }
 

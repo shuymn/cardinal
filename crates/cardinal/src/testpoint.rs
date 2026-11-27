@@ -64,6 +64,12 @@ pub const WALK_TARGET_CHECKED: &str = "walk.target_checked";
 /// `plan`'s walk read the mount of a directory below the target by its path, and has not
 /// opened it to list it.
 pub const WALK_DIR_CHECKED: &str = "walk.dir_checked";
+/// `plan`'s walk read the names in a directory it opened (the target's included) and has
+/// `lstat`ed none of them.
+pub const WALK_DIR_LISTED: &str = "walk.dir_listed";
+/// A read of the quiet period's signals read the names in an ignored entry and has `lstat`ed
+/// none of them (section 9.8).
+pub const QUIET_DIR_LISTED: &str = "quiet.dir_listed";
 /// Observation listed a worktree's filter drivers and has not run `status`.
 pub const OBSERVE_FILTERS_LISTED: &str = "observe.filters_listed";
 /// The hook classified the command.
@@ -91,6 +97,9 @@ pub const ACT_LOCK_OPENED: &str = "act.lock_opened";
 /// `act` holds the plan's `act.lock` and the worktree's in-use lock and has taken no
 /// snapshot.
 pub const ACT_EXCLUDED: &str = "act.excluded";
+/// `act`'s snapshot, or step 5's walk of the moved target, read the names in a directory of the
+/// target and has `lstat`ed none of them.
+pub const ACT_DIR_LISTED: &str = "act.dir_listed";
 /// The claim is written and synced under a temporary name and not renamed into place.
 pub const ACT_PUBLISHING: &str = "act.publishing";
 /// The claim is published and the trash entry created; nothing moved.
@@ -99,6 +108,9 @@ pub const ACT_CLAIMED: &str = "act.claimed";
 pub const ACT_MOVED: &str = "act.moved";
 /// Every check after the move passed; the commit's checks have not run.
 pub const ACT_CHECKED: &str = "act.checked";
+/// Step 8's scan of the working directories returned; the deadline of the reads after the
+/// move not checked after it, nothing published.
+pub const ACT_CWD_READ: &str = "act.cwd_read";
 /// `committed` is renamed into place and not synced, the in-use lock held; nothing taken.
 pub const ACT_COMMITTED: &str = "act.committed";
 /// An entry is in the hold and not checked.
@@ -141,6 +153,8 @@ pub const POINTS: &[&str] = &[
     ARBITER_ANSWERING,
     WALK_TARGET_CHECKED,
     WALK_DIR_CHECKED,
+    WALK_DIR_LISTED,
+    QUIET_DIR_LISTED,
     OBSERVE_FILTERS_LISTED,
     HOOK_CLASSIFIED,
     HOOK_LEASE_AGENT,
@@ -152,10 +166,12 @@ pub const POINTS: &[&str] = &[
     INBOX_REFRESH_WAITING,
     ACT_LOCK_OPENED,
     ACT_EXCLUDED,
+    ACT_DIR_LISTED,
     ACT_PUBLISHING,
     ACT_CLAIMED,
     ACT_MOVED,
     ACT_CHECKED,
+    ACT_CWD_READ,
     ACT_COMMITTED,
     ACT_TAKEN,
     ACT_HELD,

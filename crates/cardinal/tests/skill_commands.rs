@@ -51,7 +51,7 @@ fn status_index(status: ActStatus) -> usize {
 }
 
 /// Every inbox kind of `cardinal.inbox-item.v1`, in the order of [`kind_index`].
-const KINDS: [InboxKind; 11] = [
+const KINDS: [InboxKind; 12] = [
     InboxKind::RecoveryNeeded,
     InboxKind::OutlivedProcesses,
     InboxKind::Reclaimable,
@@ -63,11 +63,13 @@ const KINDS: [InboxKind; 11] = [
     InboxKind::DiskCritical,
     InboxKind::ArbiterFailing,
     InboxKind::ReclaimStranded,
+    InboxKind::InUseUnknown,
 ];
 
-/// Whether an item of `kind` is about a worktree: a pass checks the worktree still is as the item
-/// says before it answers. The others are about a job, a session, a volume, a pass, or a trash
-/// entry, which `cardinal explain` reads afresh.
+/// Whether an item of `kind` is about a worktree and answered by a pass: a pass checks the
+/// worktree still is as the item says before it answers. The others are about a job, a session,
+/// a volume, a pass, or a trash entry, which `cardinal explain` reads afresh, or, as
+/// `in_use_unknown`, the owner's alone and never assigned to a pass.
 fn about_a_worktree(kind: InboxKind) -> bool {
     match kind {
         InboxKind::Reclaimable
@@ -80,7 +82,8 @@ fn about_a_worktree(kind: InboxKind) -> bool {
         | InboxKind::DiskLow
         | InboxKind::DiskCritical
         | InboxKind::ArbiterFailing
-        | InboxKind::ReclaimStranded => false,
+        | InboxKind::ReclaimStranded
+        | InboxKind::InUseUnknown => false,
     }
 }
 
@@ -98,6 +101,7 @@ fn kind_index(kind: InboxKind) -> usize {
         InboxKind::DiskCritical => 8,
         InboxKind::ArbiterFailing => 9,
         InboxKind::ReclaimStranded => 10,
+        InboxKind::InUseUnknown => 11,
     }
 }
 

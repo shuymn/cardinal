@@ -494,7 +494,7 @@ fn unix_sizes(path: &Path, meta: &std::fs::Metadata, usage: &mut Usage) -> Exclu
 fn list_dir(path: &Path, own: crate::os::dir::Own) -> std::io::Result<crate::os::dir::Listed> {
     let opened = crate::os::dir::open(path)?
         .ok_or_else(|| std::io::Error::other("replaced while it was read"))?;
-    crate::os::dir::list(&opened, own)
+    crate::os::dir::list(&opened, own, crate::os::dir::At::path(path))
 }
 
 /// Bytes allocated to `path` and everything below it ([`sizes`]).

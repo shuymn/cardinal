@@ -74,23 +74,73 @@ pub fn reports(
         };
         let (order, blocked) = order(&volume.state.volume, observation);
         let recovery = volume.state.lines.recovery_bytes;
-        let (targets, reading, shortfall_bytes) = if executes(config) && volume.path == state.root()
-        {
-            let targets = execute(config, state, volume, &order, budget, errors);
+        let on_state = volume.path == state.root();
+        // The execution queue (section 9.8): the order without the targets of worktrees not
+        // under a covered root, the rest keeping their order, before any budget is spent.
+        let (queue, uncovered): (Vec<&Plan>, Vec<&Plan>) = order
+            .iter()
+            .partition(|plan| covered(config, &plan.target.worktree));
+        // The bounds of the queue as it ends: without a target a reload found uncovered.
+        let reachable = |withdrawn: &[(ReportTarget, Config)]| -> u64 {
+            if !(cfg!(unix) && on_state) {
+                return 0;
+            }
+            queue
+                .iter()
+                .filter(|plan| !withdrawn.iter().any(|(t, _)| t.plan_id == plan.id))
+                .map(|plan| plan.exclusive_bytes.unwrap_or(0))
+                .sum()
+        };
+        let (targets, reading, shortfall_bytes, reachable_bytes) = if executes(config) && on_state {
+            let (mut targets, withdrawn) = execute(config, state, volume, &queue, budget, errors);
             let reading = volume.reading.unwrap_or(reading);
             let shortfall = recovery.saturating_sub(reading.free_bytes);
-            (targets, reading, shortfall)
+            let reachable_bytes = reachable(&withdrawn);
+            // Each uncovered target recorded under the configuration that left it out: the
+            // startup one, or the reload that withdrew it.
+            let listed: Vec<(ReportTarget, &Config)> = uncovered
+                .iter()
+                .map(|plan| (target_of(plan), config))
+                .chain(
+                    withdrawn
+                        .iter()
+                        .map(|(target, current)| (target.clone(), current)),
+                )
+                .collect();
+            for (target, by) in &listed {
+                let recorded = record_planned(
+                    by,
+                    state,
+                    observation,
+                    &volume.state.volume,
+                    std::slice::from_ref(target),
+                    Some(act::SESSIONS_UNCOVERED),
+                );
+                if let Err(message) = recorded {
+                    errors.push(ScopedError {
+                        scope: "disk_reclaim".into(),
+                        message,
+                    });
+                }
+            }
+            targets.extend(listed.into_iter().map(|(target, _)| target));
+            (targets, reading, shortfall, reachable_bytes)
         } else {
             let (targets, shortfall) = list(&order, reading, recovery);
-            if let Err(message) =
-                record_planned(config, state, observation, &volume.state.volume, &targets)
-            {
+            if let Err(message) = record_planned(
+                config,
+                state,
+                observation,
+                &volume.state.volume,
+                &targets,
+                None,
+            ) {
                 errors.push(ScopedError {
                     scope: "disk_reclaim".into(),
                     message,
                 });
             }
-            (targets, reading, shortfall)
+            (targets, reading, shortfall, reachable(&[]))
         };
         reports.push(DiskReport {
             volume: volume.state.volume.clone(),
@@ -99,6 +149,7 @@ pub fn reports(
             checks_ms: observation.checks_ms,
             targets,
             shortfall_bytes,
+            reachable_bytes: Some(reachable_bytes),
             blocked,
             incomplete: incomplete(&volume.state.volume, observation),
         });
@@ -171,8 +222,10 @@ fn list(order: &[&Plan], reading: ReportReading, recovery: u64) -> (Vec<ReportTa
 /// volume's last reading is at or below the recovery line and `budget` is left, the volume
 /// read again after every `act`, a refused or `partial` one included; a reading that fails
 /// stops it. The configuration is loaded again before each `act`, which runs under it: one
-/// that does not load, or no longer lets the unit execute, stops it. Each target run is
-/// returned with its status and the bytes `act` expects it freed.
+/// that does not load, or no longer lets the unit execute, stops it, and a target whose
+/// worktree it no longer covers (section 9.8) is skipped before any budget is spent on it,
+/// the rest of the queue going on. Each target run is returned with its status and the bytes
+/// `act` expects it freed, then each skipped one with the configuration that skipped it.
 fn execute(
     config: &Config,
     state: &StateDir,
@@ -180,7 +233,7 @@ fn execute(
     order: &[&Plan],
     budget: &mut Budget,
     errors: &mut Vec<ScopedError>,
-) -> Vec<ReportTarget> {
+) -> (Vec<ReportTarget>, Vec<(ReportTarget, Config)>) {
     let options = ActOptions {
         dry_run: false,
         owner_approved: false,
@@ -189,6 +242,7 @@ fn execute(
     };
     let recovery = volume.state.lines.recovery_bytes;
     let mut targets = Vec::new();
+    let mut uncovered = Vec::new();
     for plan in order {
         let above = volume.reading.is_none_or(|r| r.free_bytes > recovery);
         if above || !budget.left() {
@@ -214,6 +268,10 @@ fn execute(
                 break;
             }
         };
+        if !covered(&current, &plan.target.worktree) {
+            uncovered.push((target_of(plan), current));
+            continue;
+        }
         let mut target = target_of(plan);
         match budget.spend(|| act::execute(&current, state, &plan.id, &options)) {
             Ok(result) => {
@@ -230,7 +288,13 @@ fn execute(
             break;
         }
     }
-    targets
+    (targets, uncovered)
+}
+
+/// Whether the worktree at `worktree` lies under a `[sessions] covered` root; one that cannot
+/// be resolved is not covered (section 9.8).
+fn covered(config: &Config, worktree: &str) -> bool {
+    config.host.sessions.covers(Path::new(worktree)) == Ok(true)
 }
 
 /// `plan` as a target of the report, with its bound, 0 where that is null.
@@ -331,7 +395,8 @@ fn blocked_entry(plan: &Plan, check: String, bytes: u64) -> ReportBlocked {
 }
 
 /// A `planned` record for each listed target, with the plan's checks and provenance as step
-/// 5 evaluated them, the bytes it was listed by, and the reason it did not execute: not
+/// 5 evaluated them, the bytes it was listed by, and the reason it did not execute: with
+/// `uncovered`, that reason, `sessions_uncovered`, naming `sessions.covered`; otherwise not
 /// designed off Unix, not granted otherwise, naming `unit.disk-reclaim.act` while it is false
 /// and `act.execute` while it does not grant the unit (C16); the first record that cannot be
 /// appended is returned, the others still tried.
@@ -341,17 +406,30 @@ fn record_planned(
     observation: &Observation,
     volume: &str,
     targets: &[ReportTarget],
+    uncovered: Option<&str>,
 ) -> Result<(), String> {
     let mut failed = Ok(());
     let recorder = plan::recorder(config, state);
-    let reason = if cfg!(unix) {
-        EXECUTION_NOT_GRANTED
-    } else {
-        EXECUTION_NOT_DESIGNED
+    let reason = match uncovered {
+        Some(reason) => reason,
+        None if cfg!(unix) => EXECUTION_NOT_GRANTED,
+        None => EXECUTION_NOT_DESIGNED,
     };
     let file = config.dir.join("host.toml").display().to_string();
     let mut keys = Vec::new();
-    if !config.host.unit_may_act(UNIT) {
+    if uncovered.is_some() {
+        keys.push(ConfigKey {
+            file: file.clone(),
+            key: "sessions.covered".to_owned(),
+            value: config
+                .host
+                .sessions
+                .covered
+                .iter()
+                .map(|root| root.display().to_string())
+                .collect(),
+        });
+    } else if !config.host.unit_may_act(UNIT) {
         keys.push(ConfigKey {
             file: file.clone(),
             key: format!("unit.{UNIT}.act"),

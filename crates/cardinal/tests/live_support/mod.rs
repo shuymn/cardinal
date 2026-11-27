@@ -74,9 +74,15 @@ impl Live {
         prepare: impl FnOnce(&Setup, &Path),
     ) -> Self {
         let wt = s.worktree(name);
+        // The worktree's setup and the files, an hour old, are idle without waiting out the
+        // quiet period (section 9.8); what `prepare` writes keeps its own times.
+        s.age_worktree(&wt);
         prepare(&s, &wt);
         for file in files {
             write_synced(&wt, &format!("{rel}/{file}"), file.as_bytes());
+        }
+        if !files.is_empty() {
+            plan_support::age_tree(&wt.join(rel), Duration::from_hours(1));
         }
         let plan = s.plan(PlanKind::ReclaimDir, &wt.join(rel));
         assert!(plan.invariants_ok, "{:#?}", plan.checks);
@@ -242,6 +248,23 @@ impl Paused {
         ] {
             std::fs::remove_file(file).unwrap();
         }
+    }
+
+    /// [`Paused::finish`], with whether the process reached `point` before it ended.
+    pub fn finish_reached(self, points: &[&str], point: &str) -> (ActResult, bool) {
+        for point in points {
+            self.points.release(point);
+        }
+        let pid = self.child.id();
+        let output = self
+            .child
+            .wait_with_output()
+            .expect("wait for cardinal act");
+        let reached = self.points.reached(point, pid);
+        (
+            plan_support::act_result(&output).expect("an act result"),
+            reached,
+        )
     }
 
     /// Releases every point in `points` and returns the result the process printed.

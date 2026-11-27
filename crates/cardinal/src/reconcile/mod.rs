@@ -31,8 +31,9 @@ use serde::de::DeserializeOwned;
 use crate::admission;
 use crate::config::Config;
 use crate::contract::{
-    ArbiterStart, DiskState, Error, ErrorCode, InboxChanges, Inventory, Plan, PlanKind, Reconcile,
-    ReconcileSchema, ReconcileState, ReconcileStateSchema, ScopedError, Skipped, Trigger,
+    ArbiterStart, DiskState, Error, ErrorCode, InUseUnknownStreak, InboxChanges, Inventory, Plan,
+    PlanKind, Reconcile, ReconcileSchema, ReconcileState, ReconcileStateSchema, ScopedError,
+    Skipped, Trigger,
 };
 use crate::inbox;
 use crate::observe::{self, InventoryOptions};
@@ -54,6 +55,9 @@ pub struct Observation {
     /// By plan ID, the bytes of each walked target's regular files with no name outside it
     /// (`plan::Built`).
     pub own_file_bytes: BTreeMap<String, u64>,
+    /// The worktrees whose `not_in_use` this observation read as `unknown`, each with its run
+    /// of such observations (section 9.8), kept in `reconcile/state.json`.
+    pub in_use_unknown: Vec<InUseUnknownStreak>,
 }
 
 /// `cardinal reconcile [--trigger …]`: one pass (section 10.3).
@@ -319,6 +323,8 @@ fn observe(
         .collect();
     let plans: Vec<Plan> = built.into_iter().map(|b| b.plan).collect();
     fill_sizes(&mut inventory, &plans);
+    let previous = read_state(state, errors).map(|s| s.in_use_unknown);
+    let in_use_unknown = streaks(&previous.unwrap_or_default(), &inventory);
     // Reclamation does not wait for this write: a test's fake fails it as `observation`
     // (section 13.7), and the pass goes on from the observation in memory.
     match testpoint::fake_write("observation") {
@@ -338,7 +344,31 @@ fn observe(
         plans,
         checks_ms,
         own_file_bytes,
+        in_use_unknown,
     })
+}
+
+/// The runs of `not_in_use` read as `unknown` after `inventory` (section 9.8): one more for
+/// each worktree it read so, with the input it could not read; a worktree it read as `pass`
+/// or `fail`, or did not list, ends its run.
+fn streaks(previous: &[InUseUnknownStreak], inventory: &Inventory) -> Vec<InUseUnknownStreak> {
+    inventory
+        .repos
+        .iter()
+        .flat_map(|repo| &repo.worktrees)
+        .filter_map(|worktree| {
+            let input = worktree.in_use_unknown.clone()?;
+            let before = previous
+                .iter()
+                .find(|s| s.worktree == worktree.path)
+                .map_or(0, |s| s.streak);
+            Some(InUseUnknownStreak {
+                worktree: worktree.path.clone(),
+                streak: before.saturating_add(1),
+                input,
+            })
+        })
+        .collect()
 }
 
 /// Whether the last full observation is older than `observe_every_s`, or there is none.
@@ -387,17 +417,23 @@ fn read_state(state: &StateDir, errors: &mut Vec<ScopedError>) -> Option<Reconci
     read_json(&state.reconcile_state(), "state", errors)
 }
 
-/// Step 8, second part: `reconcile/state.json`, with this pass's time and the time of the
-/// last full observation.
+/// Step 8, second part: `reconcile/state.json`, with this pass's time, the time of the last
+/// full observation, and the runs of `not_in_use` read as `unknown` that it left.
 fn write_state(state: &StateDir, observation: Option<&Observation>) -> Result<(), Error> {
-    let last_observation_ms = match observation {
-        Some(observation) => Some(observation.inventory.observed_ms),
-        None => read_state(state, &mut Vec::new()).and_then(|s| s.last_observation_ms),
+    let (last_observation_ms, in_use_unknown) = match observation {
+        Some(observation) => (
+            Some(observation.inventory.observed_ms),
+            observation.in_use_unknown.clone(),
+        ),
+        None => read_state(state, &mut Vec::new()).map_or((None, Vec::new()), |s| {
+            (s.last_observation_ms, s.in_use_unknown)
+        }),
     };
     let file = ReconcileState {
         schema: ReconcileStateSchema,
         last_pass_ms: state::now_ms(),
         last_observation_ms,
+        in_use_unknown,
     };
     let bytes = serde_json::to_vec(&file)
         .map_err(|err| Error::new(ErrorCode::Internal, err.to_string()))?;

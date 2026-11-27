@@ -6,6 +6,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use crate::contract::StatusPath;
+
 /// One entry of `git worktree list --porcelain -z`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ListedWorktree {
@@ -94,10 +96,17 @@ pub struct Status {
     pub other_changes: bool,
     /// Worktree-relative paths of ignored entries, without a trailing `/`.
     pub ignored: Vec<PathBuf>,
+    /// Every path listed as changed, unmerged, or untracked, with whether it is a tracked
+    /// deletion, for the quiet period (section 9.8); a rename or copy by its new path.
+    pub changed: Vec<StatusPath>,
 }
 
-/// Parses porcelain v2 status output with `-z`.
+/// Parses porcelain v2 status output with `-z`: every entry ends with a NUL, so output that
+/// does not is incomplete.
 pub fn parse_status(bytes: &[u8]) -> Result<Status, String> {
+    if !bytes.is_empty() && !bytes.ends_with(b"\0") {
+        return Err("status output is incomplete: its last entry has no terminator".into());
+    }
     let mut status = Status::default();
     let mut saw_oid = false;
     let mut fields = bytes.split(|&b| b == 0);
@@ -134,6 +143,10 @@ pub fn parse_status(bytes: &[u8]) -> Result<Status, String> {
                 let mut parts = rest.splitn(8, |&b| b == b' ');
                 let xy = parts.next().unwrap_or_default();
                 let path = parts.nth(6).ok_or("changed entry without a path")?;
+                status.changed.push(StatusPath {
+                    path: path_from_bytes(path)?,
+                    deleted: xy.contains(&b'D'),
+                });
                 if xy == b".M" {
                     status.modified.push(path_from_bytes(path)?);
                 } else {
@@ -142,12 +155,34 @@ pub fn parse_status(bytes: &[u8]) -> Result<Status, String> {
             }
             b'u' | b'?' => {
                 status.other_changes = true;
+                // `u <XY> <sub> <m1> <m2> <m3> <mW> <h1> <h2> <h3> <path>`, `? <path>`.
+                let path = if kind == b'u' {
+                    let mut parts = rest.splitn(10, |&b| b == b' ');
+                    parts.nth(9).ok_or("unmerged entry without a path")?
+                } else {
+                    rest
+                };
+                status.changed.push(StatusPath {
+                    path: path_from_bytes(path)?,
+                    deleted: false,
+                });
             }
             b'2' => {
                 status.other_changes = true;
-                // A rename or copy is followed by its original path as a separate field.
+                // `2 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <X><score> <path>`, followed by its
+                // original path as a separate field.
+                let mut parts = rest.splitn(9, |&b| b == b' ');
+                let xy = parts.next().unwrap_or_default();
+                let path = parts.nth(7).ok_or("rename entry without a path")?;
+                status.changed.push(StatusPath {
+                    path: path_from_bytes(path)?,
+                    deleted: xy.contains(&b'D'),
+                });
+                // The output ends with a NUL, so an entry cut after its new path's NUL leaves an
+                // empty last field here, never an original path.
                 fields
                     .next()
+                    .filter(|original| !original.is_empty())
                     .ok_or("rename entry without its original path")?;
             }
             b'!' => {
@@ -793,6 +828,57 @@ mod tests {
 
         assert!(parse_status(b"").is_err(), "no branch header");
         assert!(parse_status(b"# branch.oid x\0garbage\0").is_err());
+    }
+
+    /// Section 9.8: output cut before its last terminator is incomplete, never a status; the
+    /// same output whole parses (control).
+    #[test]
+    fn torn_status_is_incomplete() {
+        assert!(parse_status(b"# branch.oid (initial)").is_err());
+        assert!(parse_status(b"# branch.oid (initial)\0# branch.head main\0? new.tx").is_err());
+        let whole = parse_status(b"# branch.oid (initial)\0# branch.head main\0? new.txt\0");
+        assert_eq!(whole.unwrap().changed.len(), 1);
+        // A rename cut after its new path's NUL, its original path missing, is incomplete
+        // too; with the original path it parses (control).
+        let rename = format!(
+            "# branch.oid {A}\0# branch.head main\0\
+             2 R. N... 100644 100644 100644 {A} {A} R100 new.rs\0"
+        );
+        assert!(parse_status(rename.as_bytes()).is_err());
+        let whole = format!("{rename}old.rs\0");
+        assert_eq!(parse_status(whole.as_bytes()).unwrap().changed.len(), 1);
+    }
+
+    /// Section 9.8: observation keeps every path status lists as changed, unmerged, or
+    /// untracked, a rename by its new path, each tracked deletion marked, and no ignored one.
+    #[test]
+    fn status_keeps_the_changed_paths() {
+        let text = format!(
+            "# branch.oid {A}\0# branch.head main\0\
+             1 .M N... 100644 100644 100644 {A} {A} src/a file.rs\0\
+             1 .D N... 100644 100644 000000 {A} {A} gone.rs\0\
+             1 D. N... 100644 000000 000000 {A} {A} staged gone.rs\0\
+             2 R. N... 100644 100644 100644 {A} {A} R100 new name.rs\0old.rs\0\
+             u UU N... 100644 100644 100644 100644 {A} {A} {A} both changed.rs\0\
+             ? new dir/untracked.txt\0! target/\0"
+        );
+        let status = parse_status(text.as_bytes()).unwrap();
+        let changed: Vec<(&str, bool)> = status
+            .changed
+            .iter()
+            .map(|p| (p.path.to_str().unwrap(), p.deleted))
+            .collect();
+        assert_eq!(
+            changed,
+            [
+                ("src/a file.rs", false),
+                ("gone.rs", true),
+                ("staged gone.rs", true),
+                ("new name.rs", false),
+                ("both changed.rs", false),
+                ("new dir/untracked.txt", false),
+            ]
+        );
     }
 
     #[test]

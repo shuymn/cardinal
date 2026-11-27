@@ -186,6 +186,11 @@ pub struct IgnoredEntry {
     /// it was recorded, which read as null.
     #[serde(default)]
     pub exclusive_measure: Option<ExclusiveMeasure>,
+    /// The entry's path as git spelled it, which `path` may not hold (a name that is not
+    /// UTF-8), for the quiet period's reads (section 9.8). Kept in memory only, never written:
+    /// an entry read back from a file has none, which leaves the quiet period unknown.
+    #[serde(skip)]
+    pub native: Option<std::path::PathBuf>,
 }
 
 /// How a lower bound of the freed bytes was read (`docs/architecture.md` section 8.5): from
@@ -231,6 +236,25 @@ pub struct Worktree {
     pub ignored: Vec<IgnoredEntry>,
     pub reclaim: ReclaimSummary,
     pub allocated_bytes: Option<u64>,
+    /// The paths the observation's `git status` listed as changed or untracked, which the
+    /// quiet period reads (section 9.8); `None` when the status was not read. Kept in memory
+    /// only, never written: an observation read back from a file has none, which leaves the
+    /// quiet period unknown.
+    #[serde(skip)]
+    pub status_paths: Option<Vec<StatusPath>>,
+    /// What left the worktree's `not_in_use` unknown in this observation, naming the input
+    /// (section 9.8), for `in_use_unknown`; `None` when it read `pass` or `fail`. In memory
+    /// only, as `status_paths`.
+    #[serde(skip)]
+    pub in_use_unknown: Option<String>,
+}
+
+/// A path `git status` listed as changed or untracked, relative to the worktree root.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StatusPath {
+    pub path: std::path::PathBuf,
+    /// A tracked path listed as deleted, in the index or the worktree: activity now.
+    pub deleted: bool,
 }
 
 #[cfg(test)]
