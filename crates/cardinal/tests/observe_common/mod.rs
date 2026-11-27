@@ -9,9 +9,9 @@
     reason = "each test crate uses a different subset of the scene"
 )]
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use cardinal::config::Config;
 use cardinal::contract::{Error, Inventory, Worktree};
@@ -329,13 +329,108 @@ exit "$code"
 
     /// Waits out the quiet period of [`QUIET_SESSIONS_S`], so what the fixture wrote before
     /// it is idle (section 9.8); a scene with `[sessions]` of its own sets its own times and
-    /// waits for nothing here.
+    /// waits for nothing here. It waits only for what is left of the period after the newest
+    /// write [`Scene::newest_write`] finds, and for all of it when that cannot be read or lies
+    /// in the future, so a command right after another that wrote nothing starts at once.
     pub fn settle(&self) {
-        if !self.observe_extra.contains("[sessions]") {
-            std::thread::sleep(std::time::Duration::from_millis(
-                QUIET_SESSIONS_S * 1000 + 100,
-            ));
+        if self.observe_extra.contains("[sessions]") {
+            return;
         }
+        let period = Duration::from_millis(QUIET_SESSIONS_S * 1000 + 100);
+        let wait = self.newest_write().map_or(period, |newest| {
+            (newest + period)
+                .duration_since(SystemTime::now())
+                .unwrap_or(Duration::ZERO)
+                .min(period)
+        });
+        if !wait.is_zero() {
+            std::thread::sleep(wait);
+        }
+    }
+
+    /// The newest modification time of what a command can read as activity (section 9.8), and
+    /// more: every entry below the fixture's root and the other roots `[sessions] covered`
+    /// lists, never through a link, the state dir's `leases/` included. Left out are times no
+    /// signal reads: the roots' own, the fixture root's files (its tools and their
+    /// configuration), those of the worktrees directly in a root (a directory with a `.git`
+    /// entry), and in such a worktree's `.git` all but its `index`, `HEAD`, `logs/HEAD`, and
+    /// `gitdir` files, its own and its linked worktrees'; and what the commands and the test's
+    /// tools write and nothing reads as activity: the state dir but its `leases/`, the config
+    /// dir, the fake `gh`'s dir, and the scope's test points, fake tools, disk images, home,
+    /// temp dir, and hooks. `None` when an entry cannot be read.
+    fn newest_write(&self) -> Option<SystemTime> {
+        /// Where an entry is.
+        #[derive(Clone, Copy, PartialEq)]
+        enum At {
+            /// A root, the fixture's if `true`.
+            Root(bool),
+            /// Directly in a root, the fixture's if `true`.
+            Top(bool),
+            /// In a worktree's `.git`.
+            GitDir,
+            Below,
+        }
+        let root = self.fx.root();
+        let leases = self.state_dir.join("leases");
+        let mut skipped = vec![
+            self.state_dir.clone(),
+            self.config_dir.clone(),
+            self.gh_dir.clone(),
+        ];
+        skipped.extend(["points", "fakes", "home", "tmp", "hooks"].map(|name| root.join(name)));
+        let mut newest = SystemTime::UNIX_EPOCH;
+        let mut entries: Vec<(PathBuf, At)> = vec![(root.to_path_buf(), At::Root(true))];
+        entries.extend(
+            self.covered
+                .iter()
+                .map(|dir| (dir.clone(), At::Root(false))),
+        );
+        entries.push((leases.clone(), At::Below));
+        while let Some((path, at)) = entries.pop() {
+            let meta = match std::fs::symlink_metadata(&path) {
+                // No lease written yet.
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound && path == leases => {
+                    continue;
+                }
+                read => read.ok()?,
+            };
+            let worktree = matches!(at, At::Top(_))
+                && meta.is_dir()
+                && std::fs::symlink_metadata(path.join(".git")).is_ok();
+            let signal = || {
+                path.file_name()
+                    .is_some_and(|name| ["index", "HEAD", "gitdir"].map(OsStr::new).contains(&name))
+            };
+            let counted = match at {
+                At::Root(_) => false,
+                At::Top(fixture) => !worktree && (meta.is_dir() || !fixture),
+                At::GitDir => !meta.is_dir() && signal(),
+                At::Below => true,
+            };
+            if counted {
+                newest = newest.max(meta.modified().ok()?);
+            }
+            if !meta.is_dir() {
+                continue;
+            }
+            for item in std::fs::read_dir(&path).ok()? {
+                let item = item.ok()?;
+                let child = item.path();
+                let image = at == At::Root(true)
+                    && item.file_name().to_string_lossy().starts_with("image-");
+                if image || skipped.contains(&child) {
+                    continue;
+                }
+                let child_at = match at {
+                    At::Root(fixture) => At::Top(fixture),
+                    At::Top(_) if worktree && item.file_name() == ".git" => At::GitDir,
+                    At::GitDir => At::GitDir,
+                    _ => At::Below,
+                };
+                entries.push((child, child_at));
+            }
+        }
+        Some(newest)
     }
 
     /// `inventory --repo <repo>` through the library, with `--sizes` if `sizes`.
