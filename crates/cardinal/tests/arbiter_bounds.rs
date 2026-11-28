@@ -189,6 +189,28 @@ fn raise_items(state: &StateDir) -> Vec<String> {
     keys
 }
 
+/// Gives every item in the inbox the same `created_ms`, as when one pass raises them all
+/// within a millisecond, and returns their keys in the order they are due: `created_ms`, ties
+/// going by key (`docs/architecture.md` section 10.5), so across kinds not the order they
+/// were raised in.
+fn raise_together(state: &StateDir) -> Vec<String> {
+    let mut items = inbox::read_all(state).unwrap();
+    let created_ms = items.iter().map(|(_, item)| item.created_ms).min().unwrap();
+    for (path, item) in &mut items {
+        item.created_ms = created_ms;
+        let bytes = serde_json::to_vec(item).unwrap();
+        state
+            .write_atomic(path, &bytes, cardinal::state::Durability::Durable)
+            .unwrap();
+    }
+    let mut due: Vec<_> = items
+        .into_iter()
+        .map(|(_, item)| (item.created_ms, item.key))
+        .collect();
+    due.sort();
+    due.into_iter().map(|(_, key)| key).collect()
+}
+
 /// A host whose `[arbiter] command` is `cardinal inbox --assigned --brief`, so each pass's log
 /// holds exactly what a session reads, with `max_items` items at most.
 fn listing_host(max_items: usize) -> Dirs {
@@ -249,31 +271,44 @@ fn list_in_passes(dirs: &Dirs, keys: &[String], max_items: usize) -> (Vec<usize>
     (taken, largest)
 }
 
-/// A19: `max_items` due items of each kind with the largest evidence its raiser writes go to
-/// passes of at most `max_items`, in the order they became due, the rest waiting for later
-/// passes, and `cardinal inbox --assigned --brief` lists each pass's items within
-/// [`PASS_OUTPUT`], as does `inbox resolve --brief` for each item, while `cardinal inbox
-/// --assigned` would print more than Claude Code shows.
+/// A19: `max_items` due items of each kind with the largest evidence its raiser writes, all
+/// raised in one millisecond, go to passes of at most `max_items`, in the order they became
+/// due (ties by key), the rest waiting for later passes, and `cardinal inbox --assigned
+/// --brief` lists each pass's items within [`PASS_OUTPUT`], as does `inbox resolve --brief`
+/// for each item, while `cardinal inbox --assigned` would print more than Claude Code shows.
 #[test]
 fn assigned_items_stay_within_the_bound() {
     let dirs = listing_host(MAX_ITEMS);
     let state = StateDir::open(dirs.state()).unwrap();
     let keys = raise_items(&state);
-    let (taken, largest) = list_in_passes(&dirs, &keys, MAX_ITEMS);
+    let due = raise_together(&state);
+    assert_ne!(due, keys, "the tie reorders items across kinds");
+    let (taken, largest) = list_in_passes(&dirs, &due, MAX_ITEMS);
     eprintln!("largest inbox --assigned --brief: {largest} bytes; items per pass: {taken:?}");
 
-    // What a pass read before: the same items in full.
-    let full = serde_json::to_string(&cardinal::contract::Inbox {
-        schema: cardinal::contract::InboxSchema,
-        items: inbox::read_all(&state)
-            .unwrap()
-            .into_iter()
-            .map(|(_, item)| item)
-            .filter(|item| keys[..taken[0]].contains(&item.key))
-            .collect(),
-    })
-    .unwrap();
-    assert!(full.len() > INLINE, "{} bytes in full", full.len());
+    // What a pass read before: the same items in full, for the pass whose items are largest.
+    let items: Vec<_> = inbox::read_all(&state)
+        .unwrap()
+        .into_iter()
+        .map(|(_, item)| item)
+        .collect();
+    let mut start = 0;
+    let mut full = 0;
+    for n in &taken {
+        let pass = &due[start..start + n];
+        start += n;
+        let listing = serde_json::to_string(&cardinal::contract::Inbox {
+            schema: cardinal::contract::InboxSchema,
+            items: items
+                .iter()
+                .filter(|item| pass.contains(&item.key))
+                .cloned()
+                .collect(),
+        })
+        .unwrap();
+        full = full.max(listing.len());
+    }
+    assert!(full > INLINE, "{full} bytes in full");
 
     // An answer prints its item as briefly.
     for key in keys.iter().step_by(ITEMS / KINDS.len()) {

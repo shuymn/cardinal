@@ -186,11 +186,59 @@ fn config_of_a_branch_whose_name_extends_another_worktrees_branch_is_detected() 
     assert!(stderr.contains("branch.feature.fix.note=x"), "{stderr}");
 }
 
+/// Locally, what a push, a fetch, or a branch made or moved in another worktree changes is left
+/// out: a branch no worktree has checked out, remote-tracking refs (this worktree's branch's
+/// included), and the common dir's `FETCH_HEAD`, seen from the main worktree and from a linked
+/// one; the ref of the branch this worktree has checked out still counts. With `CI=true` a
+/// new branch counts too.
 #[test]
-fn new_ref_is_detected() {
-    assert_detected("a new branch", |fixture, repo| {
-        fixture.branch(repo, "other");
-    });
+fn other_branches_and_remote_refs_are_ignored_locally() {
+    for guarded in ["repo", "wt"] {
+        let (fixture, repo, _) = snapshotted();
+        let dir = fixture.path(guarded);
+        let (own, sibling) = if guarded == "repo" {
+            ("main", fixture.path("wt"))
+        } else {
+            ("feature", repo.clone())
+        };
+        // A commit the other worktree's branch has and this one's does not.
+        let moved = fixture.commit_file(&sibling, "s.txt", "s\n", "in the other worktree");
+        let file = fixture.path("own-snapshot");
+        assert_ok(&guard(&fixture, "snapshot", &dir, &file));
+        let first = fixture.rev_parse(&dir, "HEAD");
+        fixture.branch(&repo, "other");
+        fixture.update_ref(&repo, "refs/heads/other", &moved);
+        fixture.update_ref(&repo, "refs/heads/made", &moved);
+        fixture.update_ref(&repo, &format!("refs/remotes/origin/{own}"), &moved);
+        fixture.update_ref(&repo, "refs/remotes/origin/other", &moved);
+        std::fs::write(
+            repo.join(".git/FETCH_HEAD"),
+            format!("{first}\t\tbranch 'main' of /work/remote\n"),
+        )
+        .unwrap();
+        assert_ok(&guard(&fixture, "verify", &dir, &file));
+
+        fixture.update_ref(&repo, &format!("refs/heads/{own}"), &moved);
+        let output = guard(&fixture, "verify", &dir, &file);
+        assert!(!output.status.success(), "{own} moved, seen from {guarded}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.lines().any(|line| line == format!("+{moved} HEAD")),
+            "{stderr}"
+        );
+    }
+
+    let (fixture, repo, _) = snapshotted();
+    let file = fixture.path("ci-snapshot");
+    let ci = [("CI", "true")];
+    assert_ok(&guard_with(&fixture, &ci, "snapshot", &repo, Some(&file)));
+    fixture.branch(&repo, "other");
+    assert!(
+        !guard_with(&fixture, &ci, "verify", &repo, Some(&file))
+            .status
+            .success(),
+        "a new branch was ignored with CI=true"
+    );
 }
 
 #[test]
@@ -592,7 +640,7 @@ fn inherited_git_variables_do_not_redirect_the_guard() {
     // The snapshot is of the repository, so a change in it is seen through the variables.
     let file = fixture.path("snapshot");
     assert_ok(&guard_with(&fixture, &env, "snapshot", &repo, Some(&file)));
-    fixture.branch(&repo, "other");
+    fixture.tag(&repo, "v1");
     assert!(
         !guard_with(&fixture, &env, "verify", &repo, Some(&file))
             .status

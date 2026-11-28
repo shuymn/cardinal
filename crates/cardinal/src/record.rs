@@ -83,7 +83,7 @@ impl Recorder {
         };
         let shared = state::lock(&self.state.records_lock(), LockMode::Shared, deadline)
             .map_err(|err| append_error(io::Error::other(err)))?;
-        let file = state::open_append(&path).map_err(append_error)?;
+        let file = open_append(&path).map_err(append_error)?;
         testpoint::hit(testpoint::RECORD_OPENED)
             .map_err(|err| append_error(io::Error::other(err)))?;
         state::append_line(&file, &line).map_err(append_error)?;
@@ -133,6 +133,19 @@ impl Recorder {
             Err(err) => Err(err),
         }
     }
+}
+
+/// `path` opened for [`state::append_line`], created if missing, as a regular file only
+/// (`os::open_regular`): a FIFO or a link left at `records.jsonl` is an error, never written
+/// into or through.
+fn open_append(path: &std::path::Path) -> io::Result<File> {
+    crate::os::open_regular(
+        std::fs::OpenOptions::new()
+            .append(true)
+            .read(true)
+            .create(true),
+        path,
+    )
 }
 
 /// Where a rotation that keeps one file moves `records.jsonl` before it removes it: a new

@@ -359,7 +359,7 @@ EOF
       local sized=(--size $((64 << 20)) --tmpfs "$R/volume")
       if ! error=$("${bwrap[@]}" "${tail[@]}" sh -c ': >/dev/null && : >"$1/probe"' sh "$R" 2>&1)
       then
-        confinement="UNCONFINED: bubblewrap does not work here (${error:-not installed}); writes outside the per-run root are found only by the repository guard, and those to other worktrees' branches, the objects, or other refs only in CI"
+        confinement="UNCONFINED: bubblewrap does not work here (${error:-not installed}); writes outside the per-run root are found only by the repository guard, and those to other branches, remote-tracking refs, the objects, or other refs only in CI"
       elif ! "${bwrap[@]}" "${tail[@]}" test -r "$root/Cargo.toml"; then
         say "bubblewrap hides the checkout $root from the tests"
         exit 1

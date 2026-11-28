@@ -31,21 +31,27 @@
 #   file that differs from the index or HEAD and each untracked file git does not ignore,
 #   with its content.
 #
-# Other worktrees of the same repository change legitimately while the tests run, and other
-# agents add and remove them, so by default their work is left out: the branches they have
-# checked out at the snapshot or at the verify (refs, remote-tracking refs, `branch.<name>.*`
-# config, `packed-refs` lines), their entries in the worktree list and their
-# `worktrees/<name>/gitdir` lines, their git dirs, and the objects. Where the tests run
-# confined, their confinement already denies writes to the shared git dir and the guard is the
-# second check, and CI=true compares the whole worktree list on every platform. A local run
-# that is not confined (Linux without bubblewrap) has neither: a test that changes another
-# worktree's branch, the objects, or a ref outside git's own namespaces passes it and fails
-# only in CI. Lines that belong to a branch carry an `@<branch> ` prefix in the state, and
-# verify drops those of every branch another worktree had checked out at either point from
-# both states before comparing them; a branch another worktree had checked out only in
-# between counts as a change. Refs outside git's own namespaces (heads, tags, remotes, notes,
-# stash), which other tools keep for themselves, are left out too. With CI=true there are no
-# other worktrees, and the state is the whole common git dir (objects by name) and every ref.
+# Other worktrees of the same repository change legitimately while the tests run (commits,
+# pushes, fetches, branches made and deleted), and other agents add and remove them, so by
+# default their work is left out: of the refs, only HEAD (which resolves to the branch this
+# worktree has checked out), tags, notes, and the stash count, in the ref list and in
+# `packed-refs`, so other branches, remote-tracking refs, and refs outside git's own
+# namespaces, which other tools keep for themselves, are left out, as is the common dir's
+# FETCH_HEAD; so are the `branch.<name>.*` config of the branches other worktrees have
+# checked out at the snapshot or at the verify, their entries in the worktree list and their
+# `worktrees/<name>/gitdir` lines, their git dirs, and the objects. Config lines of a branch
+# carry an `@<branch> ` prefix in the state, and verify drops those of every branch another
+# worktree had checked out at either point from both states before comparing them; a branch
+# another worktree had checked out only in between counts as a change. Tags and the stash
+# stay although they are shared: a test that runs git in the wrong repository writes them as
+# readily as a branch, and the developer rarely makes them during a run (a fetch that
+# follows tags is the exception). Where the tests run confined, their confinement already
+# denies writes to the shared git dir and the guard is the second check, and CI=true
+# compares the whole worktree list on every platform. A local run that is not confined
+# (Linux without bubblewrap) has neither: a test that makes or moves a branch not checked
+# out here, a remote-tracking ref, or a ref outside git's own namespaces, or writes the
+# objects, passes it and fails only in CI. With CI=true there are no other worktrees, and
+# the state is the whole common git dir (objects by name) and every ref.
 
 # POSIX prelude: re-run under bash in a constructed environment. `sh` reads no startup file
 # when it runs a script; `bash --noprofile --norc` with BASH_ENV unset reads none either.
@@ -198,17 +204,14 @@ state() {
       /^worktree / { other = (substr($0, 10) != ENVIRON["OWN"]) }
       other && /^branch refs\/heads\// { print substr($0, 19) }' | sort -u
   fi
-  # awk prelude: keep(ref) says whether a ref is part of the state, and tag(ref) gives the
-  # `@<branch> ` prefix of a ref that belongs to a branch: the branch and its remote-tracking
-  # refs.
+  # awk prelude: keep(ref) says whether a ref is part of the state. Locally the refs are
+  # HEAD, which resolves to the branch this worktree has checked out, tags, notes, and the
+  # stash: what a test that escaped its fixture could write here. Branches and
+  # remote-tracking refs are left out, since a push, a fetch, or a branch made or deleted in
+  # another worktree changes them while the tests run.
   local filter='BEGIN { strict = (ENVIRON["STRICT"] == "yes") }
   function keep(ref) {
-    return strict || ref == "HEAD" || ref ~ /^refs\/(heads|tags|remotes|notes)\// || ref == "refs/stash"
-  }
-  function tag(ref,   name) {
-    name = ref
-    if (sub(/^refs\/heads\//, "", name) || sub(/^refs\/remotes\/[^\/]+\//, "", name)) return "@" name " "
-    return ""
+    return strict || ref == "HEAD" || ref ~ /^refs\/(tags|notes)\// || ref == "refs/stash"
   }'
 
   echo "## show-ref --head"
@@ -216,14 +219,14 @@ state() {
   # Exit 1 means no refs at all, which is a state too.
   refs=$(g show-ref --head) || [ "$?" -eq 1 ]
   printf '%s\n' "$refs" | STRICT=$strict awk "$filter"'
-    keep($2) { print tag($2) $0 }'
+    keep($2)'
 
   echo "## packed-refs"
   if [ -f "$common/packed-refs" ]; then
     STRICT=$strict awk "$filter"'
       /^#/ { print; next }
-      /^\^/ { if (kept) print prefix $0; next }
-      { kept = keep($2); prefix = tag($2); if (kept) print prefix $0 }' "$common/packed-refs"
+      /^\^/ { if (kept) print; next }
+      { kept = keep($2); if (kept) print }' "$common/packed-refs"
   else
     echo "missing"
   fi
@@ -321,8 +324,9 @@ state() {
   echo "## worktree git dir"
   if [ "$gitdir" = "$common" ]; then
     # The main worktree: its own files sit at the top of the common dir.
+    # FETCH_HEAD is the common dir's too: a fetch in any worktree writes it.
     manifest "$gitdir" content './*/*' ./config ./packed-refs ./objects ./refs ./hooks \
-      ./info ./worktrees ./modules ./lfs ./rr-cache ./branches
+      ./info ./worktrees ./modules ./lfs ./rr-cache ./branches ./FETCH_HEAD
     manifest "$gitdir/logs" content ./refs
   else
     manifest "$gitdir" content

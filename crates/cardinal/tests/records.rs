@@ -259,6 +259,58 @@ fn a_paused_appender_loses_nothing_across_two_rotations() {
     assert_eq!(seqs, [2, 3, 1], "the paused record survives");
 }
 
+/// A FIFO or a symbolic link left at `records.jsonl` fails the append (`RecordError::Append`):
+/// the record neither goes into a pipe no one reads, lost while the append reports success,
+/// nor through the link.
+#[cfg(unix)]
+#[test]
+fn an_append_to_what_is_not_a_regular_file_fails() {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::FileTypeExt;
+
+    let (dir, state) = state();
+    let current = state.records_file();
+    std::fs::create_dir_all(current.parent().unwrap()).unwrap();
+    let c = std::ffi::CString::new(current.as_os_str().as_bytes()).unwrap();
+    // SAFETY: `c` is a valid NUL-terminated path.
+    let made = unsafe { libc::mkfifo(c.as_ptr(), 0o600) };
+    assert_eq!(made, 0, "mkfifo: {}", std::io::Error::last_os_error());
+
+    // In a helper, so an append that waits in the FIFO is killed at the deadline.
+    let scope = Scope::new();
+    let output = helper::command(
+        &scope,
+        &Mode::Append {
+            state: dir.path().to_path_buf(),
+            seq: 0,
+            max_bytes: 1 << 20,
+            keep: 4,
+        },
+        scope.root(),
+    )
+    .output_within(Duration::from_secs(30))
+    .expect("the append ends");
+    assert_eq!(output.status.code(), Some(3), "{output:?}");
+    assert!(
+        std::fs::symlink_metadata(&current)
+            .unwrap()
+            .file_type()
+            .is_fifo()
+    );
+
+    std::fs::remove_file(&current).unwrap();
+    let elsewhere = dir.path().join("elsewhere");
+    std::fs::write(&elsewhere, b"").unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &current).unwrap();
+    let recorder = Recorder::new(&state, 1 << 20, 4);
+    let err = recorder.append(&numbered(&recorder, 1, 0)).unwrap_err();
+    assert!(
+        matches!(&err, cardinal::record::RecordError::Append { path, .. } if *path == current),
+        "{err:?}"
+    );
+    assert_eq!(std::fs::read(&elsewhere).unwrap(), b"");
+}
+
 #[test]
 fn concurrent_appenders_with_rotation_never_split_lines() {
     let (_dir, state) = state();
