@@ -21,7 +21,7 @@ const TABLE: &[(&str, &[&str])] = &[
     ("contract", &[]),
     ("config", &["contract"]),
     ("state", &["contract"]),
-    ("record", &["state", "contract"]),
+    ("record", &["state", "os", "contract"]),
     ("testpoint", &[]),
     ("os", &[]),
     ("sensor", &["os", "contract"]),
